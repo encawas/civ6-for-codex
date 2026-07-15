@@ -4,6 +4,7 @@ from pathlib import Path
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
 from civ6_workflow.models import ActionResult, ExecutionMode, PlanBundle, RuntimeSnapshot
 from civ6_workflow.store import WorkflowStore
+from civ6_workflow.workflow_protocol import EventResolution, ResolutionDisposition
 
 
 class _Planner:
@@ -12,7 +13,19 @@ class _Planner:
 
     async def plan(self, request):
         self.calls += 1
-        return PlanBundle(summary="no deterministic recovery task")
+        return PlanBundle(
+            summary="no deterministic recovery task",
+            requires_human_review=True,
+            event_resolutions=[
+                EventResolution(
+                    event_dedupe_key=event.dedupe_key,
+                    disposition=ResolutionDisposition.HUMAN_REVIEW,
+                    reason="The invalid builder plan cannot be repaired deterministically.",
+                )
+                for event in request.trigger_events
+                if event.blocking
+            ],
+        )
 
 
 class _Game:
@@ -103,10 +116,11 @@ def test_unresolved_rule_blocker_pauses_instead_of_polling_forever(tmp_path: Pat
 
     first = asyncio.run(engine.tick())
     assert first.agent_invoked is True
-    assert first.paused is False
+    assert first.paused is True
+    assert first.pause_reason == "Planner requested human review"
     assert planner.calls == 1
 
     second = asyncio.run(engine.tick())
     assert planner.calls == 1
     assert second.paused is True
-    assert "no executable recovery task" in second.pause_reason
+    assert "already been called" in second.pause_reason
