@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/import-standalone.yml"
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
@@ -14,12 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Download standalone source artifact
         env:
-          SOURCE_URL: "https://sdmntprwestus3.oaiusercontent.com/files/00000000-aa38-71fd-ba1d-483b1931dcf4/raw?se=2026-07-15T04%3A32%3A23Z&sp=r&sv=2026-02-06&sr=b&scid=73672776-9b1a-5f3f-918f-9333fba1727f&skoid=fadb8e47-d3c7-4c79-a9c3-970d9af3b213&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-07-15T02%3A07%3A40Z&ske=2026-07-17T02%3A07%3A40Z&sks=b&skv=2026-02-06&sig=t79ESnRth9Hpw%2BTOwCPhIcy5L%2FV aJlHLx%2B8mv6thjgE%3D"
+          SOURCE_URL: "https://sdmntprwestus3.oaiusercontent.com/files/00000000-aa38-71fd-ba1d-483b1931dcf4/raw?se=2026-07-15T04%3A32%3A23Z&sp=r&sv=2026-02-06&sr=b&scid=73672776-9b1a-5f3f-918f-9333fba1727f&skoid=fadb8e47-d3c7-4c79-a9c3-970d9af3b213&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-07-15T02%3A07%3A40Z&ske=2026-07-17T02%3A07%3A40Z&sks=b&skv=2026-02-06&sig=t79ESnRth9Hpw%2BTOwCPhIcy5L%2FVaJlHLx%2B8mv6thjgE%3D"
         run: |
-          SOURCE_URL="${SOURCE_URL// /}"
           curl --fail --location "$SOURCE_URL" --output /tmp/civ6-source.zip
           mkdir -p /tmp/civ6-source
           unzip -q /tmp/civ6-source.zip -d /tmp/civ6-source
@@ -28,7 +31,6 @@ jobs:
         run: |
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -a /tmp/civ6-source/. .
-
           rm -rf .pytest_cache .venv
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
           find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
@@ -41,4 +43,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "feat: import standalone Civ6 workflow agent"
-          git push origin main
+          git push origin HEAD:main
