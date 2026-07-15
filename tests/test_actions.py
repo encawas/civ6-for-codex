@@ -1,4 +1,4 @@
-from civ6_workflow.actions import resolve_action
+from civ6_workflow.actions import action_argument_contracts, resolve_action
 from civ6_workflow.models import StoredTask
 
 
@@ -52,4 +52,14 @@ def test_research_and_civic_share_upstream_tool_with_fixed_category():
     assert civic_arguments == {
         "tech_or_civic": "CIVIC_CRAFTSMANSHIP",
         "category": "civic",
+    }
+
+
+def test_action_contracts_separate_runtime_injected_arguments():
+    contracts = action_argument_contracts()
+
+    assert contracts["set_research"] == {
+        "required": ["tech_or_civic"],
+        "optional": [],
+        "injected_by_runtime": {"category": "tech"},
     }

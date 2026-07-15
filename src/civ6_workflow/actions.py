@@ -96,6 +96,17 @@ ACTION_REGISTRY: dict[str, ActionSpec] = {
 }
 
 
+def action_argument_contracts() -> dict[str, dict[str, Any]]:
+    return {
+        action_type: {
+            "required": sorted(spec.required_arguments),
+            "optional": sorted(spec.optional_arguments),
+            "injected_by_runtime": dict(spec.fixed_arguments),
+        }
+        for action_type, spec in sorted(ACTION_REGISTRY.items())
+    }
+
+
 def resolve_action(task: StoredTask, allowed_tools: set[str]) -> tuple[str, dict[str, Any]]:
     spec = ACTION_REGISTRY.get(task.action_type)
     if spec is None:

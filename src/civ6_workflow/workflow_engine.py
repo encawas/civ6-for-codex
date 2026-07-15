@@ -10,7 +10,9 @@ from .models import AgentRequest, PlanBundle, TickMetrics, TickResult
 from .safe_engine import SafeWorkflowEngine
 from .validation import PlanValidationContext, validate_plan_bundle
 from .workflow_protocol import (
+    READ_ONLY_QUERY_SPECS,
     WorkflowPlanBundle,
+    information_tool_argument_contracts,
     validate_event_resolution_contract,
 )
 from .workflow_queries import InformationQueryRouter
@@ -34,22 +36,8 @@ class WorkflowAwareEngine(SafeWorkflowEngine):
                 "event_resolution_required": True,
                 "planning_phase": "initial",
                 "allow_information_requests": True,
-                "allowed_information_tools": [
-                    "get_settle_advisor",
-                    "get_global_settle_advisor",
-                    "get_pathing_estimate",
-                    "get_unit_promotions",
-                    "get_district_advisor",
-                    "get_city_production",
-                    "get_map_area",
-                    "get_policies",
-                    "get_trade_options",
-                    "get_pantheon_beliefs",
-                    "get_religion_beliefs",
-                    "get_dedications",
-                    "get_city_states",
-                    "get_builder_tasks",
-                ],
+                "allowed_information_tools": sorted(READ_ONLY_QUERY_SPECS),
+                "information_tool_arguments": information_tool_argument_contracts(),
             }
         )
         return request.model_copy(update={"constraints": constraints})

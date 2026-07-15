@@ -57,6 +57,23 @@ def test_unplanned_settler_becomes_site_selection_event(tmp_path):
     )
 
 
+def test_zero_city_start_detects_settler_without_reported_blocker(tmp_path):
+    snapshot = _snapshot().model_copy(
+        update={
+            "overview": {"turn": 10, "num_cities": 0},
+            "cities": [],
+            "blockers": [],
+        }
+    )
+    compiler = DeterministicRuleCompiler(WorkflowStore(tmp_path / "state.sqlite3"))
+
+    result = compiler.compile(snapshot)
+
+    assert [event.event_type for event in result.events] == [
+        "settler_site_selection_required"
+    ]
+
+
 def test_approved_settler_target_compiles_safe_travel(tmp_path):
     store = WorkflowStore(tmp_path / "state.sqlite3")
     _save_plan(store, {"x": 8, "y": 9})

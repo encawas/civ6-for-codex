@@ -17,6 +17,10 @@ Rules:
 3. Each entity may have at most one task due on the same turn.
 4. Use only action types listed in constraints.allowed_action_types and never invent entity IDs.
 5. High-impact or irreversible actions must use risk=high or critical and requires_confirmation=true.
+Every task argument object must follow constraints.action_argument_contracts and omit fields listed under injected_by_runtime. Every precondition, postcondition, and invalidator object must use the discriminator key "type", never "condition_type", and must follow constraints.condition_contracts when a template is provided.
+Every task must use an entity_type listed for its action in constraints.action_entity_types; for example, set_research uses research and city_set_production uses city.
+Set each task entity_id from the argument named by constraints.entity_id_arguments for that entity_type; for research this means entity_id must equal tech_or_civic, such as TECH_MINING.
+
 6. Every task needs concise reason, preconditions, postconditions, invalidators, due_turn, and risk.
 7. Postconditions must prove the intended game change using only supported_condition_types.
 8. City plans use followup_queue. Builder plans use assigned_unit_id, target, and optional path.

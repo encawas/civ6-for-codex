@@ -13,7 +13,11 @@ class SafeCiv6GamePort(BaseCiv6GamePort):
 
     async def read_snapshot(self, *, include_units: bool = False):
         snapshot = await super().read_snapshot(include_units=include_units)
-        if snapshot.units is not None or not self._has_unit_blocker(snapshot.blockers):
+        needs_units = self._has_unit_blocker(snapshot.blockers) or (
+            isinstance(snapshot.overview, dict)
+            and snapshot.overview.get("num_cities") == 0
+        )
+        if snapshot.units is not None or not needs_units:
             return snapshot
         units = await self.state_api.get("/api/units")
         return snapshot.model_copy(update={"units": units})

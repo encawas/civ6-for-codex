@@ -43,7 +43,12 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
 
     def compile(self, snapshot: RuntimeSnapshot):
         compiled = super().compile(snapshot)
-        if not self._has_unit_blocker(snapshot) or snapshot.units is None:
+        zero_city_start = (
+            isinstance(snapshot.overview, dict)
+            and snapshot.overview.get("num_cities") == 0
+        )
+        needs_unit_orders = self._has_unit_blocker(snapshot) or zero_city_start
+        if snapshot.units is None or not needs_unit_orders:
             return compiled
 
         context = self.store.current_context(snapshot.game_id)

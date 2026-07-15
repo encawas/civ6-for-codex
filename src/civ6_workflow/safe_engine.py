@@ -7,10 +7,12 @@ from types import TracebackType
 from typing import BinaryIO
 
 from .agent_projection import project_agent_context
+from .actions import action_argument_contracts
 from .engine import EngineConfig as BaseEngineConfig
 from .engine import WorkflowEngine as BaseWorkflowEngine
 from .gate import EventGate, GateConfig
 from .models import AgentRequest, ExecutionMode, GameEvent, StoredTask, TaskStatus
+from .validation import ACTION_ENTITY_TYPES
 
 
 @dataclass(slots=True)
@@ -134,6 +136,53 @@ class SafeWorkflowEngine(BaseWorkflowEngine):
             relevant_state=relevant_state,
             constraints={
                 "allowed_action_types": sorted(self.config.allowed_action_types),
+                "action_argument_contracts": action_argument_contracts(),
+                "action_entity_types": {
+                    action_type: sorted(entity_types)
+                    for action_type, entity_types in sorted(
+                        ACTION_ENTITY_TYPES.items()
+                    )
+                },
+                "entity_id_arguments": {
+                    "city": "city_id",
+                    "research": "tech_or_civic",
+                    "civic": "tech_or_civic",
+                    "unit": "unit_id",
+                    "builder": "unit_id",
+                },
+                "condition_contracts": {
+                    "discriminator_key": "type",
+                    "set_research": {
+                        "required_preconditions": [
+                            {"type": "research_unselected"},
+                            {
+                                "type": "research_available",
+                                "tech_type": "$tech_or_civic",
+                            },
+                        ],
+                        "required_postconditions": [
+                            {
+                                "type": "research_equals",
+                                "tech_type": "$tech_or_civic",
+                            },
+                        ],
+                    },
+                    "city_set_production": {
+                        "required_preconditions": [
+                            {
+                                "type": "city_has_no_production",
+                                "city_id": "$city_id",
+                            },
+                        ],
+                        "required_postconditions": [
+                            {
+                                "type": "city_production_equals",
+                                "city_id": "$city_id",
+                                "item_name": "$item_name",
+                            },
+                        ],
+                    },
+                },
                 "supported_condition_types": [
                     "turn_at_least",
                     "turn_equals",

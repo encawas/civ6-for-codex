@@ -37,6 +37,29 @@ class _StateApi:
         return [{"unit_id": 7, "unit_type": "UNIT_SCOUT", "moves_remaining": 2}]
 
 
+class _ZeroCityStateApi(_StateApi):
+    async def get_optional(self, path: str):
+        payload = await super().get_optional(path)
+        payload["overview"]["num_cities"] = 0
+        payload["end_turn_blockers"] = []
+        return payload
+
+
+def test_zero_city_start_expands_units_without_reported_blocker():
+    state = _ZeroCityStateApi("")
+    port = Civ6GamePort(_Client(), state, allowed_tools=set())
+
+    snapshot = asyncio.run(port.read_snapshot(include_units=False))
+
+    assert snapshot.units == [
+        {"unit_id": 7, "unit_type": "UNIT_SCOUT", "moves_remaining": 2}
+    ]
+    assert state.paths == [
+        "/api/workflow/snapshot?include_units=false",
+        "/api/units",
+    ]
+
+
 def test_unit_blocker_expands_snapshot_units():
     state = _StateApi("ENDTURN_BLOCKING_UNITS")
     port = Civ6GamePort(_Client(), state, allowed_tools=set())

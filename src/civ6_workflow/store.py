@@ -759,16 +759,18 @@ class WorkflowStore:
         }
 
     def agent_called_for_turn(self, game_id: str, turn: int) -> bool:
+        return self.agent_call_count_for_turn(game_id, turn) > 0
+
+    def agent_call_count_for_turn(self, game_id: str, turn: int) -> int:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT 1 FROM agent_runs
+                SELECT COUNT(*) AS count FROM agent_runs
                 WHERE game_id=? AND turn=? AND success=1
-                LIMIT 1
                 """,
                 (game_id, turn),
             ).fetchone()
-        return row is not None
+        return int(row["count"])
 
     def record_agent_run(
         self,

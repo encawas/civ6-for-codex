@@ -138,16 +138,22 @@ class WorkflowEngine:
             if event.blocking and event not in agent_events
         )
 
-        already_called = self.store.agent_called_for_turn(snapshot.game_id, snapshot.turn)
+        agent_call_count = self.store.agent_call_count_for_turn(
+            snapshot.game_id, snapshot.turn
+        )
+        already_called = agent_call_count > 0
+        call_limit_reached = (
+            agent_call_count >= self.config.max_agent_calls_per_turn
+        )
         if (
             agent_events
             and self.config.max_agent_calls_per_turn > 0
-            and not already_called
+            and not call_limit_reached
         ):
             if snapshot.units is None:
                 snapshot = await self._read_snapshot(metrics, include_units=True)
             await self._invoke_planner(snapshot, agent_events, result, metrics)
-        elif agent_events and already_called:
+        elif agent_events and call_limit_reached:
             result.paused = True
             result.pause_reason = (
                 "Codex has already been called for this turn; unresolved blocking "

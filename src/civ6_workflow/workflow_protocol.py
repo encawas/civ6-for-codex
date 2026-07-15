@@ -102,6 +102,16 @@ READ_ONLY_QUERY_SPECS: dict[str, QuerySpec] = {
 }
 
 
+def information_tool_argument_contracts() -> dict[str, dict[str, list[str]]]:
+    return {
+        name: {
+            "required": sorted(spec.required_arguments),
+            "optional": sorted(spec.optional_arguments),
+        }
+        for name, spec in sorted(READ_ONLY_QUERY_SPECS.items())
+    }
+
+
 class WorkflowProtocolError(ValueError):
     pass
 

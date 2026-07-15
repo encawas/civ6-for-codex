@@ -18,9 +18,11 @@ class FakePlanner:
     def __init__(self, bundle: PlanBundle | None = None):
         self.calls = 0
         self.bundle = bundle or PlanBundle(summary="no plan changes required")
+        self.requests = []
 
     async def plan(self, request):
         self.calls += 1
+        self.requests.append(request)
         if self.bundle.requires_human_review and not self.bundle.event_resolutions:
             return self.bundle.model_copy(
                 update={
@@ -243,5 +245,54 @@ def test_l3_events_are_batched_into_one_codex_call(tmp_path: Path):
         assert planner.calls == 1
         assert second.paused is True
         assert "already been called" in second.pause_reason
+
+    asyncio.run(scenario())
+
+
+def test_configured_agent_call_limit_allows_second_call(tmp_path: Path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "workflow.sqlite3")
+        snapshot = RuntimeSnapshot(
+            turn=20,
+            game_id="game-1",
+            overview={"turn": 20},
+            diplomacy={"pending": [{"player_id": 2}]},
+            trades={"offers": [{"player_id": 3}]},
+            cities={"cities": [{"city_id": 1, "currently_building": "UNIT_BUILDER"}]},
+            blockers=[
+                {"type": "pending_diplomacy", "data": {"player_id": 2}},
+                {"type": "pending_trades", "data": {"player_id": 3}},
+            ],
+        )
+        game = FakeGame(snapshot)
+        planner = FakePlanner(
+            PlanBundle(
+                summary="blocking decision still requires review",
+                requires_human_review=True,
+            )
+        )
+        engine = WorkflowEngine(
+            store=store,
+            game=game,
+            planner=planner,
+            config=EngineConfig(
+                execution_mode=ExecutionMode.CONFIRM,
+                auto_end_turn=True,
+                max_agent_calls_per_turn=2,
+                verification_delay_seconds=0,
+            ),
+        )
+
+        first = await engine.tick()
+        second = await engine.tick()
+
+        assert first.agent_invoked is True
+        assert second.agent_invoked is True
+        assert planner.calls == 2
+        constraints = planner.requests[-1].constraints
+        assert constraints["action_entity_types"]["set_research"] == ["research"]
+        assert constraints["entity_id_arguments"]["research"] == "tech_or_civic"
+        assert constraints["condition_contracts"]["discriminator_key"] == "type"
+
 
     asyncio.run(scenario())

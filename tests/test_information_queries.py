@@ -3,7 +3,11 @@ import asyncio
 import pytest
 
 from civ6_workflow.models import EventLevel, GameEvent, RiskLevel
-from civ6_workflow.workflow_protocol import InformationRequest, WorkflowProtocolError
+from civ6_workflow.workflow_protocol import (
+    InformationRequest,
+    WorkflowProtocolError,
+    information_tool_argument_contracts,
+)
 from civ6_workflow.workflow_queries import InformationQueryRouter
 
 
@@ -35,6 +39,15 @@ def test_settler_event_prefetches_focused_advisor():
     results = asyncio.run(router.execute(requests))
     assert game.calls == [("get_settle_advisor", {"unit_id": 7})]
     assert results[requests[0].request_id]["result"]["text"].startswith("#1")
+
+
+def test_information_tool_contracts_expose_required_arguments():
+    contracts = information_tool_argument_contracts()
+
+    assert contracts["get_map_area"] == {
+        "required": ["center_x", "center_y"],
+        "optional": ["radius"],
+    }
 
 
 def test_non_read_only_query_is_rejected():
