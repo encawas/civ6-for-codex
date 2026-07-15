@@ -1,18 +1,31 @@
 # Civ6 工作流智能体
 
-这是一个面向《文明6：风云变幻》的本地工作流智能体项目。
-
-项目当前暂时位于 `1th/civ6-workflow/`，但该目录已经按独立项目组织。以后可以把整个目录直接拆成单独的 GitHub 仓库。
+这是一个面向《文明6：风云变幻》的本地工作流智能体项目。前端是控制入口，本地后端负责连接游戏、MCP（模型上下文协议）和规划器。
 
 ## 启动前端
 
-在 PowerShell 中进入项目目录：
+克隆仓库后，在 PowerShell 中进入仓库根目录：
 
 ```powershell
-cd civ6-workflow
+git clone https://github.com/encawas/civ6-for-codex.git
+cd civ6-for-codex
 ```
 
-直接运行：
+编辑 `config.toml`，填写可用模型：
+
+```toml
+[codex]
+backend = "responses"
+model = "你的 API 可用模型"
+```
+
+在当前 PowerShell 窗口设置 API Key：
+
+```powershell
+$env:OPENAI_API_KEY = "你的 OpenAI API Key"
+```
+
+启动：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start_frontend.ps1
@@ -28,24 +41,6 @@ http://127.0.0.1:8765/?token=...
 
 复制完整地址到浏览器，然后点击 **连接规划器**。
 
-## 配置规划器
-
-编辑根目录的 `config.toml`：
-
-```toml
-[codex]
-backend = "responses"
-model = "你的 API 可用模型"
-```
-
-在同一个 PowerShell 窗口设置 API Key：
-
-```powershell
-$env:OPENAI_API_KEY = "你的 OpenAI API Key"
-```
-
-API Key 只由本地后端读取，不会发送到浏览器。
-
 ## 首次实机测试
 
 保持安全模式：
@@ -59,7 +54,7 @@ auto_end_turn = false
 ## 项目结构
 
 ```text
-civ6-workflow/
+civ6-for-codex/
 ├─ config.toml
 ├─ start_frontend.ps1
 ├─ pyproject.toml
@@ -69,7 +64,7 @@ civ6-workflow/
 ├─ upstream_overlay/    # civ6-mcp 结构化接口补丁
 ├─ docs/                # 架构与实机说明
 ├─ state/               # 本地数据库和规划器运行数据
-└─ .github/workflows/   # 独立仓库 CI
+└─ .github/workflows/   # GitHub 自动测试
 ```
 
 ## 主要文档
@@ -77,6 +72,5 @@ civ6-workflow/
 - 前端详细说明：`docs/CONTROL_PANEL.md`
 - 工作流智能体架构：`docs/WORKFLOW_AGENT_ARCHITECTURE.md`
 - Windows 实机验收：`docs/LIVE_SMOKE_TEST.md`
-- 拆成独立仓库：`docs/EXTRACT_STANDALONE_REPO.md`
 
 停止前端：在启动终端按 `Ctrl+C`。
