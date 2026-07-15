@@ -17,7 +17,7 @@ jobs:
 
       - name: Download standalone source artifact
         env:
-          SOURCE_URL: "https://sdmntprwestus3.oaiusercontent.com/files/00000000-aa38-71fd-ba1d-483b1931dcf4/raw?se=2026-07-15T04%3A32%3A23Z&sp=r&sv=2026-02-06&sr=b&scid=73672776-9b1a-5f3f-918f-9333fba1727f&skoid=fadb8e47-d3c7-4c79-a9c3-970d9af3b213&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-07-15T02%3A07%3A40Z&ske=2026-07-17T02%3A07%3A40Z&sks=b&skv=2026-02-06&sig=t79ESnRth9Hpw%2BTOwCPhIcy5L%2FVaJlHLx%2B8mv6thjgE%3D"
+          SOURCE_URL: "https://sdmntprwestus.oaiusercontent.com/files/00000000-8408-7230-b787-927522b35a65/raw?se=2026-07-15T04%3A37%3A44Z&sp=r&sv=2026-02-06&sr=b&scid=962aed9b-53a2-5099-9f36-cfc010d22c60&skoid=fadb8e47-d3c7-4c79-a9c3-970d9af3b213&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-07-15T02%3A09%3A44Z&ske=2026-07-17T02%3A09%3A44Z&sks=b&skv=2026-02-06&sig=7AUW6giyFXku3OHLq3TUTjWz5EjH9frN5MXNq1cAiiA%3D"
         run: |
           curl --fail --location "$SOURCE_URL" --output /tmp/civ6-source.zip
           mkdir -p /tmp/civ6-source
