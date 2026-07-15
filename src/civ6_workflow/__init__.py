@@ -26,6 +26,7 @@ _actions_module.ACTION_REGISTRY["unit_found_city"] = ActionSpec(
     tool_name="unit_action",
     required_arguments=frozenset({"unit_id"}),
     fixed_arguments={"action": "found_city"},
+    retry_safe_after_unknown=False,
 )
 
 # Extend the auditable validation/condition language used by irreversible
