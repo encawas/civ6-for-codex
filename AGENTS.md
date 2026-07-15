@@ -10,11 +10,23 @@ When documents or existing code disagree, use this order:
 2. `docs/RUNTIME_STATE_MACHINE.md`
 3. `docs/PLANNER_CALL_POLICY.md`
 4. `docs/DOMAIN_CONTRACTS.md`
-5. `docs/REFACTOR_EXECUTION_PLAN.md`
-6. `docs/WORKFLOW_AGENT_ARCHITECTURE.md`
-7. Existing implementation details
+5. Accepted decisions under `docs/adr/`
+6. `docs/REFACTOR_EXECUTION_PLAN.md`
+7. `docs/WORKFLOW_AGENT_ARCHITECTURE.md`
+8. Existing implementation details
 
 Do not silently preserve behavior that violates a higher-authority document. Record the incompatibility, add a characterization test where useful, and migrate it explicitly.
+
+## Phase 0 required reading
+
+Before changing runtime architecture, read:
+
+- `docs/CURRENT_IMPLEMENTATION_AUDIT.md` for the effective engine/compiler/import replacement chain and known migration traps;
+- `docs/CHARACTERIZATION_TEST_CATALOG.md` for stable test identifiers and the baseline/target test matrix.
+
+These two files describe evidence and required test work. They do not override the normative contracts above.
+
+Every refactor pull request must name the relevant characterization-test IDs it adds, preserves, changes, or retires.
 
 ## Non-negotiable rules
 
