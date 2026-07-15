@@ -11,6 +11,7 @@ from civ6_workflow.models import (
     TaskStatus,
 )
 from civ6_workflow.store import WorkflowStore
+from civ6_workflow.workflow_protocol import EventResolution, ResolutionDisposition
 
 
 class FakePlanner:
@@ -18,8 +19,22 @@ class FakePlanner:
         self.calls = 0
         self.bundle = bundle or PlanBundle(summary="no plan changes required")
 
-    async def plan(self, _request):
+    async def plan(self, request):
         self.calls += 1
+        if self.bundle.requires_human_review and not self.bundle.event_resolutions:
+            return self.bundle.model_copy(
+                update={
+                    "event_resolutions": [
+                        EventResolution(
+                            event_dedupe_key=event.dedupe_key,
+                            disposition=ResolutionDisposition.HUMAN_REVIEW,
+                            reason="This blocker requires an explicit human decision.",
+                        )
+                        for event in request.trigger_events
+                        if event.blocking
+                    ]
+                }
+            )
         return self.bundle
 
 
