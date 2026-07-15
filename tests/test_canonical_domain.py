@@ -7,6 +7,7 @@ from civ6_workflow.domain import (
     ActionAttempt,
     ApprovalStatus,
     AttemptStatus,
+    MutationSentTick,
     Observation,
     RetryClassification,
     RuntimeState,
@@ -15,8 +16,6 @@ from civ6_workflow.domain import (
     SubjectRef,
     Task,
     TaskStatus,
-    TickOutcomeKind,
-    WorkflowTick,
     build_task_idempotency_key,
     normalize_slot,
     tasks_conflict,
@@ -65,12 +64,8 @@ def test_obs_006_equal_facts_have_distinct_ids_and_equal_projection_hashes():
         "source_versions": VERSIONS,
         "base_state": {"research": "TECH_MINING"},
     }
-    first = Observation(
-        observation_id="obs-1", sequence=1, observed_at=NOW, **common
-    )
-    second = Observation(
-        observation_id="obs-2", sequence=2, observed_at=NOW, **common
-    )
+    first = Observation(observation_id="obs-1", sequence=1, observed_at=NOW, **common)
+    second = Observation(observation_id="obs-2", sequence=2, observed_at=NOW, **common)
 
     assert first.observation_id != second.observation_id
     assert first.projection_hash == second.projection_hash
@@ -139,12 +134,8 @@ def test_task_003_active_slot_windows_conflict_before_scheduling():
     replacement = _task(
         "task-b", outcome="TECH_POTTERY", earliest_turn=13, latest_turn=14
     )
-    future = _task(
-        "task-c", outcome="TECH_WRITING", earliest_turn=14, latest_turn=15
-    )
-    completed = _task(
-        "task-d", status=TaskStatus.SUCCEEDED, outcome="TECH_POTTERY"
-    )
+    future = _task("task-c", outcome="TECH_WRITING", earliest_turn=14, latest_turn=15)
+    completed = _task("task-d", status=TaskStatus.SUCCEEDED, outcome="TECH_POTTERY")
 
     assert tasks_conflict(current, replacement) is True
     assert tasks_conflict(current, future) is False
@@ -176,13 +167,11 @@ def test_attempt_cannot_verify_before_it_is_sent():
 
 
 def test_tick_rejects_a_second_mutation_structurally():
-    with pytest.raises(ValidationError, match="less than or equal to 1"):
-        WorkflowTick(
+    with pytest.raises(ValidationError, match="Input should be 1"):
+        MutationSentTick(
             tick_id="tick-1",
             game_session_id="game-1",
             starting_runtime_state=RuntimeState.READY_TO_ACT,
-            ending_runtime_state=RuntimeState.ACTION_SENT,
-            outcome=TickOutcomeKind.MUTATION_SENT,
             observation_ids=("obs-1",),
             selected_operation="set_research",
             mutation_budget_used=2,
