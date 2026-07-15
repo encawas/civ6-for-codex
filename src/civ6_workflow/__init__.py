@@ -75,13 +75,14 @@ from .workflow_prompt import EXTENDED_SYSTEM_INSTRUCTIONS
 _codex_planner_module.SYSTEM_INSTRUCTIONS = EXTENDED_SYSTEM_INSTRUCTIONS
 
 # Install serialized ticks, execution-mode safety, event coverage, focused query
-# rounds, provider error classification, and cross-tick backoff.
+# rounds, provider error classification, cross-tick backoff, and unknown-commit
+# protection for irreversible actions.
 from . import engine as _engine_module
 from .safe_engine import SafeEngineConfig
-from .workflow_engine import WorkflowAwareEngine
+from .runtime_safety import CommitSafeWorkflowEngine
 
 _engine_module.EngineConfig = SafeEngineConfig
-_engine_module.WorkflowEngine = WorkflowAwareEngine
+_engine_module.WorkflowEngine = CommitSafeWorkflowEngine
 
 # Install strict recording/replay behavior.
 from . import replay as _replay_module
