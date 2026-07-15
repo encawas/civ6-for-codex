@@ -1,10 +1,6 @@
 name: Import standalone Civ6 project
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/import-standalone.yml"
   pull_request:
     branches: [main]
 
@@ -31,7 +27,7 @@ jobs:
         run: |
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -a /tmp/civ6-source/. .
-          rm -rf .pytest_cache .venv
+          rm -rf .pytest_cache .venv .github/workflows
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
           find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
           mkdir -p state
