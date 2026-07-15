@@ -64,7 +64,7 @@ def test_settler_and_promotion_are_not_auto_skipped(tmp_path: Path):
     )
     assert settler.bundle is None
     assert [event.event_type for event in settler.events] == [
-        "special_unit_orders_required"
+        "settler_site_selection_required"
     ]
     assert settler.events[0].blocking is True
 
