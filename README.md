@@ -81,6 +81,16 @@ civ6-for-codex/
 
 核心目标是：**普通已规划回合零次调用 AI，战略决策回合通常最多一次逻辑调用；规则系统连续执行阶段计划，只有计划失效或出现真正的战略决策缺口才重新规划。**
 
+## Phase 0（阶段零）审计材料
+
+开始修改运行逻辑前，还应阅读：
+
+- `docs/CURRENT_IMPLEMENTATION_AUDIT.md`：当前真实运行时、补丁继承链、持久化与恢复风险；
+- `docs/CHARACTERIZATION_TEST_CATALOG.md`：特征测试编号、场景和重构验收矩阵；
+- `docs/adr/0001-explicit-runtime-composition.md`：显式组合根决策；
+- `docs/adr/0002-stable-decision-identity-and-plan-leases.md`：稳定决策身份与计划租约决策；
+- `docs/adr/0003-mutation-attempt-and-verification-boundary.md`：单次写操作、动作尝试和后置验证边界。
+
 ## 其他文档
 
 - 前端详细说明：`docs/CONTROL_PANEL.md`
