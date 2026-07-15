@@ -50,7 +50,10 @@ class _Client:
         }
         response = httpx.Response(
             200,
-            headers={"x-request-id": "req_http_123"},
+            headers={
+                "x-request-id": "req_http_123",
+                "content-type": "application/json",
+            },
             content=json.dumps(body).encode("utf-8"),
         )
         return _Stream(response)
@@ -110,3 +113,52 @@ def test_responses_planner_fails_fast_without_api_key(monkeypatch):
         assert "OPENAI_API_KEY" in str(exc)
     else:
         raise AssertionError("missing API key must fail before an HTTP request")
+
+
+class _RetryClient(_Client):
+    calls = 0
+
+    def stream(self, method, url, *, headers, content):
+        type(self).calls += 1
+        if type(self).calls < 3:
+            return _Stream(
+                httpx.Response(
+                    502,
+                    headers={
+                        "x-request-id": f"req_retry_{type(self).calls}",
+                        "content-type": "application/json",
+                    },
+                    json={"error": "temporary upstream failure"},
+                )
+            )
+        return super().stream(method, url, headers=headers, content=content)
+
+
+def test_responses_planner_retries_transient_gateway_errors(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _RetryClient.calls = 0
+    monkeypatch.setattr(
+        "civ6_workflow.responses_planner.httpx.AsyncClient", _RetryClient
+    )
+    planner = ResponsesPlanner(
+        CodexPlannerConfig(
+            backend="responses",
+            model="test-model",
+            max_http_attempts=3,
+            retry_base_seconds=0,
+        ),
+        SYSTEM_INSTRUCTIONS,
+        PlannerError,
+    )
+    request = AgentRequest(
+        turn=5,
+        execution_mode=ExecutionMode.CONFIRM,
+        trigger_events=[],
+        constraints={"max_tasks": 2},
+    )
+
+    bundle = asyncio.run(planner.plan(request))
+
+    assert bundle.summary == "compact response plan"
+    assert _RetryClient.calls == 3
+    assert planner.last_diagnostics["attempt_count"] == 3

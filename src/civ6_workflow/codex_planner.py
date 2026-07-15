@@ -29,10 +29,13 @@ class CodexPlannerConfig:
     timeout_seconds: int = 120
     api_base_url: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
+    api_key_file: str | Path | None = None
     connect_timeout_seconds: float = 10.0
     read_timeout_seconds: float = 90.0
     write_timeout_seconds: float = 30.0
     pool_timeout_seconds: float = 10.0
+    max_http_attempts: int = 3
+    retry_base_seconds: float = 0.5
     # Persistent project-local directory used only by the CLI diagnostic
     # fallback. Responses API planning does not create Codex process state.
     state_directory: str | Path = "state/codex-planner"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 
@@ -42,10 +43,13 @@ class CodexSection(StrictModel):
     timeout_seconds: int = Field(default=120, ge=10)
     api_base_url: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
+    api_key_file: str | None = None
     connect_timeout_seconds: float = Field(default=10.0, gt=0)
     read_timeout_seconds: float = Field(default=90.0, gt=0)
     write_timeout_seconds: float = Field(default=30.0, gt=0)
     pool_timeout_seconds: float = Field(default=10.0, gt=0)
+    max_http_attempts: int = Field(default=3, ge=1, le=6)
+    retry_base_seconds: float = Field(default=0.5, ge=0, le=10)
     state_directory: str = "state/codex-planner"
     sandbox: str = "read-only"
     ephemeral: bool = True
@@ -131,6 +135,13 @@ class AppConfig(StrictModel):
         state_directory = Path(self.codex.state_directory).expanduser()
         if not state_directory.is_absolute() and base_directory is not None:
             state_directory = Path(base_directory) / state_directory
+        api_key_file = None
+        if self.codex.api_key_file:
+            api_key_file = Path(
+                os.path.expandvars(self.codex.api_key_file)
+            ).expanduser()
+            if not api_key_file.is_absolute() and base_directory is not None:
+                api_key_file = Path(base_directory) / api_key_file
         return CodexPlannerConfig(
             backend=self.codex.backend,
             command=self.codex.command,
@@ -139,10 +150,13 @@ class AppConfig(StrictModel):
             timeout_seconds=self.codex.timeout_seconds,
             api_base_url=self.codex.api_base_url,
             api_key_env=self.codex.api_key_env,
+            api_key_file=api_key_file,
             connect_timeout_seconds=self.codex.connect_timeout_seconds,
             read_timeout_seconds=self.codex.read_timeout_seconds,
             write_timeout_seconds=self.codex.write_timeout_seconds,
             pool_timeout_seconds=self.codex.pool_timeout_seconds,
+            max_http_attempts=self.codex.max_http_attempts,
+            retry_base_seconds=self.codex.retry_base_seconds,
             state_directory=state_directory,
             sandbox=self.codex.sandbox,
             ephemeral=self.codex.ephemeral,
