@@ -19,16 +19,25 @@ def test_committed_config_is_safe_and_project_local():
     assert Path(planner.state_directory) == PROJECT_ROOT / "state" / "codex-planner"
 
 
-def test_standalone_project_entry_files_exist():
+def test_standalone_project_entry_files_exist_at_repository_root():
     required = [
         "README.md",
+        "README_CN.md",
         "config.toml",
         "config.example.toml",
         "pyproject.toml",
         "start_frontend.ps1",
         ".gitignore",
         ".github/workflows/tests.yml",
-        "docs/EXTRACT_STANDALONE_REPO.md",
+        "src/civ6_workflow/__init__.py",
+        "tests/test_engine.py",
     ]
     missing = [path for path in required if not (PROJECT_ROOT / path).exists()]
     assert missing == []
+    assert not (PROJECT_ROOT / "civ6-workflow").exists()
+
+
+def test_readme_describes_current_standalone_repository():
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "1th/civ6-workflow" not in readme
+    assert "cd civ6-for-codex" in readme
