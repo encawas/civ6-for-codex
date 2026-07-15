@@ -1,0 +1,74 @@
+[runtime]
+database_path = "state/civ6-workflow.sqlite3"
+execution_mode = "readonly" # readonly | confirm | auto
+auto_end_turn = false
+poll_interval_seconds = 1.0
+max_agent_calls_per_turn = 1
+max_turn_seconds = 300
+
+[civ6_mcp]
+command = "civ-mcp"
+args = []
+env = {}
+
+[state_api]
+base_url = "http://127.0.0.1:8000"
+timeout_seconds = 10.0
+startup_retry_seconds = 5.0
+
+[codex]
+backend = "responses" # responses | codex_cli
+# Fill in a model available to your OpenAI API project before connecting.
+model = ""
+api_base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+reasoning_effort = "low"
+timeout_seconds = 120
+connect_timeout_seconds = 10.0
+read_timeout_seconds = 90.0
+write_timeout_seconds = 30.0
+pool_timeout_seconds = 10.0
+state_directory = "state/codex-planner"
+
+# codex_cli is retained only as a diagnostic fallback.
+command = "codex"
+sandbox = "read-only"
+ephemeral = true
+ignore_user_config = false
+ignore_project_rules = true
+disable_external_tools = true
+disabled_mcp_servers = ["civ6", "openaiDeveloperDocs", "node_repl"]
+config_overrides = []
+use_output_schema = true
+
+[gate]
+repeated_failure_threshold = 2
+default_cooldown_turns = 2
+
+[safety]
+allowed_action_types = [
+  "city_set_production",
+  "set_research",
+  "set_civic",
+  "unit_move",
+  "builder_improve",
+  "unit_heal",
+  "unit_fortify",
+  "unit_skip",
+]
+auto_action_types = [
+  "city_set_production",
+  "set_research",
+  "set_civic",
+  "unit_move",
+  "builder_improve",
+  "unit_heal",
+  "unit_fortify",
+  "unit_skip",
+]
+allowed_tools = [
+  "set_city_production",
+  "set_research",
+  "unit_action",
+  "end_turn",
+]
