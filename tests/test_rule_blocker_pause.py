@@ -123,4 +123,4 @@ def test_unresolved_rule_blocker_pauses_instead_of_polling_forever(tmp_path: Pat
     second = asyncio.run(engine.tick())
     assert planner.calls == 1
     assert second.paused is True
-    assert "already been called" in second.pause_reason
+    assert "no executable recovery task" in second.pause_reason
