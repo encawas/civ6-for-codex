@@ -36,6 +36,7 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
     EXPIRED = "expired"
     ESCALATED = "escalated"
+    UNCERTAIN = "uncertain"
 
 
 class ExecutionMode(str, Enum):
@@ -175,6 +176,7 @@ ActionType = Literal[
     "set_research",
     "set_civic",
     "unit_move",
+    "unit_found_city",
     "builder_improve",
     "unit_heal",
     "unit_fortify",
