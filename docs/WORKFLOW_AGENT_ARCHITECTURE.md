@@ -1,5 +1,7 @@
 # Frontend-led workflow agent architecture
 
+> **Status:** This document remains the high-level architecture overview. During the current refactor, the normative runtime constraints are defined by `REFACTOR_CONSTITUTION.md`, `RUNTIME_STATE_MACHINE.md`, `PLANNER_CALL_POLICY.md`, and `DOMAIN_CONTRACTS.md`. Where this overview appears to describe a whole-turn monolithic cycle, the bounded state-machine documents take precedence.
+
 ## Objective
 
 Build a Civilization VI workflow agent whose primary interface is the local control panel. The frontend supervises and initiates work through a local orchestration API; Codex or another model is a replaceable planning service behind that API, never the process that launches or owns the frontend.
@@ -76,25 +78,27 @@ PUT  /api/plans/units/{unit_id}
 
 ### 3. Workflow orchestrator
 
-The orchestrator owns one durable workflow cycle:
+The orchestrator owns a sequence of bounded durable ticks, not one function that attempts to finish an entire turn.
+
+A tick may perform several reads but at most one game mutation:
 
 ```text
-Observe
-→ Normalize
-→ Reconcile saved state / reload recovery
-→ Compile deterministic tasks
-→ Execute approved due tasks
-→ Verify postconditions
-→ Classify remaining blockers
-→ Project focused planner context
-→ Request strategic plan when necessary
-→ Validate and persist proposed tasks
-→ Wait for approval or continue in auto mode
-→ Re-check end-turn safety
-→ End turn
+Observe minimum required state
+→ Reconcile previous mutation / reload recovery
+→ Route one current item
+→ Perform exactly one of:
+   - gather focused read-only context
+   - request one bounded strategic plan
+   - create/validate one task
+   - execute one approved task
+   - attempt end turn
+→ Persist the resulting state
+→ Return control
 ```
 
-Each node should have a persisted status and timing record rather than existing only as control flow inside one Python method.
+After any game mutation, the tick ends. A later tick performs fresh-state verification. Continuous operation repeatedly invokes this bounded tick state machine.
+
+Each state and transition must have a persisted status and timing record rather than existing only as control flow inside one Python method.
 
 ### 4. Event router
 
