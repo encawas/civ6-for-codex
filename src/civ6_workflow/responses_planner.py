@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
 
+from .credentials import CredentialError, resolve_api_credential
 from .models import AgentRequest, PlanBundle
 
 log = logging.getLogger(__name__)
@@ -19,6 +19,8 @@ log = logging.getLogger(__name__)
 class PlannerHttpDiagnostics:
     backend: str = "responses"
     request_bytes: int = 0
+    attempt_count: int = 0
+    credential_source: str | None = None
     connect_and_headers_seconds: float | None = None
     first_byte_seconds: float | None = None
     completion_seconds: float | None = None
@@ -38,12 +40,18 @@ class ResponsesPlanner:
         self.last_diagnostics: dict[str, Any] | None = None
 
     async def plan(self, request: AgentRequest) -> PlanBundle:
-        api_key = os.environ.get(self.config.api_key_env)
-        if not api_key:
-            raise self.error_type(
-                f"Responses API planner requires environment variable "
-                f"{self.config.api_key_env}"
+        try:
+            credential = resolve_api_credential(
+                self.config.api_key_env, self.config.api_key_file
             )
+        except CredentialError as exc:
+            raise self.error_type(str(exc)) from exc
+        if credential is None:
+            raise self.error_type(
+                "Responses API planner requires an API credential from "
+                f"{self.config.api_key_env} or codex.api_key_file"
+            )
+        api_key = credential.value
         if not self.config.model:
             raise self.error_type(
                 "Responses API planner requires codex.model in config.toml"
@@ -72,7 +80,10 @@ class ResponsesPlanner:
         raw_request = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
-        diagnostics = PlannerHttpDiagnostics(request_bytes=len(raw_request))
+        diagnostics = PlannerHttpDiagnostics(
+            request_bytes=len(raw_request),
+            credential_source=credential.source,
+        )
         started = time.perf_counter()
         timeout = httpx.Timeout(
             connect=self.config.connect_timeout_seconds,
@@ -83,6 +94,7 @@ class ResponsesPlanner:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
         }
         url = f"{self.config.api_base_url.rstrip('/')}/responses"
 
@@ -90,22 +102,47 @@ class ResponsesPlanner:
             async with httpx.AsyncClient(timeout=timeout) as client:
 
                 async def perform() -> tuple[httpx.Response, bytes]:
-                    async with client.stream(
-                        "POST", url, headers=headers, content=raw_request
-                    ) as response:
-                        diagnostics.connect_and_headers_seconds = (
-                            time.perf_counter() - started
-                        )
-                        diagnostics.request_id = response.headers.get("x-request-id")
-                        diagnostics.http_status = response.status_code
-                        chunks: list[bytes] = []
-                        async for chunk in response.aiter_bytes():
-                            if diagnostics.first_byte_seconds is None:
-                                diagnostics.first_byte_seconds = (
+                    last_error: httpx.HTTPError | None = None
+                    max_attempts = max(1, int(self.config.max_http_attempts))
+                    for attempt in range(1, max_attempts + 1):
+                        diagnostics.attempt_count = attempt
+                        try:
+                            async with client.stream(
+                                "POST", url, headers=headers, content=raw_request
+                            ) as response:
+                                diagnostics.connect_and_headers_seconds = (
                                     time.perf_counter() - started
                                 )
-                            chunks.append(chunk)
-                        return response, b"".join(chunks)
+                                diagnostics.request_id = response.headers.get(
+                                    "x-request-id"
+                                )
+                                diagnostics.http_status = response.status_code
+                                chunks: list[bytes] = []
+                                async for chunk in response.aiter_bytes():
+                                    if diagnostics.first_byte_seconds is None:
+                                        diagnostics.first_byte_seconds = (
+                                            time.perf_counter() - started
+                                        )
+                                    chunks.append(chunk)
+                                body = b"".join(chunks)
+                        except httpx.HTTPError as exc:
+                            last_error = exc
+                            if attempt >= max_attempts:
+                                raise
+                        else:
+                            if (
+                                response.status_code not in {429, 502, 503, 504}
+                                or attempt >= max_attempts
+                            ):
+                                return response, body
+                        delay = float(self.config.retry_base_seconds) * (
+                            2 ** (attempt - 1)
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                    if last_error is not None:
+                        raise last_error
+                    raise RuntimeError("Responses API retry loop ended unexpectedly")
 
                 response, body = await asyncio.wait_for(
                     perform(), timeout=self.config.timeout_seconds
@@ -135,6 +172,15 @@ class ResponsesPlanner:
             raise self.error_type(
                 f"Responses API returned HTTP {response.status_code}; "
                 f"request_id={diagnostics.request_id}; body={diagnostics.error_body!r}"
+            )
+
+        content_type = response.headers.get("content-type", "").lower()
+        if "application/json" not in content_type:
+            diagnostics.error_body = body.decode("utf-8", errors="replace")[-1000:]
+            self._record(diagnostics)
+            raise self.error_type(
+                "Responses API returned non-JSON content; "
+                f"content_type={content_type!r}; request_id={diagnostics.request_id}"
             )
 
         try:

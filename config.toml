@@ -22,12 +22,15 @@ backend = "responses" # responses | codex_cli
 model = ""
 api_base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
+api_key_file = ""
 reasoning_effort = "low"
 timeout_seconds = 120
 connect_timeout_seconds = 10.0
 read_timeout_seconds = 90.0
 write_timeout_seconds = 30.0
 pool_timeout_seconds = 10.0
+max_http_attempts = 3
+retry_base_seconds = 0.5
 state_directory = "state/codex-planner"
 
 # codex_cli is retained only as a diagnostic fallback.
@@ -51,6 +54,7 @@ allowed_action_types = [
   "set_research",
   "set_civic",
   "unit_move",
+  "unit_found_city",
   "builder_improve",
   "unit_heal",
   "unit_fortify",

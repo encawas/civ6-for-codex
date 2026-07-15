@@ -61,4 +61,16 @@ class EventGate:
                 # calls, but a still-active blocker must remain visible to the
                 # engine's end-turn safety check on every tick.
                 result.emitted.append(normalized)
+
+        reconcile = getattr(self.store, "reconcile_open_events", None)
+        if reconcile is not None:
+            turn = max(
+                (event.turn for event in events),
+                default=int(self.store.get_meta("last_observed_turn", 0) or 0),
+            )
+            reconcile(
+                game_id,
+                {event.dedupe_key for event in events},
+                turn,
+            )
         return result

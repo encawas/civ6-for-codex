@@ -17,6 +17,9 @@ class ActionSpec:
     optional_arguments: frozenset[str] = field(default_factory=frozenset)
     fixed_arguments: dict[str, Any] = field(default_factory=dict)
     argument_aliases: dict[str, str] = field(default_factory=dict)
+    # False means that, after a transport error or an unverified success, the
+    # workflow must reconcile state instead of sending the action again.
+    retry_safe_after_unknown: bool = True
 
     def build_arguments(self, task: StoredTask) -> dict[str, Any]:
         supplied = dict(task.arguments)
@@ -73,6 +76,7 @@ ACTION_REGISTRY: dict[str, ActionSpec] = {
         required_arguments=frozenset({"unit_id", "improvement_type"}),
         fixed_arguments={"action": "improve"},
         argument_aliases={"improvement_type": "improvement"},
+        retry_safe_after_unknown=False,
     ),
     "unit_heal": ActionSpec(
         tool_name="unit_action",
