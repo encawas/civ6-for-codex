@@ -60,6 +60,8 @@ allowed_action_types = [
   "set_research",
   "set_civic",
   "unit_move",
+  # Irreversible and intentionally excluded from auto_action_types.
+  "unit_found_city",
   "builder_improve",
   "unit_heal",
   "unit_fortify",
