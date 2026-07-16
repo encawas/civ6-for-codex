@@ -405,5 +405,7 @@ def test_recorded_explicit_rejection_fails_without_retry(tmp_path: Path):
     assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
 
     second = asyncio.run(engine.tick())
-    assert second.agent_invoked is True
+    assert second.agent_invoked is False
+    assert second.workflow_tick["outcome"] == "NO_SAFE_ACTION"
+    assert second.paused is True
     assert store.task_status("game-1", "set-production") is TaskStatus.FAILED

@@ -17,7 +17,6 @@ from civ6_workflow.domain import (
     ApprovalStatus,
     ContinuationPolicy,
     DecisionGapStatus,
-    DecisionRoute,
     LeaseValidationResult,
     PlanLease,
     PlanLeaseStatus,
@@ -30,7 +29,6 @@ from civ6_workflow.models import (
     EventLevel,
     ExecutionMode,
     GameEvent,
-    PlanBundle,
     RiskLevel,
     RuntimeSnapshot,
 )
@@ -154,9 +152,7 @@ def test_ai_007_projection_hash_is_versioned_and_material_only():
     first = build_decision_input_projection(
         _snapshot(1), _settler_event(1), {"strategy": {"revision": 3}}
     )
-    reordered = {
-        key: first[key] for key in reversed(tuple(first))
-    }
+    reordered = {key: first[key] for key in reversed(tuple(first))}
     assert hash_decision_input(first) == hash_decision_input(reordered)
     assert first["projection_version"] == "decision-input/v1"
     assert "unrelated_raw_field" not in first["overview"]
@@ -255,9 +251,7 @@ def test_plan_004_local_lease_invalidation_preserves_other_scopes():
         logical_requests_this_turn=0,
         active_logical_request=False,
     )
-    assert [gap.decision_gap_id for gap in gate.gaps] == [
-        first.decision_gap_id
-    ]
+    assert [gap.decision_gap_id for gap in gate.gaps] == [first.decision_gap_id]
 
 
 @pytest.mark.parametrize(
@@ -312,6 +306,7 @@ def test_ai_003_005_group_is_stable_and_requires_one_observation():
             [first, second.model_copy(update={"observation_id": "obs-2"})],
         )
 
+
 def test_ai_007_met_003_004_dedup_and_metrics_survive_restart(tmp_path):
     """AI-007 / MET-003 / MET-004: durable records remain authoritative."""
 
@@ -321,9 +316,7 @@ def test_ai_007_met_003_004_dedup_and_metrics_survive_restart(tmp_path):
     store.save_decision_gap(gap, turn=1)
 
     restarted = WorkflowStore(path)
-    loaded = restarted.decision_gap_by_identity(
-        "opening", gap.stable_identity
-    )
+    loaded = restarted.decision_gap_by_identity("opening", gap.stable_identity)
     assert loaded == gap
     assert restarted.planner_metrics("opening") == {
         "logical_requests": 0,
@@ -351,6 +344,9 @@ class _Game:
             "set_research",
             "unit_action",
             "end_turn",
+            "get_notifications",
+            "get_pending_diplomacy",
+            "get_pending_trades",
             "get_settle_advisor",
         }
 
@@ -487,8 +483,7 @@ def test_ai_001_003_phase4_vertical_chain_and_zero_mutation(tmp_path):
 
         third = await engine.tick()
         assert (
-            third.workflow_tick["outcome"]
-            == TickOutcomeKind.PLANNER_ATTEMPT_COMPLETED
+            third.workflow_tick["outcome"] == TickOutcomeKind.PLANNER_ATTEMPT_COMPLETED
         )
         assert planner.summary.logical_requests == 1
         assert planner.summary.provider_attempts == 1

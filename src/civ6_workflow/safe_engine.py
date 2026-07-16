@@ -10,7 +10,7 @@ from .agent_projection import project_agent_context
 from .engine import EngineConfig as BaseEngineConfig
 from .engine import WorkflowEngine as BaseWorkflowEngine
 from .gate import EventGate, GateConfig
-from .models import AgentRequest, ExecutionMode, GameEvent, StoredTask, TaskStatus
+from .models import AgentRequest, GameEvent, StoredTask, TaskStatus
 
 
 @dataclass(slots=True)
@@ -28,9 +28,7 @@ class _TickFileLock:
     """
 
     def __init__(self, lock_path: Path | None = None):
-        self.path = lock_path or (
-            Path.home() / ".civ6-workflow" / "runtime.tick.lock"
-        )
+        self.path = lock_path or (Path.home() / ".civ6-workflow" / "runtime.tick.lock")
         self.handle: BinaryIO | None = None
 
     def __enter__(self) -> "_TickFileLock":
@@ -101,13 +99,20 @@ class SafeWorkflowEngine(BaseWorkflowEngine):
                 prepare_mode(self.config.execution_mode)
             result = await super().tick()
             game_id = self.store.get_meta("last_game_id")
+            no_safe_action = (
+                isinstance(result.workflow_tick, dict)
+                and result.workflow_tick.get("outcome") == "NO_SAFE_ACTION"
+            )
             if (
                 isinstance(game_id, str)
                 and not result.paused
                 and not result.turn_ended
                 and not result.agent_invoked
                 and any(event.blocking for event in result.events)
-                and self.store.agent_called_for_turn(game_id, result.turn)
+                and (
+                    no_safe_action
+                    or self.store.agent_called_for_turn(game_id, result.turn)
+                )
                 and not self.store.due_tasks(game_id, result.turn)
             ):
                 result.paused = True
@@ -118,9 +123,7 @@ class SafeWorkflowEngine(BaseWorkflowEngine):
                 )
             return result
 
-    def _build_agent_request(
-        self, snapshot, events: list[GameEvent]
-    ) -> AgentRequest:
+    def _build_agent_request(self, snapshot, events: list[GameEvent]) -> AgentRequest:
         context = self.store.current_context(snapshot.game_id)
         relevant_state, relevant_plans, max_tasks = project_agent_context(
             snapshot, events, context

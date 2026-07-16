@@ -29,6 +29,12 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
                 )
             )
         elif blocker_type == "pending_trades":
+            payload = dict(blocker)
+            data = payload.get("data")
+            offer_id = payload.get("offer_id")
+            if offer_id is None and isinstance(data, dict):
+                offer_id = data.get("offer_id") or data.get("player_id")
+            payload["offer_id"] = str(offer_id or _stable_hash(blocker))
             events.append(
                 GameEvent(
                     event_type="pending_trade_offer",
@@ -36,8 +42,8 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
                     level=EventLevel.L3,
                     risk=RiskLevel.HIGH,
                     blocking=True,
-                    payload=blocker,
-                    dedupe_key=f"pending_trade_offer:{_stable_hash(blocker)}",
+                    payload=payload,
+                    dedupe_key=f"pending_trade_offer:{_stable_hash(payload)}",
                 )
             )
         elif blocker_type == "city_no_production":

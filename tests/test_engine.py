@@ -204,8 +204,10 @@ def test_blocked_task_retries_once_then_escalates(tmp_path: Path):
         assert first.turn_ended is False
 
         second = await engine.tick()
-        assert planner.calls == 1
-        assert second.agent_invoked is True
+        assert planner.calls == 0
+        assert second.agent_invoked is False
+        assert second.workflow_tick["outcome"] == "NO_SAFE_ACTION"
+        assert second.paused is True
         assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
         assert second.turn_ended is False
 
@@ -246,15 +248,27 @@ def test_l3_events_are_batched_into_one_codex_call(tmp_path: Path):
         )
 
         result = await engine.tick()
-        assert planner.calls == 1
-        assert result.agent_invoked is True
+        assert result.workflow_tick["outcome"] == "DECISION_GAP_CREATED"
+        assert planner.calls == 0
+        assert result.agent_invoked is False
         assert result.turn_ended is False
-        assert result.paused is True
+        assert result.paused is False
         assert len(result.events) == 2
 
         second = await engine.tick()
+        assert second.workflow_tick["outcome"] == "LOGICAL_PLANNER_REQUEST_CREATED"
+        assert planner.calls == 0
+        assert second.agent_invoked is False
+
+        third = await engine.tick()
+        assert third.workflow_tick["outcome"] == "PLANNER_ATTEMPT_COMPLETED"
         assert planner.calls == 1
-        assert second.paused is True
-        assert "human review" in second.pause_reason
+        assert third.agent_invoked is True
+        assert third.turn_ended is False
+
+        fourth = await engine.tick()
+        assert planner.calls == 1
+        assert fourth.paused is True
+        assert "human review" in fourth.pause_reason
 
     asyncio.run(scenario())

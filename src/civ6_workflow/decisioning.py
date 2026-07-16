@@ -301,12 +301,9 @@ def build_decision_gap(
         ),
         relevant_input_hash=relevant_hash,
         input_projection=projection,
-        strategy_revision=str(
-            projection.get("strategy", {}).get("revision", "none")
-        ),
+        strategy_revision=str(projection.get("strategy", {}).get("revision", "none")),
         relevant_plan_revisions=tuple(
-            str(value)
-            for value in projection.get("plan_revisions", {}).values()
+            str(value) for value in projection.get("plan_revisions", {}).values()
         ),
         required_context=(),
         route=DecisionRoute.PLANNER,
@@ -412,9 +409,7 @@ def evaluate_plan_lease(
                     "invalidation_reason": reason,
                 }
             )
-            return LeaseEvaluation(
-                LeaseValidationResult.INVALIDATED, updated, reason
-            )
+            return LeaseEvaluation(LeaseValidationResult.INVALIDATED, updated, reason)
         if outcome.reason.startswith("unsupported condition type"):
             updated = lease.model_copy(
                 update={
@@ -507,7 +502,8 @@ def evaluate_planner_eligibility(
     eligible = tuple(
         gap
         for gap in gaps
-        if gap.status in {
+        if gap.status
+        in {
             DecisionGapStatus.OPEN,
             DecisionGapStatus.PLANNER_ELIGIBLE,
         }
@@ -516,7 +512,9 @@ def evaluate_planner_eligibility(
     )
     if not eligible:
         return PlannerEligibility(False, "no uncovered planner-routed decision gap")
-    return PlannerEligibility(True, "strategic decision gaps require planning", eligible)
+    return PlannerEligibility(
+        True, "strategic decision gaps require planning", eligible
+    )
 
 
 def _condition_payload(condition: Any) -> dict[str, Any]:
@@ -527,6 +525,7 @@ def _condition_payload(condition: Any) -> dict[str, Any]:
     if condition.expected is not True:
         payload.setdefault("value", condition.expected)
     return payload
+
 
 def _scope_for_event(event: GameEvent) -> str:
     if event.entity_type is None or event.entity_id is None:
@@ -626,6 +625,6 @@ def _observation_marker(observation: NormalizedRuntimeObservation) -> str:
     payload = {
         "turn": observation.snapshot.turn,
         "game_id": observation.snapshot.game_id,
-        "normalization_version": observation.normalization_version,
+        "normalization_version": observation.canonical.normalization_version,
     }
     return f"obs_{hash_decision_input(payload)[:24]}"

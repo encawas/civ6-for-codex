@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from .conditions import extract_known_entities
+from .domain.base import thaw_json
 from .decisioning import (
     STRATEGIC_GAP_TYPES,
     batch_compatible_gaps,
@@ -241,6 +242,7 @@ class PlannerLifecycleCoordinator:
                 validation_result=evaluation.result.value,
             )
         return None
+
     def _create_request_if_eligible(
         self,
         ctx,
@@ -332,7 +334,7 @@ class PlannerLifecycleCoordinator:
         request_projection = {
             "projection_version": group.input_projection_version,
             "decision_group_id": group.decision_group_id,
-            "gaps": [gap.input_projection for gap in eligibility.gaps],
+            "gaps": [thaw_json(gap.input_projection) for gap in eligibility.gaps],
         }
         request_payload = provider_request.model_dump(mode="json")
         context_bytes = len(
@@ -440,6 +442,7 @@ class PlannerLifecycleCoordinator:
             planner_request_id=logical_request.planner_request_id,
             information_round_id=collected.information_round_id,
         )
+
     async def _continue_request(
         self,
         ctx,
@@ -449,13 +452,13 @@ class PlannerLifecycleCoordinator:
     ) -> TickResult:
         engine = self.engine
         snapshot = observation.snapshot
-        payload = dict(logical_request.request_payload)
+        payload = thaw_json(logical_request.request_payload)
         payload["request_id"] = f"req_{uuid4().hex}"
         if logical_request.information_results:
-            payload["information_results"] = dict(
+            payload["information_results"] = thaw_json(
                 logical_request.information_results
             )
-            constraints = dict(payload.get("constraints", {}))
+            constraints = thaw_json(payload.get("constraints", {}))
             constraints.update(
                 {
                     "planning_phase": "final",
@@ -476,9 +479,7 @@ class PlannerLifecycleCoordinator:
         )
         try:
             with scope:
-                raw_bundle = await engine._plan_once(
-                    provider_request, ctx.metrics
-                )
+                raw_bundle = await engine._plan_once(provider_request, ctx.metrics)
             bundle = WorkflowPlanBundle.model_validate(
                 raw_bundle.model_dump(mode="python")
             )
@@ -491,9 +492,7 @@ class PlannerLifecycleCoordinator:
         )
         provider_count = self._provider_attempt_count(diagnostics)
         previous = len(
-            engine.store.list_provider_attempts(
-                logical_request.planner_request_id
-            )
+            engine.store.list_provider_attempts(logical_request.planner_request_id)
         )
         provider_attempts = self._provider_attempt_records(
             logical_request,
@@ -611,7 +610,13 @@ class PlannerLifecycleCoordinator:
                 "status": PlannerRequestStatus.COMPLETED,
                 "completed_at": completed,
                 "response_hash": hashlib.sha256(
-                    bundle.model_dump_json().encode("utf-8")
+                    json.dumps(
+                        bundle.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        default=str,
+                    ).encode("utf-8")
                 ).hexdigest(),
                 "validation_result": validation,
                 "provider_attempt_count": (
@@ -679,9 +684,7 @@ class PlannerLifecycleCoordinator:
         failure = engine._classify_planner_failure(error)
         transient = bool(failure["transient"])
         status = (
-            PlannerRequestStatus.BACKOFF
-            if transient
-            else PlannerRequestStatus.FAILED
+            PlannerRequestStatus.BACKOFF if transient else PlannerRequestStatus.FAILED
         )
         updated_request = logical_request.model_copy(
             update={
@@ -702,9 +705,7 @@ class PlannerLifecycleCoordinator:
                     update={
                         "status": DecisionGapStatus.AWAITING_HUMAN,
                         "logical_request_id": logical_request.planner_request_id,
-                        "resolution_reason": (
-                            f"planner failed: {failure['category']}"
-                        ),
+                        "resolution_reason": (f"planner failed: {failure['category']}"),
                     }
                 )
                 for gap in self._request_gaps(logical_request)
@@ -723,6 +724,7 @@ class PlannerLifecycleCoordinator:
             ),
             provider_attempt_count=provider_count,
         )
+
     def _contract_failure(
         self,
         ctx,
@@ -748,9 +750,7 @@ class PlannerLifecycleCoordinator:
                 update={
                     "status": DecisionGapStatus.AWAITING_HUMAN,
                     "logical_request_id": logical_request.planner_request_id,
-                    "resolution_reason": (
-                        f"planner contract rejected: {reason[:300]}"
-                    ),
+                    "resolution_reason": (f"planner contract rejected: {reason[:300]}"),
                 }
             )
             for gap in self._request_gaps(logical_request)
@@ -929,11 +929,9 @@ class PlannerLifecycleCoordinator:
         return [
             gap
             for gap_id in logical_request.decision_gap_ids
-            if (
-                gap := self.engine.store.get_decision_gap(gap_id)
-            )
-            is not None
+            if (gap := self.engine.store.get_decision_gap(gap_id)) is not None
         ]
+
     @staticmethod
     def _bundle_has_updates(bundle) -> bool:
         return bool(
@@ -1027,9 +1025,7 @@ class PlannerLifecycleCoordinator:
         completed = engine._now()
         ctx.metrics.mcp_call_count = engine.game.call_count - ctx.call_count_before
         ctx.metrics.mutation_count = ctx.budget.used
-        ctx.metrics.total_seconds = (
-            engine._monotonic() - ctx.started_monotonic
-        )
+        ctx.metrics.total_seconds = engine._monotonic() - ctx.started_monotonic
         common = {
             "tick_id": ctx.tick_id,
             "game_session_id": snapshot.game_id,
@@ -1050,9 +1046,7 @@ class PlannerLifecycleCoordinator:
             provider_attempts=provider_attempts,
             information_round=information_round,
         )
-        result = compatibility or TickResult(
-            turn=snapshot.turn, metrics=ctx.metrics
-        )
+        result = compatibility or TickResult(turn=snapshot.turn, metrics=ctx.metrics)
         result.metrics = ctx.metrics
         result.tick_id = tick.tick_id
         result.runtime_state = tick.ending_runtime_state.value
