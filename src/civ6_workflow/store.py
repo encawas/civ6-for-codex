@@ -3,14 +3,18 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
 from .domain import (
     ActionAttempt,
+    AttemptReconciledTick,
+    AttemptRecoveredTick,
     AttemptStatus,
     RuntimeState,
+    TurnTransitionConfirmedTick,
     WorkflowTick,
     validate_workflow_tick,
 )
@@ -448,7 +452,101 @@ class WorkflowStore:
             "UPDATE workflow_tasks SET updated_at=CURRENT_TIMESTAMP "
             "WHERE updated_at IS NULL"
         )
+        WorkflowStore._repair_terminal_attempt_audits(conn)
         conn.execute("PRAGMA user_version=6")
+
+    @staticmethod
+    def _repair_terminal_attempt_audits(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT attempts.attempt_json,
+                   COALESCE(tasks.due_turn, attempts.pre_send_turn, 0) AS turn
+            FROM action_attempts AS attempts
+            LEFT JOIN workflow_tasks AS tasks
+              ON tasks.game_id=attempts.game_id
+             AND tasks.task_id=attempts.task_id
+            WHERE attempts.status IN (?, ?, ?)
+            ORDER BY attempts.game_id, attempts.attempt_number,
+                     attempts.action_attempt_id
+            """,
+            (
+                AttemptStatus.SUCCEEDED.value,
+                AttemptStatus.FAILED.value,
+                AttemptStatus.REJECTED_BEFORE_SEND.value,
+            ),
+        ).fetchall()
+        for row in rows:
+            attempt = ActionAttempt.model_validate_json(row["attempt_json"])
+            outcomes = {
+                existing["outcome"]
+                for existing in conn.execute(
+                    "SELECT outcome FROM workflow_ticks WHERE action_attempt_id=?",
+                    (attempt.action_attempt_id,),
+                ).fetchall()
+            }
+            if attempt.status is AttemptStatus.REJECTED_BEFORE_SEND:
+                expected_outcomes = {"ATTEMPT_RECOVERED"}
+            elif (
+                attempt.status is AttemptStatus.SUCCEEDED
+                and attempt.action_type == "end_turn"
+            ):
+                expected_outcomes = {"TURN_TRANSITION_CONFIRMED"}
+            elif attempt.status is AttemptStatus.FAILED:
+                expected_outcomes = {"ATTEMPT_RECONCILED", "MUTATION_REJECTED"}
+            else:
+                expected_outcomes = {"ATTEMPT_RECONCILED"}
+            if outcomes & expected_outcomes:
+                continue
+
+            recovered_at = (
+                attempt.response_received_at
+                or attempt.sent_at
+                or attempt.prepared_at
+                or datetime.now(UTC)
+            )
+            common = {
+                "tick_id": (
+                    f"recovery_{attempt.action_attempt_id}_{attempt.status.value.lower()}"
+                ),
+                "game_session_id": attempt.game_session_id,
+                "turn_number": max(0, int(row["turn"])),
+                "observation_ids": (
+                    attempt.last_verification_observation_id
+                    or attempt.prepared_from_observation_id,
+                ),
+                "started_at": recovered_at,
+                "completed_at": recovered_at,
+                "metrics": {},
+            }
+            if attempt.status is AttemptStatus.REJECTED_BEFORE_SEND:
+                tick = AttemptRecoveredTick(
+                    **common,
+                    starting_runtime_state=RuntimeState.RECONCILING,
+                    action_attempt_id=attempt.action_attempt_id,
+                    task_id=attempt.task_id,
+                )
+            elif (
+                attempt.status is AttemptStatus.SUCCEEDED
+                and attempt.action_type == "end_turn"
+            ):
+                tick = TurnTransitionConfirmedTick(
+                    **common,
+                    starting_runtime_state=RuntimeState.TURN_TRANSITIONING,
+                    action_attempt_id=attempt.action_attempt_id,
+                )
+            else:
+                tick = AttemptReconciledTick(
+                    **common,
+                    starting_runtime_state=(
+                        RuntimeState.VERIFYING
+                        if attempt.status is AttemptStatus.SUCCEEDED
+                        else RuntimeState.RECONCILING
+                    ),
+                    action_attempt_id=attempt.action_attempt_id,
+                    task_id=attempt.task_id,
+                    attempt_status=attempt.status,
+                )
+            WorkflowStore._insert_workflow_tick_in_connection(conn, tick)
 
     @staticmethod
     def _migrate_turn_metrics(conn: sqlite3.Connection) -> None:

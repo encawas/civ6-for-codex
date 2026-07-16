@@ -382,11 +382,64 @@ def test_startup_repairs_legacy_terminal_attempt_inconsistency(tmp_path: Path):
 
     assert restarted.task_status("game-1", "set-production") is TaskStatus.DONE
     assert restarted.load_runtime_state("game-1") is RuntimeState.ROUTING
-    with restarted._connect() as conn:
-        row = conn.execute(
-            "SELECT active_attempt_id FROM runtime_state WHERE game_id='game-1'"
-        ).fetchone()
-    assert row["active_attempt_id"] is None
+    assert _active_attempt_id(restarted) is None
+    ticks = restarted.list_workflow_ticks("game-1")
+    assert len(ticks) == 1
+    assert ticks[0].outcome == "ATTEMPT_RECONCILED"
+    assert ticks[0].action_attempt_id == attempt.action_attempt_id
+
+    restarted_again = WorkflowStore(database)
+    assert restarted_again.list_workflow_ticks("game-1") == ticks
+
+
+def test_startup_recovers_missing_terminal_end_turn_audit(tmp_path: Path):
+    database = tmp_path / "legacy-terminal-turn.sqlite3"
+    store = WorkflowStore(database)
+    now = datetime.now(UTC)
+    verifying = ActionAttempt(
+        action_attempt_id="attempt-terminal-turn",
+        game_session_id="game-1",
+        task_id="end_turn:10",
+        action_type="end_turn",
+        attempt_number=1,
+        request_id="request-terminal-turn",
+        idempotency_key="game-1:end_turn:10",
+        prepared_from_observation_id="obs-turn-10",
+        prepared_at=now,
+        sent_at=now,
+        response_received_at=now,
+        status=AttemptStatus.VERIFYING,
+        retry_classification=RetryClassification.NEVER_BLIND_RETRY,
+        normalized_arguments={},
+        tool_result={"success": True},
+        verification_status=VerificationStatus.PENDING,
+        pre_send_turn=10,
+    )
+    store.save_action_attempt(verifying)
+    succeeded = verifying.model_copy(
+        update={
+            "status": AttemptStatus.SUCCEEDED,
+            "verification_status": VerificationStatus.PASSED,
+            "last_verification_observation_id": "obs-turn-11",
+            "verification_count": 1,
+        }
+    )
+    store.update_action_attempt(succeeded)
+    store.save_runtime_state(
+        "game-1",
+        RuntimeState.TURN_TRANSITIONING,
+        active_attempt_id=succeeded.action_attempt_id,
+    )
+
+    restarted = WorkflowStore(database)
+
+    assert restarted.load_runtime_state("game-1") is RuntimeState.OBSERVING
+    assert _active_attempt_id(restarted) is None
+    ticks = restarted.list_workflow_ticks("game-1")
+    assert len(ticks) == 1
+    assert ticks[0].outcome == "TURN_TRANSITION_CONFIRMED"
+    assert ticks[0].action_attempt_id == succeeded.action_attempt_id
+    assert WorkflowStore(database).list_workflow_ticks("game-1") == ticks
 
 
 class FakeStateApi:
