@@ -18,10 +18,15 @@ from civ6_workflow.replay import (
     ReplayGamePort,
     SnapshotRecording,
 )
+from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.safe_engine import _TickFileLock
 from civ6_workflow.safe_store import TaskIdentityConflictError
 from civ6_workflow.store import WorkflowStore
+
+
+def _compile(compiler, snapshot):
+    return getattr(compiler, "compile")(normalize_runtime_snapshot(snapshot))
 
 
 def _production_task(item_name: str, *, task_id: str = "production") -> ProposedTask:
@@ -95,7 +100,7 @@ def test_city_queue_progress_survives_new_plan_id(tmp_path: Path):
         cities=[{"city_id": 1, "currently_building": "NONE"}],
     )
     compiler = DeterministicRuleCompiler(store)
-    first_task = compiler.compile(snapshot).bundle.tasks[0]
+    first_task = _compile(compiler, snapshot).bundle.tasks[0]
     assert first_task.arguments["item_name"] == "UNIT_BUILDER"
     store.save_plan_bundle(
         "game-1",
@@ -123,10 +128,8 @@ def test_city_queue_progress_survives_new_plan_id(tmp_path: Path):
         mode=ExecutionMode.AUTO,
         auto_action_types={"city_set_production"},
     )
-    next_snapshot = snapshot.model_copy(
-        update={"turn": 11, "overview": {"turn": 11}}
-    )
-    second_task = compiler.compile(next_snapshot).bundle.tasks[0]
+    next_snapshot = snapshot.model_copy(update={"turn": 11, "overview": {"turn": 11}})
+    second_task = _compile(compiler, next_snapshot).bundle.tasks[0]
     assert second_task.arguments["item_name"] == "UNIT_SETTLER"
     assert second_task.task_id != first_task.task_id
 

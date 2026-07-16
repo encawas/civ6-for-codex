@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .conditions import find_entity
+from .domain.observations import SlotState
 from .models import (
     EventLevel,
     GameEvent,
@@ -12,6 +13,7 @@ from .models import (
     RiskLevel,
     RuntimeSnapshot,
 )
+from .observation_normalization import NormalizedRuntimeObservation
 from .store import WorkflowStore
 
 
@@ -27,7 +29,8 @@ class DeterministicRuleCompiler:
     def __init__(self, store: WorkflowStore):
         self.store = store
 
-    def compile(self, snapshot: RuntimeSnapshot) -> RuleCompilation:
+    def compile(self, observation: NormalizedRuntimeObservation) -> RuleCompilation:
+        snapshot = observation.snapshot
         context = self.store.current_context(snapshot.game_id)
         tasks: list[ProposedTask] = []
         events: list[GameEvent] = []
@@ -42,7 +45,7 @@ class DeterministicRuleCompiler:
         )
         tasks.extend(
             self._compile_city_production(
-                snapshot, context.get("cities", {}), events
+                observation, context.get("cities", {}), events
             )
         )
         tasks.extend(
@@ -65,17 +68,17 @@ class DeterministicRuleCompiler:
 
     def _compile_city_production(
         self,
-        snapshot: RuntimeSnapshot,
+        observation: NormalizedRuntimeObservation,
         plans: dict[str, dict[str, Any]],
         events: list[GameEvent],
     ) -> list[ProposedTask]:
+        snapshot = observation.snapshot
         tasks: list[ProposedTask] = []
         for city_id, plan in plans.items():
-            city = find_entity(snapshot.cities, ("city_id", "id"), str(city_id))
+            city = observation.canonical.city(city_id)
             if city is None:
                 continue
-            current = city.get("currently_building", city.get("producing"))
-            if current not in (None, "", "NONE", "none", {}, []):
+            if city.production.state is not SlotState.EMPTY:
                 continue
             queue = plan.get("followup_queue", [])
             if not isinstance(queue, list) or not queue:
@@ -149,8 +152,7 @@ class DeterministicRuleCompiler:
                     ],
                     invalidators=[],
                     reason=(
-                        "Continue approved production queue with "
-                        f"{item['item_name']}."
+                        f"Continue approved production queue with {item['item_name']}."
                     ),
                 )
             )
@@ -190,9 +192,7 @@ class DeterministicRuleCompiler:
             current_xy = (int(unit.get("x", -1)), int(unit.get("y", -1)))
             path = [
                 point
-                for point in (
-                    self._point(item) for item in plan.get("path", [])
-                )
+                for point in (self._point(item) for item in plan.get("path", []))
                 if point
             ]
             target = self._target(plan)
@@ -206,7 +206,10 @@ class DeterministicRuleCompiler:
                         level=EventLevel.L3,
                         risk=RiskLevel.MEDIUM,
                         blocking=True,
-                        payload={"builder_key": builder_key, "reason": "missing target"},
+                        payload={
+                            "builder_key": builder_key,
+                            "reason": "missing target",
+                        },
                         dedupe_key=(
                             f"invalid_builder_plan:{builder_key}:"
                             f"{source_plan_id}:missing_target"
@@ -250,15 +253,12 @@ class DeterministicRuleCompiler:
                             risk=RiskLevel.MEDIUM,
                             blocking=True,
                             payload={"builder_key": builder_key},
-                            dedupe_key=(
-                                f"builder_no_charges:{builder_key}:{unit_id}"
-                            ),
+                            dedupe_key=(f"builder_no_charges:{builder_key}:{unit_id}"),
                         )
                     )
                     continue
                 task_id = (
-                    f"builder-improve:{builder_key}:"
-                    f"{source_plan_id}:{improvement}"
+                    f"builder-improve:{builder_key}:{source_plan_id}:{improvement}"
                 )
                 if self.store.task_status(snapshot.game_id, task_id) is not None:
                     continue
@@ -272,9 +272,7 @@ class DeterministicRuleCompiler:
                         expires_turn=snapshot.turn,
                         arguments={
                             "unit_id": (
-                                int(unit_id)
-                                if str(unit_id).isdigit()
-                                else unit_id
+                                int(unit_id) if str(unit_id).isdigit() else unit_id
                             ),
                             "improvement_type": improvement,
                         },
@@ -308,10 +306,7 @@ class DeterministicRuleCompiler:
                             }
                         ],
                         invalidators=[],
-                        reason=(
-                            "Execute approved builder improvement "
-                            f"{improvement}."
-                        ),
+                        reason=(f"Execute approved builder improvement {improvement}."),
                     )
                 )
                 continue
@@ -345,9 +340,7 @@ class DeterministicRuleCompiler:
                 if next_index >= len(path)
                 else path[next_index]
             )
-            task_id = (
-                f"builder-move:{builder_key}:{source_plan_id}:{next_index}"
-            )
+            task_id = f"builder-move:{builder_key}:{source_plan_id}:{next_index}"
             if self.store.task_status(snapshot.game_id, task_id) is not None:
                 continue
             tasks.append(
@@ -435,8 +428,7 @@ class DeterministicRuleCompiler:
             key: sorted(
                 unit_id
                 for unit_id, unit in candidates.items()
-                if int(unit["_workflow_first_seen_turn"])
-                > self._bind_after_turn(plan)
+                if int(unit["_workflow_first_seen_turn"]) > self._bind_after_turn(plan)
             )
             for key, plan in unbound.items()
         }
@@ -468,9 +460,7 @@ class DeterministicRuleCompiler:
             bound_keys.add(builder_key)
             bound_unit_ids.add(unit_id)
             plan = plans[builder_key]
-            plan["assigned_unit_id"] = (
-                int(unit_id) if unit_id.isdigit() else unit_id
-            )
+            plan["assigned_unit_id"] = int(unit_id) if unit_id.isdigit() else unit_id
             plan["auto_bound_turn"] = snapshot.turn
             events.append(
                 GameEvent(
@@ -510,11 +500,7 @@ class DeterministicRuleCompiler:
             )
 
         remaining_eligible = {
-            key: [
-                unit_id
-                for unit_id in unit_ids
-                if unit_id not in bound_unit_ids
-            ]
+            key: [unit_id for unit_id in unit_ids if unit_id not in bound_unit_ids]
             for key, unit_ids in eligible_after_plan.items()
         }
         unmatched = {
@@ -535,9 +521,7 @@ class DeterministicRuleCompiler:
                 },
             }
             for key, plan in unbound.items()
-            if remaining_eligible[key]
-            and not matches[key]
-            and key not in bound_keys
+            if remaining_eligible[key] and not matches[key] and key not in bound_keys
         }
         if unmatched:
             events.append(
@@ -648,24 +632,15 @@ class DeterministicRuleCompiler:
     @classmethod
     def _target(cls, plan: dict[str, Any]) -> dict[str, Any] | None:
         raw = plan.get("target") or plan.get("primary_target")
-        if (
-            not isinstance(raw, dict)
-            or raw.get("x") is None
-            or raw.get("y") is None
-        ):
+        if not isinstance(raw, dict) or raw.get("x") is None or raw.get("y") is None:
             return None
         return {
             "x": int(raw["x"]),
             "y": int(raw["y"]),
-            "improvement_type": raw.get("improvement_type")
-            or raw.get("improvement"),
+            "improvement_type": raw.get("improvement_type") or raw.get("improvement"),
         }
 
     @staticmethod
-    def _last_index(
-        path: list[tuple[int, int]], point: tuple[int, int]
-    ) -> int | None:
-        matches = [
-            index for index, candidate in enumerate(path) if candidate == point
-        ]
+    def _last_index(path: list[tuple[int, int]], point: tuple[int, int]) -> int | None:
+        matches = [index for index, candidate in enumerate(path) if candidate == point]
         return matches[-1] if matches else None

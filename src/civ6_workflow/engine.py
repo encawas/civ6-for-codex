@@ -23,6 +23,10 @@ from .models import (
     TickMetrics,
     TickResult,
 )
+from .observation_normalization import (
+    NormalizedRuntimeObservation,
+    normalize_runtime_snapshot,
+)
 from .progression import ProgressionRuleCompiler
 from .recovery import recover_turn_rewind
 from .rules import DeterministicRuleCompiler
@@ -75,21 +79,27 @@ class WorkflowEngine:
         call_count_before = self.game.call_count
 
         snapshot = await self._read_snapshot(metrics, include_units=False)
+        observation = self._normalize_snapshot(snapshot, metrics)
         rewind_event = recover_turn_rewind(self.store, snapshot)
         result = TickResult(turn=snapshot.turn, metrics=metrics)
         self.store.set_meta("last_game_id", snapshot.game_id)
         self.store.set_meta("last_observed_turn", snapshot.turn)
         await self._verify_tool_surface()
+        snapshot = observation.snapshot
 
         existing_due = self.store.due_tasks(snapshot.game_id, snapshot.turn)
-        need_units = self.rules.needs_units(snapshot.game_id) or any(
-            task.entity_type in {"unit", "builder"} for task in existing_due
+        need_units = (
+            observation.canonical.unit_summary.detail_required
+            or self.rules.needs_units(snapshot.game_id)
+            or any(task.entity_type in {"unit", "builder"} for task in existing_due)
         )
-        if need_units:
-            snapshot = await self._read_snapshot(metrics, include_units=True)
+        if need_units and snapshot.units is None:
+            raw_snapshot = await self._read_snapshot(metrics, include_units=True)
+            observation = self._normalize_snapshot(raw_snapshot, metrics)
+            snapshot = observation.snapshot
 
-        rule_compilation = self.rules.compile(snapshot)
-        progression_compilation = self.progression.compile(snapshot)
+        rule_compilation = self.rules.compile(observation)
+        progression_compilation = self.progression.compile(observation)
         for compilation in (rule_compilation, progression_compilation):
             if compilation.bundle is not None:
                 self.store.save_plan_bundle(
@@ -105,7 +115,9 @@ class WorkflowEngine:
             any(task.entity_type in {"unit", "builder"} for task in due_tasks)
             and snapshot.units is None
         ):
-            snapshot = await self._read_snapshot(metrics, include_units=True)
+            raw_snapshot = await self._read_snapshot(metrics, include_units=True)
+            observation = self._normalize_snapshot(raw_snapshot, metrics)
+            snapshot = observation.snapshot
 
         events: list[GameEvent] = []
         if rewind_event is not None:
@@ -115,9 +127,10 @@ class WorkflowEngine:
         execution_started = time.perf_counter()
         if self.config.execution_mode is not ExecutionMode.READONLY:
             for task in due_tasks:
-                snapshot, task_events = await self._execute_one_task(
-                    task, snapshot, result, metrics
+                observation, task_events = await self._execute_one_task(
+                    task, observation, result, metrics
                 )
+                snapshot = observation.snapshot
                 events.extend(task_events)
         metrics.task_execution_seconds = time.perf_counter() - execution_started
 
@@ -138,14 +151,18 @@ class WorkflowEngine:
             if event.blocking and event not in agent_events
         )
 
-        already_called = self.store.agent_called_for_turn(snapshot.game_id, snapshot.turn)
+        already_called = self.store.agent_called_for_turn(
+            snapshot.game_id, snapshot.turn
+        )
         if (
             agent_events
             and self.config.max_agent_calls_per_turn > 0
             and not already_called
         ):
             if snapshot.units is None:
-                snapshot = await self._read_snapshot(metrics, include_units=True)
+                raw_snapshot = await self._read_snapshot(metrics, include_units=True)
+                observation = self._normalize_snapshot(raw_snapshot, metrics)
+                snapshot = observation.snapshot
             await self._invoke_planner(snapshot, agent_events, result, metrics)
         elif agent_events and already_called:
             result.paused = True
@@ -176,14 +193,15 @@ class WorkflowEngine:
     async def _execute_one_task(
         self,
         task: StoredTask,
-        snapshot: RuntimeSnapshot,
+        observation: NormalizedRuntimeObservation,
         result: TickResult,
         metrics: TickMetrics,
-    ) -> tuple[RuntimeSnapshot, list[GameEvent]]:
+    ) -> tuple[NormalizedRuntimeObservation, list[GameEvent]]:
+        snapshot = observation.snapshot
         events: list[GameEvent] = []
         self.store.set_task_status(snapshot.game_id, task.task_id, TaskStatus.RUNNING)
-        preconditions = self.conditions.evaluate_all(task.preconditions, snapshot)
-        invalidation = self._first_active_invalidator(task.invalidators, snapshot)
+        preconditions = self.conditions.evaluate_all(task.preconditions, observation)
+        invalidation = self._first_active_invalidator(task.invalidators, observation)
         if not preconditions.valid or invalidation is not None:
             message = (
                 preconditions.reason
@@ -199,7 +217,7 @@ class WorkflowEngine:
                 events,
                 blocked=True,
             )
-            return snapshot, events
+            return observation, events
 
         action_result = await self.game.execute_task(task)
         if not action_result.success:
@@ -212,21 +230,24 @@ class WorkflowEngine:
                 events,
                 blocked=action_result.blocked,
             )
-            return snapshot, events
+            return observation, events
 
         verification_started = time.perf_counter()
+        verification_observation = observation
         verification_snapshot = snapshot
         verified = not task.postconditions
         verification_reason = "task has no postconditions"
         for attempt in range(max(1, self.config.verification_attempts)):
             if attempt > 0:
                 await asyncio.sleep(self.config.verification_delay_seconds)
-            verification_snapshot = await self._read_snapshot(
+            raw_snapshot = await self._read_snapshot(
                 metrics,
                 include_units=task.entity_type in {"unit", "builder"},
             )
+            verification_observation = self._normalize_snapshot(raw_snapshot, metrics)
+            verification_snapshot = verification_observation.snapshot
             postconditions = self.conditions.evaluate_all(
-                task.postconditions, verification_snapshot
+                task.postconditions, verification_observation
             )
             if postconditions.valid:
                 verified = True
@@ -240,7 +261,7 @@ class WorkflowEngine:
                 verification_snapshot.game_id, task.task_id, TaskStatus.DONE
             )
             result.executed_task_ids.append(task.task_id)
-            return verification_snapshot, events
+            return verification_observation, events
 
         self._retry_or_escalate_task(
             verification_snapshot.game_id,
@@ -251,7 +272,7 @@ class WorkflowEngine:
             events,
             blocked=True,
         )
-        return verification_snapshot, events
+        return verification_observation, events
 
     def _retry_or_escalate_task(
         self,
@@ -304,7 +325,9 @@ class WorkflowEngine:
         has_research_retry = any(
             task.action_type == "set_research" for task in retrying_tasks
         )
-        has_civic_retry = any(task.action_type == "set_civic" for task in retrying_tasks)
+        has_civic_retry = any(
+            task.action_type == "set_civic" for task in retrying_tasks
+        )
         retained: list[GameEvent] = []
         for event in events:
             if (
@@ -314,7 +337,10 @@ class WorkflowEngine:
                 continue
             if event.event_type == "end_turn_blocker":
                 blocking_type = str(event.payload.get("blocking_type", ""))
-                if has_production_retry and blocking_type == "ENDTURN_BLOCKING_PRODUCTION":
+                if (
+                    has_production_retry
+                    and blocking_type == "ENDTURN_BLOCKING_PRODUCTION"
+                ):
                     continue
                 if has_research_retry and blocking_type == "ENDTURN_BLOCKING_RESEARCH":
                     continue
@@ -382,6 +408,16 @@ class WorkflowEngine:
             )
         metrics.agent_seconds = time.perf_counter() - agent_started
 
+    @staticmethod
+    def _normalize_snapshot(
+        snapshot: RuntimeSnapshot,
+        metrics: TickMetrics,
+    ) -> NormalizedRuntimeObservation:
+        started = time.perf_counter()
+        observation = normalize_runtime_snapshot(snapshot)
+        metrics.normalization_seconds += time.perf_counter() - started
+        return observation
+
     async def _read_snapshot(
         self, metrics: TickMetrics, *, include_units: bool
     ) -> RuntimeSnapshot:
@@ -405,10 +441,12 @@ class WorkflowEngine:
             raise RuntimeError(f"civ6-mcp is missing required tools: {sorted(missing)}")
 
     def _first_active_invalidator(
-        self, invalidators: list[dict[str, Any]], snapshot: RuntimeSnapshot
+        self,
+        invalidators: list[dict[str, Any]],
+        observation: NormalizedRuntimeObservation,
     ) -> str | None:
         for invalidator in invalidators:
-            evaluation = self.conditions.evaluate(invalidator, snapshot)
+            evaluation = self.conditions.evaluate(invalidator, observation)
             if evaluation.valid:
                 return str(invalidator)
             if evaluation.reason.startswith("unsupported condition type"):

@@ -127,6 +127,7 @@ class ActionResult(StrictModel):
 
 class TickMetrics(StrictModel):
     state_query_seconds: float = 0.0
+    normalization_seconds: float = 0.0
     task_execution_seconds: float = 0.0
     agent_seconds: float = 0.0
     verification_seconds: float = 0.0

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .actions import ActionValidationError, resolve_action
+from .domain.observations import SlotState, normalize_slot
 from .models import ActionResult, RuntimeSnapshot, StoredTask
 from .state_api import Civ6StateApi
 
@@ -21,7 +22,9 @@ class McpServerConfig:
 class GamePort(Protocol):
     call_count: int
 
-    async def read_snapshot(self, *, include_units: bool = False) -> RuntimeSnapshot: ...
+    async def read_snapshot(
+        self, *, include_units: bool = False
+    ) -> RuntimeSnapshot: ...
 
     async def execute_task(self, task: StoredTask) -> ActionResult: ...
 
@@ -71,9 +74,13 @@ class Civ6McpClient:
         result = await self._require_session().list_tools()
         return {tool.name for tool in result.tools}
 
-    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> Any:
         self.call_count += 1
-        result = await self._require_session().call_tool(name, arguments=arguments or {})
+        result = await self._require_session().call_tool(
+            name, arguments=arguments or {}
+        )
         is_error = bool(
             getattr(result, "isError", False) or getattr(result, "is_error", False)
         )
@@ -148,7 +155,9 @@ class Civ6GamePort:
             units = await self.state_api.get("/api/units") if include_units else None
             identity = await self.state_api.get_optional("/api/identity")
             notifications = await self.state_api.get_optional("/api/notifications")
-            end_turn_blockers = await self.state_api.get_optional("/api/end-turn-blockers")
+            end_turn_blockers = await self.state_api.get_optional(
+                "/api/end-turn-blockers"
+            )
             diplomacy = await self.state_api.get_optional("/api/pending-diplomacy")
             trades = await self.state_api.get_optional("/api/pending-trades")
 
@@ -205,9 +214,7 @@ class Civ6GamePort:
             turn=turn,
             game_id=game_id,
             overview=self._ensure_dict(overview),
-            tech_civics=(
-                tech_civics if isinstance(tech_civics, (dict, list)) else {}
-            ),
+            tech_civics=(tech_civics if isinstance(tech_civics, (dict, list)) else {}),
             notifications=notifications,
             diplomacy=diplomacy,
             trades=trades,
@@ -229,7 +236,9 @@ class Civ6GamePort:
 
     async def end_turn(self) -> ActionResult:
         if "end_turn" not in self.allowed_tools:
-            return ActionResult(success=False, blocked=True, message="end_turn is not allowed")
+            return ActionResult(
+                success=False, blocked=True, message="end_turn is not allowed"
+            )
         try:
             raw = await self.client.call_tool("end_turn")
         except Exception as exc:
@@ -241,13 +250,18 @@ class Civ6GamePort:
         if isinstance(raw, dict):
             text = str(raw.get("text", "")).strip()
             lowered = text.lower()
-            textual_error = lowered.startswith("error:") or lowered.startswith("failed:")
+            textual_error = lowered.startswith("error:") or lowered.startswith(
+                "failed:"
+            )
             if raw.get("success") is False or raw.get("error") or textual_error:
                 return ActionResult(
                     success=False,
                     blocked=bool(raw.get("blocked") or raw.get("blocker")),
                     message=str(
-                        raw.get("error") or raw.get("message") or text or "action failed"
+                        raw.get("error")
+                        or raw.get("message")
+                        or text
+                        or "action failed"
                     ),
                     details=raw,
                 )
@@ -306,7 +320,9 @@ class Civ6GamePort:
                     "no trade offers",
                     "none.",
                 )
-                return bool(text) and not any(marker in text for marker in negative_markers)
+                return bool(text) and not any(
+                    marker in text for marker in negative_markers
+                )
             for key in (
                 "pending",
                 "sessions",
@@ -318,7 +334,10 @@ class Civ6GamePort:
             ):
                 if key in value:
                     candidate = value[key]
-                    if isinstance(candidate, list) and key in {"items", "notifications"}:
+                    if isinstance(candidate, list) and key in {
+                        "items",
+                        "notifications",
+                    }:
                         actionable = [
                             item
                             for item in candidate
@@ -347,7 +366,7 @@ class Civ6GamePort:
             if not isinstance(city, dict):
                 continue
             production = city.get("currently_building", city.get("producing"))
-            if production in (None, "", "NONE", "none", "nothing", {}, []):
+            if normalize_slot(production).state is SlotState.EMPTY:
                 city_id = city.get("city_id", city.get("id"))
                 if city_id is not None:
                     missing.append(str(city_id))

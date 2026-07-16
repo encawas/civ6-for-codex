@@ -7,9 +7,14 @@ from civ6_workflow.models import (
     ProposedTask,
     RuntimeSnapshot,
 )
+from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.progression import ProgressionRuleCompiler
 from civ6_workflow.recovery import recover_turn_rewind
 from civ6_workflow.store import WorkflowStore
+
+
+def _compile(compiler, snapshot):
+    return getattr(compiler, "compile")(normalize_runtime_snapshot(snapshot))
 
 
 def _snapshot(*, turn: int, research="None", civic="None") -> RuntimeSnapshot:
@@ -48,7 +53,7 @@ def test_research_and_civic_queues_compile_to_verifiable_tasks(tmp_path: Path):
         auto_action_types={"set_research", "set_civic"},
     )
 
-    compiled = ProgressionRuleCompiler(store).compile(_snapshot(turn=5))
+    compiled = _compile(ProgressionRuleCompiler(store), _snapshot(turn=5))
 
     assert compiled.bundle is not None
     tasks = {task.action_type: task for task in compiled.bundle.tasks}
@@ -60,9 +65,7 @@ def test_research_and_civic_queues_compile_to_verifiable_tasks(tmp_path: Path):
     assert tasks["set_research"].postconditions == [
         {"type": "research_equals", "tech_type": "TECH_MINING"}
     ]
-    assert tasks["set_civic"].arguments == {
-        "tech_or_civic": "CIVIC_CODE_OF_LAWS"
-    }
+    assert tasks["set_civic"].arguments == {"tech_or_civic": "CIVIC_CODE_OF_LAWS"}
     assert tasks["set_civic"].postconditions == [
         {"type": "civic_equals", "civic_type": "CIVIC_CODE_OF_LAWS"}
     ]
@@ -81,8 +84,9 @@ def test_progression_queue_does_not_override_active_choice(tmp_path: Path):
         auto_action_types={"set_research"},
     )
 
-    compiled = ProgressionRuleCompiler(store).compile(
-        _snapshot(turn=5, research="Pottery", civic="Code of Laws")
+    compiled = _compile(
+        ProgressionRuleCompiler(store),
+        _snapshot(turn=5, research="Pottery", civic="Code of Laws"),
     )
 
     assert compiled.bundle is None
@@ -102,7 +106,7 @@ def test_unavailable_progression_target_is_blocking(tmp_path: Path):
         auto_action_types={"set_research"},
     )
 
-    compiled = ProgressionRuleCompiler(store).compile(_snapshot(turn=5))
+    compiled = _compile(ProgressionRuleCompiler(store), _snapshot(turn=5))
 
     event = next(
         event

@@ -22,8 +22,13 @@ from civ6_workflow.replay import (
     ReplayPlanSeed,
     SnapshotRecording,
 )
+from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
+
+
+def _compile(compiler, snapshot):
+    return getattr(compiler, "compile")(normalize_runtime_snapshot(snapshot))
 
 
 def _production_task() -> ProposedTask:
@@ -103,9 +108,7 @@ def test_replay_store_state_restores_exact_task_status(tmp_path: Path):
         10,
         PlanBundle(
             summary="state export",
-            city_plan_updates=[
-                {"city_id": 1, "followup_queue": ["UNIT_BUILDER"]}
-            ],
+            city_plan_updates=[{"city_id": 1, "followup_queue": ["UNIT_BUILDER"]}],
             tasks=[_production_task()],
         ),
         mode=ExecutionMode.AUTO,
@@ -172,7 +175,7 @@ def test_new_builder_is_bound_but_baseline_builder_is_not(tmp_path: Path):
             }
         ],
     )
-    assert compiler.compile(baseline).bundle is None
+    assert _compile(compiler, baseline).bundle is None
     assert (
         store.current_context("game-1")["builders"]["city-1-builder"].get(
             "assigned_unit_id"
@@ -197,10 +200,13 @@ def test_new_builder_is_bound_but_baseline_builder_is_not(tmp_path: Path):
             ],
         }
     )
-    compiled = compiler.compile(produced)
-    assert store.current_context("game-1")["builders"]["city-1-builder"][
-        "assigned_unit_id"
-    ] == 9
+    compiled = _compile(compiler, produced)
+    assert (
+        store.current_context("game-1")["builders"]["city-1-builder"][
+            "assigned_unit_id"
+        ]
+        == 9
+    )
     assert any(event.event_type == "builder_auto_bound" for event in compiled.events)
     assert compiled.bundle.tasks[0].arguments["unit_id"] == 9
     assert compiled.bundle.tasks[0].arguments["target_x"] == 4
@@ -218,9 +224,7 @@ def test_json_recording_round_trip_replays_verified_task(tmp_path: Path):
     verified = initial.model_copy(
         update={
             "cities": {
-                "cities": [
-                    {"city_id": 1, "currently_building": "UNIT_BUILDER"}
-                ]
+                "cities": [{"city_id": 1, "currently_building": "UNIT_BUILDER"}]
             },
             "blockers": [],
         }
