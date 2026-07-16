@@ -222,6 +222,11 @@ def test_task_004_005_city_task_creation_send_and_fresh_verification(tmp_path: P
         assert attempt.status is AttemptStatus.SUCCEEDED
         assert attempt.verification_status is VerificationStatus.PASSED
         assert attempt.last_verification_observation_id
+        assert attempt.postcondition_version == 1
+        assert (
+            attempt.last_verification_observation_id
+            != attempt.prepared_from_observation_id
+        )
         assert validate_workflow_tick(reconciled).mutation_budget_used == 0
 
     asyncio.run(scenario())
