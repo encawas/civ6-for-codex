@@ -6,11 +6,17 @@ from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 import json
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import Field, field_validator
+from pydantic import AfterValidator, Field, PlainSerializer, field_validator
 
-from .base import DomainModel, JsonValue, SourceVersions
+from .base import (
+    DomainModel,
+    FrozenDict,
+    ImmutableJsonObject,
+    SourceVersions,
+    thaw_json,
+)
 
 
 class SlotState(StrEnum):
@@ -53,6 +59,17 @@ def normalize_slot(value: Any, *, loaded: bool = True) -> SlotValue:
     raise TypeError(f"unsupported slot value: {type(value).__name__}")
 
 
+def _freeze_string_map(value: dict[str, str]) -> FrozenDict:
+    return FrozenDict(value)
+
+
+ImmutableStringMap = Annotated[
+    dict[str, str],
+    AfterValidator(_freeze_string_map),
+    PlainSerializer(thaw_json, return_type=dict[str, str]),
+]
+
+
 class Observation(DomainModel):
     observation_id: str
     game_session_id: str
@@ -60,8 +77,8 @@ class Observation(DomainModel):
     sequence: int = Field(ge=0)
     observed_at: datetime
     source_versions: SourceVersions
-    base_state: dict[str, JsonValue]
-    entity_revisions: dict[str, str] = {}
+    base_state: ImmutableJsonObject
+    entity_revisions: ImmutableStringMap = {}
 
     @property
     def projection_hash(self) -> str:
@@ -69,8 +86,8 @@ class Observation(DomainModel):
             "game_session_id": self.game_session_id,
             "turn_number": self.turn_number,
             "source_versions": self.source_versions.model_dump(mode="json"),
-            "base_state": self.base_state,
-            "entity_revisions": self.entity_revisions,
+            "base_state": thaw_json(self.base_state),
+            "entity_revisions": thaw_json(self.entity_revisions),
         }
         encoded = json.dumps(
             projection,

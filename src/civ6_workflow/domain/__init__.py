@@ -4,14 +4,19 @@ Importing this package has no domain-level runtime composition side effects.
 """
 
 from .approvals import ApprovalDecision, ApprovalRecord
-from .attempts import ActionAttempt, AttemptStatus
+from .attempts import ActionAttempt, AttemptStatus, VerificationStatus
 from .base import (
     ApprovalStatus,
     Condition,
     DomainModel,
+    FrozenDict,
+    ImmutableJsonObject,
+    ImmutableJsonValue,
     RetryClassification,
     SourceVersions,
     SubjectRef,
+    freeze_json,
+    thaw_json,
 )
 from .decisions import DecisionGap, DecisionGapStatus, DecisionRoute
 from .events import Event, EventRoute, EventStatus
@@ -25,16 +30,41 @@ from .tasks import (
     build_task_idempotency_key,
     tasks_conflict,
 )
-from .ticks import RuntimeState, TickOutcomeKind, WorkflowTick
+from .ticks import (
+    WORKFLOW_TICK_ADAPTER,
+    AwaitingApprovalTick,
+    AwaitingHumanTick,
+    AwaitingVerificationTick,
+    ContextGatheredTick,
+    MutationSentTick,
+    NoSafeActionTick,
+    ObservedOnlyTick,
+    PausedTick,
+    PlanRequestedTick,
+    PlannerBackoffTick,
+    RuntimeState,
+    SystemErrorTick,
+    TaskCreatedTick,
+    TickOutcomeKind,
+    TurnTransitionStartedTick,
+    WorkflowTick,
+    validate_workflow_tick,
+    validate_workflow_tick_json,
+)
 
 __all__ = [
     "ACTIVE_TASK_STATUSES",
+    "WORKFLOW_TICK_ADAPTER",
     "ActionAttempt",
     "ApprovalDecision",
     "ApprovalRecord",
     "ApprovalStatus",
     "AttemptStatus",
+    "AwaitingApprovalTick",
+    "AwaitingHumanTick",
+    "AwaitingVerificationTick",
     "Condition",
+    "ContextGatheredTick",
     "DecisionGap",
     "DecisionGapStatus",
     "DecisionRoute",
@@ -42,10 +72,19 @@ __all__ = [
     "Event",
     "EventRoute",
     "EventStatus",
+    "FrozenDict",
+    "ImmutableJsonObject",
+    "ImmutableJsonValue",
+    "MutationSentTick",
+    "NoSafeActionTick",
     "Observation",
+    "ObservedOnlyTick",
+    "PausedTick",
     "Plan",
+    "PlanRequestedTick",
     "PlanSource",
     "PlanStatus",
+    "PlannerBackoffTick",
     "PlannerRequest",
     "PlannerRequestStatus",
     "RetryClassification",
@@ -54,11 +93,19 @@ __all__ = [
     "SlotValue",
     "SourceVersions",
     "SubjectRef",
+    "SystemErrorTick",
     "Task",
+    "TaskCreatedTick",
     "TaskStatus",
     "TickOutcomeKind",
+    "TurnTransitionStartedTick",
+    "VerificationStatus",
     "WorkflowTick",
     "build_task_idempotency_key",
+    "freeze_json",
     "normalize_slot",
     "tasks_conflict",
+    "thaw_json",
+    "validate_workflow_tick",
+    "validate_workflow_tick_json",
 ]

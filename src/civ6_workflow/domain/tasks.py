@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from hashlib import sha256
 import json
+from typing import Any
 
 from pydantic import Field
 
-from .base import ApprovalStatus, Condition, DomainModel, JsonValue, SubjectRef
+from .base import (
+    ApprovalStatus,
+    Condition,
+    DomainModel,
+    ImmutableJsonObject,
+    SubjectRef,
+    freeze_json,
+    thaw_json,
+)
 
 
 class TaskStatus(StrEnum):
@@ -36,6 +46,15 @@ ACTIVE_TASK_STATUSES = frozenset(
         TaskStatus.UNCERTAIN,
     }
 )
+APPROVAL_SATISFIED_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.READY,
+        TaskStatus.EXECUTING,
+        TaskStatus.VERIFYING,
+        TaskStatus.UNCERTAIN,
+        TaskStatus.SUCCEEDED,
+    }
+)
 
 
 def build_task_idempotency_key(
@@ -43,7 +62,7 @@ def build_task_idempotency_key(
     game_session_id: str,
     subject: SubjectRef,
     slot: str,
-    desired_outcome: dict[str, JsonValue],
+    desired_outcome: Mapping[str, Any],
     source_plan_revision: int | None,
     earliest_turn: int,
     latest_turn: int | None,
@@ -52,7 +71,7 @@ def build_task_idempotency_key(
         "game_session_id": game_session_id,
         "subject": subject.model_dump(mode="json"),
         "slot": slot,
-        "desired_outcome": desired_outcome,
+        "desired_outcome": thaw_json(freeze_json(desired_outcome)),
         "source_plan_revision": source_plan_revision,
         "execution_window": [earliest_turn, latest_turn],
     }
@@ -72,8 +91,8 @@ class Task(DomainModel):
     task_type: str
     subject: SubjectRef
     slot: str
-    arguments: dict[str, JsonValue]
-    desired_outcome: dict[str, JsonValue]
+    arguments: ImmutableJsonObject
+    desired_outcome: ImmutableJsonObject
     source_plan_id: str | None = None
     source_plan_revision: int | None = Field(default=None, ge=1)
     source_event_ids: tuple[str, ...] = ()
@@ -92,11 +111,18 @@ class Task(DomainModel):
             raise ValueError("plan ID and revision must be supplied together")
         if self.latest_turn is not None and self.latest_turn < self.earliest_turn:
             raise ValueError("latest_turn must not precede earliest_turn")
-        if self.status is TaskStatus.READY and self.approval_status not in {
-            ApprovalStatus.NOT_REQUIRED,
-            ApprovalStatus.APPROVED,
-        }:
-            raise ValueError("a ready task must satisfy its approval requirement")
+        if self.status is TaskStatus.AWAITING_APPROVAL:
+            if self.approval_status is not ApprovalStatus.REQUIRED:
+                raise ValueError("an awaiting-approval task requires approval")
+        if self.status in APPROVAL_SATISFIED_TASK_STATUSES:
+            if self.approval_status not in {
+                ApprovalStatus.NOT_REQUIRED,
+                ApprovalStatus.APPROVED,
+            }:
+                raise ValueError(f"a {self.status} task must satisfy approval")
+        if self.approval_status is ApprovalStatus.REJECTED and self.is_active:
+            raise ValueError("a rejected task cannot remain active")
+
         expected_key = build_task_idempotency_key(
             game_session_id=self.game_session_id,
             subject=self.subject,

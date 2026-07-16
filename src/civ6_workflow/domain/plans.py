@@ -6,7 +6,13 @@ from enum import StrEnum
 
 from pydantic import Field
 
-from .base import ApprovalStatus, Condition, DomainModel, JsonValue, SubjectRef
+from .base import (
+    ApprovalStatus,
+    Condition,
+    DomainModel,
+    ImmutableJsonObject,
+    SubjectRef,
+)
 
 
 class PlanStatus(StrEnum):
@@ -42,16 +48,30 @@ class Plan(DomainModel):
     valid_until_turn: int | None = Field(default=None, ge=0)
     completion_condition: Condition | None = None
     invalidation_conditions: tuple[Condition, ...] = ()
-    objective: str
-    steps: tuple[dict[str, JsonValue], ...] = ()
-    policy_snapshot: dict[str, JsonValue] = {}
+    objective: str = Field(min_length=1)
+    steps: tuple[ImmutableJsonObject, ...] = ()
+    policy_snapshot: ImmutableJsonObject = {}
     supersedes_plan_id: str | None = None
 
     def model_post_init(self, __context: object) -> None:
         if self.valid_until_turn is None and self.completion_condition is None:
-            raise ValueError("a plan requires a validity horizon or completion condition")
+            raise ValueError(
+                "a plan requires a validity horizon or completion condition"
+            )
         if (
             self.valid_until_turn is not None
             and self.valid_until_turn < self.valid_from_turn
         ):
             raise ValueError("valid_until_turn must not precede valid_from_turn")
+        if self.status in {PlanStatus.ACTIVE, PlanStatus.COMPLETED}:
+            if self.approval_status not in {
+                ApprovalStatus.NOT_REQUIRED,
+                ApprovalStatus.APPROVED,
+            }:
+                raise ValueError(f"a {self.status} plan must satisfy approval")
+        if (self.status is PlanStatus.REJECTED) != (
+            self.approval_status is ApprovalStatus.REJECTED
+        ):
+            raise ValueError("rejected plan and approval statuses must agree")
+        if self.supersedes_plan_id == self.plan_id:
+            raise ValueError("a plan cannot supersede itself")
