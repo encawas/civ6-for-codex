@@ -97,12 +97,15 @@ def _normalize_cities(
             continue
         entity_id = normalize_entity_identifier(raw_id)
         production = normalize_slot(row.get("currently_building", row.get("producing")))
-        normalized = {
-            "city_id": entity_id.external_value,
-            "currently_building": (
-                production.value if production.state is SlotState.OCCUPIED else None
-            ),
-        }
+        normalized = deepcopy(row)
+        normalized.update(
+            {
+                "city_id": entity_id.external_value,
+                "currently_building": (
+                    production.value if production.state is SlotState.OCCUPIED else None
+                ),
+            }
+        )
         cities.append(
             NormalizedCity(
                 entity_id=entity_id,
@@ -203,10 +206,13 @@ def _available_progression(
             continue
         entity_id = normalize_entity_identifier(raw_id)
         normalized_id = entity_id.value.upper()
-        normalized = {
-            type_key: normalized_id,
-            "name": str(row.get("name", "")).strip(),
-        }
+        normalized = deepcopy(row)
+        normalized.update(
+            {
+                type_key: normalized_id,
+                "name": str(row.get("name", "")).strip(),
+            }
+        )
         identifiers.append(
             EntityIdentifier(
                 value=normalized_id,
@@ -241,24 +247,29 @@ def _normalize_units(
             action_state = UnitActionState.ACTIONABLE
         else:
             action_state = UnitActionState.EXHAUSTED
-        normalized = {
-            "unit_id": entity_id.external_value,
-            "unit_type": unit_type,
-            "name": str(row.get("name", "")).strip(),
-            "x": _optional_int(row.get("x")),
-            "y": _optional_int(row.get("y")),
-            "moves_remaining": moves,
-            "health": _optional_int(row.get("health")),
-            "max_health": _optional_int(row.get("max_health")),
-            "needs_promotion": bool(row.get("needs_promotion")),
-            "targets": (deepcopy(row.get("targets", [])) if row.get("targets") else []),
-            "build_charges": _optional_int(row.get("build_charges")) or 0,
-            "valid_improvements": [
-                str(item).strip().upper()
-                for item in (row.get("valid_improvements") or [])
-                if str(item).strip()
-            ],
-        }
+        normalized = deepcopy(row)
+        normalized.update(
+            {
+                "unit_id": entity_id.external_value,
+                "unit_type": unit_type,
+                "name": str(row.get("name", "")).strip(),
+                "x": _optional_int(row.get("x")),
+                "y": _optional_int(row.get("y")),
+                "moves_remaining": moves,
+                "health": _optional_int(row.get("health")),
+                "max_health": _optional_int(row.get("max_health")),
+                "needs_promotion": bool(row.get("needs_promotion")),
+                "targets": (
+                    deepcopy(row.get("targets", [])) if row.get("targets") else []
+                ),
+                "build_charges": _optional_int(row.get("build_charges")) or 0,
+                "valid_improvements": [
+                    str(item).strip().upper()
+                    for item in (row.get("valid_improvements") or [])
+                    if str(item).strip()
+                ],
+            }
+        )
         for key in (
             "origin_city_id",
             "home_city_id",

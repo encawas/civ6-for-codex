@@ -7,17 +7,18 @@ from .conditions import (
     ConditionResult,
     find_entity,
 )
-from .models import RuntimeSnapshot
-from .observation_normalization import normalize_runtime_snapshot
+from .observation_normalization import NormalizedRuntimeObservation
 
 
 class WorkflowConditionEvaluator(BaseConditionEvaluator):
     """Condition extensions required by irreversible unit operations."""
 
-    def evaluate(
-        self, condition: dict[str, Any], snapshot: RuntimeSnapshot
+    def _evaluate_normalized(
+        self,
+        condition: dict[str, Any],
+        observation: NormalizedRuntimeObservation,
     ) -> ConditionResult:
-        snapshot = normalize_runtime_snapshot(snapshot).snapshot
+        snapshot = observation.snapshot
         kind = condition.get("type")
         if kind == "unit_absent":
             unit_id = str(condition["unit_id"])
@@ -57,7 +58,7 @@ class WorkflowConditionEvaluator(BaseConditionEvaluator):
                 actual >= expected,
                 f"city count expected at least {expected}, got {actual}",
             )
-        return super().evaluate(condition, snapshot)
+        return super()._evaluate_normalized(condition, observation)
 
 
 def _rows(value: Any) -> list[dict[str, Any]]:

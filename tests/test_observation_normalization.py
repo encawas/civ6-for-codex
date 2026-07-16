@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+import civ6_workflow.conditions as conditions_module
+import civ6_workflow.engine as engine_module
 from civ6_workflow.domain import (
     NORMALIZATION_VERSION,
     SlotState,
@@ -12,6 +14,7 @@ from civ6_workflow.domain import (
 )
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
 from civ6_workflow.models import (
+    ActionResult,
     ExecutionMode,
     PlanBundle,
     RuntimeSnapshot,
@@ -20,6 +23,10 @@ from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.progression import ProgressionRuleCompiler
 from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
+from civ6_workflow.workflow_conditions import (
+    BaseConditionEvaluator,
+    WorkflowConditionEvaluator,
+)
 
 
 EMPTY_PRODUCTION_VALUES = [
@@ -448,3 +455,249 @@ def test_ordinary_tick_does_not_unconditionally_read_unit_detail(tmp_path: Path)
     assert UnitDetailReason.ZERO_CITIES not in (
         observation.canonical.unit_summary.detail_reasons
     )
+
+
+def _count_normalizations(monkeypatch):
+    calls = 0
+    original = conditions_module.normalize_runtime_snapshot
+
+    def counting_normalize(snapshot):
+        nonlocal calls
+        calls += 1
+        return original(snapshot)
+
+    monkeypatch.setattr(
+        conditions_module,
+        "normalize_runtime_snapshot",
+        counting_normalize,
+    )
+    return lambda: calls
+
+
+def test_evaluate_all_normalizes_once_for_multiple_conditions(monkeypatch):
+    call_count = _count_normalizations(monkeypatch)
+    snapshot = _city_snapshot("nothing")
+
+    result = BaseConditionEvaluator().evaluate_all(
+        [
+            {"type": "turn_equals", "turn": 10},
+            {
+                "type": "field_equals",
+                "path": "cities.0.currently_building",
+                "value": None,
+            },
+            {"type": "city_has_no_production", "city_id": 1},
+        ],
+        snapshot,
+    )
+
+    assert result.valid
+    assert call_count() == 1
+
+
+def test_workflow_parent_condition_normalizes_once(monkeypatch):
+    call_count = _count_normalizations(monkeypatch)
+
+    result = WorkflowConditionEvaluator().evaluate(
+        {"type": "turn_equals", "turn": 10},
+        _city_snapshot("nothing"),
+    )
+
+    assert result.valid
+    assert call_count() == 1
+
+
+def test_entity_exists_does_not_normalize_twice(monkeypatch):
+    call_count = _count_normalizations(monkeypatch)
+
+    result = BaseConditionEvaluator().evaluate(
+        {"type": "entity_exists", "entity_type": "city", "entity_id": 1},
+        _city_snapshot("nothing"),
+    )
+
+    assert result.valid
+    assert call_count() == 1
+
+
+def test_compatibility_projection_preserves_unknown_fields_and_typed_facts():
+    raw = RuntimeSnapshot(
+        turn=3,
+        game_id="game-preserve",
+        overview={"turn": 3},
+        cities=[
+            {
+                "city_id": " 11 ",
+                "currently_building": "nothing",
+                "name": "Capital",
+                "population": 4,
+                "x": 8,
+                "y": 9,
+                "owner": "PLAYER_0",
+                "extension": {"mod": "city-value"},
+            }
+        ],
+        tech_civics={
+            "current_research": None,
+            "current_civic": None,
+            "available_techs": [
+                {
+                    "name": " Mining ",
+                    "tech_type": "tech_mining",
+                    "cost": 25,
+                    "extension": {"mod": "tech-value"},
+                }
+            ],
+            "available_civics": [],
+        },
+        units=[
+            {
+                "unit_id": " 7 ",
+                "unit_type": "unit_settler",
+                "x": "4",
+                "y": "5",
+                "moves_remaining": "2",
+                "needs_promotion": 1,
+                "targets": [{"x": 6, "y": 7, "score": 3}],
+                "build_charges": "1",
+                "owner": "PLAYER_0",
+                "promotion_options": ["PROMOTION_1"],
+                "extension": {"mod": "unit-value"},
+            }
+        ],
+    )
+
+    observation = normalize_runtime_snapshot(raw)
+    city = observation.snapshot.cities[0]
+    unit = observation.snapshot.units[0]
+    tech = observation.snapshot.tech_civics["available_techs"][0]
+
+    assert city["city_id"] == "11"
+    assert city["currently_building"] is None
+    assert city["name"] == "Capital"
+    assert city["population"] == 4
+    assert city["x"] == 8
+    assert city["y"] == 9
+    assert city["owner"] == "PLAYER_0"
+    assert city["extension"] == {"mod": "city-value"}
+
+    assert unit["unit_id"] == "7"
+    assert unit["unit_type"] == "UNIT_SETTLER"
+    assert unit["x"] == 4
+    assert unit["y"] == 5
+    assert unit["moves_remaining"] == 2.0
+    assert unit["needs_promotion"] is True
+    assert unit["targets"] == [{"x": 6, "y": 7, "score": 3}]
+    assert unit["build_charges"] == 1
+    assert unit["owner"] == "PLAYER_0"
+    assert unit["promotion_options"] == ["PROMOTION_1"]
+    assert unit["extension"] == {"mod": "unit-value"}
+
+    assert tech["tech_type"] == "TECH_MINING"
+    assert tech["name"] == "Mining"
+    assert tech["cost"] == 25
+    assert tech["extension"] == {"mod": "tech-value"}
+
+    canonical = observation.canonical
+    assert canonical.city("11").production.state is SlotState.EMPTY
+    assert canonical.unit("7").unit_type == "UNIT_SETTLER"
+    assert canonical.progression.available_research_ids[0].value == "TECH_MINING"
+
+    raw_audit = canonical.raw_observation
+    assert raw_audit["cities"][0]["city_id"] == " 11 "
+    assert raw_audit["cities"][0]["currently_building"] == "nothing"
+    assert raw_audit["units"][0]["x"] == "4"
+    assert raw_audit["tech_civics"]["available_techs"][0]["tech_type"] == "tech_mining"
+    with pytest.raises(TypeError):
+        raw_audit["cities"][0]["extension"]["mod"] = "changed"
+
+
+def test_field_conditions_read_normalized_projection_not_raw_audit():
+    raw = _city_snapshot("nothing")
+    observation = normalize_runtime_snapshot(raw)
+    evaluator = BaseConditionEvaluator()
+
+    assert (
+        observation.canonical.raw_observation["cities"][0]["currently_building"]
+        == "nothing"
+    )
+    assert observation.snapshot.cities[0]["currently_building"] is None
+    assert evaluator.evaluate(
+        {
+            "type": "field_equals",
+            "path": "cities.0.currently_building",
+            "value": None,
+        },
+        observation,
+    ).valid
+    assert evaluator.evaluate(
+        {
+            "type": "field_in",
+            "path": "cities.0.currently_building",
+            "values": [None, "UNIT_SCOUT"],
+        },
+        observation,
+    ).valid
+    assert not evaluator.evaluate(
+        {
+            "type": "field_equals",
+            "path": "cities.0.currently_building",
+            "value": "nothing",
+        },
+        observation,
+    ).valid
+
+
+class _ExecutingGame(_ReadPolicyGame):
+    async def execute_task(self, task):
+        self.call_count += 1
+        self.snapshot.cities[0]["currently_building"] = task.arguments["item_name"]
+        return ActionResult(success=True, message="production selected")
+
+
+def test_tick_counts_each_real_normalization_and_reuses_it_for_conditions(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store = WorkflowStore(tmp_path / "normalization-metrics.sqlite3")
+    _save_city_plan(store)
+    game = _ExecutingGame(_city_snapshot("nothing"))
+    engine_calls = 0
+    original_engine_normalize = engine_module.normalize_runtime_snapshot
+
+    def counting_engine_normalize(snapshot):
+        nonlocal engine_calls
+        engine_calls += 1
+        return original_engine_normalize(snapshot)
+
+    def unexpected_condition_normalize(snapshot):
+        raise AssertionError("engine conditions must reuse the timed observation")
+
+    monkeypatch.setattr(
+        engine_module,
+        "normalize_runtime_snapshot",
+        counting_engine_normalize,
+    )
+    monkeypatch.setattr(
+        conditions_module,
+        "normalize_runtime_snapshot",
+        unexpected_condition_normalize,
+    )
+    engine = WorkflowEngine(
+        store=store,
+        game=game,
+        planner=_NoPlanner(),
+        config=EngineConfig(
+            execution_mode=ExecutionMode.AUTO,
+            auto_end_turn=False,
+            max_agent_calls_per_turn=0,
+            auto_action_types={"city_set_production"},
+            allowed_action_types={"city_set_production"},
+        ),
+    )
+
+    result = asyncio.run(engine.tick())
+
+    assert result.executed_task_ids
+    assert game.read_requests == [False, False]
+    assert engine_calls == len(game.read_requests)
+    assert result.metrics.normalization_seconds > 0

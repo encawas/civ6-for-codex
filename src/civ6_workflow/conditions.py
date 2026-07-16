@@ -5,7 +5,13 @@ from typing import Any, Callable
 
 from .domain.observations import SlotState
 from .models import RuntimeSnapshot
-from .observation_normalization import normalize_runtime_snapshot
+from .observation_normalization import (
+    NormalizedRuntimeObservation,
+    normalize_runtime_snapshot,
+)
+
+
+ObservationInput = RuntimeSnapshot | NormalizedRuntimeObservation
 
 
 @dataclass(slots=True)
@@ -18,31 +24,44 @@ class ConditionEvaluator:
     """Evaluates a deliberately small, auditable condition language."""
 
     def evaluate_all(
-        self, conditions: list[dict[str, Any]], snapshot: RuntimeSnapshot
+        self, conditions: list[dict[str, Any]], snapshot: ObservationInput
     ) -> ConditionResult:
+        observation = self._normalize(snapshot)
         for condition in conditions:
-            result = self.evaluate(condition, snapshot)
+            result = self._evaluate_normalized(condition, observation)
             if not result.valid:
                 return result
         return ConditionResult(True)
 
     def evaluate(
-        self, condition: dict[str, Any], snapshot: RuntimeSnapshot
+        self, condition: dict[str, Any], snapshot: ObservationInput
     ) -> ConditionResult:
-        observation = normalize_runtime_snapshot(snapshot)
+        return self._evaluate_normalized(condition, self._normalize(snapshot))
+
+    @staticmethod
+    def _normalize(snapshot: ObservationInput) -> NormalizedRuntimeObservation:
+        if isinstance(snapshot, NormalizedRuntimeObservation):
+            return snapshot
+        return normalize_runtime_snapshot(snapshot)
+
+    def _evaluate_normalized(
+        self,
+        condition: dict[str, Any],
+        observation: NormalizedRuntimeObservation,
+    ) -> ConditionResult:
         normalized_snapshot = observation.snapshot
         kind = condition.get("type")
         if kind == "turn_at_least":
             expected = int(condition["turn"])
             return ConditionResult(
-                snapshot.turn >= expected,
-                f"turn {snapshot.turn} is below required turn {expected}",
+                normalized_snapshot.turn >= expected,
+                f"turn {normalized_snapshot.turn} is below required turn {expected}",
             )
         if kind == "turn_equals":
             expected = int(condition["turn"])
             return ConditionResult(
-                snapshot.turn == expected,
-                f"turn {snapshot.turn} does not equal {expected}",
+                normalized_snapshot.turn == expected,
+                f"turn {normalized_snapshot.turn} does not equal {expected}",
             )
         if kind == "no_blocker_type":
             blocker_type = str(condition["blocker_type"]).strip().casefold()
@@ -56,7 +75,7 @@ class ConditionEvaluator:
         if kind == "field_equals":
             path = str(condition["path"])
             expected = condition.get("value")
-            actual = self._get_path(snapshot.model_dump(mode="json"), path)
+            actual = self._get_path(normalized_snapshot.model_dump(mode="json"), path)
             return ConditionResult(
                 actual == expected,
                 f"field {path} expected {expected!r}, got {actual!r}",
@@ -64,7 +83,7 @@ class ConditionEvaluator:
         if kind == "field_in":
             path = str(condition["path"])
             allowed = condition.get("values", [])
-            actual = self._get_path(snapshot.model_dump(mode="json"), path)
+            actual = self._get_path(normalized_snapshot.model_dump(mode="json"), path)
             return ConditionResult(
                 actual in allowed,
                 f"field {path} value {actual!r} is not in {allowed!r}",
@@ -72,7 +91,7 @@ class ConditionEvaluator:
         if kind == "entity_exists":
             entity_type = str(condition["entity_type"])
             entity_id = str(condition["entity_id"])
-            exists = entity_id in extract_known_entities(snapshot).get(
+            exists = entity_id in extract_known_entities(observation).get(
                 entity_type, set()
             )
             return ConditionResult(
@@ -222,8 +241,16 @@ class ConditionEvaluator:
         return current
 
 
-def extract_known_entities(snapshot: RuntimeSnapshot) -> dict[str, set[str]]:
-    snapshot = normalize_runtime_snapshot(snapshot).snapshot
+def extract_known_entities(
+    observation: NormalizedRuntimeObservation | RuntimeSnapshot,
+) -> dict[str, set[str]]:
+    """Extract IDs from an already-normalized observation or projection."""
+
+    snapshot = (
+        observation.snapshot
+        if isinstance(observation, NormalizedRuntimeObservation)
+        else observation
+    )
     return {
         "city": _entity_ids(snapshot.cities, ("city_id", "id")),
         "research": _available_progress_types(snapshot, "available_techs", "tech_type"),
