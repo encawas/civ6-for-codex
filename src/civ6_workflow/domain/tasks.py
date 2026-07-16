@@ -51,6 +51,7 @@ APPROVAL_SATISFIED_TASK_STATUSES = frozenset(
         TaskStatus.READY,
         TaskStatus.EXECUTING,
         TaskStatus.VERIFYING,
+        TaskStatus.UNCERTAIN,
         TaskStatus.SUCCEEDED,
     }
 )
