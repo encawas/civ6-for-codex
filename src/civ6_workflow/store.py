@@ -14,6 +14,14 @@ from .domain import (
     AttemptReconciledTick,
     AttemptRecoveredTick,
     AttemptStatus,
+    DecisionGap,
+    DecisionGapStatus,
+    DecisionGroup,
+    InformationRound,
+    PlanLease,
+    PlannerRequest,
+    PlannerRequestStatus,
+    ProviderAttempt,
     RuntimeState,
     TurnTransitionConfirmedTick,
     WorkflowTick,
@@ -121,6 +129,112 @@ CREATE TABLE IF NOT EXISTS event_log (
     PRIMARY KEY (game_id, dedupe_key)
 );
 
+CREATE TABLE IF NOT EXISTS decision_gaps (
+    decision_gap_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    stable_identity TEXT NOT NULL,
+    gap_type TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    status TEXT NOT NULL,
+    route TEXT NOT NULL,
+    relevant_input_hash TEXT NOT NULL,
+    input_projection_version TEXT NOT NULL,
+    logical_request_id TEXT,
+    first_seen_turn INTEGER NOT NULL,
+    last_seen_turn INTEGER NOT NULL,
+    gap_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (game_id, stable_identity)
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_gaps_active
+ON decision_gaps (game_id, status, route);
+
+CREATE TABLE IF NOT EXISTS decision_groups (
+    decision_group_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    observation_id TEXT NOT NULL,
+    decision_gap_ids_json TEXT NOT NULL,
+    input_projection_hash TEXT NOT NULL,
+    input_projection_version TEXT NOT NULL,
+    group_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS logical_planner_requests (
+    planner_request_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    decision_group_id TEXT,
+    turn INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    input_projection_hash TEXT NOT NULL,
+    input_projection_version TEXT NOT NULL,
+    decision_gap_ids_json TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (game_id, decision_group_id, input_projection_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_logical_requests_game_status
+ON logical_planner_requests (game_id, status, turn);
+
+CREATE TABLE IF NOT EXISTS provider_attempts (
+    provider_attempt_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    planner_request_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    provider_request_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (planner_request_id, attempt_number),
+    FOREIGN KEY (planner_request_id)
+        REFERENCES logical_planner_requests(planner_request_id)
+);
+
+CREATE TABLE IF NOT EXISTS information_rounds (
+    information_round_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    planner_request_id TEXT NOT NULL,
+    round_number INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    round_json TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (planner_request_id, round_number),
+    FOREIGN KEY (planner_request_id)
+        REFERENCES logical_planner_requests(planner_request_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_leases (
+    plan_lease_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    status TEXT NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    relevant_input_hash TEXT NOT NULL,
+    source_planner_request_id TEXT,
+    lease_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (source_planner_request_id)
+        REFERENCES logical_planner_requests(planner_request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_leases_active
+ON plan_leases (game_id, status, scope);
+
+CREATE TABLE IF NOT EXISTS planner_suppressions (
+    suppression_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    decision_gap_id TEXT,
+    reason TEXT NOT NULL,
+    relevant_input_hash TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS agent_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     game_id TEXT NOT NULL,
@@ -238,6 +352,13 @@ REPLAY_STATE_TABLES = (
     "builder_plans",
     "workflow_tasks",
     "event_log",
+    "decision_gaps",
+    "decision_groups",
+    "logical_planner_requests",
+    "provider_attempts",
+    "information_rounds",
+    "plan_leases",
+    "planner_suppressions",
     "agent_runs",
     "turn_metrics",
     "unit_observations",
@@ -1741,6 +1862,502 @@ class WorkflowStore:
             ).fetchall()
         return [validate_workflow_tick(self._load(row["tick_json"])) for row in rows]
 
+    @staticmethod
+    def _save_decision_gap_in_connection(
+        conn: sqlite3.Connection,
+        gap: DecisionGap,
+        turn: int,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        created_at = gap.created_at.isoformat() if gap.created_at else now
+        updated_at = gap.updated_at.isoformat() if gap.updated_at else now
+        conn.execute(
+            """
+            INSERT INTO decision_gaps(
+                decision_gap_id, game_id, stable_identity, gap_type, scope,
+                status, route, relevant_input_hash, input_projection_version,
+                logical_request_id, first_seen_turn, last_seen_turn,
+                gap_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(game_id, stable_identity) DO UPDATE SET
+                gap_type=excluded.gap_type,
+                scope=excluded.scope,
+                status=excluded.status,
+                route=excluded.route,
+                relevant_input_hash=excluded.relevant_input_hash,
+                input_projection_version=excluded.input_projection_version,
+                logical_request_id=excluded.logical_request_id,
+                last_seen_turn=excluded.last_seen_turn,
+                gap_json=excluded.gap_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                gap.decision_gap_id,
+                gap.game_session_id,
+                gap.stable_identity,
+                gap.gap_type,
+                gap.scope,
+                gap.status.value,
+                gap.route.value,
+                gap.relevant_input_hash,
+                gap.input_projection_version,
+                gap.logical_request_id,
+                turn,
+                turn,
+                gap.model_dump_json(),
+                created_at,
+                updated_at,
+            ),
+        )
+
+    def save_decision_gap(self, gap: DecisionGap, *, turn: int) -> None:
+        with self._connect() as conn:
+            self._save_decision_gap_in_connection(conn, gap, turn)
+
+    def decision_gap_by_identity(
+        self, game_id: str, stable_identity: str
+    ) -> DecisionGap | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT gap_json FROM decision_gaps
+                WHERE game_id=? AND stable_identity=?
+                """,
+                (game_id, stable_identity),
+            ).fetchone()
+        return None if row is None else DecisionGap.model_validate_json(row["gap_json"])
+
+    def get_decision_gap(self, decision_gap_id: str) -> DecisionGap | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT gap_json FROM decision_gaps WHERE decision_gap_id=?",
+                (decision_gap_id,),
+            ).fetchone()
+        return None if row is None else DecisionGap.model_validate_json(row["gap_json"])
+
+    def list_decision_gaps(
+        self,
+        game_id: str,
+        *,
+        statuses: Sequence[DecisionGapStatus] | None = None,
+    ) -> list[DecisionGap]:
+        query = "SELECT gap_json FROM decision_gaps WHERE game_id=?"
+        values: list[Any] = [game_id]
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            query += f" AND status IN ({placeholders})"
+            values.extend(status.value for status in statuses)
+        query += " ORDER BY created_at, decision_gap_id"
+        with self._connect() as conn:
+            rows = conn.execute(query, values).fetchall()
+        return [DecisionGap.model_validate_json(row["gap_json"]) for row in rows]
+
+    @staticmethod
+    def _save_plan_lease_in_connection(
+        conn: sqlite3.Connection, lease: PlanLease
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO plan_leases(
+                plan_lease_id, game_id, scope, status, plan_revision,
+                relevant_input_hash, source_planner_request_id, lease_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(plan_lease_id) DO UPDATE SET
+                scope=excluded.scope,
+                status=excluded.status,
+                plan_revision=excluded.plan_revision,
+                relevant_input_hash=excluded.relevant_input_hash,
+                source_planner_request_id=excluded.source_planner_request_id,
+                lease_json=excluded.lease_json,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                lease.plan_lease_id,
+                lease.game_session_id,
+                lease.scope,
+                lease.status.value,
+                lease.plan_revision,
+                lease.relevant_input_hash,
+                lease.source_planner_request_id,
+                lease.model_dump_json(),
+            ),
+        )
+
+    def save_plan_lease(self, lease: PlanLease) -> None:
+        with self._connect() as conn:
+            self._save_plan_lease_in_connection(conn, lease)
+
+    def list_plan_leases(self, game_id: str) -> list[PlanLease]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT lease_json FROM plan_leases
+                WHERE game_id=? ORDER BY scope, plan_lease_id
+                """,
+                (game_id,),
+            ).fetchall()
+        return [PlanLease.model_validate_json(row["lease_json"]) for row in rows]
+
+    @staticmethod
+    def _save_planner_request_in_connection(
+        conn: sqlite3.Connection, request: PlannerRequest
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO logical_planner_requests(
+                planner_request_id, game_id, decision_group_id, turn, status,
+                input_projection_hash, input_projection_version,
+                decision_gap_ids_json, request_json, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(planner_request_id) DO UPDATE SET
+                status=excluded.status,
+                request_json=excluded.request_json,
+                completed_at=excluded.completed_at
+            """,
+            (
+                request.planner_request_id,
+                request.game_session_id,
+                request.decision_group_id,
+                request.turn_number,
+                request.status.value,
+                request.input_projection_hash,
+                request.input_projection_version,
+                WorkflowStore._dump(list(request.decision_gap_ids)),
+                request.model_dump_json(),
+                request.created_at.isoformat(),
+                (
+                    None
+                    if request.completed_at is None
+                    else request.completed_at.isoformat()
+                ),
+            ),
+        )
+
+    def save_planner_request(self, request: PlannerRequest) -> None:
+        with self._connect() as conn:
+            self._save_planner_request_in_connection(conn, request)
+
+    def get_planner_request(self, planner_request_id: str) -> PlannerRequest | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT request_json FROM logical_planner_requests
+                WHERE planner_request_id=?
+                """,
+                (planner_request_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else PlannerRequest.model_validate_json(row["request_json"])
+        )
+
+    def active_planner_request(self, game_id: str) -> PlannerRequest | None:
+        terminal = tuple(status.value for status in (
+            PlannerRequestStatus.COMPLETED,
+            PlannerRequestStatus.FAILED,
+            PlannerRequestStatus.REJECTED,
+            PlannerRequestStatus.CANCELLED,
+        ))
+        placeholders = ",".join("?" for _ in terminal)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT request_json FROM logical_planner_requests
+                WHERE game_id=? AND status NOT IN ({placeholders})
+                ORDER BY created_at LIMIT 1
+                """,
+                (game_id, *terminal),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else PlannerRequest.model_validate_json(row["request_json"])
+        )
+
+    def planner_request_for_input(
+        self,
+        game_id: str,
+        decision_group_id: str,
+        input_projection_hash: str,
+    ) -> PlannerRequest | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT request_json FROM logical_planner_requests
+                WHERE game_id=? AND decision_group_id=?
+                  AND input_projection_hash=?
+                """,
+                (game_id, decision_group_id, input_projection_hash),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else PlannerRequest.model_validate_json(row["request_json"])
+        )
+
+    def logical_request_count_for_turn(self, game_id: str, turn: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS value FROM logical_planner_requests
+                WHERE game_id=? AND turn=?
+                """,
+                (game_id, turn),
+            ).fetchone()
+        return int(row["value"])
+
+    @staticmethod
+    def _save_provider_attempt_in_connection(
+        conn: sqlite3.Connection,
+        game_id: str,
+        attempt: ProviderAttempt,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO provider_attempts(
+                provider_attempt_id, game_id, planner_request_id,
+                attempt_number, provider_request_id, status, attempt_json,
+                started_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider_attempt_id) DO UPDATE SET
+                status=excluded.status,
+                attempt_json=excluded.attempt_json,
+                completed_at=excluded.completed_at
+            """,
+            (
+                attempt.provider_attempt_id,
+                game_id,
+                attempt.planner_request_id,
+                attempt.attempt_number,
+                attempt.provider_request_id,
+                attempt.status.value,
+                attempt.model_dump_json(),
+                attempt.started_at.isoformat(),
+                (
+                    None
+                    if attempt.completed_at is None
+                    else attempt.completed_at.isoformat()
+                ),
+            ),
+        )
+
+    def save_provider_attempt(
+        self, game_id: str, attempt: ProviderAttempt
+    ) -> None:
+        with self._connect() as conn:
+            self._save_provider_attempt_in_connection(conn, game_id, attempt)
+
+    def list_provider_attempts(
+        self, planner_request_id: str
+    ) -> list[ProviderAttempt]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT attempt_json FROM provider_attempts
+                WHERE planner_request_id=? ORDER BY attempt_number
+                """,
+                (planner_request_id,),
+            ).fetchall()
+        return [
+            ProviderAttempt.model_validate_json(row["attempt_json"]) for row in rows
+        ]
+
+    @staticmethod
+    def _save_information_round_in_connection(
+        conn: sqlite3.Connection,
+        game_id: str,
+        round_record: InformationRound,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO information_rounds(
+                information_round_id, game_id, planner_request_id,
+                round_number, status, round_json, requested_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(information_round_id) DO UPDATE SET
+                status=excluded.status,
+                round_json=excluded.round_json,
+                completed_at=excluded.completed_at
+            """,
+            (
+                round_record.information_round_id,
+                game_id,
+                round_record.planner_request_id,
+                round_record.round_number,
+                round_record.status.value,
+                round_record.model_dump_json(),
+                round_record.requested_at.isoformat(),
+                (
+                    None
+                    if round_record.completed_at is None
+                    else round_record.completed_at.isoformat()
+                ),
+            ),
+        )
+
+    def save_information_round(
+        self, game_id: str, round_record: InformationRound
+    ) -> None:
+        with self._connect() as conn:
+            self._save_information_round_in_connection(conn, game_id, round_record)
+
+    def list_information_rounds(
+        self, planner_request_id: str
+    ) -> list[InformationRound]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT round_json FROM information_rounds
+                WHERE planner_request_id=? ORDER BY round_number
+                """,
+                (planner_request_id,),
+            ).fetchall()
+        return [
+            InformationRound.model_validate_json(row["round_json"]) for row in rows
+        ]
+
+    def record_planner_suppression(
+        self,
+        game_id: str,
+        turn: int,
+        *,
+        reason: str,
+        decision_gap_id: str | None = None,
+        relevant_input_hash: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO planner_suppressions(
+                    game_id, turn, decision_gap_id, reason, relevant_input_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    game_id,
+                    turn,
+                    decision_gap_id,
+                    reason,
+                    relevant_input_hash,
+                ),
+            )
+
+    def persist_phase4_tick(
+        self,
+        tick: WorkflowTick,
+        *,
+        decision_gaps: Sequence[DecisionGap] = (),
+        decision_group: DecisionGroup | None = None,
+        plan_leases: Sequence[PlanLease] = (),
+        planner_request: PlannerRequest | None = None,
+        provider_attempts: Sequence[ProviderAttempt] = (),
+        information_round: InformationRound | None = None,
+        active_attempt_id: str | None = None,
+    ) -> None:
+        tick = validate_workflow_tick(tick)
+        with self._connect() as conn:
+            for gap in decision_gaps:
+                if gap.game_session_id != tick.game_session_id:
+                    raise ValueError("decision gap and Tick must belong to one game")
+                self._save_decision_gap_in_connection(conn, gap, tick.turn_number)
+            if decision_group is not None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO decision_groups(
+                        decision_group_id, game_id, observation_id,
+                        decision_gap_ids_json, input_projection_hash,
+                        input_projection_version, group_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        decision_group.decision_group_id,
+                        decision_group.game_session_id,
+                        decision_group.observation_id,
+                        self._dump(list(decision_group.decision_gap_ids)),
+                        decision_group.input_projection_hash,
+                        decision_group.input_projection_version,
+                        decision_group.model_dump_json(),
+                        decision_group.created_at.isoformat(),
+                    ),
+                )
+            if planner_request is not None:
+                if planner_request.game_session_id != tick.game_session_id:
+                    raise ValueError("planner request and Tick must belong to one game")
+                self._save_planner_request_in_connection(conn, planner_request)
+            for provider_attempt in provider_attempts:
+                self._save_provider_attempt_in_connection(
+                    conn, tick.game_session_id, provider_attempt
+                )
+            if information_round is not None:
+                self._save_information_round_in_connection(
+                    conn, tick.game_session_id, information_round
+                )
+            for lease in plan_leases:
+                if lease.game_session_id != tick.game_session_id:
+                    raise ValueError("plan lease and Tick must belong to one game")
+                self._save_plan_lease_in_connection(conn, lease)
+            self._save_runtime_state_in_connection(
+                conn,
+                tick.game_session_id,
+                tick.ending_runtime_state,
+                active_attempt_id,
+            )
+            self._insert_workflow_tick_in_connection(conn, tick)
+
+    def planner_metrics(self, game_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            logical = int(conn.execute(
+                """
+                SELECT COUNT(*) AS value FROM logical_planner_requests
+                WHERE game_id=?
+                """,
+                (game_id,),
+            ).fetchone()["value"])
+            provider = int(conn.execute(
+                """
+                SELECT COUNT(*) AS value FROM provider_attempts
+                WHERE game_id=?
+                """,
+                (game_id,),
+            ).fetchone()["value"])
+            information = int(conn.execute(
+                """
+                SELECT COUNT(*) AS value FROM information_rounds
+                WHERE game_id=?
+                """,
+                (game_id,),
+            ).fetchone()["value"])
+            suppressed = int(conn.execute(
+                """
+                SELECT COUNT(*) AS value FROM planner_suppressions
+                WHERE game_id=?
+                """,
+                (game_id,),
+            ).fetchone()["value"])
+            turn_rows = conn.execute(
+                """
+                SELECT turn,
+                       SUM(CASE WHEN outcome IN (
+                           'LOGICAL_PLANNER_REQUEST_CREATED',
+                           'PLANNER_ATTEMPT_COMPLETED',
+                           'INFORMATION_REQUESTED',
+                           'INFORMATION_COLLECTED'
+                       ) THEN 1 ELSE 0 END) AS planner_ticks
+                FROM workflow_ticks WHERE game_id=? GROUP BY turn
+                """,
+                (game_id,),
+            ).fetchall()
+        total_turns = len(turn_rows)
+        zero_turns = sum(int(row["planner_ticks"]) == 0 for row in turn_rows)
+        return {
+            "logical_requests": logical,
+            "provider_attempts": provider,
+            "information_rounds": information,
+            "duplicate_request_suppressions": suppressed,
+            "zero_planner_turn_ratio": (
+                1.0 if total_turns == 0 else zero_turns / total_turns
+            ),
+        }
     def agent_called_for_turn(self, game_id: str, turn: int) -> bool:
         with self._connect() as conn:
             row = conn.execute(

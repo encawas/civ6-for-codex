@@ -47,6 +47,7 @@ class EventResolution(StrictModel):
     plan_refs: list[str] = Field(default_factory=list)
     information_request_ids: list[str] = Field(default_factory=list)
     reason: str = Field(min_length=1, max_length=500)
+    decision_gap_ids: list[str] = Field(default_factory=list, max_length=100)
 
     @field_validator("event_dedupe_key")
     @classmethod
@@ -70,6 +71,11 @@ class WorkflowTickMetrics(BaseTickMetrics):
     agent_attempt_count: int = Field(default=0, ge=0)
     agent_success_count: int = Field(default=0, ge=0)
     information_query_count: int = Field(default=0, ge=0)
+    logical_planner_request_count: int = Field(default=0, ge=0)
+    provider_attempt_count: int = Field(default=0, ge=0)
+    information_round_count: int = Field(default=0, ge=0)
+    duplicate_request_suppression_count: int = Field(default=0, ge=0)
+    planner_context_bytes: int = Field(default=0, ge=0)
 
 
 @dataclass(frozen=True, slots=True)

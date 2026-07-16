@@ -282,6 +282,14 @@ class WorkflowEngine:
             for event in gate.by_level[EventLevel.L2]
             if event.blocking and event not in agent_events
         )
+        agent_events, planning_tick = await self._advance_decision_runtime(
+            ctx,
+            observation,
+            agent_events,
+            compat,
+        )
+        if planning_tick is not None:
+            return planning_tick
         already_called = self.store.agent_called_for_turn(
             snapshot.game_id, snapshot.turn
         )
@@ -1000,6 +1008,16 @@ class WorkflowEngine:
             return float(self.clock.monotonic())
         return time.perf_counter()
 
+    async def _advance_decision_runtime(
+        self,
+        ctx: _TickContext,
+        observation: NormalizedRuntimeObservation,
+        agent_events: list[GameEvent],
+        compatibility: TickResult,
+    ) -> tuple[list[GameEvent], TickResult | None]:
+        """Compatibility hook implemented by the canonical Phase 4 engine."""
+
+        return agent_events, None
     async def _invoke_planner(
         self,
         snapshot: RuntimeSnapshot,
