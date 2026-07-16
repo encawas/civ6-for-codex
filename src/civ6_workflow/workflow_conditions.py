@@ -8,6 +8,7 @@ from .conditions import (
     find_entity,
 )
 from .models import RuntimeSnapshot
+from .observation_normalization import normalize_runtime_snapshot
 
 
 class WorkflowConditionEvaluator(BaseConditionEvaluator):
@@ -16,6 +17,7 @@ class WorkflowConditionEvaluator(BaseConditionEvaluator):
     def evaluate(
         self, condition: dict[str, Any], snapshot: RuntimeSnapshot
     ) -> ConditionResult:
+        snapshot = normalize_runtime_snapshot(snapshot).snapshot
         kind = condition.get("type")
         if kind == "unit_absent":
             unit_id = str(condition["unit_id"])

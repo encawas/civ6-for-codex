@@ -1,8 +1,13 @@
 from pathlib import Path
 
 from civ6_workflow.models import ExecutionMode, PlanBundle, RuntimeSnapshot
+from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
+
+
+def _compile(compiler, snapshot):
+    return getattr(compiler, "compile")(normalize_runtime_snapshot(snapshot))
 
 
 def test_city_followup_queue_becomes_verified_task(tmp_path: Path):
@@ -34,7 +39,7 @@ def test_city_followup_queue_becomes_verified_task(tmp_path: Path):
         cities=[{"city_id": 1, "currently_building": "NONE"}],
     )
 
-    compiled = DeterministicRuleCompiler(store).compile(snapshot)
+    compiled = _compile(DeterministicRuleCompiler(store), snapshot)
     assert compiled.bundle is not None
     task = compiled.bundle.tasks[0]
     assert task.action_type == "city_set_production"
@@ -84,7 +89,7 @@ def test_builder_path_emits_one_step_only(tmp_path: Path):
         ],
     )
 
-    compiled = DeterministicRuleCompiler(store).compile(snapshot)
+    compiled = _compile(DeterministicRuleCompiler(store), snapshot)
     assert compiled.bundle is not None
     assert len(compiled.bundle.tasks) == 1
     task = compiled.bundle.tasks[0]
@@ -134,7 +139,7 @@ def test_builder_at_target_emits_improvement_with_charge_check(tmp_path: Path):
         ],
     )
 
-    compiled = DeterministicRuleCompiler(store).compile(snapshot)
+    compiled = _compile(DeterministicRuleCompiler(store), snapshot)
     task = compiled.bundle.tasks[0]
     assert task.action_type == "builder_improve"
     assert task.postconditions[0] == {

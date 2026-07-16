@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from .conditions import find_entity
 from .models import EventLevel, GameEvent, ProposedTask, RiskLevel, RuntimeSnapshot
 from .safe_rules import SafeDeterministicRuleCompiler
 
@@ -11,9 +10,17 @@ class SettlerDeterministicRuleCompiler(SafeDeterministicRuleCompiler):
     """Adds a safe settler plan: site selection -> travel -> found city."""
 
     def _compile_unit_blocker(
-        self, snapshot: RuntimeSnapshot, context: dict[str, Any]
+        self,
+        snapshot: RuntimeSnapshot,
+        context: dict[str, Any],
+        *,
+        unit_blocker_present: bool,
     ) -> tuple[list[ProposedTask], list[GameEvent]]:
-        tasks, events = super()._compile_unit_blocker(snapshot, context)
+        tasks, events = super()._compile_unit_blocker(
+            snapshot,
+            context,
+            unit_blocker_present=unit_blocker_present,
+        )
         unit_plans = context.get("units", {})
         if not isinstance(unit_plans, dict):
             unit_plans = {}
@@ -23,7 +30,9 @@ class SettlerDeterministicRuleCompiler(SafeDeterministicRuleCompiler):
             if event.event_type != "special_unit_orders_required":
                 retained.append(event)
                 continue
-            unit = event.payload.get("unit") if isinstance(event.payload, dict) else None
+            unit = (
+                event.payload.get("unit") if isinstance(event.payload, dict) else None
+            )
             if not isinstance(unit, dict):
                 retained.append(event)
                 continue
@@ -37,7 +46,10 @@ class SettlerDeterministicRuleCompiler(SafeDeterministicRuleCompiler):
             raw_id = unit.get("unit_id", unit.get("id", event.entity_id))
             unit_id = str(raw_id)
             plan = unit_plans.get(unit_id)
-            if not isinstance(plan, dict) or str(plan.get("goal", "")).lower() != "found_city":
+            if (
+                not isinstance(plan, dict)
+                or str(plan.get("goal", "")).lower() != "found_city"
+            ):
                 retained.append(self._settler_selection_event(snapshot, unit, raw_id))
                 continue
 
@@ -207,6 +219,13 @@ class SettlerDeterministicRuleCompiler(SafeDeterministicRuleCompiler):
             payload={"reason": reason, "unit": unit},
             dedupe_key=f"{event_type}:{raw_id}:{snapshot.turn}",
         )
+
+    @staticmethod
+    def _route_unit_without_blocker(unit: dict[str, Any]) -> bool:
+        unit_type = str(
+            unit.get("unit_type", unit.get("type", unit.get("name", "")))
+        ).upper()
+        return "SETTLER" in unit_type
 
     @staticmethod
     def _city_rows(value: Any) -> list[dict[str, Any]]:

@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .domain.observations import SlotState
 from .models import RuntimeSnapshot
+from .observation_normalization import normalize_runtime_snapshot
 
 
 @dataclass(slots=True)
@@ -27,6 +29,8 @@ class ConditionEvaluator:
     def evaluate(
         self, condition: dict[str, Any], snapshot: RuntimeSnapshot
     ) -> ConditionResult:
+        observation = normalize_runtime_snapshot(snapshot)
+        normalized_snapshot = observation.snapshot
         kind = condition.get("type")
         if kind == "turn_at_least":
             expected = int(condition["turn"])
@@ -41,9 +45,10 @@ class ConditionEvaluator:
                 f"turn {snapshot.turn} does not equal {expected}",
             )
         if kind == "no_blocker_type":
-            blocker_type = str(condition["blocker_type"])
+            blocker_type = str(condition["blocker_type"]).strip().casefold()
             present = any(
-                blocker.get("type") == blocker_type for blocker in snapshot.blockers
+                blocker.source_type == blocker_type
+                for blocker in observation.canonical.blockers
             )
             return ConditionResult(
                 not present, f"blocker {blocker_type} is currently present"
@@ -67,74 +72,83 @@ class ConditionEvaluator:
         if kind == "entity_exists":
             entity_type = str(condition["entity_type"])
             entity_id = str(condition["entity_id"])
-            exists = entity_id in extract_known_entities(snapshot).get(entity_type, set())
+            exists = entity_id in extract_known_entities(snapshot).get(
+                entity_type, set()
+            )
             return ConditionResult(
-                exists, f"{entity_type} {entity_id} does not exist in the current snapshot"
+                exists,
+                f"{entity_type} {entity_id} does not exist in the current snapshot",
             )
         if kind == "city_production_equals":
             city_id = str(condition["city_id"])
             expected = str(condition["item_name"])
-            city = find_entity(snapshot.cities, ("city_id", "id"), city_id)
+            city = observation.canonical.city(city_id)
             if city is None:
                 return ConditionResult(False, f"city {city_id} does not exist")
-            actual = city.get("currently_building", city.get("producing"))
+            actual = city.production.value
             return ConditionResult(
                 actual == expected,
                 f"city {city_id} production expected {expected!r}, got {actual!r}",
             )
         if kind == "city_has_no_production":
             city_id = str(condition["city_id"])
-            city = find_entity(snapshot.cities, ("city_id", "id"), city_id)
+            city = observation.canonical.city(city_id)
             if city is None:
                 return ConditionResult(False, f"city {city_id} does not exist")
-            actual = city.get("currently_building", city.get("producing"))
-            empty = actual in (None, "", "NONE", "none", {}, [])
-            return ConditionResult(empty, f"city {city_id} is already producing {actual!r}")
-        if kind == "research_unselected":
-            actual = _progress_value(snapshot, "current_research")
+            empty = city.production.state is SlotState.EMPTY
             return ConditionResult(
-                _is_unselected(actual), f"research is already selected: {actual!r}"
+                empty,
+                f"city {city_id} is already producing {city.production.value!r}",
+            )
+        if kind == "research_unselected":
+            slot = observation.canonical.progression.current_research
+            return ConditionResult(
+                slot.state is SlotState.EMPTY,
+                f"research is already selected: {slot.value!r}",
             )
         if kind == "civic_unselected":
-            actual = _progress_value(snapshot, "current_civic")
+            slot = observation.canonical.progression.current_civic
             return ConditionResult(
-                _is_unselected(actual), f"civic is already selected: {actual!r}"
+                slot.state is SlotState.EMPTY,
+                f"civic is already selected: {slot.value!r}",
             )
         if kind == "research_available":
             expected = str(condition["tech_type"])
-            available = _available_progress_types(
-                snapshot, "available_techs", "tech_type"
-            )
+            available = {
+                entity.value
+                for entity in (observation.canonical.progression.available_research_ids)
+            }
             return ConditionResult(
                 expected in available,
                 f"technology {expected} is not available; available={sorted(available)}",
             )
         if kind == "civic_available":
             expected = str(condition["civic_type"])
-            available = _available_progress_types(
-                snapshot, "available_civics", "civic_type"
-            )
+            available = {
+                entity.value
+                for entity in (observation.canonical.progression.available_civic_ids)
+            }
             return ConditionResult(
                 expected in available,
                 f"civic {expected} is not available; available={sorted(available)}",
             )
         if kind == "research_equals":
             expected = str(condition["tech_type"])
-            actual = _current_progress_type(snapshot, "research")
+            actual = observation.canonical.progression.current_research.value
             return ConditionResult(
                 actual == expected,
                 f"research expected {expected!r}, got {actual!r}",
             )
         if kind == "civic_equals":
             expected = str(condition["civic_type"])
-            actual = _current_progress_type(snapshot, "civic")
+            actual = observation.canonical.progression.current_civic.value
             return ConditionResult(
                 actual == expected,
                 f"civic expected {expected!r}, got {actual!r}",
             )
         if kind == "unit_at":
             unit_id = str(condition["unit_id"])
-            unit = find_entity(snapshot.units, ("unit_id", "id"), unit_id)
+            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
             expected_x = int(condition["x"])
@@ -146,7 +160,7 @@ class ConditionEvaluator:
             )
         if kind in {"unit_has_moves", "unit_no_moves"}:
             unit_id = str(condition["unit_id"])
-            unit = find_entity(snapshot.units, ("unit_id", "id"), unit_id)
+            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
             moves = _unit_moves(unit)
@@ -161,7 +175,7 @@ class ConditionEvaluator:
             )
         if kind == "unit_has_build_charge":
             unit_id = str(condition["unit_id"])
-            unit = find_entity(snapshot.units, ("unit_id", "id"), unit_id)
+            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
             charges = int(unit.get("build_charges", 0) or 0)
@@ -169,7 +183,7 @@ class ConditionEvaluator:
         if kind == "unit_build_charges_equals":
             unit_id = str(condition["unit_id"])
             expected = int(condition["charges"])
-            unit = find_entity(snapshot.units, ("unit_id", "id"), unit_id)
+            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
             actual = int(unit.get("build_charges", 0) or 0)
@@ -180,7 +194,7 @@ class ConditionEvaluator:
         if kind == "unit_can_improve":
             unit_id = str(condition["unit_id"])
             improvement = str(condition["improvement_type"])
-            unit = find_entity(snapshot.units, ("unit_id", "id"), unit_id)
+            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
             valid = unit.get("valid_improvements", []) or []
@@ -209,26 +223,28 @@ class ConditionEvaluator:
 
 
 def extract_known_entities(snapshot: RuntimeSnapshot) -> dict[str, set[str]]:
+    snapshot = normalize_runtime_snapshot(snapshot).snapshot
     return {
         "city": _entity_ids(snapshot.cities, ("city_id", "id")),
-        "research": _available_progress_types(
-            snapshot, "available_techs", "tech_type"
-        ),
-        "civic": _available_progress_types(
-            snapshot, "available_civics", "civic_type"
-        ),
+        "research": _available_progress_types(snapshot, "available_techs", "tech_type"),
+        "civic": _available_progress_types(snapshot, "available_civics", "civic_type"),
         "unit": _entity_ids(snapshot.units, ("unit_id", "id")),
         "builder": _entity_ids(
             snapshot.units,
             ("unit_id", "id"),
-            predicate=lambda row: "BUILDER" in str(
-                row.get("unit_type", row.get("type", row.get("name", "")))
-            ).upper(),
+            predicate=lambda row: (
+                "BUILDER"
+                in str(
+                    row.get("unit_type", row.get("type", row.get("name", "")))
+                ).upper()
+            ),
         ),
     }
 
 
-def find_entity(value: Any, keys: tuple[str, ...], entity_id: str) -> dict[str, Any] | None:
+def find_entity(
+    value: Any, keys: tuple[str, ...], entity_id: str
+) -> dict[str, Any] | None:
     rows = _rows(value)
     for row in rows:
         for key in keys:
@@ -239,10 +255,6 @@ def find_entity(value: Any, keys: tuple[str, ...], entity_id: str) -> dict[str, 
 
 def _progress_dict(snapshot: RuntimeSnapshot) -> dict[str, Any]:
     return snapshot.tech_civics if isinstance(snapshot.tech_civics, dict) else {}
-
-
-def _progress_value(snapshot: RuntimeSnapshot, key: str) -> Any:
-    return _progress_dict(snapshot).get(key)
 
 
 def _available_progress_types(
@@ -256,35 +268,6 @@ def _available_progress_types(
         for row in value
         if isinstance(row, dict) and row.get(type_key) is not None
     }
-
-
-def _current_progress_type(snapshot: RuntimeSnapshot, category: str) -> str | None:
-    progress = _progress_dict(snapshot)
-    explicit_key = (
-        "current_research_type" if category == "research" else "current_civic_type"
-    )
-    explicit = progress.get(explicit_key)
-    if isinstance(explicit, str) and explicit:
-        return explicit
-    current_key = "current_research" if category == "research" else "current_civic"
-    current = progress.get(current_key)
-    if _is_unselected(current):
-        return None
-    current_text = str(current)
-    if current_text.startswith(("TECH_", "CIVIC_")):
-        return current_text
-    list_key = "available_techs" if category == "research" else "available_civics"
-    type_key = "tech_type" if category == "research" else "civic_type"
-    for row in progress.get(list_key, []) or []:
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("name", "")) == current_text and row.get(type_key):
-            return str(row[type_key])
-    return None
-
-
-def _is_unselected(value: Any) -> bool:
-    return value in (None, "", "None", "NONE", "none", {}, [])
 
 
 def _unit_moves(unit: dict[str, Any]) -> float:

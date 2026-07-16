@@ -20,7 +20,22 @@ from .base import (
 )
 from .decisions import DecisionGap, DecisionGapStatus, DecisionRoute
 from .events import Event, EventRoute, EventStatus
-from .observations import Observation, SlotState, SlotValue, normalize_slot
+from .observations import (
+    NORMALIZATION_VERSION,
+    EntityIdentifier,
+    NormalizedBlocker,
+    NormalizedCity,
+    NormalizedObservation,
+    NormalizedUnit,
+    Observation,
+    ProgressionState,
+    SlotState,
+    SlotValue,
+    UnitActionState,
+    UnitDetailReason,
+    UnitSummary,
+    normalize_slot,
+)
 from .planner import PlannerRequest, PlannerRequestStatus
 from .plans import Plan, PlanSource, PlanStatus
 from .tasks import (
@@ -72,11 +87,17 @@ __all__ = [
     "Event",
     "EventRoute",
     "EventStatus",
+    "EntityIdentifier",
     "FrozenDict",
     "ImmutableJsonObject",
     "ImmutableJsonValue",
     "MutationSentTick",
+    "NORMALIZATION_VERSION",
     "NoSafeActionTick",
+    "NormalizedBlocker",
+    "NormalizedCity",
+    "NormalizedObservation",
+    "NormalizedUnit",
     "Observation",
     "ObservedOnlyTick",
     "PausedTick",
@@ -85,6 +106,7 @@ __all__ = [
     "PlanSource",
     "PlanStatus",
     "PlannerBackoffTick",
+    "ProgressionState",
     "PlannerRequest",
     "PlannerRequestStatus",
     "RetryClassification",
@@ -99,6 +121,9 @@ __all__ = [
     "TaskStatus",
     "TickOutcomeKind",
     "TurnTransitionStartedTick",
+    "UnitActionState",
+    "UnitDetailReason",
+    "UnitSummary",
     "VerificationStatus",
     "WorkflowTick",
     "build_task_idempotency_key",

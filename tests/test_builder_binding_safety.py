@@ -1,6 +1,11 @@
 from civ6_workflow.models import EventLevel, ExecutionMode, PlanBundle, RuntimeSnapshot
+from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
+
+
+def _compile(compiler, snapshot):
+    return getattr(compiler, "compile")(normalize_runtime_snapshot(snapshot))
 
 
 def _snapshot(turn: int, units):
@@ -36,9 +41,10 @@ def test_shared_builder_candidate_is_blocking_l3(tmp_path):
         ],
     )
     compiler = DeterministicRuleCompiler(store)
-    compiler.compile(_snapshot(30, []))
+    _compile(compiler, _snapshot(30, []))
 
-    result = compiler.compile(
+    result = _compile(
+        compiler,
         _snapshot(
             31,
             [
@@ -50,7 +56,7 @@ def test_shared_builder_candidate_is_blocking_l3(tmp_path):
                     "build_charges": 3,
                 }
             ],
-        )
+        ),
     )
 
     event = next(
@@ -77,9 +83,10 @@ def test_missing_origin_metadata_is_blocking_l3(tmp_path):
         ],
     )
     compiler = DeterministicRuleCompiler(store)
-    compiler.compile(_snapshot(30, []))
+    _compile(compiler, _snapshot(30, []))
 
-    result = compiler.compile(
+    result = _compile(
+        compiler,
         _snapshot(
             31,
             [
@@ -91,7 +98,7 @@ def test_missing_origin_metadata_is_blocking_l3(tmp_path):
                     "build_charges": 3,
                 }
             ],
-        )
+        ),
     )
 
     event = next(
@@ -101,9 +108,7 @@ def test_missing_origin_metadata_is_blocking_l3(tmp_path):
     )
     assert event.level is EventLevel.L3
     assert event.blocking is True
-    assert event.payload["plans"]["city-one-builder"]["candidate_unit_ids"] == [
-        "9"
-    ]
+    assert event.payload["plans"]["city-one-builder"]["candidate_unit_ids"] == ["9"]
     assert (
         store.current_context("game-1")["builders"]["city-one-builder"].get(
             "assigned_unit_id"
@@ -134,9 +139,10 @@ def test_builder_bound_to_one_plan_is_not_unmatched_for_another(tmp_path):
         ],
     )
     compiler = DeterministicRuleCompiler(store)
-    compiler.compile(_snapshot(30, []))
+    _compile(compiler, _snapshot(30, []))
 
-    result = compiler.compile(
+    result = _compile(
+        compiler,
         _snapshot(
             31,
             [
@@ -149,12 +155,11 @@ def test_builder_bound_to_one_plan_is_not_unmatched_for_another(tmp_path):
                     "build_charges": 3,
                 }
             ],
-        )
+        ),
     )
 
     assert not any(
-        event.event_type == "builder_binding_unmatched"
-        for event in result.events
+        event.event_type == "builder_binding_unmatched" for event in result.events
     )
     builders = store.current_context("game-1")["builders"]
     assert builders["city-one-builder"]["assigned_unit_id"] == 9

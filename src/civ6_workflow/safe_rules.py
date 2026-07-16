@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any
 
-from .conditions import find_entity
+from .domain.observations import SlotState, UnitDetailReason
 from .models import (
     EventLevel,
     GameEvent,
@@ -14,6 +14,7 @@ from .models import (
     RuntimeSnapshot,
     TaskStatus,
 )
+from .observation_normalization import NormalizedRuntimeObservation
 from .rules import DeterministicRuleCompiler as BaseDeterministicRuleCompiler
 
 
@@ -41,13 +42,23 @@ _SPECIAL_CIVILIAN_MARKERS = (
 class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
     """Hardened deterministic compiler, including ordinary unit blockers."""
 
-    def compile(self, snapshot: RuntimeSnapshot):
-        compiled = super().compile(snapshot)
-        if not self._has_unit_blocker(snapshot) or snapshot.units is None:
+    def compile(self, observation: NormalizedRuntimeObservation):
+        compiled = super().compile(observation)
+        snapshot = observation.snapshot
+        has_unit_blocker = self._has_unit_blocker(observation)
+        zero_city = (
+            UnitDetailReason.ZERO_CITIES
+            in observation.canonical.unit_summary.detail_reasons
+        )
+        if (not has_unit_blocker and not zero_city) or snapshot.units is None:
             return compiled
 
         context = self.store.current_context(snapshot.game_id)
-        unit_tasks, unit_events = self._compile_unit_blocker(snapshot, context)
+        unit_tasks, unit_events = self._compile_unit_blocker(
+            snapshot,
+            context,
+            unit_blocker_present=has_unit_blocker,
+        )
         compiled.events.extend(unit_events)
         if not unit_tasks:
             return compiled
@@ -71,7 +82,11 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
         return compiled
 
     def _compile_unit_blocker(
-        self, snapshot: RuntimeSnapshot, context: dict[str, Any]
+        self,
+        snapshot: RuntimeSnapshot,
+        context: dict[str, Any],
+        *,
+        unit_blocker_present: bool,
     ) -> tuple[list[ProposedTask], list[GameEvent]]:
         active_units = {
             str(task.entity_id)
@@ -93,6 +108,8 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
             if raw_id is None:
                 continue
             unit_id = str(raw_id)
+            if not unit_blocker_present and not self._route_unit_without_blocker(unit):
+                continue
             if unit_id in active_units or unit_id in builder_units:
                 continue
             moves = self._moves_remaining(unit)
@@ -162,9 +179,7 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
                         },
                         {"type": "unit_has_moves", "unit_id": raw_id},
                     ],
-                    postconditions=[
-                        {"type": "unit_no_moves", "unit_id": raw_id}
-                    ],
+                    postconditions=[{"type": "unit_no_moves", "unit_id": raw_id}],
                     reason=(
                         "No approved plan or high-risk decision applies; consume the "
                         "ordinary unit's remaining orders deterministically."
@@ -182,7 +197,11 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
     ) -> ProposedTask | None:
         raw_id = unit.get("unit_id", unit.get("id"))
         unit_id = str(raw_id)
-        path = [point for point in (self._point(item) for item in plan.get("path", [])) if point]
+        path = [
+            point
+            for point in (self._point(item) for item in plan.get("path", []))
+            if point
+        ]
         current = (int(unit.get("x", -1)), int(unit.get("y", -1)))
         current_index = self._last_index(path, current)
         if not path or current_index is None or current_index + 1 >= len(path):
@@ -215,7 +234,12 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
             preconditions=[
                 {"type": "entity_exists", "entity_type": "unit", "entity_id": raw_id},
                 {"type": "unit_has_moves", "unit_id": raw_id},
-                {"type": "unit_at", "unit_id": raw_id, "x": current[0], "y": current[1]},
+                {
+                    "type": "unit_at",
+                    "unit_id": raw_id,
+                    "x": current[0],
+                    "y": current[1],
+                },
             ],
             postconditions=[
                 {"type": "unit_at", "unit_id": raw_id, "x": target[0], "y": target[1]}
@@ -224,12 +248,15 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
         )
 
     @staticmethod
-    def _has_unit_blocker(snapshot: RuntimeSnapshot) -> bool:
+    def _has_unit_blocker(observation: NormalizedRuntimeObservation) -> bool:
         return any(
-            str(blocker.get("blocking_type", "")) == "ENDTURN_BLOCKING_UNITS"
-            for blocker in snapshot.blockers
-            if isinstance(blocker, dict)
+            blocker.blocker_type == "ENDTURN_BLOCKING_UNITS"
+            for blocker in observation.canonical.blockers
         )
+
+    @staticmethod
+    def _route_unit_without_blocker(unit: dict[str, Any]) -> bool:
+        return False
 
     @staticmethod
     def _moves_remaining(unit: dict[str, Any]) -> float:
@@ -280,17 +307,17 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
 
     def _compile_city_production(
         self,
-        snapshot: RuntimeSnapshot,
+        observation: NormalizedRuntimeObservation,
         plans: dict[str, dict[str, Any]],
         events: list[GameEvent],
     ) -> list[ProposedTask]:
+        snapshot = observation.snapshot
         tasks: list[ProposedTask] = []
         for city_id, plan in plans.items():
-            city = find_entity(snapshot.cities, ("city_id", "id"), str(city_id))
+            city = observation.canonical.city(city_id)
             if city is None:
                 continue
-            current = city.get("currently_building", city.get("producing"))
-            if current not in (None, "", "NONE", "none", {}, []):
+            if city.production.state is not SlotState.EMPTY:
                 continue
             queue = plan.get("followup_queue", [])
             if not isinstance(queue, list) or not queue:
@@ -350,11 +377,19 @@ class SafeDeterministicRuleCompiler(BaseDeterministicRuleCompiler):
                     expires_turn=snapshot.turn,
                     arguments=arguments,
                     preconditions=[
-                        {"type": "entity_exists", "entity_type": "city", "entity_id": city_id},
+                        {
+                            "type": "entity_exists",
+                            "entity_type": "city",
+                            "entity_id": city_id,
+                        },
                         {"type": "city_has_no_production", "city_id": city_id},
                     ],
                     postconditions=[
-                        {"type": "city_production_equals", "city_id": city_id, "item_name": item["item_name"]}
+                        {
+                            "type": "city_production_equals",
+                            "city_id": city_id,
+                            "item_name": item["item_name"],
+                        }
                     ],
                     invalidators=[],
                     reason=f"Continue approved production queue with {item['item_name']}.",

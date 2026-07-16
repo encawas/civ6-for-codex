@@ -4,7 +4,16 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import EventLevel, GameEvent, PlanBundle, ProposedTask, RiskLevel, RuntimeSnapshot
+from .domain.observations import SlotState
+from .models import (
+    EventLevel,
+    GameEvent,
+    PlanBundle,
+    ProposedTask,
+    RiskLevel,
+    RuntimeSnapshot,
+)
+from .observation_normalization import NormalizedRuntimeObservation
 from .store import WorkflowStore
 
 
@@ -20,34 +29,34 @@ class ProgressionRuleCompiler:
     def __init__(self, store: WorkflowStore):
         self.store = store
 
-    def compile(self, snapshot: RuntimeSnapshot) -> ProgressionCompilation:
+    def compile(
+        self,
+        observation: NormalizedRuntimeObservation,
+    ) -> ProgressionCompilation:
+        snapshot = observation.snapshot
         strategy = self.store.current_context(snapshot.game_id).get("strategy", {})
         if not isinstance(strategy, dict):
             strategy = {}
         tasks: list[ProposedTask] = []
         events: list[GameEvent] = []
         research = self._compile_category(
-            snapshot,
+            observation,
             strategy,
             category="research",
             queue_keys=("research_queue", "tech_queue"),
             action_type="set_research",
             target_keys=("tech_type", "item_name", "name"),
-            available_key="available_techs",
-            available_type_key="tech_type",
             events=events,
         )
         if research is not None:
             tasks.append(research)
         civic = self._compile_category(
-            snapshot,
+            observation,
             strategy,
             category="civic",
             queue_keys=("civic_queue",),
             action_type="set_civic",
             target_keys=("civic_type", "item_name", "name"),
-            available_key="available_civics",
-            available_type_key="civic_type",
             events=events,
         )
         if civic is not None:
@@ -65,29 +74,34 @@ class ProgressionRuleCompiler:
 
     def _compile_category(
         self,
-        snapshot: RuntimeSnapshot,
+        observation: NormalizedRuntimeObservation,
         strategy: dict[str, Any],
         *,
         category: str,
         queue_keys: tuple[str, ...],
         action_type: str,
         target_keys: tuple[str, ...],
-        available_key: str,
-        available_type_key: str,
         events: list[GameEvent],
     ) -> ProposedTask | None:
+        snapshot = observation.snapshot
         queue = self._first_queue(strategy, queue_keys)
         if not queue:
             return None
-        progress = self._progress(snapshot)
-        current_type = self.current_type(progress, category)
-        current_name = self.current_name(progress, category)
-        if not self._is_unselected(current_name):
+        progression = observation.canonical.progression
+        slot = (
+            progression.current_research
+            if category == "research"
+            else progression.current_civic
+        )
+        if slot.state is not SlotState.EMPTY:
             return None
         available = {
-            str(item[available_type_key])
-            for item in self._rows(progress.get(available_key))
-            if item.get(available_type_key)
+            entity.value
+            for entity in (
+                progression.available_research_ids
+                if category == "research"
+                else progression.available_civic_ids
+            )
         }
         for index, raw in enumerate(queue):
             target = self._queue_target(raw, target_keys)
@@ -108,8 +122,7 @@ class ProgressionRuleCompiler:
                 if status.value in {"done", "cancelled", "expired"}:
                     continue
                 return None
-            if current_type == target:
-                return None
+
             if target not in available:
                 events.append(
                     GameEvent(
@@ -185,48 +198,6 @@ class ProgressionRuleCompiler:
     def _task_id(category: str, index: int, target: str) -> str:
         digest = hashlib.sha1(f"{category}:{index}:{target}".encode()).hexdigest()[:12]
         return f"{category}-queue:{index}:{digest}"
-
-    @staticmethod
-    def _progress(snapshot: RuntimeSnapshot) -> dict[str, Any]:
-        return snapshot.tech_civics if isinstance(snapshot.tech_civics, dict) else {}
-
-    @classmethod
-    def current_name(cls, progress: dict[str, Any], category: str) -> Any:
-        key = "current_research" if category == "research" else "current_civic"
-        return progress.get(key)
-
-    @classmethod
-    def current_type(cls, progress: dict[str, Any], category: str) -> str | None:
-        explicit_key = (
-            "current_research_type"
-            if category == "research"
-            else "current_civic_type"
-        )
-        explicit = progress.get(explicit_key)
-        if isinstance(explicit, str) and explicit:
-            return explicit
-        current = cls.current_name(progress, category)
-        if cls._is_unselected(current):
-            return None
-        current_text = str(current)
-        if current_text.startswith(("TECH_", "CIVIC_")):
-            return current_text
-        options_key = "available_techs" if category == "research" else "available_civics"
-        type_key = "tech_type" if category == "research" else "civic_type"
-        for item in cls._rows(progress.get(options_key)):
-            if str(item.get("name", "")) == current_text and item.get(type_key):
-                return str(item[type_key])
-        return None
-
-    @staticmethod
-    def _is_unselected(value: Any) -> bool:
-        return value in (None, "", "None", "NONE", "none", {}, [])
-
-    @staticmethod
-    def _rows(value: Any) -> list[dict[str, Any]]:
-        if not isinstance(value, list):
-            return []
-        return [item for item in value if isinstance(item, dict)]
 
     @staticmethod
     def _invalid_queue_event(

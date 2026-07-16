@@ -23,6 +23,10 @@ from .models import (
     TickMetrics,
     TickResult,
 )
+from .observation_normalization import (
+    NormalizedRuntimeObservation,
+    normalize_runtime_snapshot,
+)
 from .progression import ProgressionRuleCompiler
 from .recovery import recover_turn_rewind
 from .rules import DeterministicRuleCompiler
@@ -75,6 +79,7 @@ class WorkflowEngine:
         call_count_before = self.game.call_count
 
         snapshot = await self._read_snapshot(metrics, include_units=False)
+        observation = self._normalize_snapshot(snapshot, metrics)
         rewind_event = recover_turn_rewind(self.store, snapshot)
         result = TickResult(turn=snapshot.turn, metrics=metrics)
         self.store.set_meta("last_game_id", snapshot.game_id)
@@ -82,14 +87,17 @@ class WorkflowEngine:
         await self._verify_tool_surface()
 
         existing_due = self.store.due_tasks(snapshot.game_id, snapshot.turn)
-        need_units = self.rules.needs_units(snapshot.game_id) or any(
-            task.entity_type in {"unit", "builder"} for task in existing_due
+        need_units = (
+            observation.canonical.unit_summary.detail_required
+            or self.rules.needs_units(snapshot.game_id)
+            or any(task.entity_type in {"unit", "builder"} for task in existing_due)
         )
-        if need_units:
+        if need_units and snapshot.units is None:
             snapshot = await self._read_snapshot(metrics, include_units=True)
+            observation = self._normalize_snapshot(snapshot, metrics)
 
-        rule_compilation = self.rules.compile(snapshot)
-        progression_compilation = self.progression.compile(snapshot)
+        rule_compilation = self.rules.compile(observation)
+        progression_compilation = self.progression.compile(observation)
         for compilation in (rule_compilation, progression_compilation):
             if compilation.bundle is not None:
                 self.store.save_plan_bundle(
@@ -138,7 +146,9 @@ class WorkflowEngine:
             if event.blocking and event not in agent_events
         )
 
-        already_called = self.store.agent_called_for_turn(snapshot.game_id, snapshot.turn)
+        already_called = self.store.agent_called_for_turn(
+            snapshot.game_id, snapshot.turn
+        )
         if (
             agent_events
             and self.config.max_agent_calls_per_turn > 0
@@ -304,7 +314,9 @@ class WorkflowEngine:
         has_research_retry = any(
             task.action_type == "set_research" for task in retrying_tasks
         )
-        has_civic_retry = any(task.action_type == "set_civic" for task in retrying_tasks)
+        has_civic_retry = any(
+            task.action_type == "set_civic" for task in retrying_tasks
+        )
         retained: list[GameEvent] = []
         for event in events:
             if (
@@ -314,7 +326,10 @@ class WorkflowEngine:
                 continue
             if event.event_type == "end_turn_blocker":
                 blocking_type = str(event.payload.get("blocking_type", ""))
-                if has_production_retry and blocking_type == "ENDTURN_BLOCKING_PRODUCTION":
+                if (
+                    has_production_retry
+                    and blocking_type == "ENDTURN_BLOCKING_PRODUCTION"
+                ):
                     continue
                 if has_research_retry and blocking_type == "ENDTURN_BLOCKING_RESEARCH":
                     continue
@@ -381,6 +396,16 @@ class WorkflowEngine:
                 duration_seconds=time.perf_counter() - agent_started,
             )
         metrics.agent_seconds = time.perf_counter() - agent_started
+
+    @staticmethod
+    def _normalize_snapshot(
+        snapshot: RuntimeSnapshot,
+        metrics: TickMetrics,
+    ) -> NormalizedRuntimeObservation:
+        started = time.perf_counter()
+        observation = normalize_runtime_snapshot(snapshot)
+        metrics.normalization_seconds += time.perf_counter() - started
+        return observation
 
     async def _read_snapshot(
         self, metrics: TickMetrics, *, include_units: bool

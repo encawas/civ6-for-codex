@@ -2,8 +2,13 @@ from pathlib import Path
 
 from civ6_workflow.conditions import ConditionEvaluator
 from civ6_workflow.models import EventLevel, RuntimeSnapshot
+from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
+
+
+def _compile(compiler, snapshot):
+    return getattr(compiler, "compile")(normalize_runtime_snapshot(snapshot))
 
 
 def _snapshot(unit: dict) -> RuntimeSnapshot:
@@ -25,7 +30,8 @@ def _snapshot(unit: dict) -> RuntimeSnapshot:
 
 def test_ordinary_unplanned_unit_becomes_verified_skip(tmp_path: Path):
     compiler = DeterministicRuleCompiler(WorkflowStore(tmp_path / "workflow.sqlite3"))
-    compiled = compiler.compile(
+    compiled = _compile(
+        compiler,
         _snapshot(
             {
                 "unit_id": 41,
@@ -36,7 +42,7 @@ def test_ordinary_unplanned_unit_becomes_verified_skip(tmp_path: Path):
                 "targets": [],
                 "needs_promotion": False,
             }
-        )
+        ),
     )
 
     assert compiled.bundle is not None
@@ -52,7 +58,8 @@ def test_ordinary_unplanned_unit_becomes_verified_skip(tmp_path: Path):
 def test_settler_and_promotion_are_not_auto_skipped(tmp_path: Path):
     compiler = DeterministicRuleCompiler(WorkflowStore(tmp_path / "workflow.sqlite3"))
 
-    settler = compiler.compile(
+    settler = _compile(
+        compiler,
         _snapshot(
             {
                 "unit_id": 42,
@@ -60,7 +67,7 @@ def test_settler_and_promotion_are_not_auto_skipped(tmp_path: Path):
                 "moves_remaining": 2,
                 "targets": [],
             }
-        )
+        ),
     )
     assert settler.bundle is None
     assert [event.event_type for event in settler.events] == [
@@ -68,7 +75,8 @@ def test_settler_and_promotion_are_not_auto_skipped(tmp_path: Path):
     ]
     assert settler.events[0].blocking is True
 
-    promoted = compiler.compile(
+    promoted = _compile(
+        compiler,
         _snapshot(
             {
                 "unit_id": 43,
@@ -77,7 +85,7 @@ def test_settler_and_promotion_are_not_auto_skipped(tmp_path: Path):
                 "needs_promotion": True,
                 "targets": [],
             }
-        )
+        ),
     )
     assert promoted.bundle is None
     assert [event.event_type for event in promoted.events] == [
