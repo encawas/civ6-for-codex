@@ -1,7 +1,14 @@
 import asyncio
 from pathlib import Path
 
-from civ6_workflow.codex_planner import CodexPlanner, CodexPlannerConfig
+import pytest
+
+from civ6_workflow.characterization import RecordingPlanner
+from civ6_workflow.codex_planner import (
+    CodexPlanner,
+    CodexPlannerConfig,
+    PlannerError,
+)
 from civ6_workflow.models import AgentRequest, ExecutionMode, PlanBundle
 
 
@@ -86,7 +93,9 @@ def test_codex_command_can_skip_remote_output_schema(tmp_path: Path):
     assert "--output-last-message" in command
 
 
-def test_cli_planner_keeps_request_artifacts_in_project_state(tmp_path: Path, monkeypatch):
+def test_cli_planner_keeps_request_artifacts_in_project_state(
+    tmp_path: Path, monkeypatch
+):
     state_directory = tmp_path / "state" / "codex-planner"
     planner = CodexPlanner(
         CodexPlannerConfig(
@@ -95,6 +104,7 @@ def test_cli_planner_keeps_request_artifacts_in_project_state(tmp_path: Path, mo
             use_output_schema=False,
         )
     )
+    recording = RecordingPlanner(planner)
     request = AgentRequest(
         request_id="req_persistent_test",
         turn=1,
@@ -130,7 +140,11 @@ def test_cli_planner_keeps_request_artifacts_in_project_state(tmp_path: Path, mo
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
-    bundle = asyncio.run(planner.plan(request))
+    async def scenario():
+        with recording.logical_request_scope("cli-success"):
+            return await recording.plan(request)
+
+    bundle = asyncio.run(scenario())
 
     request_directory = state_directory / "requests" / request.request_id
     assert bundle.summary == "persistent test"
@@ -139,3 +153,220 @@ def test_cli_planner_keeps_request_artifacts_in_project_state(tmp_path: Path, mo
     assert (request_directory / "plan.json").exists()
     assert planner.last_diagnostics is not None
     assert planner.last_diagnostics["state_directory"] == str(state_directory.resolve())
+    assert planner.last_diagnostics["attempt_count"] == 1
+    assert recording.summary.logical_requests == 1
+    assert recording.summary.provider_attempts == 1
+
+
+def test_recording_planner_counts_started_cli_with_invalid_output(
+    tmp_path: Path, monkeypatch
+):
+    planner = CodexPlanner(
+        CodexPlannerConfig(
+            backend="codex_cli",
+            state_directory=tmp_path / "invalid-output",
+            use_output_schema=False,
+        )
+    )
+    recording = RecordingPlanner(planner)
+    request = AgentRequest(
+        request_id="req_invalid_output",
+        turn=1,
+        execution_mode=ExecutionMode.READONLY,
+        trigger_events=[],
+    )
+
+    class InvalidOutputProcess:
+        returncode = 0
+
+        async def communicate(self, payload: bytes):
+            output_path = (
+                Path(planner.config.state_directory)
+                / "requests"
+                / request.request_id
+                / "plan.json"
+            )
+            output_path.write_text("{not valid json", encoding="utf-8")
+            return b"", b""
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return InvalidOutputProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        with recording.logical_request_scope("cli-invalid-output"):
+            await recording.plan(request)
+
+    with pytest.raises(PlannerError, match="invalid plan"):
+        asyncio.run(scenario())
+
+    assert planner.last_diagnostics is not None
+    assert planner.last_diagnostics["attempt_count"] == 1
+    assert recording.summary.logical_requests == 1
+    assert recording.summary.provider_attempts == 1
+
+
+def test_recording_planner_does_not_count_missing_cli_executable(
+    tmp_path: Path, monkeypatch
+):
+    planner = CodexPlanner(
+        CodexPlannerConfig(
+            backend="codex_cli",
+            command="missing-codex",
+            state_directory=tmp_path / "missing-cli",
+            use_output_schema=False,
+        )
+    )
+    recording = RecordingPlanner(planner)
+    request = AgentRequest(
+        request_id="req_missing_cli",
+        turn=1,
+        execution_mode=ExecutionMode.READONLY,
+        trigger_events=[],
+    )
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        raise FileNotFoundError("missing-codex")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        with recording.logical_request_scope("cli-missing"):
+            await recording.plan(request)
+
+    with pytest.raises(PlannerError, match="executable was not found"):
+        asyncio.run(scenario())
+
+    assert planner.last_diagnostics is not None
+    assert planner.last_diagnostics["attempt_count"] == 0
+    assert recording.summary.logical_requests == 1
+    assert recording.summary.provider_attempts == 0
+
+
+@pytest.mark.parametrize(
+    ("mode", "error_match"),
+    [
+        ("nonzero", "exit code 7"),
+        ("missing_output", "without writing"),
+        ("empty_output", "empty plan"),
+        ("too_many_tasks", "max_tasks=1"),
+    ],
+)
+def test_started_cli_failure_paths_record_current_diagnostics(
+    tmp_path: Path, monkeypatch, mode: str, error_match: str
+):
+    planner = CodexPlanner(
+        CodexPlannerConfig(
+            backend="codex_cli",
+            state_directory=tmp_path / mode,
+            use_output_schema=False,
+        )
+    )
+    request = AgentRequest(
+        request_id=f"req_{mode}",
+        turn=1,
+        execution_mode=ExecutionMode.READONLY,
+        trigger_events=[],
+        constraints={"max_tasks": 1},
+    )
+
+    class FailureProcess:
+        returncode = 7 if mode == "nonzero" else 0
+
+        async def communicate(self, payload: bytes):
+            output_path = (
+                Path(planner.config.state_directory)
+                / "requests"
+                / request.request_id
+                / "plan.json"
+            )
+            if mode == "empty_output":
+                output_path.write_text("   ", encoding="utf-8")
+            elif mode == "too_many_tasks":
+                bundle = PlanBundle(
+                    summary="too many",
+                    tasks=[
+                        {
+                            "task_id": f"task-{index}",
+                            "action_type": "unit_skip",
+                            "entity_type": "unit",
+                            "entity_id": index,
+                            "due_turn": 1,
+                            "reason": "diagnostics coverage",
+                        }
+                        for index in range(2)
+                    ],
+                )
+                output_path.write_text(bundle.model_dump_json(), encoding="utf-8")
+            return b"", b"cli failure"
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return FailureProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(PlannerError, match=error_match):
+        asyncio.run(planner.plan(request))
+
+    assert planner.last_diagnostics is not None
+    assert planner.last_diagnostics["attempt_count"] == 1
+    assert planner.last_diagnostics["error_body"]
+
+
+def test_timed_out_cli_records_started_provider_attempt(tmp_path: Path, monkeypatch):
+    planner = CodexPlanner(
+        CodexPlannerConfig(
+            backend="codex_cli",
+            state_directory=tmp_path / "timeout",
+            timeout_seconds=0,
+            use_output_schema=False,
+        )
+    )
+    request = AgentRequest(
+        request_id="req_timeout",
+        turn=1,
+        execution_mode=ExecutionMode.READONLY,
+        trigger_events=[],
+    )
+
+    class TimeoutProcess:
+        returncode = None
+
+        def __init__(self):
+            self.released = asyncio.Event()
+
+        async def communicate(self, payload: bytes):
+            await self.released.wait()
+            return b"", b"timed out"
+
+        def kill(self):
+            self.returncode = -9
+            self.released.set()
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return TimeoutProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(PlannerError, match="timed out"):
+        asyncio.run(planner.plan(request))
+
+    assert planner.last_diagnostics is not None
+    assert planner.last_diagnostics["attempt_count"] == 1
+    assert planner.last_diagnostics["error_body"]

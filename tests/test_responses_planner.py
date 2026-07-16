@@ -3,7 +3,12 @@ import json
 
 import httpx
 
-from civ6_workflow.codex_planner import CodexPlannerConfig, PlannerError, SYSTEM_INSTRUCTIONS
+from civ6_workflow.characterization import RecordingPlanner
+from civ6_workflow.codex_planner import (
+    CodexPlannerConfig,
+    PlannerError,
+    SYSTEM_INSTRUCTIONS,
+)
 from civ6_workflow.models import AgentRequest, ExecutionMode, PlanBundle
 from civ6_workflow.responses_planner import ResponsesPlanner
 
@@ -100,6 +105,8 @@ def test_responses_planner_fails_fast_without_api_key(monkeypatch):
         SYSTEM_INSTRUCTIONS,
         PlannerError,
     )
+    planner.last_diagnostics = {"attempt_count": 9}
+    recording = RecordingPlanner(planner)
     request = AgentRequest(
         turn=5,
         execution_mode=ExecutionMode.CONFIRM,
@@ -107,12 +114,21 @@ def test_responses_planner_fails_fast_without_api_key(monkeypatch):
         constraints={"max_tasks": 1},
     )
 
+    async def scenario():
+        with recording.logical_request_scope("missing-credential"):
+            await recording.plan(request)
+
     try:
-        asyncio.run(planner.plan(request))
+        asyncio.run(scenario())
     except PlannerError as exc:
         assert "OPENAI_API_KEY" in str(exc)
     else:
         raise AssertionError("missing API key must fail before an HTTP request")
+
+    assert recording.summary.logical_requests == 1
+    assert recording.summary.provider_attempts == 0
+    assert recording.calls[0].provider_attempts == 0
+    assert recording.last_diagnostics is None
 
 
 class _RetryClient(_Client):
@@ -150,6 +166,7 @@ def test_responses_planner_retries_transient_gateway_errors(monkeypatch):
         SYSTEM_INSTRUCTIONS,
         PlannerError,
     )
+    recording = RecordingPlanner(planner)
     request = AgentRequest(
         turn=5,
         execution_mode=ExecutionMode.CONFIRM,
@@ -157,8 +174,14 @@ def test_responses_planner_retries_transient_gateway_errors(monkeypatch):
         constraints={"max_tasks": 2},
     )
 
-    bundle = asyncio.run(planner.plan(request))
+    async def scenario():
+        with recording.logical_request_scope("retrying-http-request"):
+            return await recording.plan(request)
+
+    bundle = asyncio.run(scenario())
 
     assert bundle.summary == "compact response plan"
     assert _RetryClient.calls == 3
     assert planner.last_diagnostics["attempt_count"] == 3
+    assert recording.summary.logical_requests == 1
+    assert recording.summary.provider_attempts == 3

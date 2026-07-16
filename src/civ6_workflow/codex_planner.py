@@ -117,9 +117,7 @@ class CodexPlanner:
             command.extend(["--config", override])
         if not self.config.ignore_user_config:
             for server_name in self.config.disabled_mcp_servers:
-                command.extend(
-                    ["--config", f"mcp_servers.{server_name}.enabled=false"]
-                )
+                command.extend(["--config", f"mcp_servers.{server_name}.enabled=false"])
         for override in self.config.config_overrides:
             command.extend(["--config", override])
         if self.config.model:
@@ -148,8 +146,10 @@ class CodexPlanner:
         return await self._plan_with_cli(request)
 
     async def _plan_with_cli(self, request: AgentRequest) -> PlanBundle:
+        self.last_diagnostics = None
         started = asyncio.get_running_loop().time()
         prompt = self._build_prompt(request)
+        request_bytes = len(prompt.encode("utf-8"))
         root = Path(self.config.state_directory).expanduser().resolve()
         request_dir = root / "requests" / request.request_id
         request_dir.mkdir(parents=True, exist_ok=True)
@@ -167,6 +167,29 @@ class CodexPlanner:
             working_directory=root,
         )
         env = {**os.environ, **(self.config.env or {})}
+        diagnostics: dict[str, Any] = {
+            "backend": "codex_cli",
+            "attempt_count": 0,
+            "request_bytes": request_bytes,
+            "state_directory": str(root),
+            "request_directory": str(request_dir),
+        }
+
+        def record_diagnostics(
+            *,
+            response_bytes: int | None = None,
+            error_body: str | None = None,
+        ) -> None:
+            current = {
+                **diagnostics,
+                "completion_seconds": asyncio.get_running_loop().time() - started,
+            }
+            if response_bytes is not None:
+                current["response_bytes"] = response_bytes
+            if error_body is not None:
+                current["error_body"] = error_body
+            self.last_diagnostics = current
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -176,13 +199,14 @@ class CodexPlanner:
                 env=env,
             )
         except FileNotFoundError as exc:
+            record_diagnostics(error_body=str(exc))
             raise PlannerError(
                 f"Codex executable was not found: {self.config.command}"
             ) from exc
 
-        communication = asyncio.create_task(
-            process.communicate(prompt.encode("utf-8"))
-        )
+        diagnostics["attempt_count"] = 1
+        record_diagnostics()
+        communication = asyncio.create_task(process.communicate(prompt.encode("utf-8")))
         try:
             stdout, stderr = await asyncio.wait_for(
                 asyncio.shield(communication),
@@ -196,55 +220,45 @@ class CodexPlanner:
                 communication.cancel()
                 await process.wait()
                 stdout, stderr = b"", b""
-            self.last_diagnostics = {
-                "backend": "codex_cli",
-                "completion_seconds": asyncio.get_running_loop().time() - started,
-                "request_bytes": len(prompt.encode("utf-8")),
-                "state_directory": str(root),
-                "request_directory": str(request_dir),
-                "error_body": self._diagnostic_output(stdout, stderr),
-            }
+            error_body = self._diagnostic_output(stdout, stderr)
+            record_diagnostics(error_body=error_body)
             raise PlannerError(
                 f"Codex planning timed out after {self.config.timeout_seconds}s. "
-                f"{self._diagnostic_output(stdout, stderr)}"
+                f"{error_body}"
             ) from exc
 
         if process.returncode != 0:
-            self.last_diagnostics = {
-                "backend": "codex_cli",
-                "completion_seconds": asyncio.get_running_loop().time() - started,
-                "request_bytes": len(prompt.encode("utf-8")),
-                "state_directory": str(root),
-                "request_directory": str(request_dir),
-                "error_body": self._diagnostic_output(stdout, stderr),
-            }
+            error_body = self._diagnostic_output(stdout, stderr)
+            record_diagnostics(error_body=error_body)
             raise PlannerError(
                 "Codex planning failed "
                 f"with exit code {process.returncode}. "
-                f"{self._diagnostic_output(stdout, stderr)}"
+                f"{error_body}"
             )
         if not output_path.exists():
-            raise PlannerError("Codex completed without writing the final message file")
+            error = "Codex completed without writing the final message file"
+            record_diagnostics(error_body=error)
+            raise PlannerError(error)
         raw = output_path.read_text(encoding="utf-8").strip()
         if not raw:
-            raise PlannerError("Codex returned an empty plan")
+            error = "Codex returned an empty plan"
+            record_diagnostics(response_bytes=0, error_body=error)
+            raise PlannerError(error)
+        response_bytes = len(raw.encode("utf-8"))
         try:
             bundle = PlanBundle.model_validate_json(raw)
         except Exception as exc:
+            record_diagnostics(
+                response_bytes=response_bytes,
+                error_body=f"invalid PlanBundle: {exc}",
+            )
             raise PlannerError(f"Codex returned an invalid plan: {exc}") from exc
         max_tasks = int(request.constraints.get("max_tasks", 8))
         if len(bundle.tasks) > max_tasks:
-            raise PlannerError(
-                f"Codex returned {len(bundle.tasks)} tasks; max_tasks={max_tasks}"
-            )
-        self.last_diagnostics = {
-            "backend": "codex_cli",
-            "completion_seconds": asyncio.get_running_loop().time() - started,
-            "request_bytes": len(prompt.encode("utf-8")),
-            "response_bytes": len(raw.encode("utf-8")),
-            "state_directory": str(root),
-            "request_directory": str(request_dir),
-        }
+            error = f"Codex returned {len(bundle.tasks)} tasks; max_tasks={max_tasks}"
+            record_diagnostics(response_bytes=response_bytes, error_body=error)
+            raise PlannerError(error)
+        record_diagnostics(response_bytes=response_bytes)
         return bundle
 
     @staticmethod

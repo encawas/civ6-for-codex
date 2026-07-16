@@ -1,0 +1,42 @@
+{
+  "engine.WorkflowEngine": "civ6_workflow.runtime_safety.CommitSafeWorkflowEngine",
+  "engine.EngineConfig": "civ6_workflow.safe_engine.SafeEngineConfig",
+  "rules.DeterministicRuleCompiler": "civ6_workflow.settler_rules.SettlerDeterministicRuleCompiler",
+  "rules.compiler_inheritance": [
+    "civ6_workflow.settler_rules.SettlerDeterministicRuleCompiler",
+    "civ6_workflow.safe_rules.SafeDeterministicRuleCompiler",
+    "civ6_workflow.rules.DeterministicRuleCompiler"
+  ],
+  "store.WorkflowStore": "civ6_workflow.safe_store.SafeWorkflowStore",
+  "mcp_port.Civ6GamePort": "civ6_workflow.safe_mcp_port.SafeCiv6GamePort",
+  "conditions.ConditionEvaluator": "civ6_workflow.workflow_conditions.WorkflowConditionEvaluator",
+  "replay.RecordingGamePort": "civ6_workflow.safe_replay.SafeRecordingGamePort",
+  "replay.ReplayGamePort": "civ6_workflow.safe_replay.SafeReplayGamePort",
+  "web_ui.ControlPanelState": "civ6_workflow.safe_web_ui.SafeControlPanelState",
+  "web_ui.ControlPanelHandler": "civ6_workflow.safe_web_ui.SafeControlPanelHandler",
+  "web_ui.ControlPanelHTTPServer": "civ6_workflow.safe_web_ui.SafeControlPanelHTTPServer",
+  "models.PlanBundle": "civ6_workflow.workflow_protocol.WorkflowPlanBundle",
+  "models.AgentRequest": "civ6_workflow.workflow_protocol.WorkflowAgentRequest",
+  "models.TickMetrics": "civ6_workflow.workflow_protocol.WorkflowTickMetrics",
+  "unit_found_city_spec": {
+    "tool_name": "unit_action",
+    "required_arguments": [
+      "unit_id"
+    ],
+    "fixed_arguments": {
+      "action": "found_city"
+    },
+    "retry_safe_after_unknown": false
+  },
+  "unit_found_city_entity_types": [
+    "unit"
+  ],
+  "codex_system_instructions_extended": true,
+  "control_panel_html_enhanced": true,
+  "condition_types": [
+    "city_count_at_least",
+    "unit_absent",
+    "unit_moved_from",
+    "unit_type_contains"
+  ]
+}
