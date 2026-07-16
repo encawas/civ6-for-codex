@@ -110,14 +110,20 @@ def test_act_001_recording_port_fails_before_second_mutation():
 
 
 def test_met_003_planner_counts_logical_requests_and_provider_attempts():
-    """MET-003: stable request identity is counted separately from retries."""
+    """MET-003: one information round trip is one logical transaction."""
 
     async def scenario():
-        request = AgentRequest(
-            request_id="logical-1",
+        initial_request = AgentRequest(
+            request_id="provider-request-initial",
             turn=10,
             execution_mode=ExecutionMode.CONFIRM,
             trigger_events=[],
+        )
+        final_request = initial_request.model_copy(
+            update={
+                "request_id": "provider-request-final",
+                "information_results": {"settle-advisor": {"ok": True}},
+            }
         )
         delegate = ScriptedPlanner(
             [PlanBundle(summary="first"), PlanBundle(summary="final")],
@@ -125,11 +131,19 @@ def test_met_003_planner_counts_logical_requests_and_provider_attempts():
         )
         planner = RecordingPlanner(delegate)
 
-        await planner.plan(request)
-        await planner.plan(request.model_copy(update={"information_results": {}}))
+        with planner.logical_request_scope("planning-transaction-turn-10"):
+            await planner.plan(initial_request)
+            await planner.plan(final_request)
 
         assert planner.summary.logical_requests == 1
         assert planner.summary.provider_attempts == 5
+        assert [call.provider_request_id for call in planner.calls] == [
+            "provider-request-initial",
+            "provider-request-final",
+        ]
+        assert {call.logical_transaction_id for call in planner.calls} == {
+            "planning-transaction-turn-10"
+        }
         assert len(planner.requests) == 2
         assert len(planner.responses) == 2
 

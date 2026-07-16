@@ -18,6 +18,8 @@ from civ6_workflow import (
     workflow_prompt,
 )
 from civ6_workflow.runtime_safety import CommitSafeWorkflowEngine
+from civ6_workflow.safe_rules import SafeDeterministicRuleCompiler
+from civ6_workflow.settler_rules import SettlerDeterministicRuleCompiler
 
 
 BASE_CONDITION_TYPES = {
@@ -69,6 +71,21 @@ def test_imp_002_source_defined_base_engine_remains_distinct():
     assert source_base in CommitSafeWorkflowEngine.__mro__
 
 
+def test_imp_003_compiler_inheritance_chain_is_frozen():
+    """IMP-003: compiler overlays retain the exact current inheritance chain."""
+
+    source_compiler = SafeDeterministicRuleCompiler.__base__
+
+    assert SettlerDeterministicRuleCompiler.__base__ is SafeDeterministicRuleCompiler
+    assert source_compiler.__module__ == "civ6_workflow.rules"
+    assert source_compiler.__name__ == "DeterministicRuleCompiler"
+    assert SettlerDeterministicRuleCompiler.__mro__[:3] == (
+        SettlerDeterministicRuleCompiler,
+        SafeDeterministicRuleCompiler,
+        source_compiler,
+    )
+
+
 def test_imp_003_import_time_replacement_inventory_matches_fixture():
     """IMP-003 (REPLACE): every current replacement is machine-checkable."""
 
@@ -81,6 +98,10 @@ def test_imp_003_import_time_replacement_inventory_matches_fixture():
         "engine.WorkflowEngine": _identity(engine.WorkflowEngine),
         "engine.EngineConfig": _identity(engine.EngineConfig),
         "rules.DeterministicRuleCompiler": _identity(rules.DeterministicRuleCompiler),
+        "rules.compiler_inheritance": [
+            _identity(candidate)
+            for candidate in SettlerDeterministicRuleCompiler.__mro__[:3]
+        ],
         "store.WorkflowStore": _identity(store.WorkflowStore),
         "mcp_port.Civ6GamePort": _identity(mcp_port.Civ6GamePort),
         "conditions.ConditionEvaluator": _identity(conditions.ConditionEvaluator),
@@ -94,6 +115,9 @@ def test_imp_003_import_time_replacement_inventory_matches_fixture():
         "models.TickMetrics": _identity(models.TickMetrics),
         "unit_found_city_spec": {
             "tool_name": actions.ACTION_REGISTRY["unit_found_city"].tool_name,
+            "required_arguments": sorted(
+                actions.ACTION_REGISTRY["unit_found_city"].required_arguments
+            ),
             "fixed_arguments": actions.ACTION_REGISTRY[
                 "unit_found_city"
             ].fixed_arguments,

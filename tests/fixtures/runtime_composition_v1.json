@@ -2,6 +2,11 @@
   "engine.WorkflowEngine": "civ6_workflow.runtime_safety.CommitSafeWorkflowEngine",
   "engine.EngineConfig": "civ6_workflow.safe_engine.SafeEngineConfig",
   "rules.DeterministicRuleCompiler": "civ6_workflow.settler_rules.SettlerDeterministicRuleCompiler",
+  "rules.compiler_inheritance": [
+    "civ6_workflow.settler_rules.SettlerDeterministicRuleCompiler",
+    "civ6_workflow.safe_rules.SafeDeterministicRuleCompiler",
+    "civ6_workflow.rules.DeterministicRuleCompiler"
+  ],
   "store.WorkflowStore": "civ6_workflow.safe_store.SafeWorkflowStore",
   "mcp_port.Civ6GamePort": "civ6_workflow.safe_mcp_port.SafeCiv6GamePort",
   "conditions.ConditionEvaluator": "civ6_workflow.workflow_conditions.WorkflowConditionEvaluator",
@@ -15,6 +20,9 @@
   "models.TickMetrics": "civ6_workflow.workflow_protocol.WorkflowTickMetrics",
   "unit_found_city_spec": {
     "tool_name": "unit_action",
+    "required_arguments": [
+      "unit_id"
+    ],
     "fixed_arguments": {
       "action": "found_city"
     },
