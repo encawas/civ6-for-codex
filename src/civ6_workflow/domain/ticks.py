@@ -257,6 +257,8 @@ class SystemErrorTick(TickRecord):
     ending_runtime_state: Literal[RuntimeState.SYSTEM_ERROR] = RuntimeState.SYSTEM_ERROR
     mutation_budget_used: Literal[0] = 0
     blocking_reason: str = Field(min_length=1)
+    error_category: str = Field(min_length=1)
+    diagnostic_summary: str = Field(min_length=1, max_length=500)
 
 
 class NoSafeActionTick(TickRecord):

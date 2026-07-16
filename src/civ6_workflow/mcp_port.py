@@ -42,6 +42,14 @@ class MutationBudgetExceeded(RuntimeError):
     pass
 
 
+class McpToolRejectedError(RuntimeError):
+    """The MCP server received the request and explicitly rejected it."""
+
+    def __init__(self, tool_name: str, message: str):
+        super().__init__(message)
+        self.tool_name = tool_name
+
+
 @dataclass(slots=True)
 class MutationBudget:
     limit: int = 1
@@ -134,7 +142,9 @@ class Civ6McpClient:
         )
         if is_error:
             text = self._extract_text(result.content)
-            raise RuntimeError(text or f"MCP tool {name} returned an error")
+            raise McpToolRejectedError(
+                name, text or f"MCP tool {name} returned an error"
+            )
         structured = getattr(result, "structuredContent", None)
         if structured is None:
             structured = getattr(result, "structured_content", None)
@@ -283,6 +293,17 @@ class Civ6GamePort:
             )
         try:
             raw = await self.client.call_tool(tool_name, arguments)
+        except McpToolRejectedError as exc:
+            return ActionResult(
+                success=False,
+                blocked=True,
+                message=str(exc),
+                details={
+                    "tool_name": exc.tool_name,
+                    "error_type": type(exc).__name__,
+                },
+                delivery_status=MutationDeliveryStatus.EXPLICITLY_REJECTED,
+            )
         except Exception as exc:
             return ActionResult(
                 success=False,
@@ -302,6 +323,17 @@ class Civ6GamePort:
             )
         try:
             raw = await self.client.call_tool("end_turn")
+        except McpToolRejectedError as exc:
+            return ActionResult(
+                success=False,
+                blocked=True,
+                message=str(exc),
+                details={
+                    "tool_name": exc.tool_name,
+                    "error_type": type(exc).__name__,
+                },
+                delivery_status=MutationDeliveryStatus.EXPLICITLY_REJECTED,
+            )
         except Exception as exc:
             return ActionResult(
                 success=False,

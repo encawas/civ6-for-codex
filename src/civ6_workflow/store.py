@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
 from .domain import (
@@ -361,6 +361,89 @@ class WorkflowStore:
                 TaskStatus.FAILED.value,
             ),
         )
+        # Repair databases left by the pre-v6 multi-transaction finalization.
+        # The latest terminal attempt is authoritative for task/runtime recovery.
+        conn.execute(
+            """
+            UPDATE workflow_tasks
+            SET status=?, last_error=NULL, updated_at=CURRENT_TIMESTAMP
+            WHERE (
+                SELECT status FROM action_attempts
+                WHERE action_attempts.game_id=workflow_tasks.game_id
+                  AND action_attempts.task_id=workflow_tasks.task_id
+                ORDER BY attempt_number DESC LIMIT 1
+            )=?
+            """,
+            (TaskStatus.DONE.value, AttemptStatus.SUCCEEDED.value),
+        )
+        conn.execute(
+            """
+            UPDATE workflow_tasks
+            SET status=?, updated_at=CURRENT_TIMESTAMP
+            WHERE (
+                SELECT status FROM action_attempts
+                WHERE action_attempts.game_id=workflow_tasks.game_id
+                  AND action_attempts.task_id=workflow_tasks.task_id
+                ORDER BY attempt_number DESC LIMIT 1
+            )=?
+            """,
+            (
+                TaskStatus.READY.value,
+                AttemptStatus.REJECTED_BEFORE_SEND.value,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE workflow_tasks
+            SET status=?, updated_at=CURRENT_TIMESTAMP
+            WHERE status IN (?, ?, ?)
+              AND (
+                SELECT status FROM action_attempts
+                WHERE action_attempts.game_id=workflow_tasks.game_id
+                  AND action_attempts.task_id=workflow_tasks.task_id
+                ORDER BY attempt_number DESC LIMIT 1
+              )=?
+            """,
+            (
+                TaskStatus.FAILED.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.VERIFYING.value,
+                TaskStatus.UNCERTAIN.value,
+                AttemptStatus.FAILED.value,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE runtime_state
+            SET active_attempt_id=NULL,
+                state=CASE
+                    WHEN (
+                        SELECT action_type FROM action_attempts
+                        WHERE action_attempt_id=runtime_state.active_attempt_id
+                    )='end_turn'
+                    AND (
+                        SELECT status FROM action_attempts
+                        WHERE action_attempt_id=runtime_state.active_attempt_id
+                    )=?
+                    THEN ?
+                    ELSE ?
+                END,
+                revision=revision+1,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE active_attempt_id IN (
+                SELECT action_attempt_id FROM action_attempts
+                WHERE status IN (?, ?, ?)
+            )
+            """,
+            (
+                AttemptStatus.SUCCEEDED.value,
+                RuntimeState.OBSERVING.value,
+                RuntimeState.ROUTING.value,
+                AttemptStatus.SUCCEEDED.value,
+                AttemptStatus.FAILED.value,
+                AttemptStatus.REJECTED_BEFORE_SEND.value,
+            ),
+        )
         conn.execute(
             "UPDATE workflow_tasks SET updated_at=CURRENT_TIMESTAMP "
             "WHERE updated_at IS NULL"
@@ -411,6 +494,7 @@ class WorkflowStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
@@ -1072,9 +1156,21 @@ class WorkflowStore:
             self._append_attempt_transition(conn, attempt)
 
     def update_action_attempt(self, attempt: ActionAttempt) -> None:
-        current = self.get_action_attempt(attempt.action_attempt_id)
-        if current is None:
+        with self._connect() as conn:
+            self._update_action_attempt_in_connection(conn, attempt)
+
+    def _update_action_attempt_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        attempt: ActionAttempt,
+    ) -> None:
+        row = conn.execute(
+            "SELECT attempt_json FROM action_attempts WHERE action_attempt_id=?",
+            (attempt.action_attempt_id,),
+        ).fetchone()
+        if row is None:
             raise KeyError(f"unknown action attempt: {attempt.action_attempt_id}")
+        current = ActionAttempt.model_validate_json(row["attempt_json"])
         immutable_fields = (
             "action_attempt_id",
             "game_session_id",
@@ -1123,25 +1219,24 @@ class WorkflowStore:
                 f"invalid attempt transition {current.status} -> {attempt.status}"
             )
         values = self._attempt_row_values(attempt)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE action_attempts SET
-                    game_id=?, task_id=?, action_type=?, attempt_number=?,
-                    request_id=?, idempotency_key=?,
-                    prepared_from_observation_id=?, prepared_at=?, sent_at=?,
-                    response_received_at=?, status=?, retry_classification=?,
-                    normalized_arguments_json=?, transport_result_json=?,
-                    tool_result_json=?, verification_status=?,
-                    last_verification_observation_id=?, parent_attempt_id=?,
-                    pre_send_turn=?, postconditions_json=?,
-                    postcondition_version=?, verification_count=?,
-                    attempt_json=?, updated_at=CURRENT_TIMESTAMP
-                WHERE action_attempt_id=?
-                """,
-                (*values[1:], values[0]),
-            )
-            self._append_attempt_transition(conn, attempt)
+        conn.execute(
+            """
+            UPDATE action_attempts SET
+                game_id=?, task_id=?, action_type=?, attempt_number=?,
+                request_id=?, idempotency_key=?,
+                prepared_from_observation_id=?, prepared_at=?, sent_at=?,
+                response_received_at=?, status=?, retry_classification=?,
+                normalized_arguments_json=?, transport_result_json=?,
+                tool_result_json=?, verification_status=?,
+                last_verification_observation_id=?, parent_attempt_id=?,
+                pre_send_turn=?, postconditions_json=?,
+                postcondition_version=?, verification_count=?,
+                attempt_json=?, updated_at=CURRENT_TIMESTAMP
+            WHERE action_attempt_id=?
+            """,
+            (*values[1:], values[0]),
+        )
+        self._append_attempt_transition(conn, attempt)
 
     @staticmethod
     def _append_attempt_transition(
@@ -1250,6 +1345,26 @@ class WorkflowStore:
             ).fetchone()
         return RuntimeState.OBSERVING if row is None else RuntimeState(row["state"])
 
+    @staticmethod
+    def _save_runtime_state_in_connection(
+        conn: sqlite3.Connection,
+        game_id: str,
+        state: RuntimeState,
+        active_attempt_id: str | None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO runtime_state(game_id, state, active_attempt_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(game_id) DO UPDATE SET
+                state=excluded.state,
+                active_attempt_id=excluded.active_attempt_id,
+                revision=runtime_state.revision+1,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (game_id, state.value, active_attempt_id),
+        )
+
     def save_runtime_state(
         self,
         game_id: str,
@@ -1258,63 +1373,199 @@ class WorkflowStore:
         active_attempt_id: str | None = None,
     ) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO runtime_state(game_id, state, active_attempt_id)
-                VALUES (?, ?, ?)
-                ON CONFLICT(game_id) DO UPDATE SET
-                    state=excluded.state,
-                    active_attempt_id=excluded.active_attempt_id,
-                    revision=runtime_state.revision+1,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (game_id, state.value, active_attempt_id),
+            self._save_runtime_state_in_connection(
+                conn, game_id, state, active_attempt_id
             )
+
+    @classmethod
+    def _insert_workflow_tick_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO workflow_ticks(
+                tick_id, game_id, turn, outcome,
+                starting_runtime_state, ending_runtime_state,
+                observation_ids_json, mutation_budget_used,
+                selected_task_id, action_attempt_id,
+                planner_request_id, started_at, completed_at,
+                metrics_json, tick_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tick.tick_id,
+                tick.game_session_id,
+                tick.turn_number,
+                tick.outcome.value,
+                tick.starting_runtime_state.value,
+                tick.ending_runtime_state.value,
+                cls._dump(list(tick.observation_ids)),
+                tick.mutation_budget_used,
+                getattr(tick, "task_id", None),
+                getattr(tick, "action_attempt_id", None),
+                getattr(tick, "planner_request_id", None),
+                tick.started_at.isoformat(),
+                tick.completed_at.isoformat(),
+                cls._dump(tick.model_dump(mode="json")["metrics"]),
+                tick.model_dump_json(),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO turn_metrics(tick_id, game_id, turn, metrics_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                tick.tick_id,
+                tick.game_session_id,
+                tick.turn_number,
+                cls._dump(tick.model_dump(mode="json")["metrics"]),
+            ),
+        )
 
     def save_workflow_tick(self, tick: WorkflowTick) -> None:
         tick = validate_workflow_tick(tick)
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO workflow_ticks(
-                    tick_id, game_id, turn, outcome,
-                    starting_runtime_state, ending_runtime_state,
-                    observation_ids_json, mutation_budget_used,
-                    selected_task_id, action_attempt_id,
-                    planner_request_id, started_at, completed_at,
-                    metrics_json, tick_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    tick.tick_id,
-                    tick.game_session_id,
-                    tick.turn_number,
-                    tick.outcome.value,
-                    tick.starting_runtime_state.value,
-                    tick.ending_runtime_state.value,
-                    self._dump(list(tick.observation_ids)),
-                    tick.mutation_budget_used,
-                    getattr(tick, "task_id", None),
-                    getattr(tick, "action_attempt_id", None),
-                    getattr(tick, "planner_request_id", None),
-                    tick.started_at.isoformat(),
-                    tick.completed_at.isoformat(),
-                    self._dump(tick.model_dump(mode="json")["metrics"]),
-                    tick.model_dump_json(),
-                ),
+            self._insert_workflow_tick_in_connection(conn, tick)
+
+    def persist_tick_and_runtime_state(
+        self,
+        tick: WorkflowTick,
+        *,
+        active_attempt_id: str | None = None,
+        attempt: ActionAttempt | None = None,
+        task_status: TaskStatus | None = None,
+        task_error: str | None = None,
+        checkpoint: Callable[[str], None] | None = None,
+        attempt_checkpoint: str | None = None,
+    ) -> None:
+        tick = validate_workflow_tick(tick)
+        if attempt is not None and attempt.game_session_id != tick.game_session_id:
+            raise ValueError("attempt and Tick must belong to the same game")
+        if task_status is not None and attempt is None:
+            raise ValueError("task status update requires an attempt")
+        with self._connect() as conn:
+            if attempt is not None:
+                self._update_action_attempt_in_connection(conn, attempt)
+                if checkpoint is not None and attempt_checkpoint is not None:
+                    checkpoint(attempt_checkpoint)
+            if task_status is not None and attempt is not None:
+                cursor = conn.execute(
+                    """
+                    UPDATE workflow_tasks SET
+                        status=?, last_error=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE game_id=? AND task_id=?
+                    """,
+                    (
+                        task_status.value,
+                        task_error,
+                        tick.game_session_id,
+                        attempt.task_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"unknown attempt task: {attempt.task_id}")
+            self._save_runtime_state_in_connection(
+                conn,
+                tick.game_session_id,
+                tick.ending_runtime_state,
+                active_attempt_id,
             )
-            conn.execute(
-                """
-                INSERT INTO turn_metrics(tick_id, game_id, turn, metrics_json)
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    tick.tick_id,
-                    tick.game_session_id,
-                    tick.turn_number,
-                    self._dump(tick.model_dump(mode="json")["metrics"]),
-                ),
-            )
+            if checkpoint is not None:
+                checkpoint("after_runtime_state_update")
+            self._insert_workflow_tick_in_connection(conn, tick)
+
+    def finalize_attempt_success(
+        self,
+        attempt: ActionAttempt,
+        tick: WorkflowTick,
+        *,
+        checkpoint: Callable[[str], None] | None = None,
+    ) -> None:
+        if attempt.status is not AttemptStatus.SUCCEEDED:
+            raise ValueError("success finalization requires SUCCEEDED attempt")
+        self.persist_tick_and_runtime_state(
+            tick,
+            attempt=attempt,
+            task_status=TaskStatus.DONE,
+            active_attempt_id=None,
+            checkpoint=checkpoint,
+            attempt_checkpoint="after_attempt_succeeded_update",
+        )
+
+    def finalize_attempt_failure(
+        self,
+        attempt: ActionAttempt,
+        tick: WorkflowTick,
+        *,
+        task_status: TaskStatus,
+        task_error: str,
+        checkpoint: Callable[[str], None] | None = None,
+    ) -> None:
+        if attempt.status is not AttemptStatus.FAILED:
+            raise ValueError("failure finalization requires FAILED attempt")
+        if task_status not in {
+            TaskStatus.READY,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.UNCERTAIN,
+        }:
+            raise ValueError("invalid task status for failed attempt")
+        self.persist_tick_and_runtime_state(
+            tick,
+            attempt=attempt,
+            task_status=task_status,
+            task_error=task_error,
+            active_attempt_id=None,
+            checkpoint=checkpoint,
+            attempt_checkpoint="after_attempt_failed_update",
+        )
+
+    def recover_prepared_attempt(
+        self,
+        attempt: ActionAttempt,
+        tick: WorkflowTick,
+        *,
+        checkpoint: Callable[[str], None] | None = None,
+    ) -> None:
+        if attempt.status is not AttemptStatus.REJECTED_BEFORE_SEND:
+            raise ValueError("prepared recovery requires REJECTED_BEFORE_SEND attempt")
+        self.persist_tick_and_runtime_state(
+            tick,
+            attempt=attempt,
+            task_status=(
+                None if attempt.action_type == "end_turn" else TaskStatus.READY
+            ),
+            task_error=(
+                None
+                if attempt.action_type == "end_turn"
+                else "recovered a prepared attempt before delivery began"
+            ),
+            active_attempt_id=None,
+            checkpoint=checkpoint,
+            attempt_checkpoint="after_prepared_attempt_rejected_update",
+        )
+
+    def finalize_turn_transition(
+        self,
+        attempt: ActionAttempt,
+        tick: WorkflowTick,
+        *,
+        checkpoint: Callable[[str], None] | None = None,
+    ) -> None:
+        if attempt.action_type != "end_turn":
+            raise ValueError("turn finalization requires end_turn attempt")
+        if attempt.status is not AttemptStatus.SUCCEEDED:
+            raise ValueError("turn finalization requires SUCCEEDED attempt")
+        self.persist_tick_and_runtime_state(
+            tick,
+            attempt=attempt,
+            active_attempt_id=None,
+            checkpoint=checkpoint,
+            attempt_checkpoint="after_end_turn_succeeded_update",
+        )
 
     def list_workflow_ticks(self, game_id: str) -> list[WorkflowTick]:
         with self._connect() as conn:
@@ -1423,8 +1674,11 @@ class WorkflowStore:
         if not isinstance(game_id, str) or not game_id:
             raise ValueError("replay store state must contain a game_id")
         allowed_tables = {*REPLAY_STATE_TABLES, "workflow_meta"}
+        unknown_tables = set(tables) - allowed_tables
+        if unknown_tables:
+            raise ValueError(f"invalid replay state tables: {sorted(unknown_tables)}")
         with self._connect() as conn:
-            for table in REPLAY_STATE_TABLES:
+            for table in reversed(REPLAY_STATE_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE game_id=?", (game_id,))
             conn.execute(
                 """
@@ -1437,8 +1691,9 @@ class WorkflowStore:
                     f"unit_observations_initialized:{game_id}",
                 ),
             )
-            for table, rows in tables.items():
-                if table not in allowed_tables or not isinstance(rows, list):
+            for table in (*REPLAY_STATE_TABLES, "workflow_meta"):
+                rows = tables.get(table, [])
+                if not isinstance(rows, list):
                     raise ValueError(f"invalid replay state table: {table!r}")
                 known_columns = {
                     str(row["name"])

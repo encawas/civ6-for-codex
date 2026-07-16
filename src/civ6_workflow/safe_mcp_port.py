@@ -3,7 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from .actions import ActionValidationError, resolve_action
-from .mcp_port import Civ6GamePort as BaseCiv6GamePort
+from .mcp_port import (
+    Civ6GamePort as BaseCiv6GamePort,
+    McpToolRejectedError,
+)
 from .models import ActionResult, MutationDeliveryStatus, StoredTask
 from .workflow_protocol import (
     READ_ONLY_QUERY_SPECS,
@@ -34,6 +37,17 @@ class SafeCiv6GamePort(BaseCiv6GamePort):
             )
         try:
             raw = await self.client.call_tool(tool_name, arguments)
+        except McpToolRejectedError as exc:
+            return ActionResult(
+                success=False,
+                blocked=True,
+                message=str(exc),
+                details={
+                    "tool_name": exc.tool_name,
+                    "error_type": type(exc).__name__,
+                },
+                delivery_status=MutationDeliveryStatus.EXPLICITLY_REJECTED,
+            )
         except Exception as exc:
             return ActionResult(
                 success=False,

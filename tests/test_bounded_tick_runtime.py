@@ -293,21 +293,22 @@ def test_act_003_ack_ends_tick_without_read_planner_or_end_turn(tmp_path: Path):
     asyncio.run(scenario())
 
 
-def test_ver_003_inconclusive_verification_is_read_only(tmp_path: Path):
+def test_ver_city_empty_is_explicit_noncommit_and_read_only(tmp_path: Path):
     async def scenario():
         store = WorkflowStore(tmp_path / "runtime.sqlite3")
         seed_task(store)
-        game = Game([city_snapshot(), city_snapshot(), city_snapshot()])
+        game = Game([city_snapshot(), city_snapshot()])
         runtime = engine(store, game, verification_attempts=3)
 
         await runtime.tick()
-        waiting = await runtime.tick()
+        reconciled = await runtime.tick()
 
-        assert waiting.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_VERIFICATION
+        assert reconciled.workflow_tick["outcome"] == TickOutcomeKind.ATTEMPT_RECONCILED
+        assert reconciled.workflow_tick["attempt_status"] == AttemptStatus.FAILED
         assert game.mutations == 1
-        attempt = store.unresolved_action_attempt("game-1")
-        assert attempt.status is AttemptStatus.VERIFYING
-        assert attempt.verification_status is VerificationStatus.INCONCLUSIVE
+        attempt = store.list_action_attempts("game-1")[0]
+        assert attempt.status is AttemptStatus.FAILED
+        assert store.task_status("game-1", "set-production") is TaskStatus.READY
 
     asyncio.run(scenario())
 
@@ -432,10 +433,9 @@ def test_rec_003_delivery_started_restart_does_not_resend(tmp_path: Path):
         )
 
         result = await engine(store, game, verification_attempts=2).tick()
-        assert result.workflow_tick["outcome"] in {
-            TickOutcomeKind.AWAITING_VERIFICATION,
-            TickOutcomeKind.AWAITING_HUMAN,
-        }
+        assert result.workflow_tick["outcome"] == TickOutcomeKind.ATTEMPT_RECONCILED
+        assert result.workflow_tick["attempt_status"] == AttemptStatus.FAILED
+        assert store.task_status("game-1", "set-production") is TaskStatus.READY
         assert game.mutations == 0
 
     asyncio.run(scenario())
@@ -552,10 +552,8 @@ def test_rec_004_006_migration_is_idempotent_and_preserves_attempt_history(
     assert second_restart.list_action_attempts("game-1") == [attempt]
 
 
-def test_ver_004_006_explicit_negative_evidence_retries_on_later_tick(
-    tmp_path: Path,
-):
-    """VER-004/005/006: proven non-commit fails history; retry is a later Tick."""
+def test_ver_conflicting_city_production_does_not_retry(tmp_path: Path):
+    """VER-004/005/006: a different item is conflict, not non-commit proof."""
 
     async def scenario():
         store = WorkflowStore(tmp_path / "runtime.sqlite3")
@@ -576,14 +574,15 @@ def test_ver_004_006_explicit_negative_evidence_retries_on_later_tick(
         assert reconciled.workflow_tick["outcome"] == TickOutcomeKind.ATTEMPT_RECONCILED
         assert reconciled.workflow_tick["attempt_status"] == AttemptStatus.FAILED
         assert game.mutations == 1
-        assert store.task_status("game-1", "set-production") is TaskStatus.READY
+        assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
 
-        retried = await runtime.tick()
+        await runtime.tick()
         attempts = store.list_action_attempts("game-1")
-        assert retried.workflow_tick["outcome"] == TickOutcomeKind.MUTATION_SENT
-        assert game.mutations == 2
-        assert len(attempts) == 2
-        assert attempts[1].parent_attempt_id == attempts[0].action_attempt_id
+        assert game.mutations == 1
+        assert len(attempts) == 1
+        assert attempts[0].transport_result["verification_evidence"] == (
+            "CONFLICTING_STATE"
+        )
 
     asyncio.run(scenario())
 
