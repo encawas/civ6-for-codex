@@ -259,6 +259,7 @@ class SystemErrorTick(TickRecord):
     blocking_reason: str = Field(min_length=1)
     error_category: str = Field(min_length=1)
     diagnostic_summary: str = Field(min_length=1, max_length=500)
+    action_attempt_id: str | None = None
 
 
 class NoSafeActionTick(TickRecord):

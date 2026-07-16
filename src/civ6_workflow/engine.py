@@ -30,7 +30,6 @@ from .domain import (
     MutationUncertainTick,
     NoSafeActionTick,
     PlanRequestedTick,
-    RetryClassification,
     RuntimeState,
     SystemErrorTick,
     TaskCreatedTick,
@@ -483,7 +482,6 @@ class WorkflowEngine:
             tool_result=action_result.model_dump(mode="json"),
             verification_status=VerificationStatus.FAILED,
         )
-        failure_status, failure_error = self._failed_task_resolution(failed)
         return self._finish(
             ctx,
             snapshot,
@@ -494,8 +492,7 @@ class WorkflowEngine:
             blocking_reason=action_result.message or "game rejected mutation",
             failed_task_ids=[task.task_id],
             attempt_update=failed,
-            task_status=failure_status,
-            task_error=failure_error,
+            task_error=action_result.message or "game rejected mutation",
         )
 
     def _reconcile_attempt(
@@ -580,13 +577,6 @@ class WorkflowEngine:
                 last_verification_observation_id=observation_id,
                 verification_count=attempt.verification_count + 1,
             )
-            failure_status, failure_error = self._failed_task_resolution(failed)
-            if (
-                decision.evidence
-                is not VerificationEvidence.EXPLICIT_NON_COMMIT_EVIDENCE
-            ):
-                failure_status = TaskStatus.FAILED
-                failure_error = decision.reason
             return self._finish(
                 ctx,
                 snapshot,
@@ -596,8 +586,7 @@ class WorkflowEngine:
                 attempt_status=AttemptStatus.FAILED,
                 failed_task_ids=[task.task_id],
                 attempt_update=failed,
-                task_status=failure_status,
-                task_error=failure_error,
+                task_error=decision.reason,
             )
 
         count = attempt.verification_count + 1
@@ -644,30 +633,6 @@ class WorkflowEngine:
             attempt_update=uncertain,
             task_status=TaskStatus.UNCERTAIN,
             task_error=decision.reason,
-        )
-
-    @staticmethod
-    def _failed_task_resolution(
-        attempt: ActionAttempt,
-    ) -> tuple[TaskStatus, str]:
-        proven_not_sent = (
-            attempt.tool_result is not None
-            and attempt.tool_result.get("delivery_status")
-            == MutationDeliveryStatus.PROVEN_NOT_SENT.value
-        )
-        explicit_non_commit = (
-            attempt.transport_result is not None
-            and attempt.transport_result.get("verification_evidence")
-            == "EXPLICIT_NON_COMMIT_EVIDENCE"
-        )
-        if (
-            attempt.retry_classification is RetryClassification.SAFE_IF_PROVEN_NOT_SENT
-            and (proven_not_sent or explicit_non_commit)
-        ):
-            return TaskStatus.READY, "attempt is proven not committed"
-        return (
-            TaskStatus.FAILED,
-            "mutation was rejected, conflicting, or cannot be safely retried",
         )
 
     async def _send_end_turn(
@@ -861,6 +826,7 @@ class WorkflowEngine:
         attempt_update: ActionAttempt | None = None,
         task_status: TaskStatus | None = None,
         task_error: str | None = None,
+        runtime_active_attempt_id: str | None = None,
         **fields: Any,
     ) -> TickResult:
         completed = self._now()
@@ -881,7 +847,7 @@ class WorkflowEngine:
         if attempt_update is None:
             self.store.persist_tick_and_runtime_state(
                 tick,
-                active_attempt_id=None,
+                active_attempt_id=runtime_active_attempt_id,
                 checkpoint=self._checkpoint,
             )
         elif attempt_update.status is AttemptStatus.SUCCEEDED:
@@ -907,13 +873,10 @@ class WorkflowEngine:
                     attempt_checkpoint="after_attempt_failed_update",
                 )
             else:
-                if task_status is None:
-                    raise ValueError("failed attempt finalization needs task status")
                 self.store.finalize_attempt_failure(
                     attempt_update,
                     tick,
-                    task_status=task_status,
-                    task_error=task_error or "action attempt failed",
+                    task_error=task_error,
                     checkpoint=self._checkpoint,
                 )
         else:
@@ -990,6 +953,10 @@ class WorkflowEngine:
             game_id = str(self.store.get_meta("last_game_id", "runtime:unknown"))
             turn = int(self.store.get_meta("last_observed_turn", 0) or 0)
             ctx.starting_state = self.store.load_runtime_state(game_id)
+            active_attempt = self.store.unresolved_action_attempt(game_id)
+            active_attempt_id = (
+                None if active_attempt is None else active_attempt.action_attempt_id
+            )
             if not ctx.observation_ids:
                 ctx.observation_ids.append(f"error_obs_{uuid4().hex}")
             snapshot = RuntimeSnapshot(
@@ -1004,6 +971,8 @@ class WorkflowEngine:
                 blocking_reason="workflow Tick failed before mutation",
                 error_category=category,
                 diagnostic_summary=summary,
+                action_attempt_id=active_attempt_id,
+                runtime_active_attempt_id=active_attempt_id,
             )
         except InjectedCrashBoundary:
             raise

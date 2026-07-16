@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
+from .action_retry import FailedAttemptResolution, resolve_failed_attempt
 from .domain import (
     ActionAttempt,
     AttemptReconciledTick,
@@ -396,26 +397,9 @@ class WorkflowStore:
                 AttemptStatus.REJECTED_BEFORE_SEND.value,
             ),
         )
-        conn.execute(
-            """
-            UPDATE workflow_tasks
-            SET status=?, updated_at=CURRENT_TIMESTAMP
-            WHERE status IN (?, ?, ?)
-              AND (
-                SELECT status FROM action_attempts
-                WHERE action_attempts.game_id=workflow_tasks.game_id
-                  AND action_attempts.task_id=workflow_tasks.task_id
-                ORDER BY attempt_number DESC LIMIT 1
-              )=?
-            """,
-            (
-                TaskStatus.FAILED.value,
-                TaskStatus.RUNNING.value,
-                TaskStatus.VERIFYING.value,
-                TaskStatus.UNCERTAIN.value,
-                AttemptStatus.FAILED.value,
-            ),
-        )
+
+        WorkflowStore._repair_failed_attempt_tasks(conn)
+
         conn.execute(
             """
             UPDATE runtime_state
@@ -454,6 +438,56 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         conn.execute("PRAGMA user_version=6")
+
+    @staticmethod
+    def _repair_failed_attempt_tasks(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT attempts.attempt_json, tasks.game_id, tasks.task_id,
+                   tasks.retry_count, tasks.max_retries
+            FROM workflow_tasks AS tasks
+            JOIN action_attempts AS attempts
+              ON attempts.game_id=tasks.game_id
+             AND attempts.task_id=tasks.task_id
+            WHERE tasks.status IN (?, ?, ?)
+              AND attempts.status=?
+              AND NOT EXISTS (
+                  SELECT 1 FROM action_attempts AS newer
+                  WHERE newer.game_id=attempts.game_id
+                    AND newer.task_id=attempts.task_id
+                    AND newer.attempt_number>attempts.attempt_number
+              )
+            ORDER BY tasks.game_id, tasks.task_id
+            """,
+            (
+                TaskStatus.RUNNING.value,
+                TaskStatus.VERIFYING.value,
+                TaskStatus.UNCERTAIN.value,
+                AttemptStatus.FAILED.value,
+            ),
+        ).fetchall()
+        for row in rows:
+            attempt = ActionAttempt.model_validate_json(row["attempt_json"])
+            resolution = resolve_failed_attempt(
+                attempt,
+                retry_count=int(row["retry_count"]),
+                max_retries=int(row["max_retries"]),
+            )
+            conn.execute(
+                """
+                UPDATE workflow_tasks SET
+                    status=?, last_error=?, retry_count=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE game_id=? AND task_id=?
+                """,
+                (
+                    resolution.task_status.value,
+                    resolution.reason,
+                    resolution.retry_count,
+                    row["game_id"],
+                    row["task_id"],
+                ),
+            )
 
     @staticmethod
     def _repair_terminal_attempt_audits(conn: sqlite3.Connection) -> None:
@@ -837,7 +871,9 @@ class WorkflowStore:
                         requires_confirmation=excluded.requires_confirmation,
                         reason=excluded.reason,
                         status=CASE
-                            WHEN workflow_tasks.status='done' THEN workflow_tasks.status
+                            WHEN workflow_tasks.status IN (
+                                'done', 'failed', 'escalated'
+                            ) THEN workflow_tasks.status
                             ELSE excluded.status
                         END,
                         updated_at=CURRENT_TIMESTAMP
@@ -1536,29 +1572,61 @@ class WorkflowStore:
         attempt: ActionAttempt | None = None,
         task_status: TaskStatus | None = None,
         task_error: str | None = None,
+        resolve_failed_task: bool = False,
         checkpoint: Callable[[str], None] | None = None,
         attempt_checkpoint: str | None = None,
-    ) -> None:
+    ) -> FailedAttemptResolution | None:
         tick = validate_workflow_tick(tick)
         if attempt is not None and attempt.game_session_id != tick.game_session_id:
             raise ValueError("attempt and Tick must belong to the same game")
         if task_status is not None and attempt is None:
             raise ValueError("task status update requires an attempt")
+        if resolve_failed_task and (
+            attempt is None or attempt.status is not AttemptStatus.FAILED
+        ):
+            raise ValueError("failed task resolution requires a FAILED attempt")
+        if resolve_failed_task and task_status is not None:
+            raise ValueError("failed task resolution determines the task status")
+
+        failure_resolution: FailedAttemptResolution | None = None
+        task_retry_count: int | None = None
         with self._connect() as conn:
             if attempt is not None:
                 self._update_action_attempt_in_connection(conn, attempt)
                 if checkpoint is not None and attempt_checkpoint is not None:
                     checkpoint(attempt_checkpoint)
+            if resolve_failed_task and attempt is not None:
+                task_row = conn.execute(
+                    """
+                    SELECT retry_count, max_retries FROM workflow_tasks
+                    WHERE game_id=? AND task_id=?
+                    """,
+                    (tick.game_session_id, attempt.task_id),
+                ).fetchone()
+                if task_row is None:
+                    raise KeyError(f"unknown attempt task: {attempt.task_id}")
+                failure_resolution = resolve_failed_attempt(
+                    attempt,
+                    retry_count=int(task_row["retry_count"]),
+                    max_retries=int(task_row["max_retries"]),
+                    failure_reason=task_error,
+                )
+                task_status = failure_resolution.task_status
+                task_error = failure_resolution.reason
+                task_retry_count = failure_resolution.retry_count
             if task_status is not None and attempt is not None:
                 cursor = conn.execute(
                     """
                     UPDATE workflow_tasks SET
-                        status=?, last_error=?, updated_at=CURRENT_TIMESTAMP
+                        status=?, last_error=?,
+                        retry_count=COALESCE(?, retry_count),
+                        updated_at=CURRENT_TIMESTAMP
                     WHERE game_id=? AND task_id=?
                     """,
                     (
                         task_status.value,
                         task_error,
+                        task_retry_count,
                         tick.game_session_id,
                         attempt.task_id,
                     ),
@@ -1574,6 +1642,7 @@ class WorkflowStore:
             if checkpoint is not None:
                 checkpoint("after_runtime_state_update")
             self._insert_workflow_tick_in_connection(conn, tick)
+        return failure_resolution
 
     def finalize_attempt_success(
         self,
@@ -1598,28 +1667,23 @@ class WorkflowStore:
         attempt: ActionAttempt,
         tick: WorkflowTick,
         *,
-        task_status: TaskStatus,
-        task_error: str,
+        task_error: str | None = None,
         checkpoint: Callable[[str], None] | None = None,
-    ) -> None:
+    ) -> FailedAttemptResolution:
         if attempt.status is not AttemptStatus.FAILED:
             raise ValueError("failure finalization requires FAILED attempt")
-        if task_status not in {
-            TaskStatus.READY,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.UNCERTAIN,
-        }:
-            raise ValueError("invalid task status for failed attempt")
-        self.persist_tick_and_runtime_state(
+        resolution = self.persist_tick_and_runtime_state(
             tick,
             attempt=attempt,
-            task_status=task_status,
             task_error=task_error,
+            resolve_failed_task=True,
             active_attempt_id=None,
             checkpoint=checkpoint,
             attempt_checkpoint="after_attempt_failed_update",
         )
+        if resolution is None:
+            raise AssertionError("failed attempt finalization did not resolve the task")
+        return resolution
 
     def recover_prepared_attempt(
         self,
