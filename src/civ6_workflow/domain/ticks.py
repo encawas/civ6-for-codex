@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import Field, TypeAdapter
+from pydantic_core import to_json
 
+from .attempts import AttemptStatus
 from .base import DomainModel, ImmutableJsonObject
 
 
@@ -34,12 +37,19 @@ class TickOutcomeKind(StrEnum):
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
     PLAN_REQUESTED = "PLAN_REQUESTED"
     TASK_CREATED = "TASK_CREATED"
+    TASK_INVALIDATED = "TASK_INVALIDATED"
+    ATTEMPT_RECOVERED = "ATTEMPT_RECOVERED"
+    ATTEMPT_RECONCILED = "ATTEMPT_RECONCILED"
     MUTATION_SENT = "MUTATION_SENT"
+    MUTATION_REJECTED = "MUTATION_REJECTED"
+    MUTATION_UNCERTAIN = "MUTATION_UNCERTAIN"
     AWAITING_VERIFICATION = "AWAITING_VERIFICATION"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
     AWAITING_HUMAN = "AWAITING_HUMAN"
     PLANNER_BACKOFF = "PLANNER_BACKOFF"
     TURN_TRANSITION_STARTED = "TURN_TRANSITION_STARTED"
+    TURN_TRANSITION_WAITING = "TURN_TRANSITION_WAITING"
+    TURN_TRANSITION_CONFIRMED = "TURN_TRANSITION_CONFIRMED"
     PAUSED = "PAUSED"
     SYSTEM_ERROR = "SYSTEM_ERROR"
     NO_SAFE_ACTION = "NO_SAFE_ACTION"
@@ -48,6 +58,7 @@ class TickOutcomeKind(StrEnum):
 class TickRecord(DomainModel):
     tick_id: str
     game_session_id: str
+    turn_number: int = Field(default=0, ge=0)
     starting_runtime_state: RuntimeState
     observation_ids: tuple[str, ...] = Field(min_length=1)
     started_at: datetime
@@ -94,12 +105,70 @@ class TaskCreatedTick(TickRecord):
     task_id: str
 
 
+class TaskInvalidatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.TASK_INVALIDATED] = (
+        TickOutcomeKind.TASK_INVALIDATED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    task_id: str
+    blocking_reason: str = Field(min_length=1)
+
+
+class AttemptRecoveredTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.ATTEMPT_RECOVERED] = (
+        TickOutcomeKind.ATTEMPT_RECOVERED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    action_attempt_id: str
+    task_id: str
+
+
+class AttemptReconciledTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.ATTEMPT_RECONCILED] = (
+        TickOutcomeKind.ATTEMPT_RECONCILED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    action_attempt_id: str
+    task_id: str
+    attempt_status: Literal[AttemptStatus.SUCCEEDED, AttemptStatus.FAILED]
+
+
 class MutationSentTick(TickRecord):
     outcome: Literal[TickOutcomeKind.MUTATION_SENT] = TickOutcomeKind.MUTATION_SENT
     ending_runtime_state: Literal[RuntimeState.ACTION_SENT] = RuntimeState.ACTION_SENT
     mutation_budget_used: Literal[1] = 1
     action_attempt_id: str
+    task_id: str
     selected_operation: str = Field(min_length=1)
+
+
+class MutationRejectedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.MUTATION_REJECTED] = (
+        TickOutcomeKind.MUTATION_REJECTED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[1] = 1
+    action_attempt_id: str
+    task_id: str
+    selected_operation: str = Field(min_length=1)
+    blocking_reason: str = Field(min_length=1)
+
+
+class MutationUncertainTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.MUTATION_UNCERTAIN] = (
+        TickOutcomeKind.MUTATION_UNCERTAIN
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[1] = 1
+    action_attempt_id: str
+    task_id: str
+    selected_operation: str = Field(min_length=1)
+    blocking_reason: str = Field(min_length=1)
 
 
 class AwaitingVerificationTick(TickRecord):
@@ -109,6 +178,7 @@ class AwaitingVerificationTick(TickRecord):
     ending_runtime_state: Literal[RuntimeState.VERIFYING] = RuntimeState.VERIFYING
     mutation_budget_used: Literal[0] = 0
     action_attempt_id: str
+    task_id: str
 
 
 class AwaitingApprovalTick(TickRecord):
@@ -130,6 +200,7 @@ class AwaitingHumanTick(TickRecord):
     )
     mutation_budget_used: Literal[0] = 0
     blocking_reason: str = Field(min_length=1)
+    action_attempt_id: str | None = None
 
 
 class PlannerBackoffTick(TickRecord):
@@ -154,6 +225,26 @@ class TurnTransitionStartedTick(TickRecord):
     selected_operation: Literal["end_turn"] = "end_turn"
 
 
+class TurnTransitionWaitingTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.TURN_TRANSITION_WAITING] = (
+        TickOutcomeKind.TURN_TRANSITION_WAITING
+    )
+    ending_runtime_state: Literal[RuntimeState.TURN_TRANSITIONING] = (
+        RuntimeState.TURN_TRANSITIONING
+    )
+    mutation_budget_used: Literal[0] = 0
+    action_attempt_id: str
+
+
+class TurnTransitionConfirmedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.TURN_TRANSITION_CONFIRMED] = (
+        TickOutcomeKind.TURN_TRANSITION_CONFIRMED
+    )
+    ending_runtime_state: Literal[RuntimeState.OBSERVING] = RuntimeState.OBSERVING
+    mutation_budget_used: Literal[0] = 0
+    action_attempt_id: str
+
+
 class PausedTick(TickRecord):
     outcome: Literal[TickOutcomeKind.PAUSED] = TickOutcomeKind.PAUSED
     ending_runtime_state: Literal[RuntimeState.PAUSED] = RuntimeState.PAUSED
@@ -166,6 +257,9 @@ class SystemErrorTick(TickRecord):
     ending_runtime_state: Literal[RuntimeState.SYSTEM_ERROR] = RuntimeState.SYSTEM_ERROR
     mutation_budget_used: Literal[0] = 0
     blocking_reason: str = Field(min_length=1)
+    error_category: str = Field(min_length=1)
+    diagnostic_summary: str = Field(min_length=1, max_length=500)
+    action_attempt_id: str | None = None
 
 
 class NoSafeActionTick(TickRecord):
@@ -180,12 +274,19 @@ WorkflowTick: TypeAlias = Annotated[
     | ContextGatheredTick
     | PlanRequestedTick
     | TaskCreatedTick
+    | TaskInvalidatedTick
+    | AttemptRecoveredTick
+    | AttemptReconciledTick
     | MutationSentTick
+    | MutationRejectedTick
+    | MutationUncertainTick
     | AwaitingVerificationTick
     | AwaitingApprovalTick
     | AwaitingHumanTick
     | PlannerBackoffTick
     | TurnTransitionStartedTick
+    | TurnTransitionWaitingTick
+    | TurnTransitionConfirmedTick
     | PausedTick
     | SystemErrorTick
     | NoSafeActionTick,
@@ -195,8 +296,16 @@ WorkflowTick: TypeAlias = Annotated[
 WORKFLOW_TICK_ADAPTER = TypeAdapter(WorkflowTick)
 
 
+def _unwrap_compatibility_result(value: Any) -> Any:
+    workflow_tick = getattr(value, "workflow_tick", None)
+    return workflow_tick if workflow_tick is not None else value
+
+
 def validate_workflow_tick(value: Any) -> WorkflowTick:
-    return WORKFLOW_TICK_ADAPTER.validate_python(value)
+    unwrapped = _unwrap_compatibility_result(value)
+    if isinstance(unwrapped, dict):
+        return WORKFLOW_TICK_ADAPTER.validate_json(to_json(unwrapped))
+    return WORKFLOW_TICK_ADAPTER.validate_python(unwrapped)
 
 
 def validate_workflow_tick_json(value: str | bytes) -> WorkflowTick:

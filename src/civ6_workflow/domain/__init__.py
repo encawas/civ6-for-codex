@@ -4,7 +4,12 @@ Importing this package has no domain-level runtime composition side effects.
 """
 
 from .approvals import ApprovalDecision, ApprovalRecord
-from .attempts import ActionAttempt, AttemptStatus, VerificationStatus
+from .attempts import (
+    UNRESOLVED_ATTEMPT_STATUSES,
+    ActionAttempt,
+    AttemptStatus,
+    VerificationStatus,
+)
 from .base import (
     ApprovalStatus,
     Condition,
@@ -47,11 +52,15 @@ from .tasks import (
 )
 from .ticks import (
     WORKFLOW_TICK_ADAPTER,
+    AttemptReconciledTick,
+    AttemptRecoveredTick,
     AwaitingApprovalTick,
     AwaitingHumanTick,
     AwaitingVerificationTick,
     ContextGatheredTick,
+    MutationRejectedTick,
     MutationSentTick,
+    MutationUncertainTick,
     NoSafeActionTick,
     ObservedOnlyTick,
     PausedTick,
@@ -60,8 +69,11 @@ from .ticks import (
     RuntimeState,
     SystemErrorTick,
     TaskCreatedTick,
+    TaskInvalidatedTick,
     TickOutcomeKind,
+    TurnTransitionConfirmedTick,
     TurnTransitionStartedTick,
+    TurnTransitionWaitingTick,
     WorkflowTick,
     validate_workflow_tick,
     validate_workflow_tick_json,
@@ -71,6 +83,8 @@ __all__ = [
     "ACTIVE_TASK_STATUSES",
     "WORKFLOW_TICK_ADAPTER",
     "ActionAttempt",
+    "AttemptReconciledTick",
+    "AttemptRecoveredTick",
     "ApprovalDecision",
     "ApprovalRecord",
     "ApprovalStatus",
@@ -91,7 +105,9 @@ __all__ = [
     "FrozenDict",
     "ImmutableJsonObject",
     "ImmutableJsonValue",
+    "MutationRejectedTick",
     "MutationSentTick",
+    "MutationUncertainTick",
     "NORMALIZATION_VERSION",
     "NoSafeActionTick",
     "NormalizedBlocker",
@@ -118,9 +134,13 @@ __all__ = [
     "SystemErrorTick",
     "Task",
     "TaskCreatedTick",
+    "TaskInvalidatedTick",
     "TaskStatus",
     "TickOutcomeKind",
+    "TurnTransitionConfirmedTick",
     "TurnTransitionStartedTick",
+    "TurnTransitionWaitingTick",
+    "UNRESOLVED_ATTEMPT_STATUSES",
     "UnitActionState",
     "UnitDetailReason",
     "UnitSummary",

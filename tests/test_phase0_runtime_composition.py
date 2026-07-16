@@ -121,9 +121,9 @@ def test_imp_003_import_time_replacement_inventory_matches_fixture():
             "fixed_arguments": actions.ACTION_REGISTRY[
                 "unit_found_city"
             ].fixed_arguments,
-            "retry_safe_after_unknown": actions.ACTION_REGISTRY[
+            "retry_classification": actions.ACTION_REGISTRY[
                 "unit_found_city"
-            ].retry_safe_after_unknown,
+            ].retry_classification.value,
         },
         "unit_found_city_entity_types": sorted(
             validation.ACTION_ENTITY_TYPES["unit_found_city"]

@@ -64,6 +64,7 @@ class SafeWorkflowStore(BaseWorkflowStore):
         *,
         mode: ExecutionMode,
         auto_action_types: set[str],
+        observation_id: str | None = None,
     ) -> None:
         self._reject_task_id_reuse(game_id, bundle)
 
@@ -78,6 +79,7 @@ class SafeWorkflowStore(BaseWorkflowStore):
             bundle,
             mode=mode,
             auto_action_types=effective_auto_actions,
+            observation_id=observation_id,
         )
 
     def reconcile_open_events(

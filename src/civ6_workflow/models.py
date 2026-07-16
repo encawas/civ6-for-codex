@@ -29,6 +29,7 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     READY = "ready"
     RUNNING = "running"
+    VERIFYING = "verifying"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
     DONE = "done"
     BLOCKED = "blocked"
@@ -43,6 +44,13 @@ class ExecutionMode(str, Enum):
     READONLY = "readonly"
     CONFIRM = "confirm"
     AUTO = "auto"
+
+
+class MutationDeliveryStatus(str, Enum):
+    PROVEN_NOT_SENT = "proven_not_sent"
+    EXPLICITLY_REJECTED = "explicitly_rejected"
+    ACKNOWLEDGED = "acknowledged"
+    UNKNOWN = "unknown"
 
 
 class GameEvent(StrictModel):
@@ -87,6 +95,7 @@ class ProposedTask(StrictModel):
 class StoredTask(ProposedTask):
     plan_id: str
     created_turn: int = Field(ge=0)
+    created_from_observation_id: str | None = None
     status: TaskStatus = TaskStatus.PENDING
     retry_count: int = Field(default=0, ge=0)
     max_retries: int = Field(default=2, ge=0, le=10)
@@ -123,6 +132,17 @@ class ActionResult(StrictModel):
     blocked: bool = False
     message: str = ""
     details: dict[str, Any] = Field(default_factory=dict)
+    delivery_status: MutationDeliveryStatus | None = None
+
+    @property
+    def effective_delivery_status(self) -> MutationDeliveryStatus:
+        if self.delivery_status is not None:
+            return self.delivery_status
+        if self.success:
+            return MutationDeliveryStatus.ACKNOWLEDGED
+        if self.blocked:
+            return MutationDeliveryStatus.EXPLICITLY_REJECTED
+        return MutationDeliveryStatus.UNKNOWN
 
 
 class TickMetrics(StrictModel):
@@ -131,8 +151,12 @@ class TickMetrics(StrictModel):
     task_execution_seconds: float = 0.0
     agent_seconds: float = 0.0
     verification_seconds: float = 0.0
+    task_materialization_seconds: float = 0.0
+    mutation_delivery_seconds: float = 0.0
+    persistence_seconds: float = 0.0
     total_seconds: float = 0.0
     mcp_call_count: int = 0
+    mutation_count: int = 0
     agent_call_count: int = 0
 
 
@@ -144,10 +168,14 @@ class TickResult(StrictModel):
     events: list[GameEvent] = Field(default_factory=list)
     agent_invoked: bool = False
     plan_id: str | None = None
+    planner_request_id: str | None = None
     turn_ended: bool = False
     paused: bool = False
     pause_reason: str | None = None
     metrics: TickMetrics = Field(default_factory=TickMetrics)
+    tick_id: str | None = None
+    runtime_state: str | None = None
+    workflow_tick: dict[str, Any] | None = None
 
 
 class RuntimeSnapshot(StrictModel):

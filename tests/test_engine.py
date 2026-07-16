@@ -127,7 +127,9 @@ def test_ordinary_turn_executes_task_without_agent(tmp_path: Path):
         store.save_plan_bundle(
             "game-1",
             10,
-            PlanBundle(summary="continue the approved queue", tasks=[_production_task()]),
+            PlanBundle(
+                summary="continue the approved queue", tasks=[_production_task()]
+            ),
             mode=ExecutionMode.AUTO,
             auto_action_types={"city_set_production"},
         )
@@ -146,11 +148,20 @@ def test_ordinary_turn_executes_task_without_agent(tmp_path: Path):
             ),
         )
 
-        result = await engine.tick()
-        assert result.executed_task_ids == ["set-production"]
+        sent = await engine.tick()
+        assert sent.workflow_tick["outcome"] == "MUTATION_SENT"
+        assert sent.executed_task_ids == []
         assert planner.calls == 0
-        assert result.agent_invoked is False
-        assert result.turn_ended is True
+        assert game.end_turn_calls == 0
+
+        verified = await engine.tick()
+        assert verified.workflow_tick["outcome"] == "ATTEMPT_RECONCILED"
+        assert verified.executed_task_ids == ["set-production"]
+        assert game.end_turn_calls == 0
+
+        transition = await engine.tick()
+        assert transition.workflow_tick["outcome"] == "TURN_TRANSITION_STARTED"
+        assert transition.turn_ended is False
         assert game.end_turn_calls == 1
 
     asyncio.run(scenario())
@@ -168,7 +179,9 @@ def test_blocked_task_retries_once_then_escalates(tmp_path: Path):
         )
         game = AlwaysBlockedGame(_empty_city_snapshot())
         planner = FakePlanner(
-            PlanBundle(summary="blocked task needs human review", requires_human_review=True)
+            PlanBundle(
+                summary="blocked task needs human review", requires_human_review=True
+            )
         )
         engine = WorkflowEngine(
             store=store,
@@ -186,14 +199,14 @@ def test_blocked_task_retries_once_then_escalates(tmp_path: Path):
 
         first = await engine.tick()
         assert planner.calls == 0
-        assert first.agent_invoked is False
-        assert store.task_status("game-1", "set-production") is TaskStatus.READY
+        assert first.workflow_tick["outcome"] == "MUTATION_REJECTED"
+        assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
         assert first.turn_ended is False
 
         second = await engine.tick()
         assert planner.calls == 1
         assert second.agent_invoked is True
-        assert store.task_status("game-1", "set-production") is TaskStatus.ESCALATED
+        assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
         assert second.turn_ended is False
 
     asyncio.run(scenario())
@@ -242,6 +255,6 @@ def test_l3_events_are_batched_into_one_codex_call(tmp_path: Path):
         second = await engine.tick()
         assert planner.calls == 1
         assert second.paused is True
-        assert "already been called" in second.pause_reason
+        assert "human review" in second.pause_reason
 
     asyncio.run(scenario())

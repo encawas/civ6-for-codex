@@ -695,9 +695,12 @@ def test_tick_counts_each_real_normalization_and_reuses_it_for_conditions(
         ),
     )
 
-    result = asyncio.run(engine.tick())
+    created = asyncio.run(engine.tick())
+    sent = asyncio.run(engine.tick())
 
-    assert result.executed_task_ids
+    assert created.workflow_tick["outcome"] == "TASK_CREATED"
+    assert sent.workflow_tick["outcome"] == "MUTATION_SENT"
     assert game.read_requests == [False, False]
     assert engine_calls == len(game.read_requests)
-    assert result.metrics.normalization_seconds > 0
+    assert created.metrics.normalization_seconds > 0
+    assert sent.metrics.normalization_seconds > 0

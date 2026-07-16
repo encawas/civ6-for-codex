@@ -60,9 +60,7 @@ class WorkflowAwareEngine(SafeWorkflowEngine):
             task.action_type == "unit_found_city"
             and str(task.status.value)
             in {"pending", "ready", "running", "awaiting_confirmation"}
-            for task in self.store.list_tasks(
-                self.store.get_meta("last_game_id", "")
-            )
+            for task in self.store.list_tasks(self.store.get_meta("last_game_id", ""))
         )
         if not has_settler_recovery:
             return retained
@@ -93,6 +91,7 @@ class WorkflowAwareEngine(SafeWorkflowEngine):
             return
 
         request = self._build_agent_request(snapshot, agent_events)
+        result.planner_request_id = request.request_id
         planner_started = time.perf_counter()
         current_request = request
         bundle: PlanBundle | None = None
@@ -173,6 +172,7 @@ class WorkflowAwareEngine(SafeWorkflowEngine):
                 bundle,
                 mode=self.config.execution_mode,
                 auto_action_types=self.config.auto_action_types,
+                observation_id=self._active_observation_id,
             )
             self.store.set_meta(
                 "last_event_resolutions",
@@ -227,7 +227,9 @@ class WorkflowAwareEngine(SafeWorkflowEngine):
                 self.store.set_meta("last_planner_diagnostics", diagnostics)
             metrics.agent_seconds = time.perf_counter() - planner_started
 
-    async def _plan_once(self, request: AgentRequest, metrics: TickMetrics) -> PlanBundle:
+    async def _plan_once(
+        self, request: AgentRequest, metrics: TickMetrics
+    ) -> PlanBundle:
         metrics.agent_attempt_count += 1
         # Backward-compatible metric now means attempted planner calls, not only
         # successful calls.

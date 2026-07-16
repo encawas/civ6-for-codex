@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from collections.abc import Iterator, MutableMapping
+from dataclasses import InitVar, dataclass, field
+from types import MappingProxyType
+from typing import Any, Mapping
 
+from .domain import RetryClassification
 from .models import StoredTask
 
 
@@ -15,11 +18,31 @@ class ActionSpec:
     tool_name: str
     required_arguments: frozenset[str]
     optional_arguments: frozenset[str] = field(default_factory=frozenset)
-    fixed_arguments: dict[str, Any] = field(default_factory=dict)
-    argument_aliases: dict[str, str] = field(default_factory=dict)
-    # False means that, after a transport error or an unverified success, the
-    # workflow must reconcile state instead of sending the action again.
-    retry_safe_after_unknown: bool = True
+    fixed_arguments: Mapping[str, Any] = field(default_factory=dict)
+    argument_aliases: Mapping[str, str] = field(default_factory=dict)
+    retry_classification: RetryClassification = (
+        RetryClassification.SAFE_IF_PROVEN_NOT_SENT
+    )
+    retry_safe_after_unknown: InitVar[bool | None] = None
+
+    def __post_init__(self, retry_safe_after_unknown: bool | None) -> None:
+        if retry_safe_after_unknown is not None:
+            classification = (
+                RetryClassification.SAFE_IF_PROVEN_NOT_SENT
+                if retry_safe_after_unknown
+                else RetryClassification.NEVER_BLIND_RETRY
+            )
+            object.__setattr__(self, "retry_classification", classification)
+        object.__setattr__(
+            self,
+            "fixed_arguments",
+            MappingProxyType(dict(self.fixed_arguments)),
+        )
+        object.__setattr__(
+            self,
+            "argument_aliases",
+            MappingProxyType(dict(self.argument_aliases)),
+        )
 
     def build_arguments(self, task: StoredTask) -> dict[str, Any]:
         supplied = dict(task.arguments)
@@ -50,7 +73,7 @@ class ActionSpec:
         return {**translated, **self.fixed_arguments}
 
 
-ACTION_REGISTRY: dict[str, ActionSpec] = {
+_ACTION_REGISTRY = {
     "city_set_production": ActionSpec(
         tool_name="set_city_production",
         required_arguments=frozenset({"city_id", "item_type", "item_name"}),
@@ -76,7 +99,13 @@ ACTION_REGISTRY: dict[str, ActionSpec] = {
         required_arguments=frozenset({"unit_id", "improvement_type"}),
         fixed_arguments={"action": "improve"},
         argument_aliases={"improvement_type": "improvement"},
-        retry_safe_after_unknown=False,
+        retry_classification=RetryClassification.NEVER_BLIND_RETRY,
+    ),
+    "unit_found_city": ActionSpec(
+        tool_name="unit_action",
+        required_arguments=frozenset({"unit_id"}),
+        fixed_arguments={"action": "found_city"},
+        retry_classification=RetryClassification.NEVER_BLIND_RETRY,
     ),
     "unit_heal": ActionSpec(
         tool_name="unit_action",
@@ -96,10 +125,55 @@ ACTION_REGISTRY: dict[str, ActionSpec] = {
 }
 
 
-def resolve_action(task: StoredTask, allowed_tools: set[str]) -> tuple[str, dict[str, Any]]:
-    spec = ACTION_REGISTRY.get(task.action_type)
+class BootstrapActionRegistry(MutableMapping[str, ActionSpec]):
+    """One canonical registry that freezes after the legacy bootstrap write."""
+
+    def __init__(self, initial: Mapping[str, ActionSpec]):
+        self._items = dict(initial)
+        self._frozen = False
+
+    def __getitem__(self, key: str) -> ActionSpec:
+        return self._items[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __setitem__(self, key: str, value: ActionSpec) -> None:
+        if self._frozen or key != "unit_found_city":
+            raise TypeError("action registry is frozen after bootstrap")
+        self._items[key] = value
+        self._frozen = True
+
+    def __delitem__(self, key: str) -> None:
+        raise TypeError("action registry is frozen after bootstrap")
+
+
+ACTION_REGISTRY: MutableMapping[str, ActionSpec] = BootstrapActionRegistry(
+    _ACTION_REGISTRY
+)
+
+END_TURN_ACTION_SPEC = ActionSpec(
+    tool_name="end_turn",
+    required_arguments=frozenset(),
+    retry_classification=RetryClassification.NEVER_BLIND_RETRY,
+)
+
+
+def resolve_action_spec(action_type: str) -> ActionSpec:
+    spec = ACTION_REGISTRY.get(action_type)
     if spec is None:
-        raise ActionValidationError(f"unsupported action_type: {task.action_type}")
+        raise ActionValidationError(f"unsupported action_type: {action_type}")
+    return spec
+
+
+def resolve_action(
+    task: StoredTask,
+    allowed_tools: set[str],
+) -> tuple[str, dict[str, Any]]:
+    spec = resolve_action_spec(task.action_type)
     if spec.tool_name not in allowed_tools:
         raise ActionValidationError(f"tool is not allowed: {spec.tool_name}")
     return spec.tool_name, spec.build_arguments(task)

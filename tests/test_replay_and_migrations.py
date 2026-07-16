@@ -98,7 +98,7 @@ def test_legacy_database_migrates_retry_state(tmp_path: Path):
     assert task.retry_count == 0
     assert task.max_retries == 2
     with sqlite3.connect(database) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_replay_store_state_restores_exact_task_status(tmp_path: Path):
@@ -284,7 +284,10 @@ def test_json_recording_round_trip_replays_verified_task(tmp_path: Path):
         ),
     )
 
+    sent = asyncio.run(engine.tick())
     result = asyncio.run(engine.tick())
+    assert sent.workflow_tick["outcome"] == "MUTATION_SENT"
+    assert sent.executed_task_ids == []
     assert result.executed_task_ids == ["set-production"]
     assert result.agent_invoked is False
     assert game.remaining_frames == 0
@@ -334,7 +337,7 @@ def test_recorded_real_blocker_prevents_automatic_end_turn(tmp_path: Path):
     assert game.call_count == 1
 
 
-def test_recorded_failure_retries_then_escalates_once(tmp_path: Path):
+def test_recorded_explicit_rejection_fails_without_retry(tmp_path: Path):
     snapshot = RuntimeSnapshot(
         turn=10,
         game_id="game-1",
@@ -346,7 +349,12 @@ def test_recorded_failure_retries_then_escalates_once(tmp_path: Path):
     failed_action = RecordedAction(
         task_id="set-production",
         action_type="city_set_production",
-        result=ActionResult(success=False, message="recorded failure"),
+        result=ActionResult(
+            success=False,
+            blocked=True,
+            message="recorded failure",
+            delivery_status="explicitly_rejected",
+        ),
     )
     tape = SnapshotRecording(
         tools=[
@@ -393,9 +401,9 @@ def test_recorded_failure_retries_then_escalates_once(tmp_path: Path):
     first = asyncio.run(engine.tick())
     assert first.failed_task_ids == ["set-production"]
     assert first.agent_invoked is False
-    assert store.task_status("game-1", "set-production") is TaskStatus.READY
+    assert first.workflow_tick["outcome"] == "MUTATION_REJECTED"
+    assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
 
     second = asyncio.run(engine.tick())
-    assert second.failed_task_ids == ["set-production"]
     assert second.agent_invoked is True
-    assert store.task_status("game-1", "set-production") is TaskStatus.ESCALATED
+    assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
