@@ -2,7 +2,6 @@ import asyncio
 import json
 from pathlib import Path
 
-import pytest
 
 from civ6_workflow.characterization import (
     RecordingGamePort,
@@ -116,24 +115,20 @@ def _run_legacy_multi_mutation_tick(database_path: Path):
     return asyncio.run(scenario())
 
 
-def test_act_001_legacy_tick_records_multiple_mutations(tmp_path: Path):
-    """ACT-001 (REPLACE): freeze current multi-mutation Tick behavior."""
+def test_act_001_legacy_tick_now_records_one_mutation(tmp_path: Path):
+    """ACT-001 (REPLACED): the former multi-mutation path is bounded."""
 
     result, game = _run_legacy_multi_mutation_tick(tmp_path / "legacy.sqlite3")
 
-    assert result.executed_task_ids == ["city-1-production", "city-2-production"]
-    assert game.summary().mutations == 2
+    assert result.executed_task_ids == []
+    assert result.workflow_tick["outcome"] == "MUTATION_SENT"
+    assert game.summary().mutations == 1
     assert game.summary().end_turn_mutations == 0
-    assert game.summary().reads == 4
-    assert result.metrics.mcp_call_count == 6
+    game.assert_at_most_one_mutation()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ACT-001 target invariant; legacy engine still mutates twice per Tick",
-)
 def test_act_001_target_tick_has_at_most_one_mutation(tmp_path: Path):
-    """ACT-001 target: expected failure until the bounded Tick runner cuts over."""
+    """ACT-001 target: bounded Tick structurally permits one mutation."""
 
     _, game = _run_legacy_multi_mutation_tick(tmp_path / "target.sqlite3")
 
@@ -147,23 +142,19 @@ def _record_two_metrics_for_one_turn(store: WorkflowStore) -> list[dict]:
     return rows
 
 
-def test_met_001_legacy_store_overwrites_metrics_within_turn(tmp_path: Path):
-    """MET-001 (REPLACE): current schema retains one row per game turn."""
+def test_met_001_legacy_store_now_retains_each_tick_metric(tmp_path: Path):
+    """MET-001 (REPLACED): migration retains both same-turn Tick metrics."""
 
     rows = _record_two_metrics_for_one_turn(
         WorkflowStore(tmp_path / "legacy-metrics.sqlite3")
     )
 
-    assert len(rows) == 1
-    assert json.loads(rows[0]["metrics_json"])["mcp_call_count"] == 2
+    assert len(rows) == 2
+    assert [json.loads(row["metrics_json"])["mcp_call_count"] for row in rows] == [1, 2]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MET-001 target invariant requires a future tick_id metrics schema",
-)
 def test_met_001_target_store_retains_one_metrics_record_per_tick(tmp_path: Path):
-    """MET-001 target: expected failure until canonical persistence migration."""
+    """MET-001 target: one durable metrics record exists per Tick."""
 
     rows = _record_two_metrics_for_one_turn(
         WorkflowStore(tmp_path / "target-metrics.sqlite3")

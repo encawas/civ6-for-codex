@@ -5,7 +5,15 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
+from uuid import uuid4
 
+from .domain import (
+    ActionAttempt,
+    AttemptStatus,
+    RuntimeState,
+    WorkflowTick,
+    validate_workflow_tick,
+)
 from .models import (
     AgentRequest,
     EventLevel,
@@ -85,6 +93,7 @@ CREATE TABLE IF NOT EXISTS workflow_tasks (
     last_error TEXT,
     approved_by TEXT,
     created_turn INTEGER NOT NULL,
+    created_from_observation_id TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (game_id, task_id)
 );
@@ -124,12 +133,15 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_turn
 ON agent_runs (game_id, turn);
 
 CREATE TABLE IF NOT EXISTS turn_metrics (
+    tick_id TEXT PRIMARY KEY,
     game_id TEXT NOT NULL,
     turn INTEGER NOT NULL,
     metrics_json TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (game_id, turn)
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_turn_metrics_game_turn
+ON turn_metrics (game_id, turn);
 
 CREATE TABLE IF NOT EXISTS unit_observations (
     game_id TEXT NOT NULL,
@@ -140,6 +152,78 @@ CREATE TABLE IF NOT EXISTS unit_observations (
     eligible_for_binding INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (game_id, unit_id)
 );
+
+CREATE TABLE IF NOT EXISTS action_attempts (
+    action_attempt_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    action_type TEXT,
+    attempt_number INTEGER NOT NULL,
+    request_id TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
+    prepared_from_observation_id TEXT NOT NULL,
+    prepared_at TEXT NOT NULL,
+    sent_at TEXT,
+    response_received_at TEXT,
+    status TEXT NOT NULL,
+    retry_classification TEXT NOT NULL,
+    normalized_arguments_json TEXT NOT NULL,
+    transport_result_json TEXT,
+    tool_result_json TEXT,
+    verification_status TEXT,
+    last_verification_observation_id TEXT,
+    parent_attempt_id TEXT,
+    pre_send_turn INTEGER,
+    postconditions_json TEXT NOT NULL DEFAULT '[]',
+    postcondition_version INTEGER NOT NULL DEFAULT 1,
+    verification_count INTEGER NOT NULL DEFAULT 0,
+    attempt_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (game_id, task_id, attempt_number),
+    FOREIGN KEY (parent_attempt_id) REFERENCES action_attempts(action_attempt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_attempts_unresolved
+ON action_attempts (game_id, status, attempt_number);
+
+CREATE TABLE IF NOT EXISTS action_attempt_transitions (
+    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT NOT NULL,
+    action_attempt_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (action_attempt_id) REFERENCES action_attempts(action_attempt_id)
+);
+
+CREATE TABLE IF NOT EXISTS runtime_state (
+    game_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    active_attempt_id TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS workflow_ticks (
+    tick_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    starting_runtime_state TEXT NOT NULL,
+    ending_runtime_state TEXT NOT NULL,
+    observation_ids_json TEXT NOT NULL,
+    mutation_budget_used INTEGER NOT NULL CHECK (mutation_budget_used IN (0, 1)),
+    selected_task_id TEXT,
+    action_attempt_id TEXT,
+    planner_request_id TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    tick_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_ticks_game_turn
+ON workflow_ticks (game_id, turn);
 """
 
 REPLAY_STATE_TABLES = (
@@ -152,6 +236,10 @@ REPLAY_STATE_TABLES = (
     "agent_runs",
     "turn_metrics",
     "unit_observations",
+    "action_attempts",
+    "action_attempt_transitions",
+    "runtime_state",
+    "workflow_ticks",
 )
 
 
@@ -175,6 +263,7 @@ class WorkflowStore:
             "max_retries": "INTEGER NOT NULL DEFAULT 2",
             "last_error": "TEXT",
             "approved_by": "TEXT",
+            "created_from_observation_id": "TEXT",
             "updated_at": "TEXT",
         }
         for name, declaration in additions.items():
@@ -183,18 +272,87 @@ class WorkflowStore:
                     f"ALTER TABLE workflow_tasks ADD COLUMN {name} {declaration}"
                 )
 
-        # Recover tasks left in transient or legacy retry states after a restart.
         conn.execute(
-            "UPDATE workflow_tasks SET status=? WHERE status=?",
-            (TaskStatus.READY.value, TaskStatus.RUNNING.value),
+            """
+            UPDATE workflow_tasks
+            SET created_from_observation_id =
+                'legacy:' || game_id || ':' || created_turn || ':' || task_id
+            WHERE created_from_observation_id IS NULL
+            """
+        )
+        WorkflowStore._migrate_turn_metrics(conn)
+
+        unresolved = (
+            AttemptStatus.PREPARED.value,
+            AttemptStatus.VERIFYING.value,
+            AttemptStatus.UNCERTAIN.value,
+        )
+        conn.execute(
+            """
+            UPDATE workflow_tasks
+            SET status=CASE (
+                SELECT status FROM action_attempts
+                WHERE action_attempts.game_id=workflow_tasks.game_id
+                  AND action_attempts.task_id=workflow_tasks.task_id
+                  AND action_attempts.status IN (?, ?, ?)
+                ORDER BY attempt_number DESC
+                LIMIT 1
+            )
+                WHEN ? THEN ?
+                WHEN ? THEN ?
+                WHEN ? THEN ?
+                ELSE status
+            END,
+            updated_at=CURRENT_TIMESTAMP
+            WHERE EXISTS (
+                SELECT 1 FROM action_attempts
+                WHERE action_attempts.game_id=workflow_tasks.game_id
+                  AND action_attempts.task_id=workflow_tasks.task_id
+                  AND action_attempts.status IN (?, ?, ?)
+            )
+            """,
+            (
+                *unresolved,
+                AttemptStatus.PREPARED.value,
+                TaskStatus.RUNNING.value,
+                AttemptStatus.VERIFYING.value,
+                TaskStatus.VERIFYING.value,
+                AttemptStatus.UNCERTAIN.value,
+                TaskStatus.UNCERTAIN.value,
+                *unresolved,
+            ),
+        )
+
+        # A legacy RUNNING row with no attempt is the only transient state that
+        # can be proven not to have crossed the new delivery boundary.
+        conn.execute(
+            """
+            UPDATE workflow_tasks SET status=?, updated_at=CURRENT_TIMESTAMP
+            WHERE status=?
+              AND NOT EXISTS (
+                SELECT 1 FROM action_attempts
+                WHERE action_attempts.game_id=workflow_tasks.game_id
+                  AND action_attempts.task_id=workflow_tasks.task_id
+              )
+            """,
+            (
+                TaskStatus.READY.value,
+                TaskStatus.RUNNING.value,
+            ),
         )
         conn.execute(
             """
             UPDATE workflow_tasks SET status=CASE
                 WHEN retry_count >= max_retries THEN ?
                 ELSE ?
-            END
+            END,
+            updated_at=CURRENT_TIMESTAMP
             WHERE status IN (?, ?)
+              AND NOT EXISTS (
+                SELECT 1 FROM action_attempts
+                WHERE action_attempts.game_id=workflow_tasks.game_id
+                  AND action_attempts.task_id=workflow_tasks.task_id
+              )
             """,
             (
                 TaskStatus.ESCALATED.value,
@@ -207,7 +365,47 @@ class WorkflowStore:
             "UPDATE workflow_tasks SET updated_at=CURRENT_TIMESTAMP "
             "WHERE updated_at IS NULL"
         )
-        conn.execute("PRAGMA user_version=3")
+        conn.execute("PRAGMA user_version=6")
+
+    @staticmethod
+    def _migrate_turn_metrics(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(turn_metrics)").fetchall()
+        }
+        if "tick_id" in columns:
+            return
+        conn.execute("DROP INDEX IF EXISTS idx_turn_metrics_game_turn")
+        conn.execute("ALTER TABLE turn_metrics RENAME TO turn_metrics_legacy_v3")
+        conn.execute(
+            """
+            CREATE TABLE turn_metrics (
+                tick_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                turn INTEGER NOT NULL,
+                metrics_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO turn_metrics(
+                tick_id, game_id, turn, metrics_json, created_at
+            )
+            SELECT
+                'legacy:' || game_id || ':' || turn,
+                game_id,
+                turn,
+                metrics_json,
+                created_at
+            FROM turn_metrics_legacy_v3
+            """
+        )
+        conn.execute("DROP TABLE turn_metrics_legacy_v3")
+        conn.execute(
+            "CREATE INDEX idx_turn_metrics_game_turn ON turn_metrics (game_id, turn)"
+        )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -224,7 +422,9 @@ class WorkflowStore:
 
     @staticmethod
     def _dump(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
 
     @staticmethod
     def _load(value: str) -> Any:
@@ -350,7 +550,11 @@ class WorkflowStore:
         *,
         mode: ExecutionMode,
         auto_action_types: set[str],
+        observation_id: str | None = None,
     ) -> None:
+        created_from_observation_id = (
+            observation_id or f"legacy:{game_id}:{turn}:{bundle.plan_id}"
+        )
         with self._connect() as conn:
             if bundle.strategy_updates:
                 current = conn.execute(
@@ -372,15 +576,30 @@ class WorkflowStore:
                 )
 
             self._upsert_entity_plans(
-                conn, "city_plans", "city_id", game_id, bundle.plan_id, turn,
+                conn,
+                "city_plans",
+                "city_id",
+                game_id,
+                bundle.plan_id,
+                turn,
                 bundle.city_plan_updates,
             )
             self._upsert_entity_plans(
-                conn, "unit_plans", "unit_id", game_id, bundle.plan_id, turn,
+                conn,
+                "unit_plans",
+                "unit_id",
+                game_id,
+                bundle.plan_id,
+                turn,
                 bundle.unit_plan_updates,
             )
             self._upsert_entity_plans(
-                conn, "builder_plans", "builder_key", game_id, bundle.plan_id, turn,
+                conn,
+                "builder_plans",
+                "builder_key",
+                game_id,
+                bundle.plan_id,
+                turn,
                 bundle.builder_plan_updates,
             )
 
@@ -402,7 +621,10 @@ class WorkflowStore:
             for proposed in bundle.tasks:
                 if mode is ExecutionMode.READONLY:
                     status = TaskStatus.AWAITING_CONFIRMATION
-                elif proposed.requires_confirmation or proposed.action_type not in auto_action_types:
+                elif (
+                    proposed.requires_confirmation
+                    or proposed.action_type not in auto_action_types
+                ):
                     status = TaskStatus.AWAITING_CONFIRMATION
                 elif proposed.due_turn <= turn:
                     status = TaskStatus.READY
@@ -415,8 +637,9 @@ class WorkflowStore:
                         game_id, task_id, plan_id, action_type, entity_type,
                         entity_id, due_turn, expires_turn, arguments_json,
                         preconditions_json, postconditions_json, invalidators_json,
-                        risk, requires_confirmation, reason, status, created_turn
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        risk, requires_confirmation, reason, status, created_turn,
+                        created_from_observation_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(game_id, task_id) DO UPDATE SET
                         plan_id=excluded.plan_id,
                         action_type=excluded.action_type,
@@ -455,6 +678,7 @@ class WorkflowStore:
                         proposed.reason,
                         status.value,
                         turn,
+                        created_from_observation_id,
                     ),
                 )
 
@@ -577,9 +801,7 @@ class WorkflowStore:
                 """,
                 (game_id, *current_ids),
             ).fetchall()
-        return {
-            str(row["unit_id"]): int(row["first_seen_turn"]) for row in observed
-        }
+        return {str(row["unit_id"]): int(row["first_seen_turn"]) for row in observed}
 
     def bind_builder_plan(
         self, game_id: str, builder_key: str, unit_id: str, turn: int
@@ -649,6 +871,7 @@ class WorkflowStore:
             max_retries=int(row["max_retries"]),
             last_error=row["last_error"],
             approved_by=row["approved_by"],
+            created_from_observation_id=row["created_from_observation_id"],
         )
 
     def set_task_status(
@@ -671,7 +894,9 @@ class WorkflowStore:
                 (status.value, error, int(increment_retry), game_id, task_id),
             )
 
-    def approve_task(self, game_id: str, task_id: str, approved_by: str = "user") -> bool:
+    def approve_task(
+        self, game_id: str, task_id: str, approved_by: str = "user"
+    ) -> bool:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -741,11 +966,17 @@ class WorkflowStore:
         return {
             "strategy": {} if strategy is None else self._load(strategy["state_json"]),
             "cities": {
-                row["city_id"]: {**self._load(row["plan_json"]), "_plan_id": row["plan_id"]}
+                row["city_id"]: {
+                    **self._load(row["plan_json"]),
+                    "_plan_id": row["plan_id"],
+                }
                 for row in cities
             },
             "units": {
-                row["unit_id"]: {**self._load(row["plan_json"]), "_plan_id": row["plan_id"]}
+                row["unit_id"]: {
+                    **self._load(row["plan_json"]),
+                    "_plan_id": row["plan_id"],
+                }
                 for row in units
             },
             "builders": {
@@ -757,6 +988,345 @@ class WorkflowStore:
                 for row in builders
             },
         }
+
+    def task_ids(self, game_id: str) -> set[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT task_id FROM workflow_tasks WHERE game_id=?",
+                (game_id,),
+            ).fetchall()
+        return {str(row["task_id"]) for row in rows}
+
+    def get_task(self, game_id: str, task_id: str) -> StoredTask | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
+                (game_id, task_id),
+            ).fetchone()
+        return None if row is None else self._row_to_task(row)
+
+    @staticmethod
+    def _attempt_row_values(attempt: ActionAttempt) -> tuple[Any, ...]:
+        payload = attempt.model_dump(mode="json")
+        dump = WorkflowStore._dump
+        return (
+            attempt.action_attempt_id,
+            attempt.game_session_id,
+            attempt.task_id,
+            attempt.action_type,
+            attempt.attempt_number,
+            attempt.request_id,
+            attempt.idempotency_key,
+            attempt.prepared_from_observation_id,
+            payload["prepared_at"],
+            payload["sent_at"],
+            payload["response_received_at"],
+            attempt.status.value,
+            attempt.retry_classification.value,
+            dump(payload["normalized_arguments"]),
+            (
+                None
+                if payload["transport_result"] is None
+                else dump(payload["transport_result"])
+            ),
+            None if payload["tool_result"] is None else dump(payload["tool_result"]),
+            (
+                None
+                if attempt.verification_status is None
+                else attempt.verification_status.value
+            ),
+            attempt.last_verification_observation_id,
+            attempt.parent_attempt_id,
+            attempt.pre_send_turn,
+            dump(payload["postconditions"]),
+            attempt.postcondition_version,
+            attempt.verification_count,
+            attempt.model_dump_json(),
+        )
+
+    def save_action_attempt(self, attempt: ActionAttempt) -> None:
+        if attempt.game_session_id is None:
+            raise ValueError("persisted attempts require game_session_id")
+        if attempt.action_type is None:
+            raise ValueError("persisted attempts require action_type")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO action_attempts(
+                    action_attempt_id, game_id, task_id, action_type,
+                    attempt_number, request_id, idempotency_key,
+                    prepared_from_observation_id, prepared_at, sent_at,
+                    response_received_at, status, retry_classification,
+                    normalized_arguments_json, transport_result_json,
+                    tool_result_json, verification_status,
+                    last_verification_observation_id, parent_attempt_id,
+                    pre_send_turn, postconditions_json, postcondition_version,
+                    verification_count, attempt_json
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )
+                """,
+                self._attempt_row_values(attempt),
+            )
+            self._append_attempt_transition(conn, attempt)
+
+    def update_action_attempt(self, attempt: ActionAttempt) -> None:
+        current = self.get_action_attempt(attempt.action_attempt_id)
+        if current is None:
+            raise KeyError(f"unknown action attempt: {attempt.action_attempt_id}")
+        immutable_fields = (
+            "action_attempt_id",
+            "game_session_id",
+            "task_id",
+            "action_type",
+            "attempt_number",
+            "request_id",
+            "idempotency_key",
+            "prepared_from_observation_id",
+            "prepared_at",
+            "retry_classification",
+            "normalized_arguments",
+            "parent_attempt_id",
+            "pre_send_turn",
+            "postconditions",
+            "postcondition_version",
+        )
+        if any(
+            getattr(current, field) != getattr(attempt, field)
+            for field in immutable_fields
+        ):
+            raise ValueError("attempt identity and delivery contract are immutable")
+        allowed = {
+            AttemptStatus.PREPARED: {
+                AttemptStatus.REJECTED_BEFORE_SEND,
+                AttemptStatus.UNCERTAIN,
+            },
+            AttemptStatus.UNCERTAIN: {
+                AttemptStatus.UNCERTAIN,
+                AttemptStatus.VERIFYING,
+                AttemptStatus.FAILED,
+                AttemptStatus.SUCCEEDED,
+            },
+            AttemptStatus.VERIFYING: {
+                AttemptStatus.VERIFYING,
+                AttemptStatus.UNCERTAIN,
+                AttemptStatus.FAILED,
+                AttemptStatus.SUCCEEDED,
+            },
+            AttemptStatus.REJECTED_BEFORE_SEND: set(),
+            AttemptStatus.FAILED: set(),
+            AttemptStatus.SUCCEEDED: set(),
+        }
+        if attempt.status not in allowed[current.status]:
+            raise ValueError(
+                f"invalid attempt transition {current.status} -> {attempt.status}"
+            )
+        values = self._attempt_row_values(attempt)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE action_attempts SET
+                    game_id=?, task_id=?, action_type=?, attempt_number=?,
+                    request_id=?, idempotency_key=?,
+                    prepared_from_observation_id=?, prepared_at=?, sent_at=?,
+                    response_received_at=?, status=?, retry_classification=?,
+                    normalized_arguments_json=?, transport_result_json=?,
+                    tool_result_json=?, verification_status=?,
+                    last_verification_observation_id=?, parent_attempt_id=?,
+                    pre_send_turn=?, postconditions_json=?,
+                    postcondition_version=?, verification_count=?,
+                    attempt_json=?, updated_at=CURRENT_TIMESTAMP
+                WHERE action_attempt_id=?
+                """,
+                (*values[1:], values[0]),
+            )
+            self._append_attempt_transition(conn, attempt)
+
+    @staticmethod
+    def _append_attempt_transition(
+        conn: sqlite3.Connection,
+        attempt: ActionAttempt,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO action_attempt_transitions(
+                game_id, action_attempt_id, status, attempt_json
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                attempt.game_session_id,
+                attempt.action_attempt_id,
+                attempt.status.value,
+                attempt.model_dump_json(),
+            ),
+        )
+
+    def get_action_attempt(self, action_attempt_id: str) -> ActionAttempt | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT attempt_json FROM action_attempts WHERE action_attempt_id=?",
+                (action_attempt_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else ActionAttempt.model_validate_json(row["attempt_json"])
+        )
+
+    def list_action_attempts(
+        self,
+        game_id: str,
+        *,
+        statuses: Sequence[AttemptStatus] | None = None,
+    ) -> list[ActionAttempt]:
+        with self._connect() as conn:
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                rows = conn.execute(
+                    f"""
+                    SELECT attempt_json FROM action_attempts
+                    WHERE game_id=? AND status IN ({placeholders})
+                    ORDER BY prepared_at, attempt_number
+                    """,
+                    (game_id, *(status.value for status in statuses)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT attempt_json FROM action_attempts
+                    WHERE game_id=?
+                    ORDER BY prepared_at, attempt_number
+                    """,
+                    (game_id,),
+                ).fetchall()
+        return [ActionAttempt.model_validate_json(row["attempt_json"]) for row in rows]
+
+    def unresolved_action_attempt(self, game_id: str) -> ActionAttempt | None:
+        attempts = self.list_action_attempts(
+            game_id,
+            statuses=[
+                AttemptStatus.PREPARED,
+                AttemptStatus.VERIFYING,
+                AttemptStatus.UNCERTAIN,
+            ],
+        )
+        if len(attempts) > 1:
+            raise RuntimeError(
+                f"game {game_id} has multiple unresolved action attempts"
+            )
+        return attempts[0] if attempts else None
+
+    def latest_attempt_for_task(
+        self,
+        game_id: str,
+        task_id: str,
+    ) -> ActionAttempt | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT attempt_json FROM action_attempts
+                WHERE game_id=? AND task_id=?
+                ORDER BY attempt_number DESC
+                LIMIT 1
+                """,
+                (game_id, task_id),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else ActionAttempt.model_validate_json(row["attempt_json"])
+        )
+
+    def next_attempt_number(self, game_id: str, task_id: str) -> int:
+        latest = self.latest_attempt_for_task(game_id, task_id)
+        return 1 if latest is None else latest.attempt_number + 1
+
+    def load_runtime_state(self, game_id: str) -> RuntimeState:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM runtime_state WHERE game_id=?",
+                (game_id,),
+            ).fetchone()
+        return RuntimeState.OBSERVING if row is None else RuntimeState(row["state"])
+
+    def save_runtime_state(
+        self,
+        game_id: str,
+        state: RuntimeState,
+        *,
+        active_attempt_id: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO runtime_state(game_id, state, active_attempt_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(game_id) DO UPDATE SET
+                    state=excluded.state,
+                    active_attempt_id=excluded.active_attempt_id,
+                    revision=runtime_state.revision+1,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (game_id, state.value, active_attempt_id),
+            )
+
+    def save_workflow_tick(self, tick: WorkflowTick) -> None:
+        tick = validate_workflow_tick(tick)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO workflow_ticks(
+                    tick_id, game_id, turn, outcome,
+                    starting_runtime_state, ending_runtime_state,
+                    observation_ids_json, mutation_budget_used,
+                    selected_task_id, action_attempt_id,
+                    planner_request_id, started_at, completed_at,
+                    metrics_json, tick_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tick.tick_id,
+                    tick.game_session_id,
+                    tick.turn_number,
+                    tick.outcome.value,
+                    tick.starting_runtime_state.value,
+                    tick.ending_runtime_state.value,
+                    self._dump(list(tick.observation_ids)),
+                    tick.mutation_budget_used,
+                    getattr(tick, "task_id", None),
+                    getattr(tick, "action_attempt_id", None),
+                    getattr(tick, "planner_request_id", None),
+                    tick.started_at.isoformat(),
+                    tick.completed_at.isoformat(),
+                    self._dump(tick.model_dump(mode="json")["metrics"]),
+                    tick.model_dump_json(),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO turn_metrics(tick_id, game_id, turn, metrics_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    tick.tick_id,
+                    tick.game_session_id,
+                    tick.turn_number,
+                    self._dump(tick.model_dump(mode="json")["metrics"]),
+                ),
+            )
+
+    def list_workflow_ticks(self, game_id: str) -> list[WorkflowTick]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT tick_json FROM workflow_ticks
+                WHERE game_id=?
+                ORDER BY started_at, tick_id
+                """,
+                (game_id,),
+            ).fetchall()
+        return [validate_workflow_tick(self._load(row["tick_json"])) for row in rows]
 
     def agent_called_for_turn(self, game_id: str, turn: int) -> bool:
         with self._connect() as conn:
@@ -800,18 +1370,24 @@ class WorkflowStore:
                 ),
             )
 
-    def record_metrics(self, game_id: str, turn: int, metrics: TickMetrics) -> None:
+    def record_metrics(
+        self,
+        game_id: str,
+        turn: int,
+        metrics: TickMetrics,
+        *,
+        tick_id: str | None = None,
+    ) -> str:
+        metric_tick_id = tick_id or f"metric_{uuid4().hex}"
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO turn_metrics(game_id, turn, metrics_json)
-                VALUES (?, ?, ?)
-                ON CONFLICT(game_id, turn) DO UPDATE SET
-                    metrics_json=excluded.metrics_json,
-                    created_at=CURRENT_TIMESTAMP
+                INSERT INTO turn_metrics(tick_id, game_id, turn, metrics_json)
+                VALUES (?, ?, ?, ?)
                 """,
-                (game_id, turn, metrics.model_dump_json()),
+                (metric_tick_id, game_id, turn, metrics.model_dump_json()),
             )
+        return metric_tick_id
 
     def export_replay_state(self, game_id: str) -> dict[str, Any]:
         with self._connect() as conn:

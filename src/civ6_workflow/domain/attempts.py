@@ -20,6 +20,15 @@ class AttemptStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
 
 
+UNRESOLVED_ATTEMPT_STATUSES = frozenset(
+    {
+        AttemptStatus.PREPARED,
+        AttemptStatus.VERIFYING,
+        AttemptStatus.UNCERTAIN,
+    }
+)
+
+
 class VerificationStatus(StrEnum):
     PENDING = "PENDING"
     INCONCLUSIVE = "INCONCLUSIVE"
@@ -45,6 +54,12 @@ class ActionAttempt(DomainModel):
     verification_status: VerificationStatus | None = None
     last_verification_observation_id: str | None = None
     parent_attempt_id: str | None = None
+    game_session_id: str | None = None
+    action_type: str | None = None
+    postconditions: tuple[ImmutableJsonObject, ...] = ()
+    postcondition_version: int = Field(default=1, ge=1)
+    verification_count: int = Field(default=0, ge=0)
+    pre_send_turn: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
@@ -101,6 +116,10 @@ class ActionAttempt(DomainModel):
             raise ValueError("response_received_at requires sent_at")
         if self.last_verification_observation_id is not None and self.sent_at is None:
             raise ValueError("verification evidence requires sent_at")
+        if self.parent_attempt_id == self.action_attempt_id:
+            raise ValueError("an attempt cannot be its own parent")
+        if self.action_type == "end_turn" and self.pre_send_turn is None:
+            raise ValueError("an end-turn attempt requires pre_send_turn")
 
         try:
             if self.sent_at is not None and self.sent_at < self.prepared_at:

@@ -127,15 +127,15 @@ def test_unverified_irreversible_action_is_not_retried(tmp_path):
     )
 
     first = asyncio.run(engine.tick())
-    assert store.task_status("game", "improve-9") is TaskStatus.UNCERTAIN
-    assert first.paused is True
+    assert store.task_status("game", "improve-9") is TaskStatus.VERIFYING
+    assert first.workflow_tick["outcome"] == "MUTATION_SENT"
     assert first.turn_ended is False
     assert first.agent_invoked is False
     assert planner.calls == 0
-    assert any(event.event_type == "action_commit_uncertain" for event in first.events)
 
     second = asyncio.run(engine.tick())
     assert store.task_status("game", "improve-9") is TaskStatus.UNCERTAIN
+    assert second.workflow_tick["outcome"] == "AWAITING_HUMAN"
     assert second.paused is True
     assert second.turn_ended is False
     assert planner.calls == 0

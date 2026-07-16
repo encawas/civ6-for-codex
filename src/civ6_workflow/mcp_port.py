@@ -8,7 +8,12 @@ from typing import Any, Protocol
 
 from .actions import ActionValidationError, resolve_action
 from .domain.observations import SlotState, normalize_slot
-from .models import ActionResult, RuntimeSnapshot, StoredTask
+from .models import (
+    ActionResult,
+    MutationDeliveryStatus,
+    RuntimeSnapshot,
+    StoredTask,
+)
 from .state_api import Civ6StateApi
 
 
@@ -31,6 +36,49 @@ class GamePort(Protocol):
     async def end_turn(self) -> ActionResult: ...
 
     async def list_tools(self) -> set[str]: ...
+
+
+class MutationBudgetExceeded(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class MutationBudget:
+    limit: int = 1
+    used: int = 0
+
+    def consume(self, operation: str) -> None:
+        if self.used >= self.limit:
+            raise MutationBudgetExceeded(
+                f"mutation budget exhausted before {operation}"
+            )
+        self.used += 1
+
+
+class BoundedGamePort:
+    """Per-tick structural guard around every mutating game-port call."""
+
+    def __init__(self, delegate: GamePort, budget: MutationBudget):
+        self.delegate = delegate
+        self.budget = budget
+
+    @property
+    def call_count(self) -> int:
+        return self.delegate.call_count
+
+    async def read_snapshot(self, *, include_units: bool = False) -> RuntimeSnapshot:
+        return await self.delegate.read_snapshot(include_units=include_units)
+
+    async def execute_task(self, task: StoredTask) -> ActionResult:
+        self.budget.consume(task.action_type)
+        return await self.delegate.execute_task(task)
+
+    async def end_turn(self) -> ActionResult:
+        self.budget.consume("end_turn")
+        return await self.delegate.end_turn()
+
+    async def list_tools(self) -> set[str]:
+        return await self.delegate.list_tools()
 
 
 class Civ6McpClient:
@@ -227,33 +275,47 @@ class Civ6GamePort:
         try:
             tool_name, arguments = resolve_action(task, self.allowed_tools)
         except ActionValidationError as exc:
-            return ActionResult(success=False, blocked=True, message=str(exc))
+            return ActionResult(
+                success=False,
+                blocked=True,
+                message=str(exc),
+                delivery_status=MutationDeliveryStatus.PROVEN_NOT_SENT,
+            )
         try:
             raw = await self.client.call_tool(tool_name, arguments)
         except Exception as exc:
-            return ActionResult(success=False, message=str(exc))
+            return ActionResult(
+                success=False,
+                message=str(exc),
+                details={"error_type": type(exc).__name__},
+                delivery_status=MutationDeliveryStatus.UNKNOWN,
+            )
         return self._normalize_action_result(raw)
 
     async def end_turn(self) -> ActionResult:
         if "end_turn" not in self.allowed_tools:
             return ActionResult(
-                success=False, blocked=True, message="end_turn is not allowed"
+                success=False,
+                blocked=True,
+                message="end_turn is not allowed",
+                delivery_status=MutationDeliveryStatus.PROVEN_NOT_SENT,
             )
         try:
             raw = await self.client.call_tool("end_turn")
         except Exception as exc:
-            return ActionResult(success=False, message=str(exc))
+            return ActionResult(
+                success=False,
+                message=str(exc),
+                details={"error_type": type(exc).__name__},
+                delivery_status=MutationDeliveryStatus.UNKNOWN,
+            )
         return self._normalize_action_result(raw)
 
     @staticmethod
     def _normalize_action_result(raw: Any) -> ActionResult:
         if isinstance(raw, dict):
             text = str(raw.get("text", "")).strip()
-            lowered = text.lower()
-            textual_error = lowered.startswith("error:") or lowered.startswith(
-                "failed:"
-            )
-            if raw.get("success") is False or raw.get("error") or textual_error:
+            if raw.get("success") is False or raw.get("error"):
                 return ActionResult(
                     success=False,
                     blocked=bool(raw.get("blocked") or raw.get("blocker")),
@@ -264,14 +326,21 @@ class Civ6GamePort:
                         or "action failed"
                     ),
                     details=raw,
+                    delivery_status=MutationDeliveryStatus.EXPLICITLY_REJECTED,
                 )
             return ActionResult(
                 success=True,
                 blocked=False,
                 message=str(raw.get("message") or text or "ok"),
                 details=raw,
+                delivery_status=MutationDeliveryStatus.ACKNOWLEDGED,
             )
-        return ActionResult(success=True, message="ok", details={"raw": raw})
+        return ActionResult(
+            success=True,
+            message="ok",
+            details={"raw": raw},
+            delivery_status=MutationDeliveryStatus.ACKNOWLEDGED,
+        )
 
     @classmethod
     def _find_int(cls, value: Any, keys: tuple[str, ...]) -> int | None:

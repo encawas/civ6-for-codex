@@ -26,7 +26,7 @@
     "fixed_arguments": {
       "action": "found_city"
     },
-    "retry_safe_after_unknown": false
+    "retry_classification": "NEVER_BLIND_RETRY"
   },
   "unit_found_city_entity_types": [
     "unit"
