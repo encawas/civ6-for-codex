@@ -100,6 +100,7 @@ def test_cli_planner_keeps_request_artifacts_in_project_state(
     planner = CodexPlanner(
         CodexPlannerConfig(
             backend="codex_cli",
+            command=str(Path(__file__).resolve()),
             state_directory=state_directory,
             use_output_schema=False,
         )
@@ -164,6 +165,7 @@ def test_recording_planner_counts_started_cli_with_invalid_output(
     planner = CodexPlanner(
         CodexPlannerConfig(
             backend="codex_cli",
+            command=str(Path(__file__).resolve()),
             state_directory=tmp_path / "invalid-output",
             use_output_schema=False,
         )
@@ -265,6 +267,7 @@ def test_started_cli_failure_paths_record_current_diagnostics(
     planner = CodexPlanner(
         CodexPlannerConfig(
             backend="codex_cli",
+            command=str(Path(__file__).resolve()),
             state_directory=tmp_path / mode,
             use_output_schema=False,
         )
@@ -330,6 +333,7 @@ def test_timed_out_cli_records_started_provider_attempt(tmp_path: Path, monkeypa
     planner = CodexPlanner(
         CodexPlannerConfig(
             backend="codex_cli",
+            command=str(Path(__file__).resolve()),
             state_directory=tmp_path / "timeout",
             timeout_seconds=0,
             use_output_schema=False,
