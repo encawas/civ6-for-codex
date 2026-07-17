@@ -5,7 +5,10 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
+
+from .decisioning import STRATEGIC_GAP_TYPES
+from .domain import ApprovalStatus, ContinuationPolicy
 
 from .models import (
     AgentRequest as BaseAgentRequest,
@@ -40,12 +43,43 @@ class InformationRequest(StrictModel):
         return value
 
 
+class LeaseContract(StrictModel):
+    """Planner-proposed durability contract; no implicit lease defaults."""
+
+    valid_until_turn: int | None = Field(default=None, ge=0)
+    preconditions: list[dict[str, Any]] = Field(min_length=1)
+    completion_condition: dict[str, Any]
+    invalidation_conditions: list[dict[str, Any]] = Field(min_length=1)
+    review_conditions: list[dict[str, Any]] = Field(min_length=1)
+    continuation_policy: ContinuationPolicy
+    approval_status: ApprovalStatus
+    covered_slots: list[str] = Field(default_factory=list)
+    subjects: list[dict[str, str]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_horizon(self):
+        if not self.completion_condition.get("type"):
+            raise ValueError("lease completion_condition requires type")
+        for name in (
+            "preconditions",
+            "invalidation_conditions",
+            "review_conditions",
+        ):
+            if any(not item.get("type") for item in getattr(self, name)):
+                raise ValueError(f"lease {name} entries require type")
+        for subject in self.subjects:
+            if set(subject) != {"subject_type", "subject_id"}:
+                raise ValueError("lease subjects require subject_type and subject_id")
+        return self
+
+
 class EventResolution(StrictModel):
     event_dedupe_key: str
     disposition: ResolutionDisposition
     task_ids: list[str] = Field(default_factory=list)
     plan_refs: list[str] = Field(default_factory=list)
     information_request_ids: list[str] = Field(default_factory=list)
+    lease_contract: LeaseContract | None = None
     reason: str = Field(min_length=1, max_length=500)
     decision_gap_ids: list[str] = Field(default_factory=list, max_length=100)
 
@@ -59,8 +93,12 @@ class EventResolution(StrictModel):
 
 
 class WorkflowPlanBundle(BasePlanBundle):
-    information_requests: list[InformationRequest] = Field(default_factory=list, max_length=8)
-    event_resolutions: list[EventResolution] = Field(default_factory=list, max_length=100)
+    information_requests: list[InformationRequest] = Field(
+        default_factory=list, max_length=8
+    )
+    event_resolutions: list[EventResolution] = Field(
+        default_factory=list, max_length=100
+    )
 
 
 class WorkflowAgentRequest(BaseAgentRequest):
@@ -87,13 +125,9 @@ class QuerySpec:
 READ_ONLY_QUERY_SPECS: dict[str, QuerySpec] = {
     "get_settle_advisor": QuerySpec(frozenset({"unit_id"})),
     "get_global_settle_advisor": QuerySpec(),
-    "get_pathing_estimate": QuerySpec(
-        frozenset({"unit_id", "target_x", "target_y"})
-    ),
+    "get_pathing_estimate": QuerySpec(frozenset({"unit_id", "target_x", "target_y"})),
     "get_unit_promotions": QuerySpec(frozenset({"unit_id"})),
-    "get_district_advisor": QuerySpec(
-        frozenset({"city_id", "district_type"})
-    ),
+    "get_district_advisor": QuerySpec(frozenset({"city_id", "district_type"})),
     "get_city_production": QuerySpec(frozenset({"city_id"})),
     "get_map_area": QuerySpec(
         frozenset({"center_x", "center_y"}), frozenset({"radius"})
@@ -140,6 +174,7 @@ def validate_event_resolution_contract(
 ) -> None:
     errors: list[str] = []
     trigger_keys = {str(event.dedupe_key) for event in trigger_events}
+    trigger_by_key = {str(event.dedupe_key): event for event in trigger_events}
     blocking_keys = {
         str(event.dedupe_key) for event in trigger_events if bool(event.blocking)
     }
@@ -150,6 +185,10 @@ def validate_event_resolution_contract(
         if key in resolutions:
             errors.append(f"duplicate event resolution for {key}")
         resolutions[key] = resolution
+        if resolution.lease_contract is not None:
+            _validate_lease_contract_for_event(
+                resolution, trigger_by_key.get(key), errors
+            )
         if key not in trigger_keys:
             errors.append(f"event resolution references unknown trigger event: {key}")
 
@@ -189,6 +228,11 @@ def validate_event_resolution_contract(
                     f"task resolution for {key} references unknown tasks: "
                     f"{sorted(unknown_tasks)}"
                 )
+            requires_lease = bool(resolution.decision_gap_ids) or (
+                trigger_by_key[key].event_type in STRATEGIC_GAP_TYPES
+            )
+            if requires_lease and resolution.lease_contract is None:
+                errors.append(f"task resolution for {key} has no lease contract")
         elif disposition is ResolutionDisposition.PLAN_UPDATE:
             if not resolution.plan_refs:
                 errors.append(f"plan_update resolution for {key} has no plan_refs")
@@ -198,6 +242,11 @@ def validate_event_resolution_contract(
                     f"plan_update resolution for {key} references missing plans: "
                     f"{sorted(unknown_refs)}"
                 )
+            requires_lease = bool(resolution.decision_gap_ids) or (
+                trigger_by_key[key].event_type in STRATEGIC_GAP_TYPES
+            )
+            if requires_lease and resolution.lease_contract is None:
+                errors.append(f"plan_update resolution for {key} has no lease contract")
         elif disposition is ResolutionDisposition.HUMAN_REVIEW:
             if not bundle.requires_human_review:
                 errors.append(
@@ -206,12 +255,16 @@ def validate_event_resolution_contract(
                 )
         elif disposition is ResolutionDisposition.INFORMATION_REQUIRED:
             if not allow_information_requests:
-                errors.append(f"final planning phase cannot request more information: {key}")
+                errors.append(
+                    f"final planning phase cannot request more information: {key}"
+                )
             if not resolution.information_request_ids:
                 errors.append(
                     f"information_required resolution for {key} has no request IDs"
                 )
-            unknown_requests = set(resolution.information_request_ids) - set(request_by_id)
+            unknown_requests = set(resolution.information_request_ids) - set(
+                request_by_id
+            )
             if unknown_requests:
                 errors.append(
                     f"information resolution for {key} references unknown requests: "
@@ -283,6 +336,35 @@ def validate_event_resolution_contract(
 
     if errors:
         raise WorkflowProtocolError("; ".join(errors))
+
+
+def _validate_lease_contract_for_event(resolution, event, errors):
+    if event is None or event.event_type != "settler_site_selection_required":
+        return
+    contract = resolution.lease_contract
+    precondition_types = {item.get("type") for item in contract.preconditions}
+    invalidation_types = {item.get("type") for item in contract.invalidation_conditions}
+    if not {"entity_exists", "unit_type_contains"}.issubset(precondition_types):
+        errors.append("settler lease requires existence and settler-type preconditions")
+    if not ({"tile_unoccupied", "settler_target_legal"} & precondition_types):
+        errors.append("settler lease requires a legal unoccupied target")
+    if contract.completion_condition.get("type") != "city_count_at_least":
+        errors.append("settler lease must complete only after a city is observed")
+    if "unit_absent" not in invalidation_types:
+        errors.append("settler lease must invalidate when the settler disappears")
+    severe_threat = any(
+        item.get("type") == "field_in" and item.get("path") == "overview.threat_level"
+        for item in contract.invalidation_conditions
+    )
+    if not severe_threat:
+        errors.append("settler lease must handle severe threat invalidation")
+    if (
+        contract.continuation_policy
+        is not ContinuationPolicy.EXTEND_WHEN_INPUT_UNCHANGED
+    ):
+        errors.append(
+            "settler lease may continue only while relevant input is unchanged"
+        )
 
 
 def _plan_refs(bundle: WorkflowPlanBundle) -> set[str]:

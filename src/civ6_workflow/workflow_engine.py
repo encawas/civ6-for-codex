@@ -1,49 +1,14 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import time
-from contextlib import nullcontext
-from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
 from .conditions import extract_known_entities
-from .decisioning import (
-    STRATEGIC_GAP_TYPES,
-    batch_compatible_gaps,
-    build_decision_gap,
-    evaluate_plan_lease,
-    evaluate_planner_eligibility,
-)
-from .domain import (
-    ApprovalStatus,
-    ContinuationPolicy,
-    DecisionGap,
-    DecisionGapCreatedTick,
-    DecisionGapStatus,
-    DecisionGapUpdatedTick,
-    InformationCollectedTick,
-    InformationRequestedTick,
-    InformationRound,
-    InformationRoundStatus,
-    LeaseValidationResult,
-    LogicalPlannerRequestCreatedTick,
-    PlanLease,
-    PlanLeaseStatus,
-    PlannerAttemptCompletedTick,
-    PlannerBackoffTick,
-    PlannerRequest,
-    PlannerRequestStatus,
-    ProviderAttempt,
-    ProviderAttemptStatus,
-    RuntimeState,
-    validate_workflow_tick,
-)
 from .planner_lifecycle import PlannerLifecycleCoordinator
 from .models import (
     AgentRequest,
-    ExecutionMode,
     PlanBundle,
     TickMetrics,
     TickResult,
@@ -51,8 +16,6 @@ from .models import (
 from .safe_engine import SafeWorkflowEngine
 from .validation import PlanValidationContext, validate_plan_bundle
 from .workflow_protocol import (
-    InformationRequest,
-    ResolutionDisposition,
     WorkflowPlanBundle,
     validate_event_resolution_contract,
 )
@@ -118,16 +81,32 @@ class WorkflowAwareEngine(SafeWorkflowEngine):
             )
         ]
 
+    async def _pre_route_decision_runtime(self, ctx, observation, current_events):
+        compatibility = TickResult(
+            turn=observation.snapshot.turn,
+            metrics=ctx.metrics,
+            events=[],
+        )
+        return self.planner_lifecycle.validate_before_routing(
+            ctx, observation, current_events, compatibility
+        )
+
     async def _advance_decision_runtime(
         self,
         ctx,
         observation,
         agent_events,
         compatibility,
+        current_events=None,
     ):
         return await self.planner_lifecycle.advance(
-            ctx, observation, agent_events, compatibility
+            ctx,
+            observation,
+            agent_events,
+            compatibility,
+            current_events=current_events,
         )
+
     async def _invoke_planner(
         self,
         snapshot,

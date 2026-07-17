@@ -111,6 +111,7 @@ class PlanLease(DomainModel):
     covered_slots: tuple[str, ...] = ()
     plan_revision: int = Field(ge=1)
     source_planner_request_id: str | None = None
+    task_ids: tuple[str, ...] = ()
     created_from_observation_id: str = "legacy"
     status: PlanLeaseStatus
     approval_status: ApprovalStatus
@@ -143,5 +144,14 @@ class PlanLease(DomainModel):
             ApprovalStatus.APPROVED,
         }:
             raise ValueError("an active plan lease must satisfy approval")
+        if self.status is PlanLeaseStatus.ACTIVE:
+            if not self.preconditions:
+                raise ValueError("an active plan lease requires preconditions")
+            if not self.invalidation_conditions:
+                raise ValueError(
+                    "an active plan lease requires invalidation conditions"
+                )
+            if not self.review_conditions:
+                raise ValueError("an active plan lease requires review conditions")
         if self.status is PlanLeaseStatus.INVALIDATED and not self.invalidation_reason:
             raise ValueError("an invalidated plan lease requires a reason")

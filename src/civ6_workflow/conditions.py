@@ -221,6 +221,43 @@ class ConditionEvaluator:
                 improvement in valid,
                 f"unit {unit_id} cannot build {improvement}; valid={valid}",
             )
+        if kind == "unit_type_contains":
+            unit_id = str(condition["unit_id"])
+            marker = str(condition["marker"]).upper()
+            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
+            actual = (
+                ""
+                if unit is None
+                else str(unit.get("unit_type", unit.get("type", ""))).upper()
+            )
+            return ConditionResult(
+                marker in actual,
+                f"unit {unit_id} type {actual!r} does not contain {marker!r}",
+            )
+        if kind == "unit_absent":
+            unit_id = str(condition["unit_id"])
+            absent = (
+                find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
+                is None
+            )
+            return ConditionResult(absent, f"unit {unit_id} still exists")
+        if kind == "city_count_at_least":
+            expected = int(condition["count"])
+            actual = len(_rows(normalized_snapshot.cities))
+            return ConditionResult(
+                actual >= expected,
+                f"city count {actual} is below required {expected}",
+            )
+        if kind in {"tile_unoccupied", "settler_target_legal"}:
+            expected = (int(condition["x"]), int(condition["y"]))
+            occupied = any(
+                (row.get("x"), row.get("y")) == expected
+                for row in _rows(normalized_snapshot.cities)
+            )
+            return ConditionResult(
+                not occupied,
+                f"settlement target {expected} is already occupied",
+            )
         return ConditionResult(False, f"unsupported condition type: {kind!r}")
 
     @staticmethod

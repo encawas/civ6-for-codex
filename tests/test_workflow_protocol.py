@@ -1,5 +1,6 @@
 import pytest
 
+from civ6_workflow.domain import ApprovalStatus, ContinuationPolicy
 from civ6_workflow.models import (
     EventLevel,
     GameEvent,
@@ -10,6 +11,7 @@ from civ6_workflow.models import (
 from civ6_workflow.workflow_protocol import (
     EventResolution,
     InformationRequest,
+    LeaseContract,
     ResolutionDisposition,
     WorkflowProtocolError,
     validate_event_resolution_contract,
@@ -26,6 +28,30 @@ def _blocking_event():
         risk=RiskLevel.HIGH,
         blocking=True,
         dedupe_key="settler:7:10",
+    )
+
+
+def _lease_contract():
+    return LeaseContract(
+        valid_until_turn=15,
+        preconditions=[
+            {"type": "entity_exists", "entity_type": "unit", "entity_id": "7"},
+            {"type": "unit_type_contains", "unit_id": "7", "marker": "SETTLER"},
+            {"type": "tile_unoccupied", "x": 5, "y": 6},
+        ],
+        completion_condition={"type": "city_count_at_least", "count": 2},
+        invalidation_conditions=[
+            {"type": "unit_absent", "unit_id": "7"},
+            {
+                "type": "field_in",
+                "path": "overview.threat_level",
+                "values": ["HIGH", "SEVERE", "CRITICAL"],
+            },
+        ],
+        review_conditions=[{"type": "turn_at_least", "turn": 15}],
+        continuation_policy=ContinuationPolicy.EXTEND_WHEN_INPUT_UNCHANGED,
+        approval_status=ApprovalStatus.APPROVED,
+        subjects=[{"subject_type": "unit", "subject_id": "7"}],
     )
 
 
@@ -96,6 +122,7 @@ def test_settler_plan_update_closes_event_contract():
                 disposition=ResolutionDisposition.PLAN_UPDATE,
                 plan_refs=["unit:7"],
                 reason="advisor candidate selected",
+                lease_contract=_lease_contract(),
             )
         ],
     )
@@ -138,6 +165,7 @@ def test_found_city_requires_consumed_unit_and_new_city_proof():
                 disposition=ResolutionDisposition.TASK,
                 task_ids=[task.task_id],
                 reason="execute approved site",
+                lease_contract=_lease_contract(),
             )
         ],
     )

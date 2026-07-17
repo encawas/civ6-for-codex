@@ -21,6 +21,7 @@ class PlannerRequestStatus(StrEnum):
     BACKOFF = "BACKOFF"
     REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"
+    SUPERSEDED = "SUPERSEDED"
 
 
 TERMINAL_PLANNER_STATUSES = frozenset(
@@ -29,6 +30,7 @@ TERMINAL_PLANNER_STATUSES = frozenset(
         PlannerRequestStatus.FAILED,
         PlannerRequestStatus.REJECTED,
         PlannerRequestStatus.CANCELLED,
+        PlannerRequestStatus.SUPERSEDED,
     }
 )
 
@@ -37,6 +39,7 @@ class ProviderAttemptStatus(StrEnum):
     STARTED = "STARTED"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    ABANDONED = "ABANDONED"
 
 
 class InformationRoundStatus(StrEnum):
@@ -58,6 +61,8 @@ class PlannerRequest(DomainModel):
     request_payload: ImmutableJsonObject = {}
     plan_revision_refs: tuple[str, ...] = ()
     policy_revision: str
+    approval_contract_hash: str = "legacy"
+    allowed_actions_hash: str = "legacy"
     model_settings: ImmutableJsonObject
     status: PlannerRequestStatus
     created_at: datetime

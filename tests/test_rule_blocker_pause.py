@@ -121,13 +121,13 @@ def test_unresolved_rule_blocker_pauses_instead_of_polling_forever(tmp_path: Pat
 
     first = asyncio.run(engine.tick())
     assert first.agent_invoked is False
-    assert first.workflow_tick["outcome"] == "NO_SAFE_ACTION"
+    assert first.workflow_tick["outcome"] == "AWAITING_HUMAN"
     assert first.paused is True
-    assert "no executable recovery task" in first.pause_reason
+    assert "no safe automatic resolution" in first.pause_reason
     assert planner.calls == 0
 
     second = asyncio.run(engine.tick())
     assert planner.calls == 0
-    assert second.workflow_tick["outcome"] == "NO_SAFE_ACTION"
+    assert second.workflow_tick["outcome"] == "AWAITING_HUMAN"
     assert second.paused is True
-    assert "no executable recovery task" in second.pause_reason
+    assert "no safe automatic resolution" in second.pause_reason

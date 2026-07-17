@@ -183,6 +183,19 @@ class WorkflowEngine:
                 ctx.observation_ids.append(observation_id)
             return self._reconcile_attempt(ctx, observation, unresolved)
 
+        if ctx.starting_state is RuntimeState.AWAITING_HUMAN:
+            previous_ticks = self.store.list_workflow_ticks(snapshot.game_id)
+            previous_reason = (
+                getattr(previous_ticks[-1], "blocking_reason", None)
+                if previous_ticks
+                else None
+            )
+            return self._finish(
+                ctx,
+                snapshot,
+                AwaitingHumanTick,
+                blocking_reason=previous_reason or "human review is required",
+            )
         existing_due = self.store.due_tasks(snapshot.game_id, snapshot.turn)
         need_units = (
             observation.canonical.unit_summary.detail_required
@@ -201,6 +214,17 @@ class WorkflowEngine:
         materialization_started = self._monotonic()
         rule_compilation = self.rules.compile(observation)
         progression_compilation = self.progression.compile(observation)
+        current_events = [
+            *rule_compilation.events,
+            *progression_compilation.events,
+            *events_from_snapshot(snapshot),
+        ]
+        lease_tick = await self._pre_route_decision_runtime(
+            ctx, observation, current_events
+        )
+        if lease_tick is not None:
+            return lease_tick
+
         for compilation in (rule_compilation, progression_compilation):
             if compilation.bundle is not None:
                 self.store.save_plan_bundle(
@@ -287,6 +311,7 @@ class WorkflowEngine:
             observation,
             agent_events,
             compat,
+            current_events=events,
         )
         if planning_tick is not None:
             return planning_tick
@@ -329,6 +354,16 @@ class WorkflowEngine:
             )
         if self._may_end_turn(snapshot, compat):
             return await self._send_end_turn(ctx, observation)
+        if any(event.blocking for event in compat.events):
+            compat.paused = True
+            compat.pause_reason = "a blocking decision has no safe automatic resolution"
+            return self._finish(
+                ctx,
+                snapshot,
+                AwaitingHumanTick,
+                compatibility=compat,
+                blocking_reason=compat.pause_reason,
+            )
         return self._finish(
             ctx,
             snapshot,
@@ -1008,16 +1043,26 @@ class WorkflowEngine:
             return float(self.clock.monotonic())
         return time.perf_counter()
 
+    async def _pre_route_decision_runtime(
+        self,
+        ctx: _TickContext,
+        observation: NormalizedRuntimeObservation,
+        current_events: list[GameEvent],
+    ) -> TickResult | None:
+        return None
+
     async def _advance_decision_runtime(
         self,
         ctx: _TickContext,
         observation: NormalizedRuntimeObservation,
         agent_events: list[GameEvent],
         compatibility: TickResult,
+        current_events: list[GameEvent] | None = None,
     ) -> tuple[list[GameEvent], TickResult | None]:
         """Compatibility hook implemented by the canonical Phase 4 engine."""
 
         return agent_events, None
+
     async def _invoke_planner(
         self,
         snapshot: RuntimeSnapshot,

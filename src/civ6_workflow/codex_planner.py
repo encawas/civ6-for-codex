@@ -74,6 +74,15 @@ class CodexPlanner:
     def __init__(self, config: CodexPlannerConfig):
         self.config = config
         self.last_diagnostics: dict[str, Any] | None = None
+        self.provider_attempt_hook: Any | None = None
+
+    def set_provider_attempt_hook(self, hook: Any | None) -> bool:
+        self.provider_attempt_hook = hook
+        return True
+
+    async def _provider_attempt(self, phase: str, **details: Any) -> None:
+        if self.provider_attempt_hook is not None:
+            await self.provider_attempt_hook(phase, details)
 
     def build_command(
         self, *, schema_path: Path, output_path: Path, working_directory: Path
@@ -134,6 +143,7 @@ class CodexPlanner:
             from .responses_planner import ResponsesPlanner
 
             delegate = ResponsesPlanner(self.config, SYSTEM_INSTRUCTIONS, PlannerError)
+            delegate.set_provider_attempt_hook(self.provider_attempt_hook)
             try:
                 return await delegate.plan(request)
             finally:
@@ -204,6 +214,11 @@ class CodexPlanner:
                 f"Codex executable was not found: {self.config.command}"
             ) from exc
 
+        await self._provider_attempt(
+            "started",
+            provider_request_id=request.request_id,
+            attempt_number=1,
+        )
         diagnostics["attempt_count"] = 1
         record_diagnostics()
         communication = asyncio.create_task(process.communicate(prompt.encode("utf-8")))

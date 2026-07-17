@@ -163,6 +163,25 @@ def stable_decision_identity(event: GameEvent) -> tuple[str, bool]:
         else f"{event.entity_type or 'entity'}-{event.entity_id}"
     )
     parts = [event.event_type.replace("_", "-"), entity]
+    if event.event_type == "pending_diplomacy":
+        instance_id = next(
+            (
+                event.payload.get(key)
+                for key in (
+                    "diplomacy_id",
+                    "request_id",
+                    "other_player_id",
+                    "player_id",
+                )
+                if event.payload.get(key) is not None
+            ),
+            None,
+        )
+        if instance_id is None:
+            raise ValueError(
+                "diplomacy decisions require a stable player, request, or instance ID"
+            )
+        parts.append(f"instance-{instance_id}")
 
     if event.event_type in {
         "settler_plan_requires_review",
@@ -212,6 +231,7 @@ def build_decision_input_projection(
         "event_facts": _pick(event.payload, _PAYLOAD_KEYS),
         "strategy": _compact_strategy(context.get("strategy")),
         "plan_revisions": _relevant_plan_revisions(event, context),
+        "plan_facts": _relevant_plan_facts(event, context),
         "approval": {
             "execution_mode": context.get("execution_mode"),
             "required": bool(event.risk.value in {"high", "critical"}),
@@ -267,7 +287,8 @@ def build_decision_gap(
     projection = build_decision_input_projection(snapshot, event, context)
     relevant_hash = hash_decision_input(projection)
     timestamp = now or datetime.now(UTC)
-    gap_id = f"gap_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+    scoped_identity = f"{game_id}\0{identity}"
+    gap_id = f"gap_{hashlib.sha256(scoped_identity.encode('utf-8')).hexdigest()[:24]}"
     changed = existing is not None and existing.relevant_input_hash != relevant_hash
     return DecisionGap(
         decision_gap_id=gap_id,
@@ -348,7 +369,7 @@ def batch_compatible_gaps(
         ],
     }
     group_hash = hash_decision_input(combined)
-    identity = "|".join(ordered)
+    identity = f"{game_id}\0{'|'.join(ordered)}"
     return DecisionGroup(
         decision_group_id=(
             f"group_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
@@ -380,6 +401,30 @@ def evaluate_plan_lease(
         }[lease.status]
         return LeaseEvaluation(result, lease, f"lease is already {lease.status.value}")
 
+    for condition in lease.preconditions:
+        outcome = evaluator.evaluate(_condition_payload(condition), observation)
+        if outcome.reason.startswith("unsupported condition type"):
+            updated = lease.model_copy(
+                update={
+                    "status": PlanLeaseStatus.AWAITING_INFORMATION,
+                    "last_validated_observation_id": _observation_marker(observation),
+                    "last_validation_result": LeaseValidationResult.UNKNOWN,
+                }
+            )
+            return LeaseEvaluation(
+                LeaseValidationResult.UNKNOWN, updated, outcome.reason
+            )
+        if not outcome.valid:
+            reason = f"lease precondition failed: {condition.condition_type}"
+            updated = lease.model_copy(
+                update={
+                    "status": PlanLeaseStatus.INVALIDATED,
+                    "last_validated_observation_id": _observation_marker(observation),
+                    "last_validation_result": LeaseValidationResult.INVALIDATED,
+                    "invalidation_reason": reason,
+                }
+            )
+            return LeaseEvaluation(LeaseValidationResult.INVALIDATED, updated, reason)
     if lease.completion_condition is not None:
         condition = _condition_payload(lease.completion_condition)
         outcome = evaluator.evaluate(condition, observation)
@@ -424,6 +469,35 @@ def evaluate_plan_lease(
                 outcome.reason,
             )
 
+    for condition in lease.review_conditions:
+        outcome = evaluator.evaluate(_condition_payload(condition), observation)
+        if outcome.reason.startswith("unsupported condition type"):
+            updated = lease.model_copy(
+                update={
+                    "status": PlanLeaseStatus.AWAITING_INFORMATION,
+                    "last_validated_observation_id": _observation_marker(observation),
+                    "last_validation_result": LeaseValidationResult.UNKNOWN,
+                }
+            )
+            return LeaseEvaluation(
+                LeaseValidationResult.UNKNOWN, updated, outcome.reason
+            )
+        if (
+            outcome.valid
+            and lease.continuation_policy is ContinuationPolicy.REQUIRE_REVIEW
+        ):
+            updated = lease.model_copy(
+                update={
+                    "status": PlanLeaseStatus.AWAITING_INFORMATION,
+                    "last_validated_observation_id": _observation_marker(observation),
+                    "last_validation_result": LeaseValidationResult.UNKNOWN,
+                }
+            )
+            return LeaseEvaluation(
+                LeaseValidationResult.UNKNOWN,
+                updated,
+                f"review condition matched: {condition.condition_type}",
+            )
     if lease.valid_until_turn is not None and turn > lease.valid_until_turn:
         unchanged = lease.relevant_input_hash == relevant_input_hash
         if (
@@ -559,6 +633,34 @@ def _compact_strategy(value: Any) -> dict[str, Any]:
         if key in value:
             result[key] = value[key]
     return result
+
+
+def _relevant_plan_facts(event: GameEvent, context: dict[str, Any]) -> dict[str, Any]:
+    if event.entity_type == "city":
+        plans = context.get("cities", {})
+    elif event.entity_type in {"unit", "builder"}:
+        plans = context.get("units", {})
+    else:
+        return {}
+    if not isinstance(plans, dict) or event.entity_id is None:
+        return {}
+    plan = plans.get(str(event.entity_id), plans.get(event.entity_id))
+    if not isinstance(plan, dict):
+        return {}
+    keys = (
+        "revision",
+        "_revision",
+        "_plan_id",
+        "target",
+        "target_x",
+        "target_y",
+        "path",
+        "site",
+        "x",
+        "y",
+        "threat_level",
+    )
+    return _pick(plan, keys)
 
 
 def _relevant_plan_revisions(

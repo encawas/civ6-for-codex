@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from .domain import (
     DecisionGroup,
     InformationRound,
     PlanLease,
+    PlanLeaseStatus,
     PlannerRequest,
     PlannerRequestStatus,
     ProviderAttempt,
@@ -26,6 +28,7 @@ from .domain import (
     TurnTransitionConfirmedTick,
     WorkflowTick,
     validate_workflow_tick,
+    ProviderAttemptStatus,
 )
 from .models import (
     AgentRequest,
@@ -558,7 +561,195 @@ class WorkflowStore:
             "WHERE updated_at IS NULL"
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
-        conn.execute("PRAGMA user_version=6")
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < 7:
+            WorkflowStore._migrate_phase4_v7(conn)
+        conn.execute("PRAGMA user_version=7")
+
+    @staticmethod
+    def _migrate_phase4_v7(conn: sqlite3.Connection) -> None:
+        """Scope Phase 4 identities to a game and invalidate implicit v6 leases."""
+
+        gap_ids: dict[str, str] = {}
+        gap_payloads: dict[str, dict[str, Any]] = {}
+        rows = conn.execute(
+            "SELECT decision_gap_id, game_id, stable_identity, gap_json "
+            "FROM decision_gaps"
+        ).fetchall()
+        for row in rows:
+            old_id = str(row["decision_gap_id"])
+            game_id = str(row["game_id"])
+            identity = str(row["stable_identity"])
+            scoped = f"{game_id}\0{identity}".encode("utf-8")
+            new_id = f"gap_{hashlib.sha256(scoped).hexdigest()[:24]}"
+            payload = json.loads(row["gap_json"])
+            payload["decision_gap_id"] = new_id
+            payload["game_session_id"] = game_id
+            conn.execute(
+                "UPDATE decision_gaps SET decision_gap_id=?, gap_json=? "
+                "WHERE decision_gap_id=?",
+                (new_id, WorkflowStore._dump(payload), old_id),
+            )
+            gap_ids[old_id] = new_id
+            gap_payloads[new_id] = payload
+
+        group_ids: dict[str, tuple[str, str]] = {}
+        rows = conn.execute(
+            "SELECT decision_group_id, game_id, group_json FROM decision_groups"
+        ).fetchall()
+        for row in rows:
+            old_id = str(row["decision_group_id"])
+            game_id = str(row["game_id"])
+            payload = json.loads(row["group_json"])
+            mapped = sorted(
+                gap_ids.get(str(gap_id), str(gap_id))
+                for gap_id in payload.get("decision_gap_ids", [])
+            )
+            identity = f"{game_id}\0{'|'.join(mapped)}".encode("utf-8")
+            new_id = f"group_{hashlib.sha256(identity).hexdigest()[:24]}"
+            combined = {
+                "projection_version": payload.get(
+                    "input_projection_version", "decision-input/v1"
+                ),
+                "gaps": [
+                    {
+                        "decision_gap_id": gap_id,
+                        "stable_identity": gap_payloads.get(gap_id, {}).get(
+                            "stable_identity", "legacy"
+                        ),
+                        "input_hash": gap_payloads.get(gap_id, {}).get(
+                            "relevant_input_hash", "legacy"
+                        ),
+                    }
+                    for gap_id in mapped
+                ],
+            }
+            group_hash = hashlib.sha256(
+                json.dumps(
+                    combined,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            payload.update(
+                {
+                    "decision_group_id": new_id,
+                    "game_session_id": game_id,
+                    "decision_gap_ids": mapped,
+                    "input_projection_hash": group_hash,
+                }
+            )
+            conn.execute(
+                """
+                UPDATE decision_groups
+                SET decision_group_id=?, decision_gap_ids_json=?,
+                    input_projection_hash=?, group_json=?
+                WHERE decision_group_id=?
+                """,
+                (
+                    new_id,
+                    WorkflowStore._dump(mapped),
+                    group_hash,
+                    WorkflowStore._dump(payload),
+                    old_id,
+                ),
+            )
+            group_ids[old_id] = (new_id, group_hash)
+
+        rows = conn.execute(
+            "SELECT planner_request_id, decision_group_id, request_json "
+            "FROM logical_planner_requests"
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["request_json"])
+            mapped = [
+                gap_ids.get(str(gap_id), str(gap_id))
+                for gap_id in payload.get("decision_gap_ids", [])
+            ]
+            old_group = row["decision_group_id"]
+            group = (
+                (None, payload.get("input_projection_hash", "legacy"))
+                if old_group is None
+                else group_ids.get(
+                    str(old_group),
+                    (str(old_group), payload.get("input_projection_hash", "legacy")),
+                )
+            )
+            payload["decision_gap_ids"] = mapped
+            payload["decision_group_id"] = group[0]
+            payload["input_projection_hash"] = group[1]
+            projection = payload.get("input_projection")
+            if isinstance(projection, dict):
+                projection["decision_group_id"] = group[0]
+            conn.execute(
+                """
+                UPDATE logical_planner_requests
+                SET decision_group_id=?, decision_gap_ids_json=?,
+                    input_projection_hash=?, request_json=?
+                WHERE planner_request_id=?
+                """,
+                (
+                    group[0],
+                    WorkflowStore._dump(mapped),
+                    group[1],
+                    WorkflowStore._dump(payload),
+                    row["planner_request_id"],
+                ),
+            )
+
+        rows = conn.execute(
+            "SELECT plan_lease_id, status, lease_json FROM plan_leases"
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["lease_json"])
+            payload["decision_gap_ids"] = [
+                gap_ids.get(str(gap_id), str(gap_id))
+                for gap_id in payload.get("decision_gap_ids", [])
+            ]
+            status = str(row["status"])
+            if status == "ACTIVE" and not (
+                payload.get("preconditions")
+                and payload.get("completion_condition")
+                and payload.get("invalidation_conditions")
+                and payload.get("review_conditions")
+            ):
+                status = "AWAITING_INFORMATION"
+                payload["status"] = status
+                payload["last_validation_result"] = "UNKNOWN"
+                payload["invalidation_reason"] = (
+                    "v6 lease lacked an explicit durability contract"
+                )
+            conn.execute(
+                "UPDATE plan_leases SET status=?, lease_json=? WHERE plan_lease_id=?",
+                (status, WorkflowStore._dump(payload), row["plan_lease_id"]),
+            )
+
+        for old_id, new_id in gap_ids.items():
+            conn.execute(
+                "UPDATE planner_suppressions SET decision_gap_id=? "
+                "WHERE decision_gap_id=?",
+                (new_id, old_id),
+            )
+
+        rows = conn.execute("SELECT tick_id, tick_json FROM workflow_ticks").fetchall()
+        for row in rows:
+            payload = json.loads(row["tick_json"])
+            changed = False
+            if payload.get("decision_gap_id") in gap_ids:
+                payload["decision_gap_id"] = gap_ids[payload["decision_gap_id"]]
+                changed = True
+            if isinstance(payload.get("decision_gap_ids"), list):
+                payload["decision_gap_ids"] = [
+                    gap_ids.get(str(gap_id), str(gap_id))
+                    for gap_id in payload["decision_gap_ids"]
+                ]
+                changed = True
+            if changed:
+                conn.execute(
+                    "UPDATE workflow_ticks SET tick_json=? WHERE tick_id=?",
+                    (WorkflowStore._dump(payload), row["tick_id"]),
+                )
 
     @staticmethod
     def _repair_failed_attempt_tasks(conn: sqlite3.Connection) -> None:
@@ -1927,11 +2118,13 @@ class WorkflowStore:
             ).fetchone()
         return None if row is None else DecisionGap.model_validate_json(row["gap_json"])
 
-    def get_decision_gap(self, decision_gap_id: str) -> DecisionGap | None:
+    def get_decision_gap(
+        self, game_id: str, decision_gap_id: str
+    ) -> DecisionGap | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT gap_json FROM decision_gaps WHERE decision_gap_id=?",
-                (decision_gap_id,),
+                "SELECT gap_json FROM decision_gaps WHERE game_id=? AND decision_gap_id=?",
+                (game_id, decision_gap_id),
             ).fetchone()
         return None if row is None else DecisionGap.model_validate_json(row["gap_json"])
 
@@ -1951,6 +2144,33 @@ class WorkflowStore:
         with self._connect() as conn:
             rows = conn.execute(query, values).fetchall()
         return [DecisionGap.model_validate_json(row["gap_json"]) for row in rows]
+
+    @staticmethod
+    def _invalidate_plan_projection_in_connection(
+        conn: sqlite3.Connection, lease: PlanLease
+    ) -> None:
+        for subject in lease.subjects:
+            table_and_column = {
+                "city": ("city_plans", "city_id"),
+                "unit": ("unit_plans", "unit_id"),
+                "builder": ("builder_plans", "builder_key"),
+            }.get(subject.subject_type)
+            if table_and_column is None:
+                continue
+            table, column = table_and_column
+            conn.execute(
+                f"DELETE FROM {table} WHERE game_id=? AND {column}=? AND plan_id=?",
+                (
+                    lease.game_session_id,
+                    subject.subject_id,
+                    lease.plan_id,
+                ),
+            )
+        if lease.scope == "empire":
+            conn.execute(
+                "DELETE FROM strategy_state WHERE game_id=? AND plan_id=?",
+                (lease.game_session_id, lease.plan_id),
+            )
 
     @staticmethod
     def _save_plan_lease_in_connection(
@@ -2053,12 +2273,16 @@ class WorkflowStore:
         )
 
     def active_planner_request(self, game_id: str) -> PlannerRequest | None:
-        terminal = tuple(status.value for status in (
-            PlannerRequestStatus.COMPLETED,
-            PlannerRequestStatus.FAILED,
-            PlannerRequestStatus.REJECTED,
-            PlannerRequestStatus.CANCELLED,
-        ))
+        terminal = tuple(
+            status.value
+            for status in (
+                PlannerRequestStatus.COMPLETED,
+                PlannerRequestStatus.FAILED,
+                PlannerRequestStatus.REJECTED,
+                PlannerRequestStatus.CANCELLED,
+                PlannerRequestStatus.SUPERSEDED,
+            )
+        )
         placeholders = ",".join("?" for _ in terminal)
         with self._connect() as conn:
             row = conn.execute(
@@ -2142,15 +2366,77 @@ class WorkflowStore:
             ),
         )
 
-    def save_provider_attempt(
-        self, game_id: str, attempt: ProviderAttempt
-    ) -> None:
+    def save_provider_attempt(self, game_id: str, attempt: ProviderAttempt) -> None:
         with self._connect() as conn:
             self._save_provider_attempt_in_connection(conn, game_id, attempt)
 
-    def list_provider_attempts(
-        self, planner_request_id: str
-    ) -> list[ProviderAttempt]:
+    def start_provider_attempt(
+        self,
+        game_id: str,
+        request: PlannerRequest,
+        attempt: ProviderAttempt,
+    ) -> PlannerRequest:
+        """Persist STARTED before the provider call and abandon crash leftovers."""
+
+        if attempt.status is not ProviderAttemptStatus.STARTED:
+            raise ValueError("provider attempt must start in STARTED")
+        if request.game_session_id != game_id:
+            raise ValueError("planner request belongs to another game")
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT attempt_json FROM provider_attempts
+                WHERE game_id=? AND planner_request_id=? AND status=?
+                ORDER BY attempt_number
+                """,
+                (
+                    game_id,
+                    request.planner_request_id,
+                    ProviderAttemptStatus.STARTED.value,
+                ),
+            ).fetchall()
+            for row in rows:
+                interrupted = ProviderAttempt.model_validate_json(
+                    row["attempt_json"]
+                ).model_copy(
+                    update={
+                        "status": ProviderAttemptStatus.ABANDONED,
+                        "completed_at": attempt.started_at,
+                        "latency_seconds": 0.0,
+                        "failure_category": "provider_process_interrupted",
+                        "diagnostics": {
+                            "recovered_on_restart": True,
+                            "delivery": "unknown",
+                        },
+                    }
+                )
+                self._save_provider_attempt_in_connection(conn, game_id, interrupted)
+            expected = int(
+                conn.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number), 0) + 1 AS value
+                    FROM provider_attempts
+                    WHERE game_id=? AND planner_request_id=?
+                    """,
+                    (game_id, request.planner_request_id),
+                ).fetchone()["value"]
+            )
+            if attempt.attempt_number != expected:
+                raise ValueError(
+                    f"provider attempt_number must be {expected}, "
+                    f"got {attempt.attempt_number}"
+                )
+            in_progress = request.model_copy(
+                update={
+                    "status": PlannerRequestStatus.IN_PROGRESS,
+                    "provider_attempt_count": attempt.attempt_number,
+                }
+            )
+            self._save_planner_request_in_connection(conn, in_progress)
+            self._save_provider_attempt_in_connection(conn, game_id, attempt)
+        return in_progress
+
+    def list_provider_attempts(self, planner_request_id: str) -> list[ProviderAttempt]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -2213,9 +2499,7 @@ class WorkflowStore:
                 """,
                 (planner_request_id,),
             ).fetchall()
-        return [
-            InformationRound.model_validate_json(row["round_json"]) for row in rows
-        ]
+        return [InformationRound.model_validate_json(row["round_json"]) for row in rows]
 
     def record_planner_suppression(
         self,
@@ -2253,6 +2537,7 @@ class WorkflowStore:
         provider_attempts: Sequence[ProviderAttempt] = (),
         information_round: InformationRound | None = None,
         active_attempt_id: str | None = None,
+        cancel_task_ids: Sequence[str] = (),
     ) -> None:
         tick = validate_workflow_tick(tick)
         with self._connect() as conn:
@@ -2296,6 +2581,26 @@ class WorkflowStore:
                 if lease.game_session_id != tick.game_session_id:
                     raise ValueError("plan lease and Tick must belong to one game")
                 self._save_plan_lease_in_connection(conn, lease)
+                if lease.status is not PlanLeaseStatus.ACTIVE:
+                    self._invalidate_plan_projection_in_connection(conn, lease)
+            for task_id in cancel_task_ids:
+                conn.execute(
+                    """
+                    UPDATE workflow_tasks
+                    SET status=?, last_error=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE game_id=? AND task_id=?
+                      AND status IN (?, ?, ?)
+                    """,
+                    (
+                        TaskStatus.CANCELLED.value,
+                        "dependent plan lease is no longer executable",
+                        tick.game_session_id,
+                        task_id,
+                        TaskStatus.PENDING.value,
+                        TaskStatus.READY.value,
+                        TaskStatus.AWAITING_CONFIRMATION.value,
+                    ),
+                )
             self._save_runtime_state_in_connection(
                 conn,
                 tick.game_session_id,
@@ -2306,34 +2611,42 @@ class WorkflowStore:
 
     def planner_metrics(self, game_id: str) -> dict[str, Any]:
         with self._connect() as conn:
-            logical = int(conn.execute(
-                """
+            logical = int(
+                conn.execute(
+                    """
                 SELECT COUNT(*) AS value FROM logical_planner_requests
                 WHERE game_id=?
                 """,
-                (game_id,),
-            ).fetchone()["value"])
-            provider = int(conn.execute(
-                """
+                    (game_id,),
+                ).fetchone()["value"]
+            )
+            provider = int(
+                conn.execute(
+                    """
                 SELECT COUNT(*) AS value FROM provider_attempts
                 WHERE game_id=?
                 """,
-                (game_id,),
-            ).fetchone()["value"])
-            information = int(conn.execute(
-                """
+                    (game_id,),
+                ).fetchone()["value"]
+            )
+            information = int(
+                conn.execute(
+                    """
                 SELECT COUNT(*) AS value FROM information_rounds
                 WHERE game_id=?
                 """,
-                (game_id,),
-            ).fetchone()["value"])
-            suppressed = int(conn.execute(
-                """
+                    (game_id,),
+                ).fetchone()["value"]
+            )
+            suppressed = int(
+                conn.execute(
+                    """
                 SELECT COUNT(*) AS value FROM planner_suppressions
                 WHERE game_id=?
                 """,
-                (game_id,),
-            ).fetchone()["value"])
+                    (game_id,),
+                ).fetchone()["value"]
+            )
             turn_rows = conn.execute(
                 """
                 SELECT turn,
@@ -2358,6 +2671,7 @@ class WorkflowStore:
                 1.0 if total_turns == 0 else zero_turns / total_turns
             ),
         }
+
     def agent_called_for_turn(self, game_id: str, turn: int) -> bool:
         with self._connect() as conn:
             row = conn.execute(

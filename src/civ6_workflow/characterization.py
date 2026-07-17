@@ -220,6 +220,12 @@ class RecordingPlanner:
         self.requests: list[AgentRequest] = []
         self.responses: list[PlanBundle] = []
 
+    def set_provider_attempt_hook(self, hook: Any | None) -> bool:
+        setter = getattr(self.delegate, "set_provider_attempt_hook", None)
+        if callable(setter):
+            return bool(setter(hook))
+        return False
+
     @property
     def summary(self) -> PlannerCallSummary:
         return PlannerCallSummary(
@@ -297,6 +303,11 @@ class ScriptedPlanner:
         self._responses = list(responses)
         self._provider_attempts = list(provider_attempts)
         self.last_diagnostics: dict[str, Any] | None = None
+        self.provider_attempt_hook: Any | None = None
+
+    def set_provider_attempt_hook(self, hook: Any | None) -> bool:
+        self.provider_attempt_hook = hook
+        return True
 
     async def plan(self, request: AgentRequest) -> PlanBundle:
         self.last_diagnostics = None
@@ -305,6 +316,20 @@ class ScriptedPlanner:
                 f"no scripted planner response for {request.request_id}"
             )
         attempts = self._provider_attempts.pop(0) if self._provider_attempts else 1
+        for attempt in range(1, attempts + 1):
+            if self.provider_attempt_hook is not None:
+                await self.provider_attempt_hook(
+                    "started",
+                    {
+                        "provider_request_id": request.request_id,
+                        "attempt_number": attempt,
+                    },
+                )
+                if attempt < attempts:
+                    await self.provider_attempt_hook(
+                        "failed",
+                        {"failure_category": "scripted_retry"},
+                    )
         self.last_diagnostics = {"attempt_count": attempts}
         return self._responses.pop(0).model_copy(deep=True)
 

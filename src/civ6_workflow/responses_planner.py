@@ -33,11 +33,22 @@ class PlannerHttpDiagnostics:
 class ResponsesPlanner:
     """Low-overhead runtime planner using the OpenAI Responses API directly."""
 
-    def __init__(self, config: Any, system_instructions: str, error_type: type[Exception]):
+    def __init__(
+        self, config: Any, system_instructions: str, error_type: type[Exception]
+    ):
         self.config = config
         self.system_instructions = system_instructions
         self.error_type = error_type
         self.last_diagnostics: dict[str, Any] | None = None
+        self.provider_attempt_hook: Any | None = None
+
+    def set_provider_attempt_hook(self, hook: Any | None) -> bool:
+        self.provider_attempt_hook = hook
+        return True
+
+    async def _provider_attempt(self, phase: str, **details: Any) -> None:
+        if self.provider_attempt_hook is not None:
+            await self.provider_attempt_hook(phase, details)
 
     async def plan(self, request: AgentRequest) -> PlanBundle:
         try:
@@ -77,9 +88,9 @@ class ResponsesPlanner:
         }
         if self.config.reasoning_effort:
             payload["reasoning"] = {"effort": self.config.reasoning_effort}
-        raw_request = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        raw_request = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
         diagnostics = PlannerHttpDiagnostics(
             request_bytes=len(raw_request),
             credential_source=credential.source,
@@ -106,6 +117,12 @@ class ResponsesPlanner:
                     max_attempts = max(1, int(self.config.max_http_attempts))
                     for attempt in range(1, max_attempts + 1):
                         diagnostics.attempt_count = attempt
+                        await self._provider_attempt(
+                            "started",
+                            provider_request_id=request.request_id,
+                            attempt_number=attempt,
+                        )
+                        response = None
                         try:
                             async with client.stream(
                                 "POST", url, headers=headers, content=raw_request
@@ -129,12 +146,28 @@ class ResponsesPlanner:
                             last_error = exc
                             if attempt >= max_attempts:
                                 raise
+                            await self._provider_attempt(
+                                "failed",
+                                failure_category=type(exc).__name__,
+                                diagnostics=asdict(diagnostics),
+                            )
                         else:
                             if (
                                 response.status_code not in {429, 502, 503, 504}
                                 or attempt >= max_attempts
                             ):
                                 return response, body
+                        if response is not None and response.status_code in {
+                            429,
+                            502,
+                            503,
+                            504,
+                        }:
+                            await self._provider_attempt(
+                                "failed",
+                                failure_category=f"http_{response.status_code}",
+                                diagnostics=asdict(diagnostics),
+                            )
                         delay = float(self.config.retry_base_seconds) * (
                             2 ** (attempt - 1)
                         )
@@ -228,7 +261,9 @@ class ResponsesPlanner:
         self.last_diagnostics = asdict(diagnostics)
         log.info(
             "civ6 planner HTTP diagnostics: %s",
-            json.dumps(self.last_diagnostics, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(
+                self.last_diagnostics, ensure_ascii=False, separators=(",", ":")
+            ),
         )
 
 

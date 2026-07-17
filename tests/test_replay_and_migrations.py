@@ -98,7 +98,7 @@ def test_legacy_database_migrates_retry_state(tmp_path: Path):
     assert task.retry_count == 0
     assert task.max_retries == 2
     with sqlite3.connect(database) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
 
 
 def test_replay_store_state_restores_exact_task_status(tmp_path: Path):
@@ -406,6 +406,6 @@ def test_recorded_explicit_rejection_fails_without_retry(tmp_path: Path):
 
     second = asyncio.run(engine.tick())
     assert second.agent_invoked is False
-    assert second.workflow_tick["outcome"] == "NO_SAFE_ACTION"
+    assert second.workflow_tick["outcome"] == "AWAITING_HUMAN"
     assert second.paused is True
     assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
