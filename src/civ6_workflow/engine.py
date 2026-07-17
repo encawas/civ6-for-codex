@@ -72,6 +72,9 @@ from .verification import (
 from .workflow_protocol import LEASE_CONDITION_TYPES
 
 
+END_TURN_AUTHORIZATION_PROJECTION_VERSION = "end-turn-authorization/v1"
+
+
 @dataclass(slots=True)
 class EngineConfig:
     execution_mode: ExecutionMode = ExecutionMode.CONFIRM
@@ -137,6 +140,15 @@ class WorkflowEngine:
         self.progression = ProgressionRuleCompiler(store)
         self._available_tools: set[str] | None = None
         self._active_observation_id: str | None = None
+
+    def request_end_turn_retry(self, game_id: str, turn: int) -> None:
+        """Persist explicit authorization to retry the latest rejected end turn."""
+        attempt = self.store.latest_attempt_for_task(game_id, f"end_turn:{turn}")
+        if attempt is None or not self._is_explicit_end_turn_rejection(attempt):
+            raise ValueError(
+                "the current turn has no explicitly rejected end-turn attempt"
+            )
+        self.store.set_meta(self._end_turn_retry_key(attempt), True)
 
     async def tick(self) -> TickResult:
         ctx = _TickContext(
@@ -353,7 +365,16 @@ class WorkflowEngine:
                 compatibility=compat,
                 blocking_reason=compat.pause_reason or "human review is required",
             )
+        end_turn_suppression = self._end_turn_rejection_suppression(observation)
         if self._may_end_turn(snapshot, compat):
+            if end_turn_suppression is not None:
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    NoSafeActionTick,
+                    compatibility=compat,
+                    blocking_reason=end_turn_suppression,
+                )
             return await self._send_end_turn(ctx, observation)
         if any(event.blocking for event in compat.events):
             compat.paused = True
@@ -683,6 +704,7 @@ class WorkflowEngine:
         self, ctx: _TickContext, observation: NormalizedRuntimeObservation
     ) -> TickResult:
         snapshot = observation.snapshot
+        authorization_hash = self._end_turn_authorization_hash(observation)
         task_id = f"end_turn:{snapshot.turn}"
         parent = self.store.latest_attempt_for_task(snapshot.game_id, task_id)
         attempt = ActionAttempt(
@@ -697,7 +719,12 @@ class WorkflowEngine:
             prepared_at=self._now(),
             status=AttemptStatus.PREPARED,
             retry_classification=END_TURN_ACTION_SPEC.retry_classification,
-            normalized_arguments={},
+            normalized_arguments={
+                "authorization_projection_version": (
+                    END_TURN_AUTHORIZATION_PROJECTION_VERSION
+                ),
+                "authorization_projection_hash": authorization_hash,
+            },
             postconditions=(),
             parent_attempt_id=(None if parent is None else parent.action_attempt_id),
             pre_send_turn=snapshot.turn,
@@ -1274,3 +1301,117 @@ class WorkflowEngine:
             and (task.expires_turn is None or task.expires_turn >= snapshot.turn)
             for task in self.store.list_tasks(snapshot.game_id, statuses=blocking)
         )
+
+    def _end_turn_rejection_suppression(
+        self, observation: NormalizedRuntimeObservation
+    ) -> str | None:
+        snapshot = observation.snapshot
+        attempt = self.store.latest_attempt_for_task(
+            snapshot.game_id, f"end_turn:{snapshot.turn}"
+        )
+        if attempt is None or not self._is_explicit_end_turn_rejection(attempt):
+            return None
+        if self.store.get_meta(self._end_turn_retry_key(attempt), False):
+            return None
+
+        rejected_hash = attempt.normalized_arguments.get(
+            "authorization_projection_hash"
+        )
+        current_hash = self._end_turn_authorization_hash(observation)
+        material_change_key = self._end_turn_material_change_key(attempt)
+        if rejected_hash is not None and current_hash != rejected_hash:
+            self.store.set_meta(
+                material_change_key,
+                {
+                    "authorization_projection_hash": current_hash,
+                    "observation_id": self._active_observation_id,
+                },
+            )
+            return None
+        if self.store.get_meta(material_change_key) is not None:
+            return None
+        return (
+            "end turn remains suppressed because the current-turn attempt was "
+            f"explicitly rejected and authorization state is unchanged "
+            f"({attempt.action_attempt_id})"
+        )
+
+    @staticmethod
+    def _is_explicit_end_turn_rejection(attempt: ActionAttempt) -> bool:
+        return (
+            attempt.action_type == "end_turn"
+            and attempt.status is AttemptStatus.FAILED
+            and attempt.transport_result is not None
+            and attempt.transport_result.get("delivery_status")
+            == MutationDeliveryStatus.EXPLICITLY_REJECTED.value
+        )
+
+    @staticmethod
+    def _end_turn_retry_key(attempt: ActionAttempt) -> str:
+        return f"end_turn_explicit_retry:{attempt.action_attempt_id}"
+
+    @staticmethod
+    def _end_turn_material_change_key(attempt: ActionAttempt) -> str:
+        return f"end_turn_material_change:{attempt.action_attempt_id}"
+
+    @staticmethod
+    def _end_turn_authorization_hash(
+        observation: NormalizedRuntimeObservation,
+    ) -> str:
+        canonical = observation.canonical
+        snapshot = observation.snapshot
+        projection = {
+            "version": END_TURN_AUTHORIZATION_PROJECTION_VERSION,
+            "normalization_version": canonical.normalization_version,
+            "cities": sorted(
+                (
+                    {
+                        "city_id": city.entity_id.value,
+                        "production_state": city.production.state.value,
+                        "production_value": city.production.value,
+                    }
+                    for city in canonical.cities
+                ),
+                key=lambda row: row["city_id"],
+            ),
+            "progression": {
+                "research_state": canonical.progression.current_research.state.value,
+                "research_value": canonical.progression.current_research.value,
+                "civic_state": canonical.progression.current_civic.state.value,
+                "civic_value": canonical.progression.current_civic.value,
+            },
+            "units": (
+                None
+                if canonical.units is None
+                else sorted(
+                    (
+                        {
+                            "unit_id": unit.entity_id.value,
+                            "unit_type": unit.unit_type,
+                            "action_state": unit.action_state.value,
+                            "moves_remaining": unit.moves_remaining,
+                            "x": unit.values.get("x"),
+                            "y": unit.values.get("y"),
+                            "needs_promotion": unit.values.get("needs_promotion"),
+                        }
+                        for unit in canonical.units
+                    ),
+                    key=lambda row: row["unit_id"],
+                )
+            ),
+            "blockers": sorted(
+                (blocker.model_dump(mode="json") for blocker in canonical.blockers),
+                key=lambda row: json.dumps(row, sort_keys=True, default=str),
+            ),
+            "notifications": snapshot.notifications,
+            "diplomacy": snapshot.diplomacy,
+            "trades": snapshot.trades,
+        }
+        encoded = json.dumps(
+            projection,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
