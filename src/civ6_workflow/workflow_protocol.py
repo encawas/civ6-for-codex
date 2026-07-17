@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -7,7 +9,7 @@ from uuid import uuid4
 
 from pydantic import Field, field_validator, model_validator
 
-from .decisioning import STRATEGIC_GAP_TYPES
+from .decisioning import SETTLER_GAP_TYPES, STRATEGIC_GAP_TYPES
 from .domain import ContinuationPolicy
 
 from .models import (
@@ -19,38 +21,132 @@ from .models import (
     TickMetrics as BaseTickMetrics,
 )
 
-LEASE_CONDITION_TYPES = frozenset(
+_LEASE_CONDITION_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "all_of": (frozenset({"conditions"}), frozenset()),
+    "approved_target_equals": (frozenset({"x", "y"}), frozenset()),
+    "city_at_target": (frozenset({"x", "y"}), frozenset({"owner"})),
+    "city_count_at_least": (frozenset({"count"}), frozenset()),
+    "entity_exists": (
+        frozenset({"entity_type", "entity_id"}),
+        frozenset(),
+    ),
+    "field_in": (frozenset({"path", "values"}), frozenset()),
+    "settler_path_reachable": (frozenset({"x", "y"}), frozenset()),
+    "settler_target_legal": (frozenset({"x", "y"}), frozenset()),
+    "severe_threat_absent": (frozenset(), frozenset()),
+    "tile_unoccupied": (frozenset({"x", "y"}), frozenset()),
+    "turn_at_least": (frozenset({"turn"}), frozenset()),
+    "turn_equals": (frozenset({"turn"}), frozenset()),
+    "unit_absent": (frozenset({"unit_id"}), frozenset()),
+    "unit_type_contains": (
+        frozenset({"unit_id", "marker"}),
+        frozenset(),
+    ),
+}
+LEASE_CONDITION_TYPES = frozenset(_LEASE_CONDITION_FIELDS)
+_COORDINATE_CONDITION_TYPES = frozenset(
     {
-        "all_of",
         "approved_target_equals",
         "city_at_target",
-        "city_count_at_least",
-        "entity_exists",
-        "field_in",
         "settler_path_reachable",
         "settler_target_legal",
-        "severe_threat_absent",
         "tile_unoccupied",
-        "turn_at_least",
-        "turn_equals",
-        "unit_absent",
-        "unit_type_contains",
     }
 )
 
 
+def _strict_non_negative_int(
+    condition: dict[str, Any],
+    field_name: str,
+    *,
+    maximum: int,
+) -> int:
+    value = condition[field_name]
+    if type(value) is not int or not 0 <= value <= maximum:
+        raise ValueError(
+            f"lease condition {field_name} must be an integer from 0 to {maximum}"
+        )
+    return value
+
+
+def _strict_identifier(condition: dict[str, Any], field_name: str) -> None:
+    value = condition[field_name]
+    if type(value) is int:
+        if value < 0:
+            raise ValueError(f"lease condition {field_name} must not be negative")
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"lease condition {field_name} must be a non-empty string or integer"
+        )
+
+
+def _strict_string(condition: dict[str, Any], field_name: str) -> None:
+    value = condition[field_name]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"lease condition {field_name} must be a non-empty string")
+
+
 def _validate_lease_condition(condition: dict[str, Any]) -> None:
+    if not isinstance(condition, dict):
+        raise ValueError("lease conditions must be objects")
     condition_type = condition.get("type")
-    if condition_type not in LEASE_CONDITION_TYPES:
+    if (
+        not isinstance(condition_type, str)
+        or condition_type not in LEASE_CONDITION_TYPES
+    ):
         raise ValueError(f"unsupported lease condition type: {condition_type}")
+
+    required, optional = _LEASE_CONDITION_FIELDS[condition_type]
+    supplied = set(condition) - {"type"}
+    missing = required - supplied
+    if missing:
+        raise ValueError(
+            f"lease condition {condition_type} missing fields: {sorted(missing)}"
+        )
+    unknown = supplied - required - optional
+    if unknown:
+        raise ValueError(
+            f"lease condition {condition_type} has unknown fields: {sorted(unknown)}"
+        )
+
     if condition_type == "all_of":
-        nested = condition.get("conditions")
+        nested = condition["conditions"]
         if not isinstance(nested, list) or not nested:
-            raise ValueError("all_of lease condition requires conditions")
+            raise ValueError(
+                "all_of lease condition requires a non-empty conditions list"
+            )
         for item in nested:
-            if not isinstance(item, dict):
-                raise ValueError("all_of lease conditions must be objects")
             _validate_lease_condition(item)
+        return
+
+    if condition_type in _COORDINATE_CONDITION_TYPES:
+        _strict_non_negative_int(condition, "x", maximum=9999)
+        _strict_non_negative_int(condition, "y", maximum=9999)
+    if condition_type in {"turn_at_least", "turn_equals"}:
+        _strict_non_negative_int(condition, "turn", maximum=2_147_483_647)
+    if condition_type == "city_count_at_least":
+        _strict_non_negative_int(condition, "count", maximum=1_000_000)
+    if condition_type == "entity_exists":
+        _strict_string(condition, "entity_type")
+        _strict_identifier(condition, "entity_id")
+    if condition_type in {"unit_absent", "unit_type_contains"}:
+        _strict_identifier(condition, "unit_id")
+    if condition_type == "unit_type_contains":
+        _strict_string(condition, "marker")
+    if condition_type == "field_in":
+        _strict_string(condition, "path")
+        values = condition["values"]
+        if not isinstance(values, list) or not values:
+            raise ValueError("lease condition values must be a non-empty list")
+        if any(
+            type(value) not in {str, int, float, bool}
+            or (type(value) is float and not math.isfinite(value))
+            for value in values
+        ):
+            raise ValueError("lease condition values must contain JSON scalar values")
+    if condition_type == "city_at_target" and "owner" in condition:
+        _strict_identifier(condition, "owner")
 
 
 class ResolutionDisposition(str, Enum):
@@ -427,7 +523,7 @@ def validate_event_resolution_contract(
 
 
 def _validate_lease_contract_for_event(resolution, event, errors):
-    if event is None or event.event_type != "settler_site_selection_required":
+    if event is None or event.event_type not in SETTLER_GAP_TYPES:
         return
     contract = resolution.lease_contract
     precondition_types = {item.get("type") for item in contract.preconditions}

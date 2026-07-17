@@ -58,6 +58,13 @@ TURN_SPECIFIC_GAP_TYPES = frozenset(
     }
 )
 
+SETTLER_GAP_TYPES = frozenset(
+    {
+        "settler_site_selection_required",
+        "settler_plan_requires_review",
+    }
+)
+
 ROUTINE_EVENT_TYPES = frozenset(
     {
         "city_no_production",
@@ -569,7 +576,7 @@ def _material_input_change_is_proven_safe(
     if projection is None:
         return False
     baseline = lease.model_dump(mode="json").get("contract_baseline", {})
-    if baseline.get("gap_type") != "settler_site_selection_required":
+    if baseline.get("gap_type") not in SETTLER_GAP_TYPES:
         return False
     required_conditions = {
         "settler_target_legal",

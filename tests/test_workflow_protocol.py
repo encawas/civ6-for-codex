@@ -314,3 +314,48 @@ def test_global_resolution_structure_rejects_conflicting_task_and_plan_ownership
         validate_global_resolution_structure(
             bundle, [], required_gap_ids={"gap-a", "gap-b"}
         )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "condition", "message"),
+    [
+        ("review_conditions", {"type": "turn_equals"}, "turn"),
+        (
+            "completion_condition",
+            {"type": "city_at_target", "x": 5},
+            "y",
+        ),
+        ("invalidation_conditions", {"type": "unit_absent"}, "unit_id"),
+        (
+            "review_conditions",
+            {"type": "field_in", "path": "overview.threat_level"},
+            "values",
+        ),
+        (
+            "continuation_conditions",
+            {"type": "settler_path_reachable", "x": "5", "y": 6},
+            "x",
+        ),
+        (
+            "completion_condition",
+            {
+                "type": "all_of",
+                "conditions": [{"type": "unit_absent"}],
+            },
+            "unit_id",
+        ),
+        (
+            "review_conditions",
+            {"type": "severe_threat_absent", "unexpected": True},
+            "unexpected",
+        ),
+    ],
+)
+def test_lease_condition_parameters_are_strict(field_name, condition, message):
+    payload = _lease_contract().model_dump(mode="python")
+    payload[field_name] = (
+        condition if field_name == "completion_condition" else [condition]
+    )
+
+    with pytest.raises(ValueError, match=message):
+        LeaseContract.model_validate(payload)

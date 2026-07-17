@@ -350,17 +350,94 @@ class ConditionEvaluator:
             False, f"unsupported condition type: {kind!r}", known=False
         )
 
-    @staticmethod
+    @classmethod
     def _settler_target_fact(
+        cls,
         condition: Mapping[str, Any],
         projection: Mapping[str, Any] | None,
     ) -> Mapping[str, Any] | None:
         if projection is None:
             return None
         expected = (int(condition["x"]), int(condition["y"]))
+        fact = (
+            "legal" if condition.get("type") == "settler_target_legal" else "reachable"
+        )
+        matching: Mapping[str, Any] | None = None
         for row in projection.get("candidate_targets", ()):
-            if isinstance(row, Mapping) and (row.get("x"), row.get("y")) == expected:
-                return row
+            if not isinstance(row, Mapping):
+                continue
+            if (row.get("x"), row.get("y")) != expected:
+                continue
+            matching = row
+            value = row.get(
+                fact,
+                row.get("path_reachable" if fact == "reachable" else "target_legal"),
+            )
+            if (normalized := cls._boolean_fact_value(value)) is not None:
+                return {fact: normalized}
+            if fact == "reachable":
+                status = cls._path_status_value(row.get("path_status"))
+                if status is not None:
+                    return {fact: status}
+
+        path = projection.get("path")
+        if not isinstance(path, Mapping):
+            return matching
+        path_x = path.get("x", path.get("target_x"))
+        path_y = path.get("y", path.get("target_y"))
+        if (path_x is None) != (path_y is None):
+            return matching
+        if path_x is not None and (int(path_x), int(path_y)) != expected:
+            return matching
+        if fact == "reachable":
+            value = path.get("reachable", path.get("path_reachable"))
+            if (normalized := cls._boolean_fact_value(value)) is not None:
+                return {fact: normalized}
+            status = cls._path_status_value(path.get("path_status"))
+            if status is not None:
+                return {fact: status}
+        else:
+            value = path.get("target_legal", path.get("route_legal"))
+            if (normalized := cls._boolean_fact_value(value)) is not None:
+                return {fact: normalized}
+        return matching
+
+    @staticmethod
+    def _boolean_fact_value(value: Any) -> bool | None:
+        if type(value) is bool:
+            return value
+        if type(value) is int and value in {0, 1}:
+            return bool(value)
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().upper()
+        if normalized in {"TRUE", "YES", "VALID", "REACHABLE", "LEGAL"}:
+            return True
+        if normalized in {
+            "FALSE",
+            "NO",
+            "INVALID",
+            "UNREACHABLE",
+            "ILLEGAL",
+        }:
+            return False
+        return None
+
+    @staticmethod
+    def _path_status_value(value: Any) -> bool | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+        if normalized in {"REACHABLE", "VALID", "OK", "SUCCESS", "PATH_FOUND"}:
+            return True
+        if normalized in {
+            "UNREACHABLE",
+            "BLOCKED",
+            "INVALID",
+            "NO_PATH",
+            "PATH_NOT_FOUND",
+        }:
+            return False
         return None
 
     @staticmethod

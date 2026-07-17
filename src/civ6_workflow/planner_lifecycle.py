@@ -13,9 +13,11 @@ from .conditions import extract_known_entities, find_entity
 from .domain.base import thaw_json
 from .decisioning import (
     TURN_SPECIFIC_GAP_TYPES,
+    SETTLER_GAP_TYPES,
     STRATEGIC_GAP_TYPES,
     batch_compatible_gaps,
     build_decision_gap,
+    hash_decision_input,
     evaluate_plan_lease,
     evaluate_planner_eligibility,
     stable_decision_identity,
@@ -80,6 +82,11 @@ class PlannerLifecycleCoordinator:
             RuntimeState.VERIFYING,
         }:
             return None
+        gap_tick = self._reconcile_persisted_gaps(
+            ctx, observation, compatibility, current_events=current_events
+        )
+        if gap_tick is not None:
+            return gap_tick
         return self._validate_leases(
             ctx, observation, compatibility, current_events=current_events
         )
@@ -221,6 +228,120 @@ class PlannerLifecycleCoordinator:
             compatibility,
             observation_id,
         )
+
+    def _reconcile_persisted_gaps(
+        self,
+        ctx,
+        observation,
+        compatibility,
+        *,
+        current_events,
+    ):
+        engine = self.engine
+        snapshot = observation.snapshot
+        active_request = engine.store.active_planner_request(snapshot.game_id)
+        protected_gap_ids = (
+            set(active_request.decision_gap_ids)
+            if active_request is not None
+            else set()
+        )
+        for lease in engine.store.list_plan_leases(snapshot.game_id):
+            if lease.status in {
+                PlanLeaseStatus.ACTIVE,
+                PlanLeaseStatus.AWAITING_APPROVAL,
+                PlanLeaseStatus.AWAITING_INFORMATION,
+            }:
+                protected_gap_ids.update(lease.decision_gap_ids)
+
+        current_identities = set()
+        for event in current_events:
+            if event.event_type not in STRATEGIC_GAP_TYPES:
+                continue
+            try:
+                identity, _ = stable_decision_identity(event)
+            except ValueError:
+                continue
+            current_identities.add(identity)
+
+        candidates = {
+            DecisionGapStatus.OPEN,
+            DecisionGapStatus.PLANNER_ELIGIBLE,
+            DecisionGapStatus.REQUESTED,
+            DecisionGapStatus.AWAITING_INFORMATION,
+            DecisionGapStatus.PROPOSED,
+        }
+        invalidated = []
+        cancel_task_ids: set[str] = set()
+        for gap in engine.store.list_decision_gaps(snapshot.game_id):
+            if gap.decision_gap_id in protected_gap_ids or gap.status not in candidates:
+                continue
+            projection = thaw_json(gap.input_projection)
+            if gap.turn_specific and gap.identity_turn_number != snapshot.turn:
+                reason = "turn-specific decision expired before routing"
+            elif (
+                projection.get("requires_current_event")
+                and gap.stable_identity not in current_identities
+            ):
+                reason = "required strategic event disappeared before routing"
+            else:
+                continue
+            invalidated.append(
+                gap.model_copy(
+                    update={
+                        "status": DecisionGapStatus.INVALIDATED,
+                        "observation_id": (
+                            engine._active_observation_id or gap.observation_id
+                        ),
+                        "logical_request_id": None,
+                        "resolution_reason": None,
+                        "invalidation_reason": reason,
+                        "reopen_reason": None,
+                        "updated_at": engine._now(),
+                    }
+                )
+            )
+            cancel_task_ids.update(self._dependent_task_ids_for_gap(gap))
+
+        if not invalidated:
+            return None
+        return self._finish(
+            ctx,
+            snapshot,
+            DecisionGapUpdatedTick,
+            compatibility=compatibility,
+            decision_gaps=invalidated,
+            cancel_task_ids=tuple(sorted(cancel_task_ids)),
+            decision_gap_id=invalidated[0].decision_gap_id,
+            update_reason=invalidated[0].invalidation_reason,
+        )
+
+    def _dependent_task_ids_for_gap(self, gap):
+        subjects = {
+            (subject.subject_type, subject.subject_id) for subject in gap.subjects
+        }
+        action_slots = {
+            "city_set_production": "city_production",
+            "set_research": "research",
+            "set_civic": "civic",
+            "unit_move": "unit_route",
+            "unit_skip": "unit_route",
+            "unit_found_city": "unit_route",
+            "builder_improve": "builder_route",
+        }
+        scope_slot = {
+            "research": "research",
+            "civic": "civic",
+        }.get(gap.scope.split(":", 1)[0])
+        result = set()
+        for task in self.engine.store.list_tasks(gap.game_session_id):
+            subject_matches = (task.entity_type, str(task.entity_id)) in subjects
+            slot_matches = (
+                scope_slot is not None
+                and action_slots.get(task.action_type) == scope_slot
+            )
+            if subject_matches or slot_matches:
+                result.add(task.task_id)
+        return tuple(sorted(result))
 
     def _validate_leases(self, ctx, observation, compatibility, *, current_events):
         engine = self.engine
@@ -850,6 +971,17 @@ class PlannerLifecycleCoordinator:
             for payload in pending_round.requests
         ]
         results = await engine.information_queries.execute(requests)
+        observation_id = engine._active_observation_id or ctx.observation_ids[-1]
+        results = {
+            request_id: {
+                **payload,
+                "information_request_id": request_id,
+                "planner_request_id": logical_request.planner_request_id,
+                "information_round_id": pending_round.information_round_id,
+                "collected_from_observation_id": observation_id,
+            }
+            for request_id, payload in results.items()
+        }
         ctx.metrics.information_query_count += len(results)
         ctx.metrics.information_round_count += 1
         now = engine._now()
@@ -973,6 +1105,7 @@ class PlannerLifecycleCoordinator:
         started_monotonic = time.perf_counter()
         bundle: WorkflowPlanBundle | None = None
         error: Exception | None = None
+        contract_error: Exception | None = None
         planner_scope = getattr(engine.planner, "logical_request_scope", None)
         scope = (
             planner_scope(logical_request.planner_request_id)
@@ -982,15 +1115,19 @@ class PlannerLifecycleCoordinator:
         try:
             with scope:
                 raw_bundle = await engine._plan_once(provider_request, ctx.metrics)
-            bundle = WorkflowPlanBundle.model_validate(
-                raw_bundle.model_dump(mode="python")
-            )
         except Exception as exc:
             from .engine import InjectedCrashBoundary
 
             if isinstance(exc, InjectedCrashBoundary):
                 raise
             error = exc
+        else:
+            try:
+                bundle = WorkflowPlanBundle.model_validate(
+                    raw_bundle.model_dump(mode="python")
+                )
+            except Exception as exc:
+                contract_error = exc
         finally:
             if hook_supported:
                 setter(None)
@@ -1034,6 +1171,16 @@ class PlannerLifecycleCoordinator:
                 provider_attempts,
                 provider_count,
                 error,
+            )
+        if contract_error is not None:
+            return self._contract_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                provider_count,
+                str(contract_error),
             )
 
         assert bundle is not None
@@ -1600,6 +1747,20 @@ class PlannerLifecycleCoordinator:
                     "reopen_reason": gap.reopen_reason,
                 }
             )
+            lease_baseline = thaw_json(lease.contract_baseline)
+            if lease_baseline.get("information_evidence"):
+                effective_projection = self._carry_information_baseline(
+                    thaw_json(refreshed.input_projection),
+                    lease_baseline,
+                )
+                refreshed = refreshed.model_copy(
+                    update={
+                        "input_projection": effective_projection,
+                        "relevant_input_hash": hash_decision_input(
+                            effective_projection
+                        ),
+                    }
+                )
             gap_by_id[gap_id] = refreshed
             refreshed_leases.append(
                 lease.model_copy(
@@ -1769,7 +1930,7 @@ class PlannerLifecycleCoordinator:
             default=0,
         )
         bound = self._bind_runtime_lease_contract(
-            gap, bundle, resolution, observation, contract
+            gap, bundle, logical_request, resolution, observation, contract
         )
         projection = bound["projection"]
         preconditions = tuple(
@@ -1866,23 +2027,24 @@ class PlannerLifecycleCoordinator:
             ),
             contract_baseline=bound["baseline"],
             continuation_policy=contract.continuation_policy,
-            relevant_input_hash=gap.relevant_input_hash,
+            relevant_input_hash=bound["relevant_input_hash"],
             last_validated_observation_id=logical_request.observation_id,
             last_validation_result=LeaseValidationResult.VALID,
         )
 
     @classmethod
     def _bind_runtime_lease_contract(
-        cls, gap, bundle, resolution, observation, contract
+        cls, gap, bundle, logical_request, resolution, observation, contract
     ):
         projection = thaw_json(gap.input_projection)
         baseline = {
             "gap_type": gap.gap_type,
             "relevant_input_projection": projection,
         }
-        if gap.gap_type != "settler_site_selection_required":
+        if gap.gap_type not in SETTLER_GAP_TYPES:
             return {
                 "projection": projection,
+                "relevant_input_hash": gap.relevant_input_hash,
                 "preconditions": [dict(item) for item in contract.preconditions],
                 "continuation": [
                     dict(item) for item in contract.continuation_conditions
@@ -1921,6 +2083,13 @@ class PlannerLifecycleCoordinator:
             **projection,
             "plan_target": {"target": {"x": target_x, "y": target_y}},
         }
+        projection, information_evidence = cls._merge_information_evidence(
+            projection,
+            logical_request,
+            resolution,
+            unit_id,
+            (target_x, target_y),
+        )
         start_conditions = [
             {"type": "entity_exists", "entity_type": "unit", "entity_id": unit_id},
             {"type": "unit_type_contains", "unit_id": unit_id, "marker": "SETTLER"},
@@ -1955,10 +2124,12 @@ class PlannerLifecycleCoordinator:
             "approved_target": {"x": target_x, "y": target_y},
             "owner": owner,
             "settler_unit_id": unit_id,
+            "information_evidence": information_evidence,
             "relevant_input_projection": projection,
         }
         return {
             "projection": projection,
+            "relevant_input_hash": hash_decision_input(projection),
             "preconditions": cls._replace_conditions(
                 contract.preconditions, start_conditions
             ),
@@ -1968,6 +2139,292 @@ class PlannerLifecycleCoordinator:
             "completion": completion,
             "baseline": baseline,
         }
+
+    @staticmethod
+    def _carry_information_baseline(projection, baseline):
+        sources = baseline.get("information_evidence", [])
+        target = baseline.get("approved_target", {})
+        target_x = target.get("x") if isinstance(target, dict) else None
+        target_y = target.get("y") if isinstance(target, dict) else None
+        if target_x is None or target_y is None:
+            return projection
+        facts = {}
+        for source in sources:
+            if isinstance(source, dict) and isinstance(source.get("facts"), dict):
+                facts.update(source["facts"])
+        if not facts:
+            return projection
+        targets = [
+            dict(row)
+            for row in projection.get("candidate_targets", [])
+            if isinstance(row, dict)
+        ]
+        for index, row in enumerate(targets):
+            if (row.get("x"), row.get("y")) == (target_x, target_y):
+                targets[index] = {**row, **facts}
+                break
+        else:
+            targets.append({"x": target_x, "y": target_y, **facts})
+        targets.sort(key=lambda row: (str(row.get("x")), str(row.get("y"))))
+        updated = {
+            **projection,
+            "candidate_targets": targets,
+            "information_evidence": sources,
+            "plan_target": {"target": {"x": target_x, "y": target_y}},
+        }
+        if "reachable" in facts:
+            updated["path"] = {
+                **(
+                    projection.get("path", {})
+                    if isinstance(projection.get("path"), dict)
+                    else {}
+                ),
+                "target_x": target_x,
+                "target_y": target_y,
+                "path_reachable": facts["reachable"],
+            }
+        return updated
+
+    @classmethod
+    def _merge_information_evidence(
+        cls,
+        projection,
+        logical_request,
+        resolution,
+        unit_id,
+        target,
+    ):
+        results = thaw_json(logical_request.information_results)
+        if not isinstance(results, dict):
+            return projection, []
+        target_x, target_y = target
+        merged_facts: dict[str, bool] = {}
+        sources = []
+        allowed_tools = {
+            "get_pathing_estimate",
+            "get_settle_advisor",
+            "get_global_settle_advisor",
+        }
+        for request_id, payload in results.items():
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("information_request_id") != request_id:
+                continue
+            if payload.get("planner_request_id") != logical_request.planner_request_id:
+                continue
+            if payload.get("event_dedupe_key") != resolution.event_dedupe_key:
+                continue
+            if not payload.get("information_round_id") or not payload.get(
+                "collected_from_observation_id"
+            ):
+                continue
+            tool_name = payload.get("tool_name")
+            if tool_name not in allowed_tools:
+                continue
+            arguments = payload.get("arguments")
+            if not isinstance(arguments, dict):
+                continue
+            argument_unit = arguments.get("unit_id")
+            if argument_unit is not None and str(argument_unit) != str(unit_id):
+                continue
+            facts = cls._settler_query_facts(
+                tool_name,
+                arguments,
+                payload.get("result"),
+                (target_x, target_y),
+            )
+            if not facts:
+                continue
+            for fact_name, fact_value in facts.items():
+                if (
+                    fact_name in merged_facts
+                    and merged_facts[fact_name] is not fact_value
+                ):
+                    raise ValueError("conflicting information evidence")
+                merged_facts[fact_name] = fact_value
+            sources.append(
+                {
+                    "information_request_id": request_id,
+                    "planner_request_id": logical_request.planner_request_id,
+                    "information_round_id": payload["information_round_id"],
+                    "collected_from_observation_id": payload[
+                        "collected_from_observation_id"
+                    ],
+                    "event_dedupe_key": resolution.event_dedupe_key,
+                    "query_type": payload.get("query_type"),
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "target": {"x": target_x, "y": target_y},
+                    "facts": facts,
+                }
+            )
+
+        if not merged_facts:
+            return projection, []
+        targets = [
+            dict(row)
+            for row in projection.get("candidate_targets", [])
+            if isinstance(row, dict)
+        ]
+        matched = False
+        for index, row in enumerate(targets):
+            if (row.get("x"), row.get("y")) != (target_x, target_y):
+                continue
+            targets[index] = {**row, **merged_facts}
+            matched = True
+            break
+        if not matched:
+            targets.append({"x": target_x, "y": target_y, **merged_facts})
+        targets.sort(key=lambda row: (str(row.get("x")), str(row.get("y"))))
+        updated = {
+            **projection,
+            "candidate_targets": targets,
+            "information_evidence": sources,
+        }
+        if "reachable" in merged_facts:
+            updated["path"] = {
+                **(
+                    projection.get("path", {})
+                    if isinstance(projection.get("path"), dict)
+                    else {}
+                ),
+                "target_x": target_x,
+                "target_y": target_y,
+                "path_reachable": merged_facts["reachable"],
+            }
+        return updated, sources
+
+    @classmethod
+    def _settler_query_facts(cls, tool_name, arguments, raw_result, target):
+        facts: dict[str, bool] = {}
+        for row in cls._query_candidate_rows(raw_result):
+            x = row.get("x", row.get("target_x"))
+            y = row.get("y", row.get("target_y"))
+            if x is None or y is None or (int(x), int(y)) != target:
+                continue
+            legal = cls._strict_bool_fact(
+                row,
+                ("legal", "is_legal", "valid", "is_valid", "target_legal"),
+            )
+            reachable = cls._strict_bool_fact(
+                row,
+                ("reachable", "path_reachable"),
+            )
+            path = row.get("path")
+            if reachable is None and isinstance(path, dict):
+                reachable = cls._strict_bool_fact(
+                    path,
+                    ("reachable", "path_reachable"),
+                )
+                if reachable is None:
+                    reachable = cls._path_status_fact(path.get("path_status"))
+            if reachable is None:
+                reachable = cls._path_status_fact(row.get("path_status"))
+            if legal is not None:
+                facts["legal"] = legal
+            if reachable is not None:
+                facts["reachable"] = reachable
+
+        argument_target = (arguments.get("target_x"), arguments.get("target_y"))
+        if tool_name == "get_pathing_estimate" and None not in argument_target:
+            if (int(argument_target[0]), int(argument_target[1])) == target:
+                rows = cls._query_mapping_rows(raw_result)
+                reachable = next(
+                    (
+                        value
+                        for row in rows
+                        if (
+                            value := cls._strict_bool_fact(
+                                row, ("reachable", "path_reachable")
+                            )
+                        )
+                        is not None
+                    ),
+                    None,
+                )
+                if reachable is None:
+                    reachable = next(
+                        (
+                            value
+                            for row in rows
+                            if (value := cls._path_status_fact(row.get("path_status")))
+                            is not None
+                        ),
+                        None,
+                    )
+                if reachable is not None:
+                    facts["reachable"] = reachable
+        return facts
+
+    @classmethod
+    def _query_candidate_rows(cls, value):
+        rows = []
+        if isinstance(value, list):
+            for item in value:
+                rows.extend(cls._query_candidate_rows(item))
+            return rows
+        if not isinstance(value, dict):
+            return rows
+        x = value.get("x", value.get("target_x"))
+        y = value.get("y", value.get("target_y"))
+        if x is not None and y is not None:
+            rows.append(value)
+        for key in (
+            "sites",
+            "candidates",
+            "targets",
+            "recommended_sites",
+            "settle_sites",
+            "items",
+        ):
+            nested = value.get(key)
+            if isinstance(nested, (dict, list)):
+                rows.extend(cls._query_candidate_rows(nested))
+        return rows
+
+    @staticmethod
+    def _query_mapping_rows(value):
+        if not isinstance(value, dict):
+            return []
+        rows = [value]
+        for key in ("path", "estimate", "data", "result"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                rows.append(nested)
+        return rows
+
+    @staticmethod
+    def _strict_bool_fact(row, keys):
+        for key in keys:
+            value = row.get(key)
+            if type(value) is bool:
+                return value
+            if type(value) is int and value in {0, 1}:
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().upper()
+                if normalized in {"TRUE", "YES", "VALID", "REACHABLE"}:
+                    return True
+                if normalized in {"FALSE", "NO", "INVALID", "UNREACHABLE"}:
+                    return False
+        return None
+
+    @staticmethod
+    def _path_status_fact(value):
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+        if normalized in {"REACHABLE", "VALID", "OK", "SUCCESS", "PATH_FOUND"}:
+            return True
+        if normalized in {
+            "UNREACHABLE",
+            "BLOCKED",
+            "INVALID",
+            "NO_PATH",
+            "PATH_NOT_FOUND",
+        }:
+            return False
+        return None
 
     @staticmethod
     def _replace_conditions(existing, replacements):

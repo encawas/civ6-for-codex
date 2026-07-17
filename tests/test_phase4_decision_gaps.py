@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 
 from civ6_workflow.characterization import RecordingPlanner
+from civ6_workflow.conditions import ConditionEvaluator
 from civ6_workflow.decisioning import (
     batch_compatible_gaps,
     build_decision_gap,
@@ -52,6 +53,7 @@ from civ6_workflow.models import (
     RuntimeSnapshot,
 )
 from civ6_workflow.events import events_from_snapshot
+from civ6_workflow.rules import RuleCompilation
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.workflow_protocol import (
@@ -2605,5 +2607,386 @@ def test_issue7_turn_specific_active_request_expires_before_provider_call(tmp_pa
         assert planner.summary.logical_requests == 0
         assert engine.store.list_provider_attempts(request_id) == []
         assert game.mutations == 0
+
+    asyncio.run(scenario())
+
+
+class _TurnScopedRuleCompiler:
+    def __init__(self, event):
+        self.event = event
+
+    @staticmethod
+    def needs_units(_game_id):
+        return False
+
+    def compile(self, observation):
+        events = [self.event] if observation.snapshot.turn == self.event.turn else []
+        return RuleCompilation(events=events)
+
+
+def test_issue7_bare_turn_specific_gap_is_reconciled_before_routing(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _ResolvingPlanner())
+        tactical = GameEvent(
+            event_type="tactical_attack_opportunity",
+            turn=1,
+            entity_type="unit",
+            entity_id=7,
+            blocking=True,
+            dedupe_key="bare-tactical:7:1",
+        )
+        engine.rules = _TurnScopedRuleCompiler(tactical)
+
+        first = await engine.tick()
+        assert first.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_CREATED
+        gap = engine.store.list_decision_gaps("opening")[0]
+        assert gap.status is DecisionGapStatus.OPEN
+        assert engine.store.active_planner_request("opening") is None
+
+        stale_task = ProposedTask(
+            task_id="bare-tactical-task",
+            action_type="unit_skip",
+            entity_type="unit",
+            entity_id=7,
+            due_turn=2,
+            arguments={"unit_id": 7},
+            preconditions=[
+                {"type": "entity_exists", "entity_type": "unit", "entity_id": 7}
+            ],
+            postconditions=[{"type": "unit_no_moves", "unit_id": 7}],
+            reason="must not execute after the tactical opportunity expires",
+        )
+        engine.store.save_plan_bundle(
+            "opening",
+            1,
+            PlanBundle(summary="stale tactical task", tasks=[stale_task]),
+            mode=ExecutionMode.AUTO,
+            auto_action_types={"unit_skip"},
+        )
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 2,
+                "overview": {**game.snapshot.overview, "turn": 2},
+            }
+        )
+
+        second = await engine.tick()
+
+        assert second.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
+        assert second.metrics.mutation_count == 0
+        assert planner.summary.provider_attempts == 0
+        assert game.mutations == 0
+        assert (
+            engine.store.get_decision_gap("opening", gap.decision_gap_id).status
+            is DecisionGapStatus.INVALIDATED
+        )
+        assert (
+            engine.store.task_status("opening", stale_task.task_id).value == "cancelled"
+        )
+        assert [
+            item
+            for item in engine.store.list_decision_gaps("opening")
+            if item.gap_type == "tactical_attack_opportunity"
+        ] == [engine.store.get_decision_gap("opening", gap.decision_gap_id)]
+
+    asyncio.run(scenario())
+
+
+def test_issue7_bare_requires_current_event_gap_is_reconciled(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _ResolvingPlanner())
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "units": [
+                    {
+                        "unit_id": 7,
+                        "unit_type": "UNIT_WARRIOR",
+                        "moves_remaining": 2,
+                        "x": 4,
+                        "y": 5,
+                    }
+                ],
+                "blockers": [
+                    {
+                        "type": "pending_diplomacy",
+                        "data": {"request_id": "dip-7", "player_id": 2},
+                    }
+                ],
+            }
+        )
+
+        first = await engine.tick()
+        assert first.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_CREATED
+        gap = engine.store.list_decision_gaps("opening")[0]
+        assert gap.gap_type == "pending_diplomacy"
+        assert gap.status is DecisionGapStatus.OPEN
+        assert engine.store.active_planner_request("opening") is None
+
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 2,
+                "overview": {**game.snapshot.overview, "turn": 2},
+                "blockers": [],
+            }
+        )
+        second = await engine.tick()
+
+        assert second.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
+        assert second.metrics.mutation_count == 0
+        assert planner.summary.provider_attempts == 0
+        assert game.mutations == 0
+        stored = engine.store.get_decision_gap("opening", gap.decision_gap_id)
+        assert stored.status is DecisionGapStatus.INVALIDATED
+
+    asyncio.run(scenario())
+
+
+def test_issue7_information_evidence_activates_settler_lease(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _InformationPlanner())
+        unit = dict(game.snapshot.units[0])
+        unit["targets"] = [{"x": 8, "y": 9}]
+        game.snapshot = game.snapshot.model_copy(update={"units": [unit]})
+
+        async def query_tool(name, arguments):
+            game.call_count += 1
+            game.query_count += 1
+            assert name == "get_settle_advisor"
+            assert arguments == {"unit_id": 7}
+            return {
+                "sites": [
+                    {
+                        "x": 8,
+                        "y": 9,
+                        "legal": True,
+                        "path_reachable": True,
+                    }
+                ]
+            }
+
+        game.query_tool = query_tool
+        outcomes = []
+        for _ in range(5):
+            result = await engine.tick()
+            outcomes.append(result.workflow_tick["outcome"])
+
+        assert outcomes[-1] == TickOutcomeKind.PLANNER_ATTEMPT_COMPLETED
+        assert planner.summary.logical_requests == 1
+        assert planner.summary.provider_attempts == 2
+        assert game.query_count == 1
+        leases = engine.store.list_plan_leases("opening")
+        assert len(leases) == 1
+        assert leases[0].status is PlanLeaseStatus.ACTIVE
+        request_id = leases[0].source_planner_request_id
+        rounds = engine.store.list_information_rounds(request_id)
+        assert len(rounds) == 1
+        result = rounds[0].model_dump(mode="json")["results"]["site-info"]
+        assert result["information_request_id"] == "site-info"
+        assert result["planner_request_id"] == request_id
+        assert result["information_round_id"] == rounds[0].information_round_id
+        assert result["collected_from_observation_id"]
+        metrics = engine.store.planner_metrics("opening")
+        assert metrics["logical_requests"] == 1
+        assert metrics["provider_attempts"] == 2
+        assert metrics["information_rounds"] == 1
+
+        fresh_tick = await engine.tick()
+        assert fresh_tick.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert fresh_tick.metrics.mutation_count == 0
+        assert game.mutations == 0
+        assert (
+            engine.store.list_plan_leases("opening")[0].status
+            is PlanLeaseStatus.AWAITING_INFORMATION
+        )
+
+    asyncio.run(scenario())
+
+
+def test_issue7_unreachable_information_evidence_rejects_active_lease(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _InformationPlanner())
+        unit = dict(game.snapshot.units[0])
+        unit["targets"] = [{"x": 8, "y": 9}]
+        game.snapshot = game.snapshot.model_copy(update={"units": [unit]})
+
+        async def query_tool(_name, _arguments):
+            game.call_count += 1
+            game.query_count += 1
+            return {
+                "sites": [
+                    {
+                        "x": 8,
+                        "y": 9,
+                        "legal": True,
+                        "path_reachable": False,
+                    }
+                ]
+            }
+
+        game.query_tool = query_tool
+        final = None
+        for _ in range(5):
+            final = await engine.tick()
+
+        assert final.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert planner.summary.logical_requests == 1
+        assert planner.summary.provider_attempts == 2
+        assert game.query_count == 1
+        assert engine.store.list_plan_leases("opening") == []
+        gap = engine.store.list_decision_gaps("opening")[0]
+        assert gap.status is DecisionGapStatus.AWAITING_HUMAN
+
+    asyncio.run(scenario())
+
+
+class _WeakReviewPlanner(_ResolvingPlanner):
+    async def plan(self, request):
+        bundle = await super().plan(request)
+        resolution = bundle.event_resolutions[0]
+        weak = resolution.lease_contract.model_copy(
+            update={
+                "completion_condition": {
+                    "type": "all_of",
+                    "conditions": [
+                        {"type": "unit_absent", "unit_id": "7"},
+                        {"type": "city_count_at_least", "count": 0},
+                    ],
+                }
+            }
+        )
+        return bundle.model_copy(
+            update={
+                "event_resolutions": [
+                    resolution.model_copy(update={"lease_contract": weak})
+                ]
+            }
+        )
+
+
+def test_issue7_settler_review_lease_uses_runtime_safety_binding(tmp_path):
+    async def scenario():
+        engine, _, _ = _engine(tmp_path, _WeakReviewPlanner())
+        engine.store.save_plan_bundle(
+            "opening",
+            1,
+            PlanBundle(
+                plan_id="review-source-plan",
+                summary="settler plan awaiting target review",
+                unit_plan_updates=[{"unit_id": 7, "goal": "found_city", "revision": 4}],
+            ),
+            mode=ExecutionMode.AUTO,
+            auto_action_types=set(),
+        )
+
+        await engine.tick()
+        await engine.tick()
+        final = await engine.tick()
+
+        assert (
+            final.workflow_tick["outcome"] == TickOutcomeKind.PLANNER_ATTEMPT_COMPLETED
+        )
+        gap = engine.store.list_decision_gaps("opening")[0]
+        assert gap.gap_type == "settler_plan_requires_review"
+        lease = engine.store.list_plan_leases("opening")[0]
+        baseline = lease.model_dump(mode="json")["contract_baseline"]
+        assert baseline["baseline_city_count"] == 0
+        assert baseline["settler_unit_id"] == "7"
+        assert baseline["approved_target"] == {"x": 8, "y": 9}
+        completion = lease.completion_condition.model_dump(mode="json")
+        nested = completion["parameters"]["conditions"]
+        assert {"type": "city_count_at_least", "count": 1} in nested
+        assert {
+            "type": "city_at_target",
+            "x": 8,
+            "y": 9,
+            "owner": 1,
+        } in nested
+        continuation_types = {
+            condition.condition_type for condition in lease.continuation_conditions
+        }
+        assert {
+            "settler_target_legal",
+            "settler_path_reachable",
+            "approved_target_equals",
+            "severe_threat_absent",
+        }.issubset(continuation_types)
+
+    asyncio.run(scenario())
+
+
+def test_issue7_settler_path_condition_accepts_supported_projection_shapes():
+    evaluator = ConditionEvaluator()
+    observation = normalize_runtime_snapshot(_snapshot())
+    condition = {"type": "settler_path_reachable", "x": 8, "y": 9}
+    projections = [
+        {"candidate_targets": [{"x": 8, "y": 9, "reachable": True}]},
+        {"candidate_targets": [{"x": 8, "y": 9, "path_reachable": True}]},
+        {
+            "candidate_targets": [{"x": 8, "y": 9}],
+            "path": {"target_x": 8, "target_y": 9, "path_reachable": True},
+        },
+        {
+            "candidate_targets": [{"x": 8, "y": 9}],
+            "path": {"target_x": 8, "target_y": 9, "path_status": "PATH_FOUND"},
+        },
+    ]
+
+    for projection in projections:
+        result = evaluator.evaluate(
+            condition,
+            observation,
+            decision_projection=projection,
+        )
+        assert result.known is True
+        assert result.valid is True
+
+
+class _RawPlannerBundle:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def model_copy(self, *, deep=False):
+        return self
+
+    def model_dump(self, *, mode="python"):
+        return json.loads(json.dumps(self.payload))
+
+
+class _InvalidLeaseConditionPlanner(_ResolvingPlanner):
+    async def plan(self, request):
+        bundle = await super().plan(request)
+        payload = bundle.model_dump(mode="python")
+        payload["event_resolutions"][0]["lease_contract"]["review_conditions"] = [
+            {"type": "turn_equals"}
+        ]
+        return _RawPlannerBundle(payload)
+
+
+def test_issue7_invalid_lease_parameters_are_contract_rejection(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(
+            tmp_path,
+            _InvalidLeaseConditionPlanner(),
+        )
+
+        await engine.tick()
+        await engine.tick()
+        final = await engine.tick()
+
+        assert final.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert final.workflow_tick["outcome"] != TickOutcomeKind.SYSTEM_ERROR
+        assert final.metrics.mutation_count == 0
+        assert game.mutations == 0
+        assert engine.store.load_runtime_state("opening") is RuntimeState.AWAITING_HUMAN
+        gap = engine.store.list_decision_gaps("opening")[0]
+        assert gap.status is DecisionGapStatus.AWAITING_HUMAN
+        request = engine.store.get_planner_request(gap.logical_request_id)
+        assert request.status is PlannerRequestStatus.REJECTED
+        assert request.failure_category == "planner_contract_failure"
+        attempts = engine.store.list_provider_attempts(request.planner_request_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is ProviderAttemptStatus.SUCCEEDED
+        assert planner.summary.provider_attempts == 1
+        assert engine.store.list_plan_leases("opening") == []
 
     asyncio.run(scenario())
