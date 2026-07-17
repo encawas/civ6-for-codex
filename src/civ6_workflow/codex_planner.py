@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
+import shutil
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -74,6 +75,15 @@ class CodexPlanner:
     def __init__(self, config: CodexPlannerConfig):
         self.config = config
         self.last_diagnostics: dict[str, Any] | None = None
+        self.provider_attempt_hook: Any | None = None
+
+    def set_provider_attempt_hook(self, hook: Any | None) -> bool:
+        self.provider_attempt_hook = hook
+        return True
+
+    async def _provider_attempt(self, phase: str, **details: Any) -> None:
+        if self.provider_attempt_hook is not None:
+            await self.provider_attempt_hook(phase, details)
 
     def build_command(
         self, *, schema_path: Path, output_path: Path, working_directory: Path
@@ -134,6 +144,7 @@ class CodexPlanner:
             from .responses_planner import ResponsesPlanner
 
             delegate = ResponsesPlanner(self.config, SYSTEM_INSTRUCTIONS, PlannerError)
+            delegate.set_provider_attempt_hook(self.provider_attempt_hook)
             try:
                 return await delegate.plan(request)
             finally:
@@ -190,6 +201,26 @@ class CodexPlanner:
                 current["error_body"] = error_body
             self.last_diagnostics = current
 
+        executable = command[0]
+        candidate = Path(executable).expanduser()
+        resolved = (
+            str(candidate.resolve())
+            if candidate.parent != Path(".") and candidate.is_file()
+            else shutil.which(executable)
+        )
+        if resolved is None:
+            error = f"Codex executable was not found: {self.config.command}"
+            record_diagnostics(error_body=error)
+            raise PlannerError(error)
+        command[0] = resolved
+
+        await self._provider_attempt(
+            "started",
+            provider_request_id=request.request_id,
+            attempt_number=1,
+        )
+        diagnostics["attempt_count"] = 1
+        record_diagnostics()
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -201,11 +232,8 @@ class CodexPlanner:
         except FileNotFoundError as exc:
             record_diagnostics(error_body=str(exc))
             raise PlannerError(
-                f"Codex executable was not found: {self.config.command}"
+                f"Codex executable disappeared after preflight: {resolved}"
             ) from exc
-
-        diagnostics["attempt_count"] = 1
-        record_diagnostics()
         communication = asyncio.create_task(process.communicate(prompt.encode("utf-8")))
         try:
             stdout, stderr = await asyncio.wait_for(

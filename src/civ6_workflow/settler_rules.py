@@ -76,6 +76,9 @@ class SettlerDeterministicRuleCompiler(SafeDeterministicRuleCompiler):
                 unit,
                 "settler_plan_requires_review",
                 "Settler plan has no valid target coordinates.",
+                plan_revision=plan.get(
+                    "revision", plan.get("_plan_id", plan.get("plan_id", "unknown"))
+                ),
             )
 
         current = (int(unit.get("x", -1)), int(unit.get("y", -1)))
@@ -197,7 +200,7 @@ class SettlerDeterministicRuleCompiler(SafeDeterministicRuleCompiler):
                 "reason": "Settler needs an approved city site before it can move.",
                 "unit": unit,
             },
-            dedupe_key=f"settler_site_selection_required:{raw_id}:{snapshot.turn}",
+            dedupe_key=f"settler_site_selection_required:{raw_id}",
         )
 
     @staticmethod
@@ -206,6 +209,7 @@ class SettlerDeterministicRuleCompiler(SafeDeterministicRuleCompiler):
         unit: dict[str, Any],
         event_type: str,
         reason: str,
+        plan_revision: Any,
     ) -> GameEvent:
         raw_id = unit.get("unit_id", unit.get("id", "unknown"))
         return GameEvent(
@@ -216,8 +220,12 @@ class SettlerDeterministicRuleCompiler(SafeDeterministicRuleCompiler):
             level=EventLevel.L3,
             risk=RiskLevel.HIGH,
             blocking=True,
-            payload={"reason": reason, "unit": unit},
-            dedupe_key=f"{event_type}:{raw_id}:{snapshot.turn}",
+            payload={
+                "reason": reason,
+                "unit": unit,
+                "plan_revision": plan_revision,
+            },
+            dedupe_key=f"{event_type}:{raw_id}:{plan_revision}",
         )
 
     @staticmethod

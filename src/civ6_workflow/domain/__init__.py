@@ -23,7 +23,13 @@ from .base import (
     freeze_json,
     thaw_json,
 )
-from .decisions import DecisionGap, DecisionGapStatus, DecisionRoute
+from .decisions import (
+    DECISION_INPUT_PROJECTION_VERSION,
+    DecisionGap,
+    DecisionGapStatus,
+    DecisionGroup,
+    DecisionRoute,
+)
 from .events import Event, EventRoute, EventStatus
 from .observations import (
     NORMALIZATION_VERSION,
@@ -41,8 +47,23 @@ from .observations import (
     UnitSummary,
     normalize_slot,
 )
-from .planner import PlannerRequest, PlannerRequestStatus
-from .plans import Plan, PlanSource, PlanStatus
+from .planner import (
+    InformationRound,
+    InformationRoundStatus,
+    PlannerRequest,
+    PlannerRequestStatus,
+    ProviderAttempt,
+    ProviderAttemptStatus,
+)
+from .plans import (
+    ContinuationPolicy,
+    LeaseValidationResult,
+    Plan,
+    PlanLease,
+    PlanLeaseStatus,
+    PlanSource,
+    PlanStatus,
+)
 from .tasks import (
     ACTIVE_TASK_STATUSES,
     Task,
@@ -58,9 +79,16 @@ from .ticks import (
     AwaitingHumanTick,
     AwaitingVerificationTick,
     ContextGatheredTick,
+    DecisionGapCreatedTick,
+    DecisionGapUpdatedTick,
+    InformationCollectedTick,
+    InformationRequestedTick,
+    LogicalPlannerRequestCreatedTick,
     MutationRejectedTick,
     MutationSentTick,
     MutationUncertainTick,
+    PlanLeaseUpdatedTick,
+    PlannerAttemptCompletedTick,
     NoSafeActionTick,
     ObservedOnlyTick,
     PausedTick,
@@ -81,6 +109,23 @@ from .ticks import (
 
 __all__ = [
     "ACTIVE_TASK_STATUSES",
+    "ProviderAttemptStatus",
+    "ProviderAttempt",
+    "PlannerAttemptCompletedTick",
+    "PlanLeaseUpdatedTick",
+    "PlanLeaseStatus",
+    "PlanLease",
+    "LogicalPlannerRequestCreatedTick",
+    "LeaseValidationResult",
+    "InformationRoundStatus",
+    "InformationRound",
+    "InformationRequestedTick",
+    "InformationCollectedTick",
+    "DecisionGroup",
+    "DecisionGapUpdatedTick",
+    "DecisionGapCreatedTick",
+    "ContinuationPolicy",
+    "DECISION_INPUT_PROJECTION_VERSION",
     "WORKFLOW_TICK_ADAPTER",
     "ActionAttempt",
     "AttemptReconciledTick",

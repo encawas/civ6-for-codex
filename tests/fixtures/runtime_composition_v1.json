@@ -34,6 +34,7 @@
   "codex_system_instructions_extended": true,
   "control_panel_html_enhanced": true,
   "condition_types": [
+    "all_of",
     "city_count_at_least",
     "unit_absent",
     "unit_moved_from",

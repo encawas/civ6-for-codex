@@ -34,6 +34,13 @@ class RuntimeState(StrEnum):
 
 class TickOutcomeKind(StrEnum):
     OBSERVED_ONLY = "OBSERVED_ONLY"
+    DECISION_GAP_CREATED = "DECISION_GAP_CREATED"
+    DECISION_GAP_UPDATED = "DECISION_GAP_UPDATED"
+    PLAN_LEASE_UPDATED = "PLAN_LEASE_UPDATED"
+    LOGICAL_PLANNER_REQUEST_CREATED = "LOGICAL_PLANNER_REQUEST_CREATED"
+    PLANNER_ATTEMPT_COMPLETED = "PLANNER_ATTEMPT_COMPLETED"
+    INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
+    INFORMATION_COLLECTED = "INFORMATION_COLLECTED"
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
     PLAN_REQUESTED = "PLAN_REQUESTED"
     TASK_CREATED = "TASK_CREATED"
@@ -78,6 +85,81 @@ class ObservedOnlyTick(TickRecord):
     ending_runtime_state: Literal[RuntimeState.OBSERVING] = RuntimeState.OBSERVING
     mutation_budget_used: Literal[0] = 0
 
+
+class DecisionGapCreatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.DECISION_GAP_CREATED] = (
+        TickOutcomeKind.DECISION_GAP_CREATED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    decision_gap_id: str
+
+
+class DecisionGapUpdatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.DECISION_GAP_UPDATED] = (
+        TickOutcomeKind.DECISION_GAP_UPDATED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    decision_gap_id: str
+    update_reason: str = Field(min_length=1)
+
+
+class PlanLeaseUpdatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.PLAN_LEASE_UPDATED] = (
+        TickOutcomeKind.PLAN_LEASE_UPDATED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    plan_lease_id: str
+    validation_result: str = Field(min_length=1)
+
+
+class LogicalPlannerRequestCreatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED] = (
+        TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+    )
+    ending_runtime_state: Literal[RuntimeState.REQUESTING_PLAN] = (
+        RuntimeState.REQUESTING_PLAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    decision_gap_ids: tuple[str, ...] = Field(min_length=1)
+
+
+class PlannerAttemptCompletedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.PLANNER_ATTEMPT_COMPLETED] = (
+        TickOutcomeKind.PLANNER_ATTEMPT_COMPLETED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    provider_attempt_id: str
+    provider_attempt_count: int = Field(ge=0)
+
+
+class InformationRequestedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.INFORMATION_REQUESTED] = (
+        TickOutcomeKind.INFORMATION_REQUESTED
+    )
+    ending_runtime_state: Literal[RuntimeState.GATHERING_CONTEXT] = (
+        RuntimeState.GATHERING_CONTEXT
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    information_round_id: str
+
+
+class InformationCollectedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.INFORMATION_COLLECTED] = (
+        TickOutcomeKind.INFORMATION_COLLECTED
+    )
+    ending_runtime_state: Literal[RuntimeState.REQUESTING_PLAN] = (
+        RuntimeState.REQUESTING_PLAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    information_round_id: str
 
 class ContextGatheredTick(TickRecord):
     outcome: Literal[TickOutcomeKind.CONTEXT_GATHERED] = (
@@ -271,6 +353,13 @@ class NoSafeActionTick(TickRecord):
 
 WorkflowTick: TypeAlias = Annotated[
     ObservedOnlyTick
+    | DecisionGapCreatedTick
+    | DecisionGapUpdatedTick
+    | PlanLeaseUpdatedTick
+    | LogicalPlannerRequestCreatedTick
+    | PlannerAttemptCompletedTick
+    | InformationRequestedTick
+    | InformationCollectedTick
     | ContextGatheredTick
     | PlanRequestedTick
     | TaskCreatedTick

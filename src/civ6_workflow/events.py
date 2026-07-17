@@ -17,29 +17,66 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
     for blocker in snapshot.blockers:
         blocker_type = str(blocker.get("type", "unknown_blocker"))
         if blocker_type == "pending_diplomacy":
-            events.append(
-                GameEvent(
-                    event_type="pending_diplomacy",
-                    turn=snapshot.turn,
-                    level=EventLevel.L3,
-                    risk=RiskLevel.HIGH,
-                    blocking=True,
-                    payload=blocker,
-                    dedupe_key=f"pending_diplomacy:{_stable_hash(blocker)}",
+            data = blocker.get("data")
+            rows = data if isinstance(data, list) else [data or blocker]
+            base = {key: value for key, value in blocker.items() if key != "data"}
+            for row in rows:
+                payload = {**base, **(row if isinstance(row, dict) else {})}
+                instance_id = next(
+                    (
+                        payload.get(key)
+                        for key in (
+                            "diplomacy_id",
+                            "request_id",
+                            "other_player_id",
+                            "player_id",
+                        )
+                        if payload.get(key) is not None
+                    ),
+                    None,
                 )
-            )
+                if instance_id is None:
+                    instance_id = f"content-{_stable_hash(payload)}"
+                    payload["diplomacy_id"] = instance_id
+                player_id = payload.get(
+                    "other_player_id", payload.get("player_id", instance_id)
+                )
+                events.append(
+                    GameEvent(
+                        event_type="pending_diplomacy",
+                        turn=snapshot.turn,
+                        entity_type="player",
+                        entity_id=player_id,
+                        level=EventLevel.L3,
+                        risk=RiskLevel.HIGH,
+                        blocking=True,
+                        payload=payload,
+                        dedupe_key=f"pending_diplomacy:{instance_id}",
+                    )
+                )
         elif blocker_type == "pending_trades":
-            events.append(
-                GameEvent(
-                    event_type="pending_trade_offer",
-                    turn=snapshot.turn,
-                    level=EventLevel.L3,
-                    risk=RiskLevel.HIGH,
-                    blocking=True,
-                    payload=blocker,
-                    dedupe_key=f"pending_trade_offer:{_stable_hash(blocker)}",
+            data = blocker.get("data")
+            rows = data if isinstance(data, list) else [data or blocker]
+            base = {key: value for key, value in blocker.items() if key != "data"}
+            for row in rows:
+                payload = {**base, **(row if isinstance(row, dict) else {})}
+                offer_id = payload.get("offer_id")
+                if offer_id is None:
+                    offer_id = f"content-{_stable_hash(payload)}"
+                payload["offer_id"] = str(offer_id)
+                events.append(
+                    GameEvent(
+                        event_type="pending_trade_offer",
+                        turn=snapshot.turn,
+                        entity_type="trade_offer",
+                        entity_id=str(offer_id),
+                        level=EventLevel.L3,
+                        risk=RiskLevel.HIGH,
+                        blocking=True,
+                        payload=payload,
+                        dedupe_key=f"pending_trade_offer:{offer_id}",
+                    )
                 )
-            )
         elif blocker_type == "city_no_production":
             for city_id in blocker.get("city_ids", []):
                 events.append(

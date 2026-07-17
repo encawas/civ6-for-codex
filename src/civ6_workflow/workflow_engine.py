@@ -6,7 +6,13 @@ from typing import Any
 from uuid import uuid4
 
 from .conditions import extract_known_entities
-from .models import AgentRequest, PlanBundle, TickMetrics, TickResult
+from .planner_lifecycle import PlannerLifecycleCoordinator
+from .models import (
+    AgentRequest,
+    PlanBundle,
+    TickMetrics,
+    TickResult,
+)
 from .safe_engine import SafeWorkflowEngine
 from .validation import PlanValidationContext, validate_plan_bundle
 from .workflow_protocol import (
@@ -25,6 +31,7 @@ class WorkflowAwareEngine(SafeWorkflowEngine):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.information_queries = InformationQueryRouter(self.game)
+        self.planner_lifecycle = PlannerLifecycleCoordinator(self)
 
     def _build_agent_request(self, snapshot, events):
         request = super()._build_agent_request(snapshot, events)
@@ -73,6 +80,32 @@ class WorkflowAwareEngine(SafeWorkflowEngine):
                 == "ENDTURN_BLOCKING_UNITS"
             )
         ]
+
+    async def _pre_route_decision_runtime(self, ctx, observation, current_events):
+        compatibility = TickResult(
+            turn=observation.snapshot.turn,
+            metrics=ctx.metrics,
+            events=[],
+        )
+        return self.planner_lifecycle.validate_before_routing(
+            ctx, observation, current_events, compatibility
+        )
+
+    async def _advance_decision_runtime(
+        self,
+        ctx,
+        observation,
+        agent_events,
+        compatibility,
+        current_events=None,
+    ):
+        return await self.planner_lifecycle.advance(
+            ctx,
+            observation,
+            agent_events,
+            compatibility,
+            current_events=current_events,
+        )
 
     async def _invoke_planner(
         self,
