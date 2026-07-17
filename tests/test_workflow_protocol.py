@@ -1,6 +1,6 @@
 import pytest
 
-from civ6_workflow.domain import ApprovalStatus, ContinuationPolicy
+from civ6_workflow.domain import ContinuationPolicy
 from civ6_workflow.models import (
     EventLevel,
     GameEvent,
@@ -39,7 +39,18 @@ def _lease_contract():
             {"type": "unit_type_contains", "unit_id": "7", "marker": "SETTLER"},
             {"type": "tile_unoccupied", "x": 5, "y": 6},
         ],
-        completion_condition={"type": "city_count_at_least", "count": 2},
+        completion_condition={
+            "type": "all_of",
+            "conditions": [
+                {"type": "unit_absent", "unit_id": "7"},
+                {"type": "city_count_at_least", "count": 2},
+            ],
+        },
+        continuation_conditions=[
+            {"type": "entity_exists", "entity_type": "unit", "entity_id": "7"},
+            {"type": "unit_type_contains", "unit_id": "7", "marker": "SETTLER"},
+            {"type": "tile_unoccupied", "x": 5, "y": 6},
+        ],
         invalidation_conditions=[
             {"type": "unit_absent", "unit_id": "7"},
             {
@@ -50,7 +61,7 @@ def _lease_contract():
         ],
         review_conditions=[{"type": "turn_at_least", "turn": 15}],
         continuation_policy=ContinuationPolicy.EXTEND_WHEN_INPUT_UNCHANGED,
-        approval_status=ApprovalStatus.APPROVED,
+        approval_required=True,
         subjects=[{"subject_type": "unit", "subject_id": "7"}],
     )
 
@@ -171,6 +182,45 @@ def test_found_city_requires_consumed_unit_and_new_city_proof():
     )
     validate_event_resolution_contract(
         bundle,
+        [event],
+        known_task_ids=set(),
+        allow_information_requests=False,
+    )
+
+
+def test_planner_lease_contract_cannot_claim_runtime_approval():
+    payload = _lease_contract().model_dump(mode="python")
+    payload["approval_status"] = "APPROVED"
+    with pytest.raises(ValueError, match="approval_status"):
+        LeaseContract.model_validate(payload)
+
+
+def test_multi_gap_resolution_requires_explicit_atomic_contract():
+    event = _blocking_event()
+    resolution = EventResolution(
+        event_dedupe_key=event.dedupe_key,
+        disposition=ResolutionDisposition.HUMAN_REVIEW,
+        decision_gap_ids=["gap-a", "gap-b"],
+        reason="review both decisions together",
+    )
+    bundle = PlanBundle(
+        summary="implicit group",
+        requires_human_review=True,
+        event_resolutions=[resolution],
+    )
+    with pytest.raises(WorkflowProtocolError, match="atomic=true"):
+        validate_event_resolution_contract(
+            bundle,
+            [event],
+            known_task_ids=set(),
+            allow_information_requests=False,
+        )
+
+    explicit = bundle.model_copy(
+        update={"event_resolutions": [resolution.model_copy(update={"atomic": True})]}
+    )
+    validate_event_resolution_contract(
+        explicit,
         [event],
         known_task_ids=set(),
         allow_information_requests=False,

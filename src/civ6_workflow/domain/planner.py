@@ -17,6 +17,7 @@ class PlannerRequestStatus(StrEnum):
     AWAITING_INFORMATION = "AWAITING_INFORMATION"
     READY_TO_CONTINUE = "READY_TO_CONTINUE"
     COMPLETED = "COMPLETED"
+    PARTIALLY_COMPLETED = "PARTIALLY_COMPLETED"
     FAILED = "FAILED"
     BACKOFF = "BACKOFF"
     REJECTED = "REJECTED"
@@ -28,6 +29,7 @@ TERMINAL_PLANNER_STATUSES = frozenset(
     {
         PlannerRequestStatus.COMPLETED,
         PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.PARTIALLY_COMPLETED,
         PlannerRequestStatus.REJECTED,
         PlannerRequestStatus.CANCELLED,
         PlannerRequestStatus.SUPERSEDED,
@@ -90,7 +92,10 @@ class PlannerRequest(DomainModel):
                 "non-terminal planner requests cannot contain result evidence"
             )
 
-        if self.status is PlannerRequestStatus.COMPLETED:
+        if self.status in {
+            PlannerRequestStatus.COMPLETED,
+            PlannerRequestStatus.PARTIALLY_COMPLETED,
+        }:
             if self.response_hash is None or self.validation_result is None:
                 raise ValueError(
                     "completed planner requests require validated response evidence"

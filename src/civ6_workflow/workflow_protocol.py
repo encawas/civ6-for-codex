@@ -8,9 +8,11 @@ from uuid import uuid4
 from pydantic import Field, field_validator, model_validator
 
 from .decisioning import STRATEGIC_GAP_TYPES
-from .domain import ApprovalStatus, ContinuationPolicy
+from .domain import ContinuationPolicy
 
 from .models import (
+    ExecutionMode,
+    RiskLevel,
     AgentRequest as BaseAgentRequest,
     PlanBundle as BasePlanBundle,
     StrictModel,
@@ -50,9 +52,12 @@ class LeaseContract(StrictModel):
     preconditions: list[dict[str, Any]] = Field(min_length=1)
     completion_condition: dict[str, Any]
     invalidation_conditions: list[dict[str, Any]] = Field(min_length=1)
+    continuation_conditions: list[dict[str, Any]] = Field(min_length=1)
     review_conditions: list[dict[str, Any]] = Field(min_length=1)
     continuation_policy: ContinuationPolicy
-    approval_status: ApprovalStatus
+    approval_required: bool = False
+    recommended_risk: RiskLevel = RiskLevel.LOW
+    proposed_execution_mode: ExecutionMode | None = None
     covered_slots: list[str] = Field(default_factory=list)
     subjects: list[dict[str, str]] = Field(default_factory=list)
 
@@ -63,6 +68,7 @@ class LeaseContract(StrictModel):
         for name in (
             "preconditions",
             "invalidation_conditions",
+            "continuation_conditions",
             "review_conditions",
         ):
             if any(not item.get("type") for item in getattr(self, name)):
@@ -82,6 +88,7 @@ class EventResolution(StrictModel):
     lease_contract: LeaseContract | None = None
     reason: str = Field(min_length=1, max_length=500)
     decision_gap_ids: list[str] = Field(default_factory=list, max_length=100)
+    atomic: bool = False
 
     @field_validator("event_dedupe_key")
     @classmethod
@@ -185,6 +192,10 @@ def validate_event_resolution_contract(
         if key in resolutions:
             errors.append(f"duplicate event resolution for {key}")
         resolutions[key] = resolution
+        if len(resolution.decision_gap_ids) > 1 and not resolution.atomic:
+            errors.append(
+                f"multi-gap resolution for {key} must explicitly declare atomic=true"
+            )
         if resolution.lease_contract is not None:
             _validate_lease_contract_for_event(
                 resolution, trigger_by_key.get(key), errors
@@ -348,8 +359,17 @@ def _validate_lease_contract_for_event(resolution, event, errors):
         errors.append("settler lease requires existence and settler-type preconditions")
     if not ({"tile_unoccupied", "settler_target_legal"} & precondition_types):
         errors.append("settler lease requires a legal unoccupied target")
-    if contract.completion_condition.get("type") != "city_count_at_least":
-        errors.append("settler lease must complete only after a city is observed")
+    completion = contract.completion_condition
+    completion_items = (
+        completion.get("conditions", [])
+        if completion.get("type") == "all_of"
+        else [completion]
+    )
+    completion_types = {item.get("type") for item in completion_items}
+    if not {"unit_absent", "city_count_at_least"}.issubset(completion_types):
+        errors.append(
+            "settler lease completion requires consumed unit and new city evidence"
+        )
     if "unit_absent" not in invalidation_types:
         errors.append("settler lease must invalidate when the settler disappears")
     severe_threat = any(

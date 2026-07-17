@@ -217,8 +217,13 @@ def build_decision_input_projection(
     """Project only material, explicitly versioned facts for one strategic gap."""
 
     identity, turn_specific = stable_decision_identity(event)
+    builder = DECISION_INPUT_PROJECTION_REGISTRY.get(
+        event.event_type, _project_generic_gap
+    )
     projection: dict[str, Any] = {
-        "projection_version": DECISION_INPUT_PROJECTION_VERSION,
+        "projection_version": GAP_PROJECTION_VERSIONS.get(
+            event.event_type, f"{DECISION_INPUT_PROJECTION_VERSION}/generic/v1"
+        ),
         "policy_revision": policy_revision,
         "stable_identity": identity,
         "gap_type": event.event_type,
@@ -227,39 +232,14 @@ def build_decision_input_projection(
             "type": event.entity_type,
             "id": None if event.entity_id is None else str(event.entity_id),
         },
-        "overview": _pick(snapshot.overview, _OVERVIEW_KEYS),
-        "event_facts": _pick(event.payload, _PAYLOAD_KEYS),
-        "strategy": _compact_strategy(context.get("strategy")),
-        "plan_revisions": _relevant_plan_revisions(event, context),
-        "plan_facts": _relevant_plan_facts(event, context),
         "approval": {
             "execution_mode": context.get("execution_mode"),
             "required": bool(event.risk.value in {"high", "critical"}),
         },
+        **builder(snapshot, event, context),
     }
     if turn_specific:
         projection["identity_turn_number"] = event.turn
-
-    if event.entity_type == "city" and event.entity_id is not None:
-        row = find_entity(snapshot.cities, ("city_id", "id"), str(event.entity_id))
-        projection["city"] = _pick(row, _CITY_KEYS)
-    elif event.entity_type in {"unit", "builder"} and event.entity_id is not None:
-        row = find_entity(snapshot.units, ("unit_id", "id"), str(event.entity_id))
-        projection["unit"] = _pick(row, _UNIT_KEYS)
-
-    if event.event_type in {
-        "research_direction_required",
-        "research_unavailable",
-        "civic_direction_required",
-        "civic_unavailable",
-    }:
-        projection["progression"] = _compact_progression(snapshot.tech_civics)
-    if event.event_type in {"pending_diplomacy", "war_posture_required"}:
-        projection["diplomacy"] = _bounded_rows(snapshot.diplomacy, 12)
-    if event.event_type == "pending_trade_offer":
-        projection["trades"] = _matching_offer(
-            snapshot.trades, event.payload.get("offer_id")
-        )
     return projection
 
 
@@ -321,6 +301,7 @@ def build_decision_gap(
             else existing.first_observation_id or existing.observation_id
         ),
         relevant_input_hash=relevant_hash,
+        input_projection_version=str(projection["projection_version"]),
         input_projection=projection,
         strategy_revision=str(projection.get("strategy", {}).get("revision", "none")),
         relevant_plan_revisions=tuple(
@@ -398,10 +379,37 @@ def evaluate_plan_lease(
             PlanLeaseStatus.EXPIRED: LeaseValidationResult.EXPIRED,
             PlanLeaseStatus.INVALIDATED: LeaseValidationResult.INVALIDATED,
             PlanLeaseStatus.AWAITING_INFORMATION: LeaseValidationResult.UNKNOWN,
+            PlanLeaseStatus.AWAITING_APPROVAL: LeaseValidationResult.UNKNOWN,
         }[lease.status]
         return LeaseEvaluation(result, lease, f"lease is already {lease.status.value}")
 
-    for condition in lease.preconditions:
+    if lease.completion_condition is not None:
+        condition = _condition_payload(lease.completion_condition)
+        outcome = evaluator.evaluate(condition, observation)
+        if outcome.reason.startswith("unsupported condition type"):
+            updated = lease.model_copy(
+                update={
+                    "status": PlanLeaseStatus.AWAITING_INFORMATION,
+                    "last_validated_observation_id": _observation_marker(observation),
+                    "last_validation_result": LeaseValidationResult.UNKNOWN,
+                }
+            )
+            return LeaseEvaluation(
+                LeaseValidationResult.UNKNOWN, updated, outcome.reason
+            )
+        if outcome.valid:
+            reason = "completion condition is satisfied"
+            updated = lease.model_copy(
+                update={
+                    "status": PlanLeaseStatus.COMPLETED,
+                    "last_validated_observation_id": _observation_marker(observation),
+                    "last_validation_result": LeaseValidationResult.VALID,
+                    "completion_reason": reason,
+                }
+            )
+            return LeaseEvaluation(LeaseValidationResult.VALID, updated, reason)
+
+    for condition in lease.continuation_conditions:
         outcome = evaluator.evaluate(_condition_payload(condition), observation)
         if outcome.reason.startswith("unsupported condition type"):
             updated = lease.model_copy(
@@ -415,7 +423,7 @@ def evaluate_plan_lease(
                 LeaseValidationResult.UNKNOWN, updated, outcome.reason
             )
         if not outcome.valid:
-            reason = f"lease precondition failed: {condition.condition_type}"
+            reason = f"lease continuation condition failed: {condition.condition_type}"
             updated = lease.model_copy(
                 update={
                     "status": PlanLeaseStatus.INVALIDATED,
@@ -425,22 +433,6 @@ def evaluate_plan_lease(
                 }
             )
             return LeaseEvaluation(LeaseValidationResult.INVALIDATED, updated, reason)
-    if lease.completion_condition is not None:
-        condition = _condition_payload(lease.completion_condition)
-        outcome = evaluator.evaluate(condition, observation)
-        if outcome.valid:
-            updated = lease.model_copy(
-                update={
-                    "status": PlanLeaseStatus.COMPLETED,
-                    "last_validated_observation_id": _observation_marker(observation),
-                    "last_validation_result": LeaseValidationResult.VALID,
-                }
-            )
-            return LeaseEvaluation(
-                LeaseValidationResult.VALID,
-                updated,
-                "completion condition is satisfied",
-            )
 
     for condition in lease.invalidation_conditions:
         outcome = evaluator.evaluate(_condition_payload(condition), observation)
@@ -658,6 +650,9 @@ def _relevant_plan_facts(event: GameEvent, context: dict[str, Any]) -> dict[str,
         "site",
         "x",
         "y",
+        "path_reachable",
+        "route_legal",
+        "target_legal",
         "threat_level",
     )
     return _pick(plan, keys)
@@ -721,6 +716,214 @@ def _matching_offer(value: Any, offer_id: Any) -> Any:
         if isinstance(row, dict) and str(row.get("offer_id")) == str(offer_id):
             return row
     return {}
+
+
+def _strategy_fields(context: dict[str, Any], *keys: str) -> dict[str, Any]:
+    strategy = context.get("strategy")
+    if not isinstance(strategy, dict):
+        return {}
+    if not keys:
+        return _pick(_compact_strategy(strategy), ("revision",))
+    revision_keys = tuple(f"{key}_revision" for key in keys)
+    return _pick(strategy, (*keys, *revision_keys))
+
+
+def _project_generic_gap(
+    snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "event_facts": _pick(event.payload, _PAYLOAD_KEYS),
+        "strategy": _strategy_fields(context),
+        "plan_revisions": _relevant_plan_revisions(event, context),
+    }
+
+
+def _canonical_target_rows(
+    snapshot: RuntimeSnapshot,
+    event: GameEvent,
+    plan: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw = event.payload.get(
+        "available_targets",
+        event.payload.get("targets", event.payload.get("target", [])),
+    )
+    rows = raw if isinstance(raw, list) else [raw]
+    if not rows and isinstance(event.payload.get("unit"), dict):
+        unit_targets = event.payload["unit"].get("targets", [])
+        rows = unit_targets if isinstance(unit_targets, list) else [unit_targets]
+    plan_target = plan.get("target", plan.get("site"))
+    if not isinstance(plan_target, dict):
+        target_x = plan.get("target_x", plan.get("x"))
+        target_y = plan.get("target_y", plan.get("y"))
+        plan_target = (
+            {"x": target_x, "y": target_y}
+            if target_x is not None and target_y is not None
+            else None
+        )
+    if isinstance(plan_target, dict):
+        rows = [*rows, plan_target]
+    occupied = {
+        (row.get("x"), row.get("y"))
+        for row in snapshot.cities or []
+        if isinstance(row, dict)
+    }
+    keys = (
+        "x",
+        "y",
+        "legal",
+        "is_legal",
+        "valid",
+        "occupied",
+        "is_occupied",
+        "reachable",
+        "path_reachable",
+        "path_status",
+    )
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = _pick(row, keys)
+        coordinates = (row.get("x"), row.get("y"))
+        item["occupied"] = bool(
+            row.get("occupied", row.get("is_occupied", coordinates in occupied))
+        )
+        item["legal"] = bool(
+            row.get("legal", row.get("is_legal", row.get("valid", True)))
+        )
+        item["reachable"] = bool(row.get("reachable", row.get("path_reachable", True)))
+        result.append(item)
+    deduplicated = {
+        json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=True): item
+        for item in result
+    }
+    return [deduplicated[key] for key in sorted(deduplicated)]
+
+
+def _project_settler_site(
+    snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
+) -> dict[str, Any]:
+    unit = find_entity(snapshot.units, ("unit_id", "id"), str(event.entity_id))
+    plan = _relevant_plan_facts(event, context)
+    return {
+        "settler": {
+            "exists": bool(unit),
+            "unit_type": None
+            if not isinstance(unit, dict)
+            else unit.get("unit_type", unit.get("type")),
+        },
+        "candidate_targets": _canonical_target_rows(snapshot, event, plan),
+        "path": {
+            **_pick(
+                plan, ("path_reachable", "path_status", "route_legal", "target_legal")
+            ),
+            **_pick(
+                event.payload,
+                ("path_reachable", "path_status", "route_legal", "target_legal"),
+            ),
+        },
+        "major_threat": str(snapshot.overview.get("threat_level", "")).upper()
+        in {"HIGH", "SEVERE", "CRITICAL"},
+        "strategy": _strategy_fields(context, "expansion_target"),
+        "plan_revisions": _relevant_plan_revisions(event, context),
+        "plan_target": _pick(plan, ("target", "target_x", "target_y", "site")),
+    }
+
+
+def _project_research_direction(
+    snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
+) -> dict[str, Any]:
+    progression = _compact_progression(snapshot.tech_civics)
+    return {
+        "research": _pick(
+            progression,
+            ("current_research", "current_tech", "research", "available_techs"),
+        ),
+        "strategy": _strategy_fields(context, "research_queue", "victory_focus"),
+    }
+
+
+def _project_city_role(
+    snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
+) -> dict[str, Any]:
+    row = find_entity(snapshot.cities, ("city_id", "id"), str(event.entity_id))
+    return {
+        "city": _pick(
+            row,
+            ("city_id", "id", "owner", "population", "x", "y", "districts"),
+        ),
+        "event_facts": _pick(event.payload, ("target", "plan_revision")),
+        "strategy": _strategy_fields(context, "stage", "victory_focus"),
+        "plan_revisions": _relevant_plan_revisions(event, context),
+    }
+
+
+def _project_diplomacy(
+    snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "request": _pick(
+            event.payload,
+            (
+                "diplomacy_id",
+                "request_id",
+                "other_player_id",
+                "player_id",
+                "request_type",
+                "status",
+                "terms",
+            ),
+        ),
+        "diplomacy": _bounded_rows(snapshot.diplomacy, 12),
+        "war_state": {
+            "at_war": snapshot.overview.get("at_war"),
+            "major_threat": str(snapshot.overview.get("threat_level", "")).upper()
+            in {"HIGH", "SEVERE", "CRITICAL"},
+        },
+        "strategy": _strategy_fields(context, "military_posture"),
+    }
+
+
+def _project_trade_offer(
+    snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "offer": _matching_offer(snapshot.trades, event.payload.get("offer_id"))
+        or _pick(
+            event.payload, ("offer_id", "other_player_id", "terms", "expires_turn")
+        ),
+        "strategy": _strategy_fields(context, "victory_focus"),
+    }
+
+
+def _project_war_posture(
+    snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "war_state": _pick(
+            snapshot.overview,
+            ("at_war", "military_strength", "threat_level"),
+        ),
+        "diplomacy": _bounded_rows(snapshot.diplomacy, 12),
+        "strategy": _strategy_fields(context, "military_posture", "victory_focus"),
+    }
+
+
+DECISION_INPUT_PROJECTION_REGISTRY = {
+    "settler_site_selection_required": _project_settler_site,
+    "settler_plan_requires_review": _project_settler_site,
+    "research_direction_required": _project_research_direction,
+    "research_unavailable": _project_research_direction,
+    "city_role_required": _project_city_role,
+    "pending_diplomacy": _project_diplomacy,
+    "pending_trade_offer": _project_trade_offer,
+    "war_posture_required": _project_war_posture,
+}
+
+GAP_PROJECTION_VERSIONS = {
+    gap_type: f"{DECISION_INPUT_PROJECTION_VERSION}/{gap_type}/v1"
+    for gap_type in DECISION_INPUT_PROJECTION_REGISTRY
+}
 
 
 def _observation_marker(observation: NormalizedRuntimeObservation) -> str:

@@ -12,6 +12,7 @@ from uuid import uuid4
 from .action_retry import FailedAttemptResolution, resolve_failed_attempt
 from .domain import (
     ActionAttempt,
+    ApprovalRecord,
     AttemptReconciledTick,
     AttemptRecoveredTick,
     AttemptStatus,
@@ -228,6 +229,21 @@ CREATE TABLE IF NOT EXISTS plan_leases (
 
 CREATE INDEX IF NOT EXISTS idx_plan_leases_active
 ON plan_leases (game_id, status, scope);
+CREATE TABLE IF NOT EXISTS approval_records (
+    approval_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    proposal_type TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    proposal_revision INTEGER NOT NULL,
+    decision TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_approval_records_proposal
+ON approval_records (
+    game_id, proposal_type, proposal_id, proposal_revision, created_at
+);
 
 CREATE TABLE IF NOT EXISTS planner_suppressions (
     suppression_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,6 +373,7 @@ REPLAY_STATE_TABLES = (
     "event_log",
     "decision_gaps",
     "decision_groups",
+    "approval_records",
     "logical_planner_requests",
     "provider_attempts",
     "information_rounds",
@@ -710,6 +727,7 @@ class WorkflowStore:
             status = str(row["status"])
             if status == "ACTIVE" and not (
                 payload.get("preconditions")
+                and payload.get("continuation_conditions")
                 and payload.get("completion_condition")
                 and payload.get("invalidation_conditions")
                 and payload.get("review_conditions")
@@ -1080,137 +1098,158 @@ class WorkflowStore:
         auto_action_types: set[str],
         observation_id: str | None = None,
     ) -> None:
+        with self._connect() as conn:
+            self._save_plan_bundle_in_connection(
+                conn,
+                game_id,
+                turn,
+                bundle,
+                mode=mode,
+                auto_action_types=auto_action_types,
+                observation_id=observation_id,
+            )
+
+    def _save_plan_bundle_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        game_id: str,
+        turn: int,
+        bundle: PlanBundle,
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+        observation_id: str | None = None,
+    ) -> None:
         created_from_observation_id = (
             observation_id or f"legacy:{game_id}:{turn}:{bundle.plan_id}"
         )
-        with self._connect() as conn:
-            if bundle.strategy_updates:
-                current = conn.execute(
-                    "SELECT state_json FROM strategy_state WHERE game_id=?", (game_id,)
-                ).fetchone()
-                merged = {} if current is None else self._load(current["state_json"])
-                merged.update(bundle.strategy_updates)
-                conn.execute(
-                    """
-                    INSERT INTO strategy_state(game_id, state_json, plan_id, updated_turn)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(game_id) DO UPDATE SET
-                        state_json=excluded.state_json,
-                        plan_id=excluded.plan_id,
-                        updated_turn=excluded.updated_turn,
-                        updated_at=CURRENT_TIMESTAMP
-                    """,
-                    (game_id, self._dump(merged), bundle.plan_id, turn),
-                )
-
-            self._upsert_entity_plans(
-                conn,
-                "city_plans",
-                "city_id",
-                game_id,
-                bundle.plan_id,
-                turn,
-                bundle.city_plan_updates,
-            )
-            self._upsert_entity_plans(
-                conn,
-                "unit_plans",
-                "unit_id",
-                game_id,
-                bundle.plan_id,
-                turn,
-                bundle.unit_plan_updates,
-            )
-            self._upsert_entity_plans(
-                conn,
-                "builder_plans",
-                "builder_key",
-                game_id,
-                bundle.plan_id,
-                turn,
-                bundle.builder_plan_updates,
+        if bundle.strategy_updates:
+            current = conn.execute(
+                "SELECT state_json FROM strategy_state WHERE game_id=?", (game_id,)
+            ).fetchone()
+            merged = {} if current is None else self._load(current["state_json"])
+            merged.update(bundle.strategy_updates)
+            conn.execute(
+                """
+                INSERT INTO strategy_state(game_id, state_json, plan_id, updated_turn)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(game_id) DO UPDATE SET
+                    state_json=excluded.state_json,
+                    plan_id=excluded.plan_id,
+                    updated_turn=excluded.updated_turn,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (game_id, self._dump(merged), bundle.plan_id, turn),
             )
 
-            for task_id in bundle.cancel_task_ids:
-                conn.execute(
-                    """
-                    UPDATE workflow_tasks SET status=?, updated_at=CURRENT_TIMESTAMP
-                    WHERE game_id=? AND task_id=? AND status NOT IN (?, ?)
-                    """,
-                    (
-                        TaskStatus.CANCELLED.value,
-                        game_id,
-                        task_id,
-                        TaskStatus.DONE.value,
-                        TaskStatus.CANCELLED.value,
-                    ),
-                )
+        self._upsert_entity_plans(
+            conn,
+            "city_plans",
+            "city_id",
+            game_id,
+            bundle.plan_id,
+            turn,
+            bundle.city_plan_updates,
+        )
+        self._upsert_entity_plans(
+            conn,
+            "unit_plans",
+            "unit_id",
+            game_id,
+            bundle.plan_id,
+            turn,
+            bundle.unit_plan_updates,
+        )
+        self._upsert_entity_plans(
+            conn,
+            "builder_plans",
+            "builder_key",
+            game_id,
+            bundle.plan_id,
+            turn,
+            bundle.builder_plan_updates,
+        )
 
-            for proposed in bundle.tasks:
-                if mode is ExecutionMode.READONLY:
-                    status = TaskStatus.AWAITING_CONFIRMATION
-                elif (
-                    proposed.requires_confirmation
-                    or proposed.action_type not in auto_action_types
-                ):
-                    status = TaskStatus.AWAITING_CONFIRMATION
-                elif proposed.due_turn <= turn:
-                    status = TaskStatus.READY
-                else:
-                    status = TaskStatus.PENDING
+        for task_id in bundle.cancel_task_ids:
+            conn.execute(
+                """
+                UPDATE workflow_tasks SET status=?, updated_at=CURRENT_TIMESTAMP
+                WHERE game_id=? AND task_id=? AND status NOT IN (?, ?)
+                """,
+                (
+                    TaskStatus.CANCELLED.value,
+                    game_id,
+                    task_id,
+                    TaskStatus.DONE.value,
+                    TaskStatus.CANCELLED.value,
+                ),
+            )
 
-                conn.execute(
-                    """
-                    INSERT INTO workflow_tasks(
-                        game_id, task_id, plan_id, action_type, entity_type,
-                        entity_id, due_turn, expires_turn, arguments_json,
-                        preconditions_json, postconditions_json, invalidators_json,
-                        risk, requires_confirmation, reason, status, created_turn,
-                        created_from_observation_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(game_id, task_id) DO UPDATE SET
-                        plan_id=excluded.plan_id,
-                        action_type=excluded.action_type,
-                        entity_type=excluded.entity_type,
-                        entity_id=excluded.entity_id,
-                        due_turn=excluded.due_turn,
-                        expires_turn=excluded.expires_turn,
-                        arguments_json=excluded.arguments_json,
-                        preconditions_json=excluded.preconditions_json,
-                        postconditions_json=excluded.postconditions_json,
-                        invalidators_json=excluded.invalidators_json,
-                        risk=excluded.risk,
-                        requires_confirmation=excluded.requires_confirmation,
-                        reason=excluded.reason,
-                        status=CASE
-                            WHEN workflow_tasks.status IN (
-                                'done', 'failed', 'escalated'
-                            ) THEN workflow_tasks.status
-                            ELSE excluded.status
-                        END,
-                        updated_at=CURRENT_TIMESTAMP
-                    """,
-                    (
-                        game_id,
-                        proposed.task_id,
-                        bundle.plan_id,
-                        proposed.action_type,
-                        proposed.entity_type,
-                        str(proposed.entity_id),
-                        proposed.due_turn,
-                        proposed.expires_turn,
-                        self._dump(proposed.arguments),
-                        self._dump(proposed.preconditions),
-                        self._dump(proposed.postconditions),
-                        self._dump(proposed.invalidators),
-                        proposed.risk.value,
-                        int(proposed.requires_confirmation),
-                        proposed.reason,
-                        status.value,
-                        turn,
-                        created_from_observation_id,
-                    ),
-                )
+        for proposed in bundle.tasks:
+            if mode is ExecutionMode.READONLY:
+                status = TaskStatus.AWAITING_CONFIRMATION
+            elif (
+                proposed.requires_confirmation
+                or proposed.action_type not in auto_action_types
+            ):
+                status = TaskStatus.AWAITING_CONFIRMATION
+            elif proposed.due_turn <= turn:
+                status = TaskStatus.READY
+            else:
+                status = TaskStatus.PENDING
+
+            conn.execute(
+                """
+                INSERT INTO workflow_tasks(
+                    game_id, task_id, plan_id, action_type, entity_type,
+                    entity_id, due_turn, expires_turn, arguments_json,
+                    preconditions_json, postconditions_json, invalidators_json,
+                    risk, requires_confirmation, reason, status, created_turn,
+                    created_from_observation_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(game_id, task_id) DO UPDATE SET
+                    plan_id=excluded.plan_id,
+                    action_type=excluded.action_type,
+                    entity_type=excluded.entity_type,
+                    entity_id=excluded.entity_id,
+                    due_turn=excluded.due_turn,
+                    expires_turn=excluded.expires_turn,
+                    arguments_json=excluded.arguments_json,
+                    preconditions_json=excluded.preconditions_json,
+                    postconditions_json=excluded.postconditions_json,
+                    invalidators_json=excluded.invalidators_json,
+                    risk=excluded.risk,
+                    requires_confirmation=excluded.requires_confirmation,
+                    reason=excluded.reason,
+                    status=CASE
+                        WHEN workflow_tasks.status IN (
+                            'done', 'failed', 'escalated'
+                        ) THEN workflow_tasks.status
+                        ELSE excluded.status
+                    END,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    game_id,
+                    proposed.task_id,
+                    bundle.plan_id,
+                    proposed.action_type,
+                    proposed.entity_type,
+                    str(proposed.entity_id),
+                    proposed.due_turn,
+                    proposed.expires_turn,
+                    self._dump(proposed.arguments),
+                    self._dump(proposed.preconditions),
+                    self._dump(proposed.postconditions),
+                    self._dump(proposed.invalidators),
+                    proposed.risk.value,
+                    int(proposed.requires_confirmation),
+                    proposed.reason,
+                    status.value,
+                    turn,
+                    created_from_observation_id,
+                ),
+            )
 
     def _upsert_entity_plans(
         self,
@@ -2207,6 +2246,53 @@ class WorkflowStore:
         with self._connect() as conn:
             self._save_plan_lease_in_connection(conn, lease)
 
+    def save_approval_record(self, game_id: str, record: ApprovalRecord) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO approval_records(
+                    approval_id, game_id, proposal_type, proposal_id,
+                    proposal_revision, decision, record_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(approval_id) DO NOTHING
+                """,
+                (
+                    record.approval_id,
+                    game_id,
+                    record.proposal_type,
+                    record.proposal_id,
+                    record.proposal_revision,
+                    record.decision.value,
+                    record.model_dump_json(),
+                    record.created_at.isoformat(),
+                ),
+            )
+
+    def latest_approval_record(
+        self,
+        game_id: str,
+        *,
+        proposal_type: str,
+        proposal_id: str,
+        proposal_revision: int,
+    ) -> ApprovalRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT record_json FROM approval_records
+                WHERE game_id=? AND proposal_type=? AND proposal_id=?
+                  AND proposal_revision=?
+                ORDER BY created_at DESC, approval_id DESC
+                LIMIT 1
+                """,
+                (game_id, proposal_type, proposal_id, proposal_revision),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else ApprovalRecord.model_validate_json(row["record_json"])
+        )
+
     def list_plan_leases(self, game_id: str) -> list[PlanLease]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -2252,6 +2338,62 @@ class WorkflowStore:
                 ),
             ),
         )
+        WorkflowStore._abandon_started_provider_attempts_for_terminal_request(
+            conn, request
+        )
+
+    @staticmethod
+    def _abandon_started_provider_attempts_for_terminal_request(
+        conn: sqlite3.Connection, request: PlannerRequest
+    ) -> None:
+        if request.status not in {
+            PlannerRequestStatus.COMPLETED,
+            PlannerRequestStatus.PARTIALLY_COMPLETED,
+            PlannerRequestStatus.SUPERSEDED,
+            PlannerRequestStatus.CANCELLED,
+            PlannerRequestStatus.FAILED,
+            PlannerRequestStatus.REJECTED,
+        }:
+            return
+        completed_at = request.completed_at or datetime.now(UTC)
+        rows = conn.execute(
+            """
+            SELECT attempt_json FROM provider_attempts
+            WHERE planner_request_id=? AND status=?
+            ORDER BY attempt_number
+            """,
+            (
+                request.planner_request_id,
+                ProviderAttemptStatus.STARTED.value,
+            ),
+        ).fetchall()
+        for row in rows:
+            started = ProviderAttempt.model_validate_json(row["attempt_json"])
+            diagnostics = dict(started.diagnostics)
+            diagnostics.update(
+                {
+                    "abandoned_by_request_status": request.status.value,
+                    "termination_reason": request.failure_category
+                    or f"request_{request.status.value.lower()}",
+                }
+            )
+            abandoned = started.model_copy(
+                update={
+                    "status": ProviderAttemptStatus.ABANDONED,
+                    "completed_at": completed_at,
+                    "latency_seconds": max(
+                        0.0, (completed_at - started.started_at).total_seconds()
+                    ),
+                    "failure_category": (
+                        request.failure_category
+                        or f"request_{request.status.value.lower()}"
+                    ),
+                    "diagnostics": diagnostics,
+                }
+            )
+            WorkflowStore._save_provider_attempt_in_connection(
+                conn, request.game_session_id, abandoned
+            )
 
     def save_planner_request(self, request: PlannerRequest) -> None:
         with self._connect() as conn:
@@ -2277,6 +2419,7 @@ class WorkflowStore:
             status.value
             for status in (
                 PlannerRequestStatus.COMPLETED,
+                PlannerRequestStatus.PARTIALLY_COMPLETED,
                 PlannerRequestStatus.FAILED,
                 PlannerRequestStatus.REJECTED,
                 PlannerRequestStatus.CANCELLED,
@@ -2536,11 +2679,27 @@ class WorkflowStore:
         planner_request: PlannerRequest | None = None,
         provider_attempts: Sequence[ProviderAttempt] = (),
         information_round: InformationRound | None = None,
+        plan_bundle: PlanBundle | None = None,
+        plan_bundle_mode: ExecutionMode | None = None,
+        plan_bundle_auto_action_types: Sequence[str] = (),
+        plan_bundle_observation_id: str | None = None,
         active_attempt_id: str | None = None,
         cancel_task_ids: Sequence[str] = (),
     ) -> None:
         tick = validate_workflow_tick(tick)
         with self._connect() as conn:
+            if plan_bundle is not None:
+                if plan_bundle_mode is None:
+                    raise ValueError("plan bundle persistence requires execution mode")
+                self._save_plan_bundle_in_connection(
+                    conn,
+                    tick.game_session_id,
+                    tick.turn_number,
+                    plan_bundle,
+                    mode=plan_bundle_mode,
+                    auto_action_types=set(plan_bundle_auto_action_types),
+                    observation_id=plan_bundle_observation_id,
+                )
             for gap in decision_gaps:
                 if gap.game_session_id != tick.game_session_id:
                     raise ValueError("decision gap and Tick must belong to one game")
@@ -2581,7 +2740,11 @@ class WorkflowStore:
                 if lease.game_session_id != tick.game_session_id:
                     raise ValueError("plan lease and Tick must belong to one game")
                 self._save_plan_lease_in_connection(conn, lease)
-                if lease.status is not PlanLeaseStatus.ACTIVE:
+                if lease.status in {
+                    PlanLeaseStatus.COMPLETED,
+                    PlanLeaseStatus.EXPIRED,
+                    PlanLeaseStatus.INVALIDATED,
+                }:
                     self._invalidate_plan_projection_in_connection(conn, lease)
             for task_id in cancel_task_ids:
                 conn.execute(

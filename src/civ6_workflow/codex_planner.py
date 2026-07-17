@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
+import shutil
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -200,6 +201,26 @@ class CodexPlanner:
                 current["error_body"] = error_body
             self.last_diagnostics = current
 
+        executable = command[0]
+        candidate = Path(executable).expanduser()
+        resolved = (
+            str(candidate.resolve())
+            if candidate.parent != Path(".") and candidate.is_file()
+            else shutil.which(executable)
+        )
+        if resolved is None:
+            error = f"Codex executable was not found: {self.config.command}"
+            record_diagnostics(error_body=error)
+            raise PlannerError(error)
+        command[0] = resolved
+
+        await self._provider_attempt(
+            "started",
+            provider_request_id=request.request_id,
+            attempt_number=1,
+        )
+        diagnostics["attempt_count"] = 1
+        record_diagnostics()
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -211,16 +232,8 @@ class CodexPlanner:
         except FileNotFoundError as exc:
             record_diagnostics(error_body=str(exc))
             raise PlannerError(
-                f"Codex executable was not found: {self.config.command}"
+                f"Codex executable disappeared after preflight: {resolved}"
             ) from exc
-
-        await self._provider_attempt(
-            "started",
-            provider_request_id=request.request_id,
-            attempt_number=1,
-        )
-        diagnostics["attempt_count"] = 1
-        record_diagnostics()
         communication = asyncio.create_task(process.communicate(prompt.encode("utf-8")))
         try:
             stdout, stderr = await asyncio.wait_for(

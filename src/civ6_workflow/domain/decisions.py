@@ -11,7 +11,7 @@ from pydantic import Field, model_validator
 from .base import DomainModel, ImmutableJsonObject, SubjectRef
 
 
-DECISION_INPUT_PROJECTION_VERSION = "decision-input/v1"
+DECISION_INPUT_PROJECTION_VERSION = "decision-input/v2"
 
 
 class DecisionGapStatus(StrEnum):
@@ -86,11 +86,15 @@ class DecisionGap(DomainModel):
             raise ValueError(
                 "identity_turn_number is allowed exactly for turn-specific gaps"
             )
-        if self.status in {
-            DecisionGapStatus.REQUESTED,
-            DecisionGapStatus.AWAITING_INFORMATION,
-            DecisionGapStatus.PLANNER_REQUESTED,
-        } and self.logical_request_id is None:
+        if (
+            self.status
+            in {
+                DecisionGapStatus.REQUESTED,
+                DecisionGapStatus.AWAITING_INFORMATION,
+                DecisionGapStatus.PLANNER_REQUESTED,
+            }
+            and self.logical_request_id is None
+        ):
             raise ValueError("requested decision gaps require logical_request_id")
         if self.status in TERMINAL_DECISION_GAP_STATUSES and not (
             self.resolution_reason or self.invalidation_reason

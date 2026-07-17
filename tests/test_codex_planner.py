@@ -370,3 +370,43 @@ def test_timed_out_cli_records_started_provider_attempt(tmp_path: Path, monkeypa
     assert planner.last_diagnostics is not None
     assert planner.last_diagnostics["attempt_count"] == 1
     assert planner.last_diagnostics["error_body"]
+
+
+def test_cli_started_hook_precedes_subprocess_creation(tmp_path: Path, monkeypatch):
+    planner = CodexPlanner(
+        CodexPlannerConfig(
+            backend="codex_cli",
+            command=str(Path(__file__).resolve()),
+            state_directory=tmp_path / "prelaunch",
+            use_output_schema=False,
+        )
+    )
+    request = AgentRequest(
+        request_id="req-prelaunch-crash",
+        turn=1,
+        execution_mode=ExecutionMode.READONLY,
+        trigger_events=[],
+    )
+    phases = []
+    spawned = False
+
+    class CrashBeforeSpawn(RuntimeError):
+        pass
+
+    async def hook(phase, details):
+        phases.append((phase, details["attempt_number"]))
+        raise CrashBeforeSpawn("persisted STARTED boundary")
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("subprocess must not start before STARTED is persisted")
+
+    planner.set_provider_attempt_hook(hook)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(CrashBeforeSpawn, match="STARTED"):
+        asyncio.run(planner.plan(request))
+
+    assert phases == [("started", 1)]
+    assert spawned is False

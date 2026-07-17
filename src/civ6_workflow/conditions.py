@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -51,6 +52,20 @@ class ConditionEvaluator:
     ) -> ConditionResult:
         normalized_snapshot = observation.snapshot
         kind = condition.get("type")
+        if kind == "all_of":
+            nested = condition.get("conditions")
+            if not isinstance(nested, (list, tuple)) or not nested:
+                return ConditionResult(False, "all_of requires nested conditions")
+            for item in nested:
+                if not isinstance(item, Mapping):
+                    return ConditionResult(
+                        False, "all_of contains an invalid condition"
+                    )
+                result = self._evaluate_normalized(dict(item), observation)
+                if not result.valid:
+                    return result
+            return ConditionResult(True)
+
         if kind == "turn_at_least":
             expected = int(condition["turn"])
             return ConditionResult(

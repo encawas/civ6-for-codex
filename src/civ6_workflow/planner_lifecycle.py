@@ -21,6 +21,8 @@ from .decisioning import (
 )
 from .domain import (
     ApprovalStatus,
+    ApprovalDecision,
+    AwaitingApprovalTick,
     AwaitingHumanTick,
     Condition,
     DecisionGap,
@@ -49,6 +51,7 @@ from .domain import (
 from .models import (
     AgentRequest,
     EventLevel,
+    ExecutionMode,
     GameEvent,
     RiskLevel,
     TickResult,
@@ -58,6 +61,7 @@ from .workflow_protocol import (
     InformationRequest,
     ResolutionDisposition,
     WorkflowPlanBundle,
+    validate_event_resolution_contract,
 )
 
 
@@ -69,7 +73,6 @@ class PlannerLifecycleCoordinator:
 
     def validate_before_routing(self, ctx, observation, current_events, compatibility):
         if ctx.starting_state in {
-            RuntimeState.AWAITING_APPROVAL,
             RuntimeState.AWAITING_HUMAN,
             RuntimeState.TURN_TRANSITIONING,
             RuntimeState.VERIFYING,
@@ -222,6 +225,58 @@ class PlannerLifecycleCoordinator:
         snapshot = observation.snapshot
         observation_id = engine._active_observation_id or ctx.observation_ids[-1]
         for lease in engine.store.list_plan_leases(snapshot.game_id):
+            if lease.status is PlanLeaseStatus.AWAITING_APPROVAL:
+                approval = engine.store.latest_approval_record(
+                    snapshot.game_id,
+                    proposal_type="decision_gap",
+                    proposal_id=lease.decision_gap_ids[0],
+                    proposal_revision=lease.plan_revision,
+                )
+                if approval is None or approval.decision not in {
+                    ApprovalDecision.APPROVED,
+                    ApprovalDecision.EDITED_AND_APPROVED,
+                }:
+                    compatibility.paused = True
+                    compatibility.pause_reason = "plan lease approval is required"
+                    return self._finish(
+                        ctx,
+                        snapshot,
+                        AwaitingApprovalTick,
+                        compatibility=compatibility,
+                        plan_leases=[lease],
+                        proposal_id=lease.decision_gap_ids[0],
+                        blocking_reason=compatibility.pause_reason,
+                    )
+                activated = lease.model_copy(
+                    update={
+                        "status": PlanLeaseStatus.ACTIVE,
+                        "approval_status": ApprovalStatus.APPROVED,
+                        "last_validated_observation_id": observation_id,
+                    }
+                )
+                gap_updates = []
+                gap = engine.store.get_decision_gap(
+                    snapshot.game_id, lease.decision_gap_ids[0]
+                )
+                if gap is not None:
+                    gap_updates = [
+                        gap.model_copy(
+                            update={
+                                "status": DecisionGapStatus.RESOLVED,
+                                "resolution_reason": "durable approval activated lease",
+                            }
+                        )
+                    ]
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    PlanLeaseUpdatedTick,
+                    compatibility=compatibility,
+                    decision_gaps=gap_updates,
+                    plan_leases=[activated],
+                    plan_lease_id=lease.plan_lease_id,
+                    validation_result=LeaseValidationResult.VALID.value,
+                )
             if lease.status is not PlanLeaseStatus.ACTIVE:
                 continue
             gap = (
@@ -236,110 +291,118 @@ class PlannerLifecycleCoordinator:
                 if gap is None
                 else self._rebuild_current_gap(gap, observation, current_events)
             )
-            if current_gap is None:
-                reason = "the source strategic decision is no longer present"
-                updated_lease = lease.model_copy(
-                    update={
-                        "status": PlanLeaseStatus.INVALIDATED,
-                        "last_validated_observation_id": observation_id,
-                        "last_validation_result": LeaseValidationResult.INVALIDATED,
-                        "invalidation_reason": reason,
-                    }
-                )
-                invalidated_gap = (
-                    []
-                    if gap is None
-                    else [
-                        gap.model_copy(
-                            update={
-                                "status": DecisionGapStatus.INVALIDATED,
-                                "observation_id": observation_id,
-                                "logical_request_id": None,
-                                "invalidation_reason": reason,
-                                "resolution_reason": None,
-                            }
-                        )
-                    ]
-                )
-                return self._finish(
-                    ctx,
-                    snapshot,
-                    PlanLeaseUpdatedTick,
-                    compatibility=compatibility,
-                    decision_gaps=invalidated_gap,
-                    plan_leases=[updated_lease],
-                    cancel_task_ids=self._dependent_task_ids(lease),
-                    plan_lease_id=lease.plan_lease_id,
-                    validation_result=LeaseValidationResult.INVALIDATED.value,
-                )
-
             evaluation = evaluate_plan_lease(
                 lease,
                 observation,
-                relevant_input_hash=current_gap.relevant_input_hash,
+                relevant_input_hash=(
+                    lease.relevant_input_hash
+                    if current_gap is None
+                    else current_gap.relevant_input_hash
+                ),
                 evaluator=engine.conditions,
             )
-            input_changed = current_gap.relevant_input_hash != gap.relevant_input_hash
+            evaluated_lease = evaluation.lease
+            result = evaluation.result
+            reason = evaluation.reason
+
+            if (
+                current_gap is None
+                and evaluated_lease.status is not PlanLeaseStatus.COMPLETED
+            ):
+                reason = "one-shot event disappeared without completion evidence"
+                evaluated_lease = lease.model_copy(
+                    update={
+                        "status": PlanLeaseStatus.AWAITING_INFORMATION,
+                        "last_validated_observation_id": observation_id,
+                        "last_validation_result": LeaseValidationResult.UNKNOWN,
+                    }
+                )
+                result = LeaseValidationResult.UNKNOWN
+
+            input_changed = (
+                current_gap is not None
+                and gap is not None
+                and current_gap.relevant_input_hash != gap.relevant_input_hash
+            )
             material = (
-                input_changed
-                or evaluation.lease.status is not lease.status
-                or evaluation.lease.valid_until_turn != lease.valid_until_turn
-                or evaluation.lease.last_validation_result
+                current_gap is None
+                or input_changed
+                or evaluated_lease.status is not lease.status
+                or evaluated_lease.valid_until_turn != lease.valid_until_turn
+                or evaluated_lease.last_validation_result
                 is not lease.last_validation_result
             )
             if not material:
                 continue
 
-            gap_update = current_gap.model_copy(
-                update={
-                    "status": gap.status,
-                    "route": gap.route,
-                    "logical_request_id": gap.logical_request_id,
-                    "resolution_reason": gap.resolution_reason,
-                    "invalidation_reason": gap.invalidation_reason,
-                    "reopen_reason": gap.reopen_reason,
-                }
-            )
+            gap_update = current_gap or gap
+            gap_updates = []
             cancel_task_ids: tuple[str, ...] = ()
-            if evaluation.result in {
-                LeaseValidationResult.EXPIRED,
-                LeaseValidationResult.INVALIDATED,
-                LeaseValidationResult.UNKNOWN,
-            }:
-                gap_update = gap_update.model_copy(
-                    update={
-                        "status": DecisionGapStatus.OPEN,
-                        "logical_request_id": None,
-                        "reopen_reason": evaluation.reason,
-                        "resolution_reason": None,
-                        "invalidation_reason": None,
-                    }
-                )
+            if gap_update is not None:
+                if evaluated_lease.status is PlanLeaseStatus.COMPLETED:
+                    gap_update = gap_update.model_copy(
+                        update={
+                            "status": DecisionGapStatus.RESOLVED,
+                            "observation_id": observation_id,
+                            "resolution_reason": reason,
+                            "invalidation_reason": None,
+                            "reopen_reason": None,
+                        }
+                    )
+                    cancel_task_ids = self._dependent_task_ids(lease)
+                elif result in {
+                    LeaseValidationResult.EXPIRED,
+                    LeaseValidationResult.INVALIDATED,
+                    LeaseValidationResult.UNKNOWN,
+                }:
+                    gap_update = gap_update.model_copy(
+                        update={
+                            "status": DecisionGapStatus.OPEN,
+                            "logical_request_id": None,
+                            "reopen_reason": reason,
+                            "resolution_reason": None,
+                            "invalidation_reason": None,
+                        }
+                    )
+                    cancel_task_ids = self._dependent_task_ids(lease)
+                else:
+                    gap_update = gap_update.model_copy(
+                        update={
+                            "status": gap.status,
+                            "route": gap.route,
+                            "logical_request_id": gap.logical_request_id,
+                            "resolution_reason": gap.resolution_reason,
+                            "invalidation_reason": gap.invalidation_reason,
+                            "reopen_reason": gap.reopen_reason,
+                        }
+                    )
+                gap_updates = [gap_update]
+            elif evaluated_lease.status is not PlanLeaseStatus.ACTIVE:
                 cancel_task_ids = self._dependent_task_ids(lease)
 
-            if evaluation.result is LeaseValidationResult.UNKNOWN:
+            if result is LeaseValidationResult.UNKNOWN:
                 compatibility.paused = True
-                compatibility.pause_reason = evaluation.reason
+                compatibility.pause_reason = reason
                 return self._finish(
                     ctx,
                     snapshot,
                     AwaitingHumanTick,
                     compatibility=compatibility,
-                    decision_gaps=[gap_update],
-                    plan_leases=[evaluation.lease],
+                    decision_gaps=gap_updates,
+                    plan_leases=[evaluated_lease],
                     cancel_task_ids=cancel_task_ids,
-                    blocking_reason=evaluation.reason,
+                    blocking_reason=reason,
                 )
             return self._finish(
                 ctx,
                 snapshot,
                 PlanLeaseUpdatedTick,
                 compatibility=compatibility,
-                decision_gaps=[gap_update],
-                plan_leases=[evaluation.lease],
+                decision_gaps=gap_updates,
+                plan_leases=[evaluated_lease],
                 cancel_task_ids=cancel_task_ids,
                 plan_lease_id=lease.plan_lease_id,
-                validation_result=evaluation.result.value,
+                validation_result=result.value,
             )
         return None
 
@@ -347,11 +410,23 @@ class PlannerLifecycleCoordinator:
         subjects = {
             (subject.subject_type, subject.subject_id) for subject in lease.subjects
         }
+        action_slots = {
+            "city_set_production": "city_production",
+            "set_research": "research",
+            "set_civic": "civic",
+            "unit_move": "unit_route",
+            "unit_skip": "unit_route",
+            "unit_found_city": "unit_route",
+            "builder_improve": "builder_route",
+        }
         result = set(lease.task_ids)
         for task in self.engine.store.list_tasks(lease.game_session_id):
-            if task.plan_id == lease.plan_id or (
-                (task.entity_type, str(task.entity_id)) in subjects
-            ):
+            subject_matches = (task.entity_type, str(task.entity_id)) in subjects
+            slot = action_slots.get(task.action_type)
+            slot_matches = not lease.covered_slots or slot in lease.covered_slots
+            if subject_matches and slot_matches:
+                result.add(task.task_id)
+            elif not subjects and slot is not None and slot in lease.covered_slots:
                 result.add(task.task_id)
         return tuple(sorted(result))
 
@@ -382,15 +457,26 @@ class PlannerLifecycleCoordinator:
         if matching is None:
             projection = thaw_json(gap.input_projection)
             subject = projection.get("subject", {})
+            payload = dict(projection.get("event_facts", {}))
+            if gap.gap_type in {
+                "settler_site_selection_required",
+                "settler_plan_requires_review",
+            }:
+                payload["available_targets"] = projection.get("candidate_targets", [])
+                payload.update(projection.get("path", {}))
             matching = GameEvent(
                 event_type=gap.gap_type,
                 turn=snapshot.turn,
                 entity_type=subject.get("type"),
                 entity_id=subject.get("id"),
                 level=EventLevel.L3,
-                risk=RiskLevel.HIGH,
+                risk=(
+                    RiskLevel.HIGH
+                    if projection.get("approval", {}).get("required")
+                    else RiskLevel.LOW
+                ),
                 blocking=True,
-                payload=projection.get("event_facts", {}),
+                payload=payload,
                 dedupe_key=gap.cooldown_key,
             )
         return build_decision_gap(
@@ -973,9 +1059,58 @@ class PlannerLifecycleCoordinator:
             provider_request,
             snapshot,
         )
+        resolved_gaps, leases = self._resolve_gaps(
+            logical_request,
+            valid_bundle,
+            validation,
+            snapshot.turn,
+            observation,
+        )
+        successful_gap_ids = {
+            gap_id for lease in leases for gap_id in lease.decision_gap_ids
+        }
+        valid_subset = self._subset_for_resolved_gaps(valid_bundle, successful_gap_ids)
+        resolved_gaps, leases = self._refresh_effective_lease_baselines(
+            snapshot,
+            provider_request,
+            resolved_gaps,
+            leases,
+            valid_subset,
+        )
+        human_gaps = [
+            gap
+            for gap in resolved_gaps
+            if gap.status is DecisionGapStatus.AWAITING_HUMAN
+        ]
+        active_leases = [
+            lease for lease in leases if lease.status is PlanLeaseStatus.ACTIVE
+        ]
+        pending_approval = [
+            lease
+            for lease in leases
+            if lease.status is PlanLeaseStatus.AWAITING_APPROVAL
+        ]
+        if human_gaps and leases:
+            request_status = PlannerRequestStatus.PARTIALLY_COMPLETED
+            validation = {
+                **validation,
+                "result": "partially_completed",
+                "successful_gap_ids": sorted(successful_gap_ids),
+                "human_gap_ids": sorted(gap.decision_gap_id for gap in human_gaps),
+            }
+        elif human_gaps:
+            request_status = PlannerRequestStatus.REJECTED
+            validation = {**validation, "result": "rejected"}
+        else:
+            request_status = PlannerRequestStatus.COMPLETED
+            validation = {
+                **validation,
+                "result": "completed",
+                "successful_gap_ids": sorted(successful_gap_ids),
+            }
         updated_request = logical_request.model_copy(
             update={
-                "status": PlannerRequestStatus.COMPLETED,
+                "status": request_status,
                 "completed_at": completed,
                 "response_hash": hashlib.sha256(
                     json.dumps(
@@ -988,34 +1123,13 @@ class PlannerLifecycleCoordinator:
                 ).hexdigest(),
                 "validation_result": validation,
                 "provider_attempt_count": logical_request.provider_attempt_count,
+                "failure_category": (
+                    "invalid_planner_output_item" if human_gaps else None
+                ),
             }
         )
-        resolved_gaps, leases = self._resolve_gaps(
-            logical_request,
-            valid_bundle,
-            validation,
-            snapshot.turn,
-        )
-        needs_human = any(
-            gap.status is DecisionGapStatus.AWAITING_HUMAN for gap in resolved_gaps
-        )
-        if needs_human:
-            updated_request = updated_request.model_copy(
-                update={
-                    "status": PlannerRequestStatus.REJECTED,
-                    "failure_category": "invalid_planner_output_item",
-                }
-            )
-        if not needs_human and self._bundle_has_updates(valid_bundle):
-            engine.store.save_plan_bundle(
-                snapshot.game_id,
-                snapshot.turn,
-                valid_bundle,
-                mode=engine.config.execution_mode,
-                auto_action_types=engine.config.auto_action_types,
-                observation_id=engine._active_observation_id,
-            )
-            compatibility.plan_id = valid_bundle.plan_id
+        if self._bundle_has_updates(valid_subset):
+            compatibility.plan_id = valid_subset.plan_id
         engine.store.mark_events_sent_to_agent(
             snapshot.game_id,
             [event.dedupe_key for event in trigger_events],
@@ -1024,13 +1138,13 @@ class PlannerLifecycleCoordinator:
         engine.store.record_agent_run(
             snapshot.game_id,
             provider_request,
-            response=valid_bundle,
+            response=valid_subset,
             success=True,
             error=None,
             duration_seconds=duration,
         )
         engine._clear_backoff()
-        if needs_human:
+        if human_gaps and not leases:
             compatibility.paused = True
             compatibility.pause_reason = (
                 "planner output did not establish a valid executable lease"
@@ -1045,6 +1159,22 @@ class PlannerLifecycleCoordinator:
                 provider_attempts=provider_attempts,
                 blocking_reason=compatibility.pause_reason,
             )
+        if pending_approval and not active_leases and not human_gaps:
+            compatibility.paused = True
+            compatibility.pause_reason = "plan lease approval is required"
+            return self._finish(
+                ctx,
+                snapshot,
+                AwaitingApprovalTick,
+                compatibility=compatibility,
+                decision_gaps=resolved_gaps,
+                plan_leases=leases,
+                planner_request=updated_request,
+                provider_attempts=provider_attempts,
+                plan_bundle=valid_subset,
+                proposal_id=pending_approval[0].decision_gap_ids[0],
+                blocking_reason=compatibility.pause_reason,
+            )
         result = self._finish(
             ctx,
             snapshot,
@@ -1054,6 +1184,7 @@ class PlannerLifecycleCoordinator:
             plan_leases=leases,
             planner_request=updated_request,
             provider_attempts=provider_attempts,
+            plan_bundle=valid_subset,
             planner_request_id=logical_request.planner_request_id,
             provider_attempt_id=self._provider_tick_id(
                 logical_request, provider_attempts
@@ -1203,13 +1334,47 @@ class PlannerLifecycleCoordinator:
         valid_ids = {task.task_id for task in valid_tasks}
         valid_resolutions = []
         invalid_resolution_gaps: set[str] = set()
+        resolution_errors: dict[str, str] = {}
+        trigger_by_key = {
+            str(event.dedupe_key): event for event in request.trigger_events
+        }
         for resolution in bundle.event_resolutions:
             if resolution.disposition is ResolutionDisposition.TASK and (
                 set(resolution.task_ids) - valid_ids
             ):
                 invalid_resolution_gaps.update(resolution.decision_gap_ids)
+                for gap_id in resolution.decision_gap_ids:
+                    resolution_errors[gap_id] = "resolution references an invalid task"
                 continue
-            valid_resolutions.append(resolution)
+            event = trigger_by_key.get(resolution.event_dedupe_key)
+            candidate = bundle.model_copy(
+                update={
+                    "tasks": [
+                        task
+                        for task in valid_tasks
+                        if task.task_id in set(resolution.task_ids)
+                    ],
+                    "cancel_task_ids": [],
+                    "information_requests": [],
+                    "event_resolutions": [resolution],
+                    "requires_human_review": (
+                        resolution.disposition is ResolutionDisposition.HUMAN_REVIEW
+                    ),
+                }
+            )
+            try:
+                validate_event_resolution_contract(
+                    candidate,
+                    [] if event is None else [event],
+                    known_task_ids=set(),
+                    allow_information_requests=False,
+                )
+            except Exception as exc:
+                invalid_resolution_gaps.update(resolution.decision_gap_ids)
+                for gap_id in resolution.decision_gap_ids:
+                    resolution_errors[gap_id] = str(exc)
+            else:
+                valid_resolutions.append(resolution)
         valid_bundle = bundle.model_copy(
             update={
                 "tasks": valid_tasks,
@@ -1221,10 +1386,141 @@ class PlannerLifecycleCoordinator:
             "valid_task_ids": sorted(valid_ids),
             "invalid_tasks": invalid_tasks,
             "invalid_resolution_gap_ids": sorted(invalid_resolution_gaps),
+            "resolution_errors": resolution_errors,
             "independent_validation": True,
         }
 
-    def _resolve_gaps(self, logical_request, bundle, validation, turn):
+    @staticmethod
+    def _subset_for_resolved_gaps(bundle, successful_gap_ids):
+        resolutions = [
+            resolution
+            for resolution in bundle.event_resolutions
+            if set(resolution.decision_gap_ids) & set(successful_gap_ids)
+        ]
+        task_ids = {
+            task_id for resolution in resolutions for task_id in resolution.task_ids
+        }
+        plan_refs = {
+            plan_ref for resolution in resolutions for plan_ref in resolution.plan_refs
+        }
+        return bundle.model_copy(
+            update={
+                "strategy_updates": (
+                    bundle.strategy_updates if "strategy" in plan_refs else {}
+                ),
+                "city_plan_updates": [
+                    row
+                    for row in bundle.city_plan_updates
+                    if f"city:{row.get('city_id')}" in plan_refs
+                ],
+                "unit_plan_updates": [
+                    row
+                    for row in bundle.unit_plan_updates
+                    if f"unit:{row.get('unit_id')}" in plan_refs
+                ],
+                "builder_plan_updates": [
+                    row
+                    for row in bundle.builder_plan_updates
+                    if f"builder:{row.get('builder_key')}" in plan_refs
+                ],
+                "tasks": [task for task in bundle.tasks if task.task_id in task_ids],
+                "cancel_task_ids": [],
+                "event_resolutions": resolutions,
+                "requires_human_review": False,
+            }
+        )
+
+    def _effective_context_for_bundle(self, game_id, bundle):
+        current = self.engine.store.current_context(game_id)
+        context = {
+            "strategy": dict(current.get("strategy", {})),
+            "cities": {
+                str(key): dict(value)
+                for key, value in current.get("cities", {}).items()
+            },
+            "units": {
+                str(key): dict(value) for key, value in current.get("units", {}).items()
+            },
+            "builders": {
+                str(key): dict(value)
+                for key, value in current.get("builders", {}).items()
+            },
+        }
+        if bundle.strategy_updates:
+            context["strategy"].update(bundle.strategy_updates)
+            context["strategy"]["_plan_id"] = bundle.plan_id
+        for collection, id_key, rows in (
+            ("cities", "city_id", bundle.city_plan_updates),
+            ("units", "unit_id", bundle.unit_plan_updates),
+            ("builders", "builder_key", bundle.builder_plan_updates),
+        ):
+            for row in rows:
+                entity_id = row.get(id_key)
+                if entity_id is None:
+                    continue
+                context[collection][str(entity_id)] = {
+                    **dict(row),
+                    "_plan_id": bundle.plan_id,
+                }
+        context["execution_mode"] = self.engine.config.execution_mode.value
+        return context
+
+    def _refresh_effective_lease_baselines(
+        self, snapshot, provider_request, resolved_gaps, leases, bundle
+    ):
+        if not leases:
+            return resolved_gaps, leases
+        context = self._effective_context_for_bundle(snapshot.game_id, bundle)
+        events_by_identity = {}
+        for event in provider_request.trigger_events:
+            try:
+                identity, _ = stable_decision_identity(event)
+            except ValueError:
+                continue
+            events_by_identity[identity] = event
+        gap_by_id = {gap.decision_gap_id: gap for gap in resolved_gaps}
+        refreshed_leases = []
+        for lease in leases:
+            gap_id = lease.decision_gap_ids[0]
+            gap = gap_by_id[gap_id]
+            event = events_by_identity.get(gap.stable_identity)
+            if event is None:
+                refreshed_leases.append(lease)
+                continue
+            refreshed = build_decision_gap(
+                snapshot.game_id,
+                self.engine._active_observation_id or gap.observation_id,
+                snapshot,
+                event,
+                context,
+                existing=gap,
+                now=self.engine._now(),
+            ).model_copy(
+                update={
+                    "status": gap.status,
+                    "route": gap.route,
+                    "logical_request_id": gap.logical_request_id,
+                    "resolution_reason": gap.resolution_reason,
+                    "invalidation_reason": gap.invalidation_reason,
+                    "reopen_reason": gap.reopen_reason,
+                }
+            )
+            gap_by_id[gap_id] = refreshed
+            refreshed_leases.append(
+                lease.model_copy(
+                    update={
+                        "relevant_input_hash": refreshed.relevant_input_hash,
+                        "input_projection_version": refreshed.input_projection_version,
+                        "last_validated_observation_id": refreshed.observation_id,
+                    }
+                )
+            )
+        return (
+            [gap_by_id[gap.decision_gap_id] for gap in resolved_gaps],
+            refreshed_leases,
+        )
+
+    def _resolve_gaps(self, logical_request, bundle, validation, turn, observation):
         resolutions_by_gap = {}
         for resolution in bundle.event_resolutions:
             for gap_id in resolution.decision_gap_ids:
@@ -1293,6 +1589,7 @@ class PlannerLifecycleCoordinator:
                     logical_request,
                     turn,
                     resolution,
+                    observation,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 resolved.append(
@@ -1307,19 +1604,29 @@ class PlannerLifecycleCoordinator:
                     )
                 )
                 continue
+            if lease.status is PlanLeaseStatus.AWAITING_APPROVAL:
+                completed_gap = completed_gap.model_copy(
+                    update={
+                        "status": DecisionGapStatus.PROPOSED,
+                        "resolution_reason": "validated plan lease awaits runtime approval",
+                    }
+                )
             resolved.append(completed_gap)
             leases.append(lease)
         return resolved, leases
 
-    def _lease_for_resolution(self, gap, bundle, logical_request, turn, resolution):
+    def _lease_for_resolution(
+        self,
+        gap,
+        bundle,
+        logical_request,
+        turn,
+        resolution,
+        observation,
+    ):
         contract = resolution.lease_contract
         if contract is None:
             raise ValueError("resolution has no lease contract")
-        if contract.approval_status not in {
-            ApprovalStatus.NOT_REQUIRED,
-            ApprovalStatus.APPROVED,
-        }:
-            raise ValueError("lease contract approval is not satisfied")
         engine = self.engine
         existing = [
             lease
@@ -1329,6 +1636,59 @@ class PlannerLifecycleCoordinator:
         revision = 1 + max(
             (lease.plan_revision for lease in existing),
             default=0,
+        )
+        preconditions = tuple(
+            self._contract_condition(item) for item in contract.preconditions
+        )
+        for condition in preconditions:
+            outcome = engine.conditions.evaluate(
+                self._condition_for_evaluation(condition), observation
+            )
+            if not outcome.valid:
+                raise ValueError(
+                    f"lease start precondition failed: {condition.condition_type}"
+                )
+        resolution_tasks = [
+            task for task in bundle.tasks if task.task_id in set(resolution.task_ids)
+        ]
+        runtime_requires_approval = (
+            contract.approval_required
+            or contract.recommended_risk in {RiskLevel.HIGH, RiskLevel.CRITICAL}
+            or any(
+                task.requires_confirmation
+                or task.risk in {RiskLevel.HIGH, RiskLevel.CRITICAL}
+                for task in resolution_tasks
+            )
+        )
+        runtime_policy_allows_auto = all(
+            task.action_type in engine.config.auto_action_types
+            for task in resolution_tasks
+        )
+
+        approval_record = engine.store.latest_approval_record(
+            gap.game_session_id,
+            proposal_type="decision_gap",
+            proposal_id=gap.decision_gap_id,
+            proposal_revision=revision,
+        )
+        if approval_record is not None and approval_record.decision in {
+            ApprovalDecision.APPROVED,
+            ApprovalDecision.EDITED_AND_APPROVED,
+        }:
+            approval_status = ApprovalStatus.APPROVED
+        elif (
+            engine.config.execution_mode is ExecutionMode.AUTO
+            and not runtime_requires_approval
+            and runtime_policy_allows_auto
+            and contract.proposed_execution_mode in {None, ExecutionMode.AUTO}
+        ):
+            approval_status = ApprovalStatus.NOT_REQUIRED
+        else:
+            approval_status = ApprovalStatus.REQUIRED
+        lease_status = (
+            PlanLeaseStatus.ACTIVE
+            if approval_status in {ApprovalStatus.APPROVED, ApprovalStatus.NOT_REQUIRED}
+            else PlanLeaseStatus.AWAITING_APPROVAL
         )
         contract_subjects = tuple(
             SubjectRef(
@@ -1349,12 +1709,14 @@ class PlannerLifecycleCoordinator:
             plan_revision=revision,
             source_planner_request_id=logical_request.planner_request_id,
             created_from_observation_id=logical_request.observation_id,
-            status=PlanLeaseStatus.ACTIVE,
-            approval_status=contract.approval_status,
+            status=lease_status,
+            approval_status=approval_status,
             valid_from_turn=turn,
             valid_until_turn=contract.valid_until_turn,
-            preconditions=tuple(
-                self._contract_condition(item) for item in contract.preconditions
+            preconditions=preconditions,
+            continuation_conditions=tuple(
+                self._contract_condition(item)
+                for item in contract.continuation_conditions
             ),
             completion_condition=self._contract_condition(
                 contract.completion_condition
@@ -1371,6 +1733,16 @@ class PlannerLifecycleCoordinator:
             last_validated_observation_id=logical_request.observation_id,
             last_validation_result=LeaseValidationResult.VALID,
         )
+
+    @staticmethod
+    def _condition_for_evaluation(condition):
+        payload = {"type": condition.condition_type, **dict(condition.parameters)}
+        if condition.subject is not None:
+            payload.setdefault("entity_type", condition.subject.subject_type)
+            payload.setdefault("entity_id", condition.subject.subject_id)
+        if condition.expected is not True:
+            payload.setdefault("value", condition.expected)
+        return payload
 
     @staticmethod
     def _contract_condition(payload):
@@ -1493,6 +1865,7 @@ class PlannerLifecycleCoordinator:
         planner_request=None,
         provider_attempts=(),
         information_round=None,
+        plan_bundle=None,
         cancel_task_ids=(),
         **fields,
     ):
@@ -1520,6 +1893,10 @@ class PlannerLifecycleCoordinator:
             planner_request=planner_request,
             provider_attempts=provider_attempts,
             information_round=information_round,
+            plan_bundle=plan_bundle,
+            plan_bundle_mode=engine.config.execution_mode,
+            plan_bundle_auto_action_types=engine.config.auto_action_types,
+            plan_bundle_observation_id=engine._active_observation_id,
             cancel_task_ids=cancel_task_ids,
         )
         result = compatibility or TickResult(turn=snapshot.turn, metrics=ctx.metrics)

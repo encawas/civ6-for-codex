@@ -12,6 +12,7 @@ class PlanValidationError(ValueError):
 
 
 DEFAULT_CONDITION_TYPES = {
+    "all_of",
     "turn_at_least",
     "turn_equals",
     "no_blocker_type",
@@ -90,8 +91,8 @@ def validate_plan_bundle(bundle: PlanBundle, context: PlanValidationContext) -> 
         else:
             supplied = set(task.arguments)
             missing = set(spec.required_arguments) - supplied
-            unknown = supplied - set(spec.required_arguments) - set(
-                spec.optional_arguments
+            unknown = (
+                supplied - set(spec.required_arguments) - set(spec.optional_arguments)
             )
             fixed_collision = supplied & set(spec.fixed_arguments)
             if missing:

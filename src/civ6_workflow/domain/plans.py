@@ -40,6 +40,7 @@ class PlanLeaseStatus(StrEnum):
     EXPIRED = "EXPIRED"
     INVALIDATED = "INVALIDATED"
     AWAITING_INFORMATION = "AWAITING_INFORMATION"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
 
 
 class LeaseValidationResult(StrEnum):
@@ -118,6 +119,7 @@ class PlanLease(DomainModel):
     valid_from_turn: int = Field(ge=0)
     valid_until_turn: int | None = Field(default=None, ge=0)
     preconditions: tuple[Condition, ...] = ()
+    continuation_conditions: tuple[Condition, ...] = ()
     completion_condition: Condition | None = None
     invalidation_conditions: tuple[Condition, ...] = ()
     review_conditions: tuple[Condition, ...] = ()
@@ -153,5 +155,15 @@ class PlanLease(DomainModel):
                 )
             if not self.review_conditions:
                 raise ValueError("an active plan lease requires review conditions")
+            if not self.continuation_conditions:
+                raise ValueError(
+                    "an active plan lease requires continuation conditions"
+                )
+        if (
+            self.status is PlanLeaseStatus.AWAITING_APPROVAL
+            and self.approval_status is not ApprovalStatus.REQUIRED
+        ):
+            raise ValueError("a lease awaiting approval must require approval")
+
         if self.status is PlanLeaseStatus.INVALIDATED and not self.invalidation_reason:
             raise ValueError("an invalidated plan lease requires a reason")
