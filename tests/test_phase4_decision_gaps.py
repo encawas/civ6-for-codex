@@ -90,8 +90,9 @@ def _snapshot(turn=1, *, threat="LOW", targets=None):
             "num_cities": 1,
             "threat_level": threat,
             "unrelated_raw_field": f"raw-{turn}",
+            "player_id": 1,
         },
-        cities=[{"city_id": 1, "currently_building": "UNIT_SCOUT"}],
+        cities=[{"city_id": 1, "owner": 1, "currently_building": "UNIT_SCOUT"}],
         units=[
             {
                 "unit_id": 7,
@@ -100,6 +101,8 @@ def _snapshot(turn=1, *, threat="LOW", targets=None):
                 "x": 4,
                 "y": 5,
                 "unrelated_extension": targets,
+                "targets": targets
+                or [{"x": 8, "y": 9, "legal": True, "reachable": True}],
             }
         ],
         blockers=[
@@ -520,11 +523,17 @@ def _settler_lease_contract(turn=1):
             {"type": "entity_exists", "entity_type": "unit", "entity_id": "7"},
             {"type": "unit_type_contains", "unit_id": "7", "marker": "SETTLER"},
             {"type": "tile_unoccupied", "x": 8, "y": 9},
+            {"type": "settler_target_legal", "x": 8, "y": 9},
+            {"type": "settler_path_reachable", "x": 8, "y": 9},
         ],
         continuation_conditions=[
             {"type": "entity_exists", "entity_type": "unit", "entity_id": "7"},
             {"type": "unit_type_contains", "unit_id": "7", "marker": "SETTLER"},
             {"type": "tile_unoccupied", "x": 8, "y": 9},
+            {"type": "settler_target_legal", "x": 8, "y": 9},
+            {"type": "settler_path_reachable", "x": 8, "y": 9},
+            {"type": "approved_target_equals", "x": 8, "y": 9},
+            {"type": "severe_threat_absent"},
         ],
         completion_condition={
             "type": "all_of",
@@ -620,7 +629,7 @@ def _engine(tmp_path, planner):
     snapshot = RuntimeSnapshot(
         turn=1,
         game_id="opening",
-        overview={"turn": 1, "num_cities": 0, "num_units": 1},
+        overview={"turn": 1, "player_id": 1, "num_cities": 0, "num_units": 1},
         cities=[],
         units=[
             {
@@ -629,6 +638,7 @@ def _engine(tmp_path, planner):
                 "moves_remaining": 2,
                 "x": 4,
                 "y": 5,
+                "targets": [{"x": 8, "y": 9, "legal": True, "reachable": True}],
             }
         ],
         blockers=[],
@@ -2084,3 +2094,516 @@ def test_issue7_terminal_request_atomically_abandons_started_attempt(tmp_path):
     assert stored_attempt.status is ProviderAttemptStatus.ABANDONED
     assert stored_attempt.completed_at is not None
     assert stored_attempt.failure_category == "decision_input_changed"
+
+
+def test_issue7_material_path_change_invalidates_active_lease_immediately(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _ResolvingPlanner())
+        await engine.tick()
+        await engine.tick()
+        await engine.tick()
+        lease = engine.store.list_plan_leases("opening")[0]
+        assert lease.valid_until_turn > game.snapshot.turn
+        baseline_hash = lease.relevant_input_hash
+        dependent = ProposedTask(
+            task_id="approved-route-step",
+            action_type="unit_skip",
+            entity_type="unit",
+            entity_id=7,
+            due_turn=1,
+            arguments={"unit_id": 7},
+            preconditions=[
+                {"type": "entity_exists", "entity_type": "unit", "entity_id": 7}
+            ],
+            postconditions=[{"type": "unit_no_moves", "unit_id": 7}],
+            reason="continue the approved settler route",
+        )
+        engine.store.save_plan_bundle(
+            "opening",
+            1,
+            PlanBundle(summary="leased route task", tasks=[dependent]),
+            mode=ExecutionMode.AUTO,
+            auto_action_types={"unit_skip"},
+        )
+        changed_unit = dict(game.snapshot.units[0])
+        changed_unit["targets"] = [{"x": 8, "y": 9, "legal": True, "reachable": False}]
+        game.snapshot = game.snapshot.model_copy(update={"units": [changed_unit]})
+
+        result = await engine.tick()
+
+        assert result.workflow_tick["outcome"] == TickOutcomeKind.PLAN_LEASE_UPDATED
+        assert result.metrics.mutation_count == 0
+        assert game.mutations == 0
+        stored_lease = engine.store.list_plan_leases("opening")[0]
+        assert stored_lease.status is PlanLeaseStatus.INVALIDATED
+        stored_gap = engine.store.get_decision_gap(
+            "opening", stored_lease.decision_gap_ids[0]
+        )
+        assert stored_gap.status is DecisionGapStatus.OPEN
+        assert stored_gap.relevant_input_hash != baseline_hash
+        assert (
+            engine.store.task_status("opening", dependent.task_id).value == "cancelled"
+        )
+        assert planner.summary.logical_requests == 1
+
+    asyncio.run(scenario())
+
+
+def test_issue7_settler_completion_uses_runtime_bound_city_baseline(tmp_path):
+    async def scenario():
+        engine, game, _ = _engine(tmp_path, _ResolvingPlanner())
+        game.snapshot = _snapshot(1)
+        await engine.tick()
+        await engine.tick()
+        await engine.tick()
+        lease = engine.store.list_plan_leases("opening")[0]
+        baseline = lease.model_dump(mode="json")["contract_baseline"]
+        assert baseline == {
+            **baseline,
+            "baseline_city_count": 1,
+            "approved_target": {"x": 8, "y": 9},
+            "owner": 1,
+            "settler_unit_id": "7",
+        }
+        completion = lease.completion_condition.model_dump(mode="json")
+        nested = completion["parameters"]["conditions"]
+        assert {"type": "city_count_at_least", "count": 2} in nested
+        assert {
+            "type": "city_at_target",
+            "x": 8,
+            "y": 9,
+            "owner": 1,
+        } in nested
+        projection = baseline["relevant_input_projection"]
+
+        destroyed = _snapshot(2).model_copy(update={"units": []})
+        destroyed_result = evaluate_plan_lease(
+            lease,
+            normalize_runtime_snapshot(destroyed),
+            relevant_input_hash=lease.relevant_input_hash,
+            relevant_input_projection=projection,
+        )
+        assert destroyed_result.lease.status is PlanLeaseStatus.INVALIDATED
+
+        founded = destroyed.model_copy(
+            update={
+                "cities": [
+                    *destroyed.cities,
+                    {
+                        "city_id": 2,
+                        "owner": 1,
+                        "x": 8,
+                        "y": 9,
+                        "currently_building": None,
+                    },
+                ]
+            }
+        )
+        founded_result = evaluate_plan_lease(
+            lease,
+            normalize_runtime_snapshot(founded),
+            relevant_input_hash=lease.relevant_input_hash,
+            relevant_input_projection=projection,
+        )
+        assert founded_result.lease.status is PlanLeaseStatus.COMPLETED
+
+        wrong_site = destroyed.model_copy(
+            update={
+                "cities": [
+                    *destroyed.cities,
+                    {
+                        "city_id": 2,
+                        "owner": 1,
+                        "x": 12,
+                        "y": 13,
+                        "currently_building": None,
+                    },
+                ]
+            }
+        )
+        wrong_site_result = evaluate_plan_lease(
+            lease,
+            normalize_runtime_snapshot(wrong_site),
+            relevant_input_hash=lease.relevant_input_hash,
+            relevant_input_projection=projection,
+        )
+        assert wrong_site_result.lease.status is PlanLeaseStatus.INVALIDATED
+
+        occupied = _snapshot(2).model_copy(
+            update={
+                "cities": [
+                    *_snapshot(2).cities,
+                    {
+                        "city_id": 2,
+                        "owner": 2,
+                        "x": 8,
+                        "y": 9,
+                        "currently_building": None,
+                    },
+                ]
+            }
+        )
+        occupied_result = evaluate_plan_lease(
+            lease,
+            normalize_runtime_snapshot(occupied),
+            relevant_input_hash=lease.relevant_input_hash,
+            relevant_input_projection=projection,
+        )
+        assert occupied_result.lease.status is PlanLeaseStatus.INVALIDATED
+
+    asyncio.run(scenario())
+
+
+def test_issue7_turn_specific_tactical_gap_expires_without_reconstruction(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _ResolvingPlanner())
+        tactical = GameEvent(
+            event_type="tactical_attack_opportunity",
+            turn=1,
+            entity_type="unit",
+            entity_id=7,
+            blocking=True,
+            dedupe_key="tactical:7:1",
+        )
+        gap = build_decision_gap(
+            "opening",
+            "obs-tactical-1",
+            game.snapshot,
+            tactical,
+            {"strategy": {}},
+            now=datetime.now(UTC),
+        ).model_copy(
+            update={
+                "status": DecisionGapStatus.RESOLVED,
+                "resolution_reason": "approved one-turn attack",
+            }
+        )
+        lease = _lease(gap, scope="unit:7", until=5).model_copy(
+            update={
+                "decision_gap_ids": (gap.decision_gap_id,),
+                "relevant_input_hash": gap.relevant_input_hash,
+            }
+        )
+        task = ProposedTask(
+            task_id="turn-one-tactical-task",
+            action_type="unit_skip",
+            entity_type="unit",
+            entity_id=7,
+            due_turn=2,
+            arguments={"unit_id": 7},
+            preconditions=[
+                {"type": "entity_exists", "entity_type": "unit", "entity_id": 7}
+            ],
+            postconditions=[{"type": "unit_no_moves", "unit_id": 7}],
+            reason="old tactical action",
+        )
+        engine.store.save_decision_gap(gap, turn=1)
+        engine.store.save_plan_lease(lease)
+        engine.store.save_plan_bundle(
+            "opening",
+            1,
+            PlanBundle(summary="one-turn tactic", tasks=[task]),
+            mode=ExecutionMode.AUTO,
+            auto_action_types={"unit_skip"},
+        )
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 2,
+                "overview": {**game.snapshot.overview, "turn": 2},
+            }
+        )
+
+        result = await engine.tick()
+
+        assert result.workflow_tick["outcome"] == TickOutcomeKind.PLAN_LEASE_UPDATED
+        assert result.metrics.mutation_count == 0
+        assert game.mutations == 0
+        assert planner.summary.provider_attempts == 0
+        stored = engine.store.get_decision_gap("opening", gap.decision_gap_id)
+        assert stored.status is DecisionGapStatus.INVALIDATED
+        assert (
+            engine.store.list_plan_leases("opening")[0].status
+            is PlanLeaseStatus.EXPIRED
+        )
+        assert engine.store.task_status("opening", task.task_id).value == "cancelled"
+        tactical_gaps = [
+            item
+            for item in engine.store.list_decision_gaps("opening")
+            if item.gap_type == "tactical_attack_opportunity"
+        ]
+        assert [item.decision_gap_id for item in tactical_gaps] == [gap.decision_gap_id]
+
+    asyncio.run(scenario())
+
+
+class _AtomicCityPlanner:
+    def __init__(self):
+        self.gap_ids = ()
+        self.calls = 0
+        self.last_diagnostics = None
+
+    async def plan(self, request):
+        self.calls += 1
+        self.last_diagnostics = {"attempt_count": 1, "backend": "test"}
+        tasks = [
+            ProposedTask(
+                task_id="atomic-produce-A",
+                action_type="city_set_production",
+                entity_type="city",
+                entity_id="A",
+                due_turn=request.turn,
+                arguments={
+                    "city_id": "A",
+                    "item_type": "UNIT",
+                    "item_name": "UNIT_BUILDER",
+                },
+                preconditions=[{"type": "city_has_no_production", "city_id": "A"}],
+                postconditions=[
+                    {
+                        "type": "city_production_equals",
+                        "city_id": "A",
+                        "item_name": "UNIT_BUILDER",
+                    }
+                ],
+                reason="valid atomic item",
+            ),
+            ProposedTask(
+                task_id="atomic-produce-B",
+                action_type="unsupported_atomic_action",
+                entity_type="city",
+                entity_id="B",
+                due_turn=request.turn,
+                arguments={"city_id": "B"},
+                reason="invalid atomic item",
+            ),
+        ]
+        return WorkflowPlanBundle(
+            plan_id="atomic-city-plan",
+            summary="atomic city decisions",
+            city_plan_updates=[
+                {"city_id": "A", "role": "production"},
+                {"city_id": "B", "role": "production"},
+            ],
+            tasks=tasks,
+            event_resolutions=[
+                EventResolution(
+                    event_dedupe_key=request.trigger_events[0].dedupe_key,
+                    decision_gap_ids=list(self.gap_ids),
+                    disposition=ResolutionDisposition.TASK,
+                    task_ids=[task.task_id for task in tasks],
+                    plan_refs=["city:A", "city:B"],
+                    reason="both city decisions are atomic",
+                    lease_contract=_city_lease_contract("A"),
+                    atomic=True,
+                )
+            ],
+        )
+
+
+def test_issue7_atomic_multi_gap_failure_persists_no_partial_outputs(tmp_path):
+    async def scenario():
+        snapshot = RuntimeSnapshot(
+            turn=1,
+            game_id="opening",
+            overview={"turn": 1, "num_cities": 2, "num_units": 0},
+            cities=[
+                {"city_id": "A", "currently_building": None},
+                {"city_id": "B", "currently_building": None},
+            ],
+            units=[],
+            blockers=[],
+        )
+        game = _Game(snapshot)
+        delegate = _AtomicCityPlanner()
+        planner = RecordingPlanner(delegate)
+        engine = WorkflowEngine(
+            store=WorkflowStore(tmp_path / "atomic.sqlite3"),
+            game=game,
+            planner=planner,
+            config=EngineConfig(
+                execution_mode=ExecutionMode.AUTO,
+                auto_end_turn=False,
+                max_agent_calls_per_turn=1,
+            ),
+        )
+        events = [
+            GameEvent(
+                event_type="city_role_required",
+                turn=1,
+                entity_type="city",
+                entity_id=city_id,
+                blocking=True,
+                dedupe_key=f"atomic-city-role:{city_id}",
+            )
+            for city_id in ("A", "B")
+        ]
+        context = engine.store.current_context("opening")
+        context["execution_mode"] = ExecutionMode.AUTO.value
+        gaps = [
+            build_decision_gap(
+                "opening",
+                "obs-atomic",
+                snapshot,
+                event,
+                context,
+                now=datetime.now(UTC),
+            )
+            for event in events
+        ]
+        group = batch_compatible_gaps("opening", "obs-atomic", gaps)
+        delegate.gap_ids = group.decision_gap_ids
+        logical_id = "logical-atomic"
+        provider_request = engine._build_agent_request(snapshot, events).model_copy(
+            update={
+                "constraints": {
+                    **engine._build_agent_request(snapshot, events).constraints,
+                    "decision_gap_ids": list(group.decision_gap_ids),
+                }
+            }
+        )
+        requested_gaps = [
+            gap.model_copy(
+                update={
+                    "status": DecisionGapStatus.REQUESTED,
+                    "logical_request_id": logical_id,
+                }
+            )
+            for gap in gaps
+        ]
+        request = PlannerRequest(
+            planner_request_id=logical_id,
+            game_session_id="opening",
+            turn_number=1,
+            observation_id="obs-atomic",
+            decision_gap_ids=group.decision_gap_ids,
+            decision_group_id=group.decision_group_id,
+            input_projection_hash=group.input_projection_hash,
+            input_projection={
+                "decision_group_id": group.decision_group_id,
+                "gaps": [
+                    gap.model_dump(mode="json")["input_projection"]
+                    for gap in requested_gaps
+                ],
+            },
+            request_payload=provider_request.model_dump(mode="json"),
+            plan_revision_refs=(),
+            policy_revision="planner-call-policy/v1",
+            approval_contract_hash=engine.planner_lifecycle._contract_hash(
+                [
+                    gap.model_dump(mode="json")["input_projection"]["approval"]
+                    for gap in requested_gaps
+                ]
+            ),
+            allowed_actions_hash=engine.planner_lifecycle._contract_hash(
+                sorted(engine.config.allowed_action_types)
+            ),
+            model_settings={"provider": "test"},
+            status=PlannerRequestStatus.PENDING,
+            created_at=datetime.now(UTC),
+        )
+        for gap in requested_gaps:
+            engine.store.save_decision_gap(gap, turn=1)
+        engine.store.save_planner_request(request)
+
+        result = await engine.tick()
+
+        assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        stored_request = engine.store.get_planner_request(logical_id)
+        assert stored_request.status is PlannerRequestStatus.REJECTED
+        assert all(
+            gap.status is DecisionGapStatus.AWAITING_HUMAN
+            for gap in engine.store.list_decision_gaps("opening")
+        )
+        assert engine.store.get_task("opening", "atomic-produce-A") is None
+        assert engine.store.get_task("opening", "atomic-produce-B") is None
+        assert engine.store.list_plan_leases("opening") == []
+        assert engine.store.current_context("opening")["cities"] == {}
+        assert planner.summary.logical_requests == 1
+
+    asyncio.run(scenario())
+
+
+def test_issue7_turn_specific_active_request_expires_before_provider_call(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _ResolvingPlanner())
+        event = GameEvent(
+            event_type="tactical_attack_opportunity",
+            turn=1,
+            entity_type="unit",
+            entity_id=7,
+            blocking=True,
+            dedupe_key="tactical-request:7:1",
+        )
+        gap = build_decision_gap(
+            "opening",
+            "obs-tactical-request",
+            game.snapshot,
+            event,
+            {"strategy": {}},
+            now=datetime.now(UTC),
+        )
+        group = batch_compatible_gaps("opening", "obs-tactical-request", [gap])
+        request_id = "logical-tactical-request"
+        requested_gap = gap.model_copy(
+            update={
+                "status": DecisionGapStatus.REQUESTED,
+                "logical_request_id": request_id,
+            }
+        )
+        provider_request = engine._build_agent_request(
+            game.snapshot, [event]
+        ).model_copy(
+            update={
+                "constraints": {
+                    **engine._build_agent_request(game.snapshot, [event]).constraints,
+                    "decision_gap_ids": [gap.decision_gap_id],
+                }
+            }
+        )
+        request = PlannerRequest(
+            planner_request_id=request_id,
+            game_session_id="opening",
+            turn_number=1,
+            observation_id="obs-tactical-request",
+            decision_gap_ids=(gap.decision_gap_id,),
+            decision_group_id=group.decision_group_id,
+            input_projection_hash=group.input_projection_hash,
+            input_projection=gap.model_dump(mode="json")["input_projection"],
+            request_payload=provider_request.model_dump(mode="json"),
+            plan_revision_refs=gap.relevant_plan_revisions,
+            policy_revision="planner-call-policy/v1",
+            approval_contract_hash=engine.planner_lifecycle._contract_hash(
+                [gap.model_dump(mode="json")["input_projection"]["approval"]]
+            ),
+            allowed_actions_hash=engine.planner_lifecycle._contract_hash(
+                sorted(engine.config.allowed_action_types)
+            ),
+            model_settings={"provider": "test"},
+            status=PlannerRequestStatus.PENDING,
+            created_at=datetime.now(UTC),
+        )
+        engine.store.save_decision_gap(requested_gap, turn=1)
+        engine.store.save_planner_request(request)
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 2,
+                "overview": {**game.snapshot.overview, "turn": 2},
+            }
+        )
+
+        result = await engine.tick()
+
+        assert result.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
+        assert (
+            engine.store.get_planner_request(request_id).status
+            is PlannerRequestStatus.SUPERSEDED
+        )
+        assert (
+            engine.store.get_decision_gap("opening", gap.decision_gap_id).status
+            is DecisionGapStatus.INVALIDATED
+        )
+        assert planner.summary.logical_requests == 0
+        assert engine.store.list_provider_attempts(request_id) == []
+        assert game.mutations == 0
+
+    asyncio.run(scenario())

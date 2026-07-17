@@ -126,6 +126,7 @@ class PlanLease(DomainModel):
     continuation_policy: ContinuationPolicy
     relevant_input_hash: str
     input_projection_version: str = "decision-input/v1"
+    contract_baseline: ImmutableJsonObject = {}
     last_validated_observation_id: str
     last_validation_result: LeaseValidationResult
     invalidation_reason: str | None = None

@@ -17,6 +17,8 @@ class WorkflowConditionEvaluator(BaseConditionEvaluator):
         self,
         condition: dict[str, Any],
         observation: NormalizedRuntimeObservation,
+        *,
+        decision_projection: dict[str, Any] | None = None,
     ) -> ConditionResult:
         snapshot = observation.snapshot
         kind = condition.get("type")
@@ -58,7 +60,11 @@ class WorkflowConditionEvaluator(BaseConditionEvaluator):
                 actual >= expected,
                 f"city count expected at least {expected}, got {actual}",
             )
-        return super()._evaluate_normalized(condition, observation)
+        return super()._evaluate_normalized(
+            condition,
+            observation,
+            decision_projection=decision_projection,
+        )
 
 
 def _rows(value: Any) -> list[dict[str, Any]]:

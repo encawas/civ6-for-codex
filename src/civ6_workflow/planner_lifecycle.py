@@ -9,9 +9,10 @@ from contextlib import nullcontext
 from typing import Any
 from uuid import uuid4
 
-from .conditions import extract_known_entities
+from .conditions import extract_known_entities, find_entity
 from .domain.base import thaw_json
 from .decisioning import (
+    TURN_SPECIFIC_GAP_TYPES,
     STRATEGIC_GAP_TYPES,
     batch_compatible_gaps,
     build_decision_gap,
@@ -62,6 +63,7 @@ from .workflow_protocol import (
     ResolutionDisposition,
     WorkflowPlanBundle,
     validate_event_resolution_contract,
+    validate_global_resolution_structure,
 )
 
 
@@ -300,6 +302,11 @@ class PlannerLifecycleCoordinator:
                     else current_gap.relevant_input_hash
                 ),
                 evaluator=engine.conditions,
+                relevant_input_projection=(
+                    None
+                    if current_gap is None
+                    else thaw_json(current_gap.input_projection)
+                ),
             )
             evaluated_lease = evaluation.lease
             result = evaluation.result
@@ -309,15 +316,26 @@ class PlannerLifecycleCoordinator:
                 current_gap is None
                 and evaluated_lease.status is not PlanLeaseStatus.COMPLETED
             ):
-                reason = "one-shot event disappeared without completion evidence"
-                evaluated_lease = lease.model_copy(
-                    update={
-                        "status": PlanLeaseStatus.AWAITING_INFORMATION,
-                        "last_validated_observation_id": observation_id,
-                        "last_validation_result": LeaseValidationResult.UNKNOWN,
-                    }
-                )
-                result = LeaseValidationResult.UNKNOWN
+                if gap is not None and gap.gap_type in TURN_SPECIFIC_GAP_TYPES:
+                    reason = "turn-specific decision is no longer current"
+                    evaluated_lease = lease.model_copy(
+                        update={
+                            "status": PlanLeaseStatus.EXPIRED,
+                            "last_validated_observation_id": observation_id,
+                            "last_validation_result": LeaseValidationResult.EXPIRED,
+                        }
+                    )
+                    result = LeaseValidationResult.EXPIRED
+                else:
+                    reason = "one-shot event disappeared without completion evidence"
+                    evaluated_lease = lease.model_copy(
+                        update={
+                            "status": PlanLeaseStatus.AWAITING_INFORMATION,
+                            "last_validated_observation_id": observation_id,
+                            "last_validation_result": LeaseValidationResult.UNKNOWN,
+                        }
+                    )
+                    result = LeaseValidationResult.UNKNOWN
 
             input_changed = (
                 current_gap is not None
@@ -339,7 +357,22 @@ class PlannerLifecycleCoordinator:
             gap_updates = []
             cancel_task_ids: tuple[str, ...] = ()
             if gap_update is not None:
-                if evaluated_lease.status is PlanLeaseStatus.COMPLETED:
+                if (
+                    gap is not None
+                    and gap.gap_type in TURN_SPECIFIC_GAP_TYPES
+                    and current_gap is None
+                ):
+                    gap_update = gap.model_copy(
+                        update={
+                            "status": DecisionGapStatus.INVALIDATED,
+                            "logical_request_id": None,
+                            "resolution_reason": None,
+                            "invalidation_reason": reason,
+                            "reopen_reason": None,
+                        }
+                    )
+                    cancel_task_ids = self._dependent_task_ids(lease)
+                elif evaluated_lease.status is PlanLeaseStatus.COMPLETED:
                     gap_update = gap_update.model_copy(
                         update={
                             "status": DecisionGapStatus.RESOLVED,
@@ -447,23 +480,40 @@ class PlannerLifecycleCoordinator:
                 matching = event
                 break
 
-        if matching is None and gap.gap_type in {
-            "pending_diplomacy",
-            "pending_trade_offer",
-            "world_congress_vote_required",
-            "emergency_response_window",
-        }:
+        projection = thaw_json(gap.input_projection)
+        if gap.gap_type in TURN_SPECIFIC_GAP_TYPES and (
+            matching is None or snapshot.turn != gap.identity_turn_number
+        ):
+            return None
+        if matching is None and projection.get("requires_current_event"):
             return None
         if matching is None:
-            projection = thaw_json(gap.input_projection)
             subject = projection.get("subject", {})
             payload = dict(projection.get("event_facts", {}))
             if gap.gap_type in {
                 "settler_site_selection_required",
                 "settler_plan_requires_review",
             }:
-                payload["available_targets"] = projection.get("candidate_targets", [])
-                payload.update(projection.get("path", {}))
+                unit = find_entity(
+                    snapshot.units, ("unit_id", "id"), str(subject.get("id"))
+                )
+                current_targets = (
+                    unit.get("targets", []) if isinstance(unit, dict) else []
+                )
+                payload["available_targets"] = current_targets
+                if isinstance(unit, dict):
+                    payload.update(
+                        {
+                            key: unit[key]
+                            for key in (
+                                "path_reachable",
+                                "path_status",
+                                "route_legal",
+                                "target_legal",
+                            )
+                            if key in unit
+                        }
+                    )
             matching = GameEvent(
                 event_type=gap.gap_type,
                 turn=snapshot.turn,
@@ -570,14 +620,24 @@ class PlannerLifecycleCoordinator:
         reopened = []
         source = refreshed or gaps
         for gap in source:
+            turn_specific_expired = (
+                gap.gap_type in TURN_SPECIFIC_GAP_TYPES
+                and snapshot.turn != gap.identity_turn_number
+            )
             reopened.append(
                 gap.model_copy(
                     update={
-                        "status": DecisionGapStatus.OPEN,
+                        "status": (
+                            DecisionGapStatus.INVALIDATED
+                            if turn_specific_expired
+                            else DecisionGapStatus.OPEN
+                        ),
                         "logical_request_id": None,
-                        "reopen_reason": reason,
+                        "reopen_reason": None if turn_specific_expired else reason,
                         "resolution_reason": None,
-                        "invalidation_reason": None,
+                        "invalidation_reason": (
+                            reason if turn_specific_expired else None
+                        ),
                     }
                 )
             )
@@ -1304,6 +1364,41 @@ class PlannerLifecycleCoordinator:
 
     def _partition_bundle(self, bundle, request, snapshot):
         engine = self.engine
+        request_gap_ids = {
+            str(gap_id) for gap_id in request.constraints.get("decision_gap_ids", ())
+        } or {
+            str(gap_id)
+            for resolution in bundle.event_resolutions
+            for gap_id in resolution.decision_gap_ids
+        }
+        try:
+            validate_global_resolution_structure(
+                bundle,
+                request.trigger_events,
+                required_gap_ids=request_gap_ids,
+            )
+        except Exception as exc:
+            empty_bundle = bundle.model_copy(
+                update={
+                    "strategy_updates": {},
+                    "city_plan_updates": [],
+                    "unit_plan_updates": [],
+                    "builder_plan_updates": [],
+                    "tasks": [],
+                    "cancel_task_ids": [],
+                    "information_requests": [],
+                    "event_resolutions": [],
+                }
+            )
+            reason = str(exc)
+            return empty_bundle, {
+                "valid_task_ids": [],
+                "invalid_tasks": {},
+                "invalid_resolution_gap_ids": sorted(request_gap_ids),
+                "resolution_errors": {gap_id: reason for gap_id in request_gap_ids},
+                "independent_validation": False,
+                "global_structure_error": reason,
+            }
         valid_tasks = []
         invalid_tasks: dict[str, str] = {}
         context = PlanValidationContext(
@@ -1511,6 +1606,12 @@ class PlannerLifecycleCoordinator:
                     update={
                         "relevant_input_hash": refreshed.relevant_input_hash,
                         "input_projection_version": refreshed.input_projection_version,
+                        "contract_baseline": {
+                            **thaw_json(lease.contract_baseline),
+                            "relevant_input_projection": thaw_json(
+                                refreshed.input_projection
+                            ),
+                        },
                         "last_validated_observation_id": refreshed.observation_id,
                     }
                 )
@@ -1613,6 +1714,36 @@ class PlannerLifecycleCoordinator:
                 )
             resolved.append(completed_gap)
             leases.append(lease)
+        successful_ids = {
+            gap_id for lease in leases for gap_id in lease.decision_gap_ids
+        }
+        failed_atomic_ids: set[str] = set()
+        for resolution in bundle.event_resolutions:
+            atomic_ids = set(resolution.decision_gap_ids) & set(
+                logical_request.decision_gap_ids
+            )
+            if resolution.atomic and atomic_ids - successful_ids:
+                failed_atomic_ids.update(atomic_ids)
+        if failed_atomic_ids:
+            leases = [
+                lease
+                for lease in leases
+                if not (set(lease.decision_gap_ids) & failed_atomic_ids)
+            ]
+            resolved = [
+                gap.model_copy(
+                    update={
+                        "status": DecisionGapStatus.AWAITING_HUMAN,
+                        "logical_request_id": logical_request.planner_request_id,
+                        "resolution_reason": (
+                            "atomic planner resolution rejected as a whole"
+                        ),
+                    }
+                )
+                if gap.decision_gap_id in failed_atomic_ids
+                else gap
+                for gap in resolved
+            ]
         return resolved, leases
 
     def _lease_for_resolution(
@@ -1637,13 +1768,21 @@ class PlannerLifecycleCoordinator:
             (lease.plan_revision for lease in existing),
             default=0,
         )
+        bound = self._bind_runtime_lease_contract(
+            gap, bundle, resolution, observation, contract
+        )
+        projection = bound["projection"]
         preconditions = tuple(
-            self._contract_condition(item) for item in contract.preconditions
+            self._contract_condition(item) for item in bound["preconditions"]
         )
         for condition in preconditions:
             outcome = engine.conditions.evaluate(
-                self._condition_for_evaluation(condition), observation
+                self._condition_for_evaluation(condition),
+                observation,
+                decision_projection=projection,
             )
+            if not outcome.known:
+                raise ValueError(outcome.reason)
             if not outcome.valid:
                 raise ValueError(
                     f"lease start precondition failed: {condition.condition_type}"
@@ -1715,12 +1854,9 @@ class PlannerLifecycleCoordinator:
             valid_until_turn=contract.valid_until_turn,
             preconditions=preconditions,
             continuation_conditions=tuple(
-                self._contract_condition(item)
-                for item in contract.continuation_conditions
+                self._contract_condition(item) for item in bound["continuation"]
             ),
-            completion_condition=self._contract_condition(
-                contract.completion_condition
-            ),
+            completion_condition=self._contract_condition(bound["completion"]),
             invalidation_conditions=tuple(
                 self._contract_condition(item)
                 for item in contract.invalidation_conditions
@@ -1728,11 +1864,148 @@ class PlannerLifecycleCoordinator:
             review_conditions=tuple(
                 self._contract_condition(item) for item in contract.review_conditions
             ),
+            contract_baseline=bound["baseline"],
             continuation_policy=contract.continuation_policy,
             relevant_input_hash=gap.relevant_input_hash,
             last_validated_observation_id=logical_request.observation_id,
             last_validation_result=LeaseValidationResult.VALID,
         )
+
+    @classmethod
+    def _bind_runtime_lease_contract(
+        cls, gap, bundle, resolution, observation, contract
+    ):
+        projection = thaw_json(gap.input_projection)
+        baseline = {
+            "gap_type": gap.gap_type,
+            "relevant_input_projection": projection,
+        }
+        if gap.gap_type != "settler_site_selection_required":
+            return {
+                "projection": projection,
+                "preconditions": [dict(item) for item in contract.preconditions],
+                "continuation": [
+                    dict(item) for item in contract.continuation_conditions
+                ],
+                "completion": dict(contract.completion_condition),
+                "baseline": baseline,
+            }
+
+        unit_id = next(
+            (
+                subject.subject_id
+                for subject in gap.subjects
+                if subject.subject_type == "unit"
+            ),
+            None,
+        )
+        if unit_id is None:
+            raise ValueError("settler lease requires a bound unit subject")
+        target = cls._approved_settler_target(bundle, resolution, unit_id, contract)
+        if target is None:
+            raise ValueError("settler lease requires an approved target")
+        target_x, target_y = target
+        snapshot = observation.snapshot
+        owner = next(
+            (
+                row.get("owner")
+                for row in snapshot.cities or []
+                if isinstance(row, dict) and row.get("owner") is not None
+            ),
+            snapshot.overview.get("player_id"),
+        )
+        if owner is None:
+            raise ValueError("settler lease requires current-player ownership evidence")
+        baseline_city_count = len(snapshot.cities or [])
+        projection = {
+            **projection,
+            "plan_target": {"target": {"x": target_x, "y": target_y}},
+        }
+        start_conditions = [
+            {"type": "entity_exists", "entity_type": "unit", "entity_id": unit_id},
+            {"type": "unit_type_contains", "unit_id": unit_id, "marker": "SETTLER"},
+            {"type": "tile_unoccupied", "x": target_x, "y": target_y},
+            {"type": "settler_target_legal", "x": target_x, "y": target_y},
+            {"type": "settler_path_reachable", "x": target_x, "y": target_y},
+        ]
+        continuation_conditions = [
+            *start_conditions,
+            {"type": "approved_target_equals", "x": target_x, "y": target_y},
+            {"type": "severe_threat_absent"},
+        ]
+        completion = {
+            "type": "all_of",
+            "conditions": [
+                {"type": "unit_absent", "unit_id": unit_id},
+                {
+                    "type": "city_count_at_least",
+                    "count": baseline_city_count + 1,
+                },
+                {
+                    "type": "city_at_target",
+                    "x": target_x,
+                    "y": target_y,
+                    "owner": owner,
+                },
+            ],
+        }
+        baseline = {
+            "gap_type": gap.gap_type,
+            "baseline_city_count": baseline_city_count,
+            "approved_target": {"x": target_x, "y": target_y},
+            "owner": owner,
+            "settler_unit_id": unit_id,
+            "relevant_input_projection": projection,
+        }
+        return {
+            "projection": projection,
+            "preconditions": cls._replace_conditions(
+                contract.preconditions, start_conditions
+            ),
+            "continuation": cls._replace_conditions(
+                contract.continuation_conditions, continuation_conditions
+            ),
+            "completion": completion,
+            "baseline": baseline,
+        }
+
+    @staticmethod
+    def _replace_conditions(existing, replacements):
+        replacement_types = {item["type"] for item in replacements}
+        return [
+            *(
+                dict(item)
+                for item in existing
+                if item.get("type") not in replacement_types
+            ),
+            *(dict(item) for item in replacements),
+        ]
+
+    @staticmethod
+    def _approved_settler_target(bundle, resolution, unit_id, contract):
+        for row in bundle.unit_plan_updates:
+            if str(row.get("unit_id")) != str(unit_id):
+                continue
+            target = row.get("target")
+            if (
+                isinstance(target, dict)
+                and target.get("x") is not None
+                and target.get("y") is not None
+            ):
+                return int(target["x"]), int(target["y"])
+        for task in bundle.tasks:
+            if task.task_id not in set(resolution.task_ids):
+                continue
+            x = task.arguments.get("target_x")
+            y = task.arguments.get("target_y")
+            if x is not None and y is not None:
+                return int(x), int(y)
+        for condition in contract.preconditions:
+            if condition.get("type") not in {"tile_unoccupied", "settler_target_legal"}:
+                continue
+            if condition.get("x") is not None and condition.get("y") is not None:
+                return int(condition["x"]), int(condition["y"])
+        return None
 
     @staticmethod
     def _condition_for_evaluation(condition):

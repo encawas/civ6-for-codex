@@ -15,6 +15,7 @@ from civ6_workflow.workflow_protocol import (
     ResolutionDisposition,
     WorkflowProtocolError,
     validate_event_resolution_contract,
+    validate_global_resolution_structure,
 )
 
 
@@ -38,6 +39,8 @@ def _lease_contract():
             {"type": "entity_exists", "entity_type": "unit", "entity_id": "7"},
             {"type": "unit_type_contains", "unit_id": "7", "marker": "SETTLER"},
             {"type": "tile_unoccupied", "x": 5, "y": 6},
+            {"type": "settler_target_legal", "x": 5, "y": 6},
+            {"type": "settler_path_reachable", "x": 5, "y": 6},
         ],
         completion_condition={
             "type": "all_of",
@@ -50,6 +53,10 @@ def _lease_contract():
             {"type": "entity_exists", "entity_type": "unit", "entity_id": "7"},
             {"type": "unit_type_contains", "unit_id": "7", "marker": "SETTLER"},
             {"type": "tile_unoccupied", "x": 5, "y": 6},
+            {"type": "settler_target_legal", "x": 5, "y": 6},
+            {"type": "settler_path_reachable", "x": 5, "y": 6},
+            {"type": "approved_target_equals", "x": 5, "y": 6},
+            {"type": "severe_threat_absent"},
         ],
         invalidation_conditions=[
             {"type": "unit_absent", "unit_id": "7"},
@@ -225,3 +232,85 @@ def test_multi_gap_resolution_requires_explicit_atomic_contract():
         known_task_ids=set(),
         allow_information_requests=False,
     )
+
+
+def test_global_resolution_structure_rejects_duplicate_gap_ownership():
+    bundle = PlanBundle(
+        summary="conflicting gap ownership",
+        requires_human_review=True,
+        event_resolutions=[
+            EventResolution(
+                event_dedupe_key="event-a",
+                disposition=ResolutionDisposition.HUMAN_REVIEW,
+                decision_gap_ids=["gap-shared"],
+                reason="first owner",
+            ),
+            EventResolution(
+                event_dedupe_key="event-b",
+                disposition=ResolutionDisposition.HUMAN_REVIEW,
+                decision_gap_ids=["gap-shared"],
+                reason="second owner",
+            ),
+        ],
+    )
+
+    with pytest.raises(WorkflowProtocolError, match="multiple resolutions"):
+        validate_global_resolution_structure(
+            bundle, [], required_gap_ids={"gap-shared"}
+        )
+
+
+def test_global_resolution_structure_rejects_duplicate_event_key():
+    bundle = PlanBundle(
+        summary="conflicting event ownership",
+        requires_human_review=True,
+        event_resolutions=[
+            EventResolution(
+                event_dedupe_key="event-shared",
+                disposition=ResolutionDisposition.HUMAN_REVIEW,
+                decision_gap_ids=["gap-a"],
+                reason="first event result",
+            ),
+            EventResolution(
+                event_dedupe_key="event-shared",
+                disposition=ResolutionDisposition.HUMAN_REVIEW,
+                decision_gap_ids=["gap-b"],
+                reason="second event result",
+            ),
+        ],
+    )
+
+    with pytest.raises(WorkflowProtocolError, match="duplicate event resolution"):
+        validate_global_resolution_structure(
+            bundle, [], required_gap_ids={"gap-a", "gap-b"}
+        )
+
+
+def test_global_resolution_structure_rejects_conflicting_task_and_plan_ownership():
+    bundle = PlanBundle(
+        summary="conflicting output ownership",
+        requires_human_review=True,
+        event_resolutions=[
+            EventResolution(
+                event_dedupe_key="event-a",
+                disposition=ResolutionDisposition.HUMAN_REVIEW,
+                decision_gap_ids=["gap-a"],
+                task_ids=["task-shared"],
+                plan_refs=["city:A"],
+                reason="first owner",
+            ),
+            EventResolution(
+                event_dedupe_key="event-b",
+                disposition=ResolutionDisposition.HUMAN_REVIEW,
+                decision_gap_ids=["gap-b"],
+                task_ids=["task-shared"],
+                plan_refs=["city:A"],
+                reason="second owner",
+            ),
+        ],
+    )
+
+    with pytest.raises(WorkflowProtocolError, match="conflicting resolution owners"):
+        validate_global_resolution_structure(
+            bundle, [], required_gap_ids={"gap-a", "gap-b"}
+        )

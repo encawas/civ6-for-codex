@@ -69,6 +69,7 @@ from .verification import (
     VerificationEvidence,
     evaluate_action_verification,
 )
+from .workflow_protocol import LEASE_CONDITION_TYPES
 
 
 @dataclass(slots=True)
@@ -1231,6 +1232,7 @@ class WorkflowEngine:
                     "unit_build_charges_equals",
                     "unit_can_improve",
                 ],
+                "supported_lease_condition_types": sorted(LEASE_CONDITION_TYPES),
                 "strategy_queue_fields": {
                     "research_queue": "ordered TECH_* type names",
                     "civic_queue": "ordered CIVIC_* type names",

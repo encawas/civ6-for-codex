@@ -19,6 +19,39 @@ from .models import (
     TickMetrics as BaseTickMetrics,
 )
 
+LEASE_CONDITION_TYPES = frozenset(
+    {
+        "all_of",
+        "approved_target_equals",
+        "city_at_target",
+        "city_count_at_least",
+        "entity_exists",
+        "field_in",
+        "settler_path_reachable",
+        "settler_target_legal",
+        "severe_threat_absent",
+        "tile_unoccupied",
+        "turn_at_least",
+        "turn_equals",
+        "unit_absent",
+        "unit_type_contains",
+    }
+)
+
+
+def _validate_lease_condition(condition: dict[str, Any]) -> None:
+    condition_type = condition.get("type")
+    if condition_type not in LEASE_CONDITION_TYPES:
+        raise ValueError(f"unsupported lease condition type: {condition_type}")
+    if condition_type == "all_of":
+        nested = condition.get("conditions")
+        if not isinstance(nested, list) or not nested:
+            raise ValueError("all_of lease condition requires conditions")
+        for item in nested:
+            if not isinstance(item, dict):
+                raise ValueError("all_of lease conditions must be objects")
+            _validate_lease_condition(item)
+
 
 class ResolutionDisposition(str, Enum):
     TASK = "task"
@@ -63,16 +96,15 @@ class LeaseContract(StrictModel):
 
     @model_validator(mode="after")
     def validate_horizon(self):
-        if not self.completion_condition.get("type"):
-            raise ValueError("lease completion_condition requires type")
+        _validate_lease_condition(self.completion_condition)
         for name in (
             "preconditions",
             "invalidation_conditions",
             "continuation_conditions",
             "review_conditions",
         ):
-            if any(not item.get("type") for item in getattr(self, name)):
-                raise ValueError(f"lease {name} entries require type")
+            for item in getattr(self, name):
+                _validate_lease_condition(item)
         for subject in self.subjects:
             if set(subject) != {"subject_type", "subject_id"}:
                 raise ValueError("lease subjects require subject_type and subject_id")
@@ -170,6 +202,51 @@ def validate_information_request(request: InformationRequest) -> None:
         raise WorkflowProtocolError(
             f"information request {request.request_id} has unknown arguments: {sorted(unknown)}"
         )
+
+
+def validate_global_resolution_structure(
+    bundle: WorkflowPlanBundle,
+    _trigger_events: list[Any],
+    *,
+    required_gap_ids: set[str] | None = None,
+) -> None:
+    """Validate ownership and atomic relationships before item partitioning."""
+
+    errors: list[str] = []
+    event_owners: dict[str, int] = {}
+    gap_owners: dict[str, int] = {}
+    task_owners: dict[str, int] = {}
+    plan_owners: dict[str, int] = {}
+    for index, resolution in enumerate(bundle.event_resolutions):
+        key = resolution.event_dedupe_key
+        if key in event_owners:
+            errors.append(f"duplicate event resolution for {key}")
+        event_owners[key] = index
+        if len(resolution.decision_gap_ids) > 1 and not resolution.atomic:
+            errors.append(
+                f"multi-gap resolution for {key} must explicitly declare atomic=true"
+            )
+        for gap_id in resolution.decision_gap_ids:
+            if gap_id in gap_owners:
+                errors.append(f"decision gap {gap_id} has multiple resolutions")
+            gap_owners[gap_id] = index
+        for task_id in resolution.task_ids:
+            if task_id in task_owners:
+                errors.append(f"task {task_id} has conflicting resolution owners")
+            task_owners[task_id] = index
+        for plan_ref in resolution.plan_refs:
+            if plan_ref in plan_owners:
+                errors.append(
+                    f"plan update {plan_ref} has conflicting resolution owners"
+                )
+            plan_owners[plan_ref] = index
+
+    if required_gap_ids is not None:
+        missing = set(required_gap_ids) - set(gap_owners)
+        if missing:
+            errors.append(f"blocking gaps have no resolution: {sorted(missing)}")
+    if errors:
+        raise WorkflowProtocolError("; ".join(errors))
 
 
 def validate_event_resolution_contract(
@@ -357,8 +434,23 @@ def _validate_lease_contract_for_event(resolution, event, errors):
     invalidation_types = {item.get("type") for item in contract.invalidation_conditions}
     if not {"entity_exists", "unit_type_contains"}.issubset(precondition_types):
         errors.append("settler lease requires existence and settler-type preconditions")
-    if not ({"tile_unoccupied", "settler_target_legal"} & precondition_types):
-        errors.append("settler lease requires a legal unoccupied target")
+    required_start = {
+        "tile_unoccupied",
+        "settler_target_legal",
+        "settler_path_reachable",
+    }
+    if not required_start.issubset(precondition_types):
+        errors.append(
+            "settler lease requires legal, unoccupied, reachable target evidence"
+        )
+    continuation_types = {item.get("type") for item in contract.continuation_conditions}
+    required_continuation = {
+        *required_start,
+        "approved_target_equals",
+        "severe_threat_absent",
+    }
+    if not required_continuation.issubset(continuation_types):
+        errors.append("settler lease lacks material continuation conditions")
     completion = contract.completion_condition
     completion_items = (
         completion.get("conditions", [])

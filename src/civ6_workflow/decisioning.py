@@ -368,6 +368,7 @@ def evaluate_plan_lease(
     observation: NormalizedRuntimeObservation,
     *,
     relevant_input_hash: str,
+    relevant_input_projection: dict[str, Any] | None = None,
     evaluator: ConditionEvaluator | None = None,
 ) -> LeaseEvaluation:
     evaluator = evaluator or ConditionEvaluator()
@@ -385,8 +386,12 @@ def evaluate_plan_lease(
 
     if lease.completion_condition is not None:
         condition = _condition_payload(lease.completion_condition)
-        outcome = evaluator.evaluate(condition, observation)
-        if outcome.reason.startswith("unsupported condition type"):
+        outcome = evaluator.evaluate(
+            condition,
+            observation,
+            decision_projection=relevant_input_projection,
+        )
+        if not outcome.known:
             updated = lease.model_copy(
                 update={
                     "status": PlanLeaseStatus.AWAITING_INFORMATION,
@@ -410,8 +415,12 @@ def evaluate_plan_lease(
             return LeaseEvaluation(LeaseValidationResult.VALID, updated, reason)
 
     for condition in lease.continuation_conditions:
-        outcome = evaluator.evaluate(_condition_payload(condition), observation)
-        if outcome.reason.startswith("unsupported condition type"):
+        outcome = evaluator.evaluate(
+            _condition_payload(condition),
+            observation,
+            decision_projection=relevant_input_projection,
+        )
+        if not outcome.known:
             updated = lease.model_copy(
                 update={
                     "status": PlanLeaseStatus.AWAITING_INFORMATION,
@@ -435,7 +444,11 @@ def evaluate_plan_lease(
             return LeaseEvaluation(LeaseValidationResult.INVALIDATED, updated, reason)
 
     for condition in lease.invalidation_conditions:
-        outcome = evaluator.evaluate(_condition_payload(condition), observation)
+        outcome = evaluator.evaluate(
+            _condition_payload(condition),
+            observation,
+            decision_projection=relevant_input_projection,
+        )
         if outcome.valid:
             reason = f"invalidation condition matched: {condition.condition_type}"
             updated = lease.model_copy(
@@ -447,7 +460,7 @@ def evaluate_plan_lease(
                 }
             )
             return LeaseEvaluation(LeaseValidationResult.INVALIDATED, updated, reason)
-        if outcome.reason.startswith("unsupported condition type"):
+        if not outcome.known:
             updated = lease.model_copy(
                 update={
                     "status": PlanLeaseStatus.AWAITING_INFORMATION,
@@ -462,8 +475,12 @@ def evaluate_plan_lease(
             )
 
     for condition in lease.review_conditions:
-        outcome = evaluator.evaluate(_condition_payload(condition), observation)
-        if outcome.reason.startswith("unsupported condition type"):
+        outcome = evaluator.evaluate(
+            _condition_payload(condition),
+            observation,
+            decision_projection=relevant_input_projection,
+        )
+        if not outcome.known:
             updated = lease.model_copy(
                 update={
                     "status": PlanLeaseStatus.AWAITING_INFORMATION,
@@ -490,8 +507,23 @@ def evaluate_plan_lease(
                 updated,
                 f"review condition matched: {condition.condition_type}",
             )
+    validated_hash = lease.relevant_input_hash
+    if lease.relevant_input_hash != relevant_input_hash:
+        if _material_input_change_is_proven_safe(lease, relevant_input_projection):
+            validated_hash = relevant_input_hash
+        else:
+            reason = "material decision input changed and requires review"
+            updated = lease.model_copy(
+                update={
+                    "status": PlanLeaseStatus.AWAITING_INFORMATION,
+                    "last_validated_observation_id": _observation_marker(observation),
+                    "last_validation_result": LeaseValidationResult.UNKNOWN,
+                }
+            )
+            return LeaseEvaluation(LeaseValidationResult.UNKNOWN, updated, reason)
+
     if lease.valid_until_turn is not None and turn > lease.valid_until_turn:
-        unchanged = lease.relevant_input_hash == relevant_input_hash
+        unchanged = validated_hash == relevant_input_hash
         if (
             unchanged
             and lease.continuation_policy
@@ -500,6 +532,7 @@ def evaluate_plan_lease(
             updated = lease.model_copy(
                 update={
                     "valid_until_turn": turn + 1,
+                    "relevant_input_hash": validated_hash,
                     "last_validated_observation_id": _observation_marker(observation),
                     "last_validation_result": LeaseValidationResult.VALID,
                 }
@@ -523,10 +556,37 @@ def evaluate_plan_lease(
     updated = lease.model_copy(
         update={
             "last_validated_observation_id": _observation_marker(observation),
+            "relevant_input_hash": validated_hash,
             "last_validation_result": LeaseValidationResult.VALID,
         }
     )
     return LeaseEvaluation(LeaseValidationResult.VALID, updated, "lease remains valid")
+
+
+def _material_input_change_is_proven_safe(
+    lease: PlanLease, projection: dict[str, Any] | None
+) -> bool:
+    if projection is None:
+        return False
+    baseline = lease.model_dump(mode="json").get("contract_baseline", {})
+    if baseline.get("gap_type") != "settler_site_selection_required":
+        return False
+    required_conditions = {
+        "settler_target_legal",
+        "tile_unoccupied",
+        "settler_path_reachable",
+        "approved_target_equals",
+        "severe_threat_absent",
+    }
+    condition_types = {
+        condition.condition_type for condition in lease.continuation_conditions
+    }
+    if not required_conditions.issubset(condition_types):
+        return False
+    baseline_projection = baseline.get("relevant_input_projection", {})
+    return baseline_projection.get("strategy") == projection.get(
+        "strategy"
+    ) and baseline_projection.get("plan_revisions") == projection.get("plan_revisions")
 
 
 def evaluate_planner_eligibility(
@@ -743,14 +803,24 @@ def _canonical_target_rows(
     event: GameEvent,
     plan: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    rows: list[Any] = []
+    current_unit = find_entity(snapshot.units, ("unit_id", "id"), str(event.entity_id))
+    if isinstance(current_unit, dict):
+        current_targets = current_unit.get("targets", [])
+        rows.extend(
+            current_targets if isinstance(current_targets, list) else [current_targets]
+        )
+    event_unit = event.payload.get("unit")
+    if isinstance(event_unit, dict):
+        event_targets = event_unit.get("targets", [])
+        rows.extend(
+            event_targets if isinstance(event_targets, list) else [event_targets]
+        )
     raw = event.payload.get(
         "available_targets",
         event.payload.get("targets", event.payload.get("target", [])),
     )
-    rows = raw if isinstance(raw, list) else [raw]
-    if not rows and isinstance(event.payload.get("unit"), dict):
-        unit_targets = event.payload["unit"].get("targets", [])
-        rows = unit_targets if isinstance(unit_targets, list) else [unit_targets]
+    rows.extend(raw if isinstance(raw, list) else [raw])
     plan_target = plan.get("target", plan.get("site"))
     if not isinstance(plan_target, dict):
         target_x = plan.get("target_x", plan.get("x"))
@@ -761,7 +831,7 @@ def _canonical_target_rows(
             else None
         )
     if isinstance(plan_target, dict):
-        rows = [*rows, plan_target]
+        rows.append(plan_target)
     occupied = {
         (row.get("x"), row.get("y"))
         for row in snapshot.cities or []
@@ -779,25 +849,32 @@ def _canonical_target_rows(
         "path_reachable",
         "path_status",
     )
-    result: list[dict[str, Any]] = []
+    by_coordinates: dict[tuple[Any, Any], dict[str, Any]] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
-        item = _pick(row, keys)
         coordinates = (row.get("x"), row.get("y"))
+        if None in coordinates:
+            continue
+        item = {**by_coordinates.get(coordinates, {}), **_pick(row, keys)}
         item["occupied"] = bool(
             row.get("occupied", row.get("is_occupied", coordinates in occupied))
         )
-        item["legal"] = bool(
-            row.get("legal", row.get("is_legal", row.get("valid", True)))
-        )
-        item["reachable"] = bool(row.get("reachable", row.get("path_reachable", True)))
-        result.append(item)
-    deduplicated = {
-        json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=True): item
-        for item in result
-    }
-    return [deduplicated[key] for key in sorted(deduplicated)]
+        legal = row.get("legal", row.get("is_legal", row.get("valid")))
+        if legal is not None:
+            item["legal"] = bool(legal)
+        else:
+            item.setdefault("legal", None)
+        reachable = row.get("reachable", row.get("path_reachable"))
+        if reachable is not None:
+            item["reachable"] = bool(reachable)
+        else:
+            item.setdefault("reachable", None)
+        by_coordinates[coordinates] = item
+    return [
+        by_coordinates[key]
+        for key in sorted(by_coordinates, key=lambda item: (str(item[0]), str(item[1])))
+    ]
 
 
 def _project_settler_site(
@@ -862,6 +939,7 @@ def _project_diplomacy(
     snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
 ) -> dict[str, Any]:
     return {
+        "requires_current_event": True,
         "request": _pick(
             event.payload,
             (
@@ -888,6 +966,7 @@ def _project_trade_offer(
     snapshot: RuntimeSnapshot, event: GameEvent, context: dict[str, Any]
 ) -> dict[str, Any]:
     return {
+        "requires_current_event": True,
         "offer": _matching_offer(snapshot.trades, event.payload.get("offer_id"))
         or _pick(
             event.payload, ("offer_id", "other_player_id", "terms", "expires_turn")

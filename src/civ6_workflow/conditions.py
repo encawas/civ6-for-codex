@@ -19,25 +19,40 @@ ObservationInput = RuntimeSnapshot | NormalizedRuntimeObservation
 class ConditionResult:
     valid: bool
     reason: str = ""
+    known: bool = True
 
 
 class ConditionEvaluator:
     """Evaluates a deliberately small, auditable condition language."""
 
     def evaluate_all(
-        self, conditions: list[dict[str, Any]], snapshot: ObservationInput
+        self,
+        conditions: list[dict[str, Any]],
+        snapshot: ObservationInput,
+        *,
+        decision_projection: Mapping[str, Any] | None = None,
     ) -> ConditionResult:
         observation = self._normalize(snapshot)
         for condition in conditions:
-            result = self._evaluate_normalized(condition, observation)
+            result = self._evaluate_normalized(
+                condition, observation, decision_projection=decision_projection
+            )
             if not result.valid:
                 return result
         return ConditionResult(True)
 
     def evaluate(
-        self, condition: dict[str, Any], snapshot: ObservationInput
+        self,
+        condition: dict[str, Any],
+        snapshot: ObservationInput,
+        *,
+        decision_projection: Mapping[str, Any] | None = None,
     ) -> ConditionResult:
-        return self._evaluate_normalized(condition, self._normalize(snapshot))
+        return self._evaluate_normalized(
+            condition,
+            self._normalize(snapshot),
+            decision_projection=decision_projection,
+        )
 
     @staticmethod
     def _normalize(snapshot: ObservationInput) -> NormalizedRuntimeObservation:
@@ -49,6 +64,8 @@ class ConditionEvaluator:
         self,
         condition: dict[str, Any],
         observation: NormalizedRuntimeObservation,
+        *,
+        decision_projection: Mapping[str, Any] | None = None,
     ) -> ConditionResult:
         normalized_snapshot = observation.snapshot
         kind = condition.get("type")
@@ -61,7 +78,11 @@ class ConditionEvaluator:
                     return ConditionResult(
                         False, "all_of contains an invalid condition"
                     )
-                result = self._evaluate_normalized(dict(item), observation)
+                result = self._evaluate_normalized(
+                    dict(item),
+                    observation,
+                    decision_projection=decision_projection,
+                )
                 if not result.valid:
                     return result
             return ConditionResult(True)
@@ -263,7 +284,7 @@ class ConditionEvaluator:
                 actual >= expected,
                 f"city count {actual} is below required {expected}",
             )
-        if kind in {"tile_unoccupied", "settler_target_legal"}:
+        if kind == "tile_unoccupied":
             expected = (int(condition["x"]), int(condition["y"]))
             occupied = any(
                 (row.get("x"), row.get("y")) == expected
@@ -273,7 +294,91 @@ class ConditionEvaluator:
                 not occupied,
                 f"settlement target {expected} is already occupied",
             )
-        return ConditionResult(False, f"unsupported condition type: {kind!r}")
+        if kind in {"settler_target_legal", "settler_path_reachable"}:
+            target = self._settler_target_fact(condition, decision_projection)
+            fact = "legal" if kind == "settler_target_legal" else "reachable"
+            if target is None or target.get(fact) is None:
+                return ConditionResult(
+                    False,
+                    f"condition evidence unavailable: settler target {fact}",
+                    known=False,
+                )
+            value = bool(target[fact])
+            return ConditionResult(
+                value,
+                f"settlement target {(condition['x'], condition['y'])} is not {fact}",
+            )
+        if kind == "approved_target_equals":
+            expected = (int(condition["x"]), int(condition["y"]))
+            actual = self._projection_target(decision_projection)
+            if actual is None:
+                return ConditionResult(
+                    False,
+                    "condition evidence unavailable: approved target",
+                    known=False,
+                )
+            return ConditionResult(
+                actual == expected,
+                f"approved target expected {expected}, got {actual}",
+            )
+        if kind == "severe_threat_absent":
+            if decision_projection is None or "major_threat" not in decision_projection:
+                return ConditionResult(
+                    False,
+                    "condition evidence unavailable: major threat",
+                    known=False,
+                )
+            present = bool(decision_projection["major_threat"])
+            return ConditionResult(not present, "a severe settlement threat is present")
+        if kind == "city_at_target":
+            expected = (int(condition["x"]), int(condition["y"]))
+            owner = condition.get("owner")
+            matches = [
+                row
+                for row in _rows(normalized_snapshot.cities)
+                if (row.get("x"), row.get("y")) == expected
+            ]
+            if owner is not None:
+                matches = [
+                    row for row in matches if str(row.get("owner")) == str(owner)
+                ]
+            return ConditionResult(
+                bool(matches),
+                f"no matching city exists at approved target {expected}",
+            )
+        return ConditionResult(
+            False, f"unsupported condition type: {kind!r}", known=False
+        )
+
+    @staticmethod
+    def _settler_target_fact(
+        condition: Mapping[str, Any],
+        projection: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        if projection is None:
+            return None
+        expected = (int(condition["x"]), int(condition["y"]))
+        for row in projection.get("candidate_targets", ()):
+            if isinstance(row, Mapping) and (row.get("x"), row.get("y")) == expected:
+                return row
+        return None
+
+    @staticmethod
+    def _projection_target(
+        projection: Mapping[str, Any] | None,
+    ) -> tuple[int, int] | None:
+        if projection is None:
+            return None
+        value = projection.get("plan_target")
+        if isinstance(value, Mapping) and isinstance(value.get("target"), Mapping):
+            value = value["target"]
+        if not isinstance(value, Mapping):
+            return None
+        x = value.get("x", value.get("target_x"))
+        y = value.get("y", value.get("target_y"))
+        if x is None or y is None:
+            return None
+        return int(x), int(y)
 
     @staticmethod
     def _get_path(value: Any, path: str) -> Any:

@@ -9,6 +9,7 @@ from typing import BinaryIO
 from .agent_projection import project_agent_context
 from .engine import EngineConfig as BaseEngineConfig
 from .engine import WorkflowEngine as BaseWorkflowEngine
+from .workflow_protocol import LEASE_CONDITION_TYPES
 from .gate import EventGate, GateConfig
 from .models import AgentRequest, GameEvent, StoredTask, TaskStatus
 
@@ -159,6 +160,7 @@ class SafeWorkflowEngine(BaseWorkflowEngine):
                     "unit_build_charges_equals",
                     "unit_can_improve",
                 ],
+                "supported_lease_condition_types": sorted(LEASE_CONDITION_TYPES),
                 "strategy_queue_fields": {
                     "research_queue": "ordered TECH_* type names",
                     "civic_queue": "ordered CIVIC_* type names",
