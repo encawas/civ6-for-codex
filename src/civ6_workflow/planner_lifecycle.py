@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from .conditions import extract_known_entities, find_entity
+from .domain.observations import SlotState
 from .domain.base import thaw_json
 from .decisioning import (
     TURN_SPECIFIC_GAP_TYPES,
@@ -20,6 +21,7 @@ from .decisioning import (
     hash_decision_input,
     evaluate_plan_lease,
     evaluate_planner_eligibility,
+    opening_decision_events,
     stable_decision_identity,
 )
 from .domain import (
@@ -145,7 +147,18 @@ class PlannerLifecycleCoordinator:
                 ctx, observation, active, compatibility
             )
 
-        decision_events = current_events if current_events is not None else agent_events
+        decision_events = list(
+            current_events if current_events is not None else agent_events
+        )
+        if engine.config.max_agent_calls_per_turn > 0 and not any(
+            event.event_type in STRATEGIC_GAP_TYPES for event in decision_events
+        ):
+            decision_events.extend(
+                opening_decision_events(
+                    observation,
+                    existing_events=decision_events,
+                )
+            )
         strategic = [
             event
             for event in decision_events
@@ -584,6 +597,32 @@ class PlannerLifecycleCoordinator:
                 result.add(task.task_id)
         return tuple(sorted(result))
 
+    @staticmethod
+    def _opening_gap_resolution_reason(gap, observation):
+        if gap.gap_type == "research_direction_required":
+            if (
+                observation.canonical.progression.current_research.state
+                is SlotState.OCCUPIED
+            ):
+                return "research slot was filled outside the workflow"
+            return None
+
+        if gap.gap_type == "city_role_required":
+            subject_id = next(
+                (
+                    subject.subject_id
+                    for subject in gap.subjects
+                    if subject.subject_type == "city"
+                ),
+                None,
+            )
+            city = (
+                None if subject_id is None else observation.canonical.city(subject_id)
+            )
+            if city is not None and city.production.state is SlotState.OCCUPIED:
+                return "city production slot was filled outside the workflow"
+        return None
+
     def _rebuild_current_gap(self, gap, observation, current_events):
         engine = self.engine
         snapshot = observation.snapshot
@@ -600,6 +639,10 @@ class PlannerLifecycleCoordinator:
             if identity == gap.stable_identity:
                 matching = event
                 break
+
+        resolution_reason = self._opening_gap_resolution_reason(gap, observation)
+        if resolution_reason is not None:
+            return None
 
         projection = thaw_json(gap.input_projection)
         if gap.gap_type in TURN_SPECIFIC_GAP_TYPES and (
@@ -680,7 +723,10 @@ class PlannerLifecycleCoordinator:
             for gap in gaps:
                 current = self._rebuild_current_gap(gap, observation, current_events)
                 if current is None:
-                    reason = "source strategic event is no longer active"
+                    reason = (
+                        self._opening_gap_resolution_reason(gap, observation)
+                        or "source strategic event is no longer active"
+                    )
                     break
                 refreshed.append(current)
 
@@ -738,30 +784,63 @@ class PlannerLifecycleCoordinator:
                     "completed_at": engine._now(),
                 }
             )
-        reopened = []
-        source = refreshed or gaps
-        for gap in source:
-            turn_specific_expired = (
-                gap.gap_type in TURN_SPECIFIC_GAP_TYPES
-                and snapshot.turn != gap.identity_turn_number
-            )
-            reopened.append(
-                gap.model_copy(
-                    update={
-                        "status": (
-                            DecisionGapStatus.INVALIDATED
-                            if turn_specific_expired
-                            else DecisionGapStatus.OPEN
-                        ),
-                        "logical_request_id": None,
-                        "reopen_reason": None if turn_specific_expired else reason,
-                        "resolution_reason": None,
-                        "invalidation_reason": (
-                            reason if turn_specific_expired else None
-                        ),
-                    }
+        opening_resolution_reasons = {
+            gap.decision_gap_id: resolution_reason
+            for gap in gaps
+            if (
+                resolution_reason := self._opening_gap_resolution_reason(
+                    gap, observation
                 )
             )
+            is not None
+        }
+        reopened = []
+        if opening_resolution_reasons:
+            for gap in gaps:
+                resolution_reason = opening_resolution_reasons.get(gap.decision_gap_id)
+                if resolution_reason is not None:
+                    update = {
+                        "status": DecisionGapStatus.RESOLVED,
+                        "logical_request_id": None,
+                        "reopen_reason": None,
+                        "resolution_reason": resolution_reason,
+                        "invalidation_reason": None,
+                    }
+                else:
+                    update = {
+                        "status": DecisionGapStatus.OPEN,
+                        "logical_request_id": None,
+                        "reopen_reason": reason,
+                        "resolution_reason": None,
+                        "invalidation_reason": None,
+                    }
+                reopened.append(gap.model_copy(update=update))
+        else:
+            source = refreshed or gaps
+            for gap in source:
+                turn_specific_expired = (
+                    gap.gap_type in TURN_SPECIFIC_GAP_TYPES
+                    and snapshot.turn != gap.identity_turn_number
+                )
+                reopened.append(
+                    gap.model_copy(
+                        update={
+                            "status": (
+                                DecisionGapStatus.INVALIDATED
+                                if turn_specific_expired
+                                else DecisionGapStatus.OPEN
+                            ),
+                            "logical_request_id": None,
+                            "reopen_reason": (
+                                None if turn_specific_expired else reason
+                            ),
+                            "resolution_reason": None,
+                            "invalidation_reason": (
+                                reason if turn_specific_expired else None
+                            ),
+                        }
+                    )
+                )
         if not reopened:
             return self._finish(
                 ctx,
@@ -822,7 +901,7 @@ class PlannerLifecycleCoordinator:
             active_attempt=(
                 engine.store.unresolved_action_attempt(snapshot.game_id) is not None
             ),
-            logical_requests_this_turn=engine.store.logical_request_count_for_turn(
+            logical_requests_this_turn=engine.store.provider_budget_request_count_for_turn(
                 snapshot.game_id, snapshot.turn
             ),
             active_logical_request=False,

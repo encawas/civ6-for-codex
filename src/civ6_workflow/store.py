@@ -2474,6 +2474,32 @@ class WorkflowStore:
             ).fetchone()
         return int(row["value"])
 
+    def provider_budget_request_count_for_turn(self, game_id: str, turn: int) -> int:
+        """Count requests that consumed this turn's provider-call budget.
+
+        A superseded request with no persisted ProviderAttempt never reached the
+        provider boundary, so a successor may reuse the same turn's one-call
+        budget while the original request remains available for audit.
+        """
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS value
+                FROM logical_planner_requests AS request
+                WHERE request.game_id=? AND request.turn=?
+                  AND (
+                    request.status != ?
+                    OR EXISTS(
+                        SELECT 1 FROM provider_attempts AS attempt
+                        WHERE attempt.planner_request_id=request.planner_request_id
+                    )
+                  )
+                """,
+                (game_id, turn, PlannerRequestStatus.SUPERSEDED.value),
+            ).fetchone()
+        return int(row["value"])
+
     @staticmethod
     def _save_provider_attempt_in_connection(
         conn: sqlite3.Connection,

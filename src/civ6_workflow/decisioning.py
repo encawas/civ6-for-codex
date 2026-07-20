@@ -22,7 +22,8 @@ from .domain import (
     PlanLeaseStatus,
     SubjectRef,
 )
-from .models import GameEvent, RuntimeSnapshot
+from .domain.observations import SlotState
+from .models import EventLevel, GameEvent, RiskLevel, RuntimeSnapshot
 from .observation_normalization import NormalizedRuntimeObservation
 
 
@@ -154,6 +155,73 @@ class PlannerEligibility:
     eligible: bool
     reason: str
     gaps: tuple[DecisionGap, ...] = ()
+
+
+def opening_decision_events(
+    observation: NormalizedRuntimeObservation,
+    *,
+    existing_events: list[GameEvent] = (),
+) -> list[GameEvent]:
+    """Project unfilled opening slots into strategic decisions.
+
+    Callers invoke this only after deterministic task materialization. An
+    approved queue therefore wins whenever it can safely produce a task; an
+    empty slot with no such task becomes an explicit, durable planner question.
+    """
+
+    snapshot = observation.snapshot
+    covered = {
+        (event.event_type, None if event.entity_id is None else str(event.entity_id))
+        for event in existing_events
+    }
+    events: list[GameEvent] = []
+
+    if (
+        observation.canonical.progression.current_research.state is SlotState.EMPTY
+        and ("research_direction_required", None) not in covered
+    ):
+        events.append(
+            GameEvent(
+                event_type="research_direction_required",
+                turn=snapshot.turn,
+                entity_type="research",
+                level=EventLevel.L3,
+                risk=RiskLevel.MEDIUM,
+                blocking=True,
+                payload={
+                    "current_research": None,
+                    "available_techs": [
+                        entity.value
+                        for entity in observation.canonical.progression.available_research_ids
+                    ],
+                },
+                dedupe_key="research_direction_required:empire",
+            )
+        )
+
+    for city in observation.canonical.cities:
+        city_id = city.entity_id.value
+        if city.production.state is not SlotState.EMPTY:
+            continue
+        if ("city_role_required", city_id) in covered:
+            continue
+        events.append(
+            GameEvent(
+                event_type="city_role_required",
+                turn=snapshot.turn,
+                entity_type="city",
+                entity_id=city_id,
+                level=EventLevel.L3,
+                risk=RiskLevel.MEDIUM,
+                blocking=True,
+                payload={
+                    "city_id": city.entity_id.external_value,
+                    "currently_building": None,
+                },
+                dedupe_key=f"city_role_required:{city_id}",
+            )
+        )
+    return events
 
 
 def stable_decision_identity(event: GameEvent) -> tuple[str, bool]:

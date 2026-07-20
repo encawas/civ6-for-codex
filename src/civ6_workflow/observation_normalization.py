@@ -172,15 +172,23 @@ def _progression_slot(
     available_rows: list[dict[str, Any]],
     type_key: str,
 ) -> SlotValue:
-    explicit = normalize_slot(progress.get(explicit_type_key))
-    current = (
-        explicit
-        if explicit.state is SlotState.OCCUPIED
-        else normalize_slot(progress.get(current_key))
+    explicit = normalize_slot(
+        progress.get(explicit_type_key),
+        loaded=explicit_type_key in progress,
     )
-    if current.state is not SlotState.OCCUPIED:
-        return current
-    value = current.value or ""
+    current = normalize_slot(
+        progress.get(current_key),
+        loaded=current_key in progress,
+    )
+    if explicit.state is SlotState.OCCUPIED:
+        slot = explicit
+    elif current.state is not SlotState.NOT_LOADED:
+        slot = current
+    else:
+        slot = explicit
+    if slot.state is not SlotState.OCCUPIED:
+        return slot
+    value = slot.value or ""
     if value.upper().startswith(prefix):
         return SlotValue(state=SlotState.OCCUPIED, value=value.upper())
     by_name = {
