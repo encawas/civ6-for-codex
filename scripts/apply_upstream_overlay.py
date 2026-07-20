@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,22 +12,47 @@ IMPORT_LINE = "from civ_mcp.workflow_api import mount_workflow_routes\n"
 MOUNT_LINE = "    mount_workflow_routes(app)\n\n"
 IMPORT_ANCHOR = "from civ_mcp.game_state import GameState\n"
 RETURN_ANCHOR = "    return app\n"
-UVICORN_ANCHOR = (
-    '    uvi_config = uvicorn.Config(web_app, host="0.0.0.0", port=8000, '
-    'log_level="info")\n'
+UVICORN_CONFIG_PATTERN = re.compile(
+    r'(?m)^    uvi_config = uvicorn\.Config\('
+    r'web_app, host=(?P<host>"(?:0\.0\.0\.0|127\.0\.0\.1)"), '
+    r'port=8000, log_level="info"\)\r?\n'
 )
-UVICORN_PATCH = '''    # MCP stdio stdout must contain JSON-RPC only. Disable Uvicorn's
-    # access logger and default logging configuration; application logging uses
-    # Python logging handlers, which write to stderr.
+UVICORN_LOG_ISOLATION_MARKER = "access_log=False,\n        log_config=None,"
+UVICORN_PATCH = '''    # MCP stdio stdout must contain JSON-RPC only. Keep the upstream bind
+    # address, route framework logging through stderr, and suppress access logs.
     uvi_config = uvicorn.Config(
         web_app,
-        host="0.0.0.0",
+        host={host},
         port=8000,
         log_level="warning",
         access_log=False,
         log_config=None,
     )
 '''
+LOGGING_ANCHOR = "    logging.basicConfig(level=logging.INFO)\n"
+LOGGING_PATCH = '''    # JSON-RPC owns stdout. Force all application/framework logging to stderr
+    # even if a dependency configured the root logger before main() runs.
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
+'''
+
+
+def _patch_uvicorn_logging(server_text: str) -> str:
+    if UVICORN_LOG_ISOLATION_MARKER in server_text:
+        return server_text
+    match = UVICORN_CONFIG_PATTERN.search(server_text)
+    if match is None:
+        raise AssertionError("validated Uvicorn configuration anchor disappeared")
+    return server_text[: match.start()] + UVICORN_PATCH.format(
+        host=match.group("host")
+    ) + server_text[match.end() :]
+
+
+def _patch_root_logging(server_text: str) -> str:
+    if LOGGING_PATCH in server_text:
+        return server_text
+    if LOGGING_ANCHOR not in server_text:
+        raise AssertionError("validated logging configuration anchor disappeared")
+    return server_text.replace(LOGGING_ANCHOR, LOGGING_PATCH, 1)
 
 
 def _upstream_head(upstream_root: Path) -> str | None:
@@ -104,17 +130,21 @@ def apply_overlay(
         patched_web = patched_web.replace(RETURN_ANCHOR, MOUNT_LINE + RETURN_ANCHOR, 1)
 
     server_text = server_module.read_text(encoding="utf-8")
-    if UVICORN_PATCH not in server_text and UVICORN_ANCHOR not in server_text:
+    if (
+        UVICORN_LOG_ISOLATION_MARKER not in server_text
+        and UVICORN_CONFIG_PATTERN.search(server_text) is None
+    ):
         raise SystemExit(
             "upstream server.py changed: Uvicorn configuration anchor was not found; "
             "review logging compatibility before applying the overlay"
         )
-    patched_server = (
-        server_text
-        if UVICORN_PATCH in server_text
-        else server_text.replace(UVICORN_ANCHOR, UVICORN_PATCH, 1)
-    )
-
+    if LOGGING_PATCH not in server_text and LOGGING_ANCHOR not in server_text:
+        raise SystemExit(
+            "upstream server.py changed: logging configuration anchor was not found; "
+            "review stdio logging compatibility before applying the overlay"
+        )
+    patched_server = _patch_uvicorn_logging(server_text)
+    patched_server = _patch_root_logging(patched_server)
     if check_only:
         if (
             patched_web != web_text
@@ -139,7 +169,7 @@ def apply_overlay(
     server_module.write_text(patched_server, encoding="utf-8")
     print(f"installed {target_module}")
     print(f"patched {web_api}")
-    print(f"patched {server_module} (access_log=False, log_config=None)")
+    print(f"patched {server_module} (stdout JSON-RPC only; logs to stderr)")
     print(f"backup {web_backup}")
     print(f"backup {server_backup}")
     if head is not None:
