@@ -55,6 +55,20 @@ class SafeControlPanelHandler(BaseControlPanelHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/workflow/resume":
+            if not self._authorized(parsed):
+                return
+            game_id = self.server.control.store.get_meta("last_game_id")
+            if not isinstance(
+                game_id, str
+            ) or not self.server.control.store.request_human_resume(game_id):
+                self._send_json(
+                    {"error": "workflow is not awaiting human review"},
+                    HTTPStatus.CONFLICT,
+                )
+                return
+            self._send_json({"ok": True, "resume_requested": True})
+            return
         if parsed.path == "/api/planner/probe":
             if not self._authorized(parsed):
                 return

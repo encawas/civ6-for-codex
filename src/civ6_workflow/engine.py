@@ -73,6 +73,7 @@ from .workflow_protocol import LEASE_CONDITION_TYPES
 
 
 END_TURN_AUTHORIZATION_PROJECTION_VERSION = "end-turn-authorization/v1"
+HUMAN_WAIT_PROJECTION_VERSION = "human-wait-observation/v1"
 
 
 @dataclass(slots=True)
@@ -105,6 +106,7 @@ class _TickContext:
     budget: MutationBudget
     starting_state: RuntimeState = RuntimeState.OBSERVING
     observation_ids: list[str] = field(default_factory=list)
+    resuming_human_wait: bool = False
 
 
 class InjectedCrashBoundary(RuntimeError):
@@ -197,18 +199,25 @@ class WorkflowEngine:
             return self._reconcile_attempt(ctx, observation, unresolved)
 
         if ctx.starting_state is RuntimeState.AWAITING_HUMAN:
-            previous_ticks = self.store.list_workflow_ticks(snapshot.game_id)
-            previous_reason = (
-                getattr(previous_ticks[-1], "blocking_reason", None)
-                if previous_ticks
-                else None
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                AwaitingHumanTick,
-                blocking_reason=previous_reason or "human review is required",
-            )
+            wait = self.store.human_wait_context(snapshot.game_id) or {}
+            if wait.get("requires_unit_details") is True and snapshot.units is None:
+                raw = await self._read_snapshot(ctx.metrics, include_units=True)
+                observation = self._normalize_snapshot(raw, ctx.metrics)
+                snapshot = observation.snapshot
+                observation_id = self._observation_id(observation)
+                self._active_observation_id = observation_id
+                ctx.observation_ids.append(observation_id)
+            resume_reason = self._human_wait_resume_reason(observation)
+            if resume_reason is None:
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    AwaitingHumanTick,
+                    blocking_reason=str(
+                        wait.get("blocking_reason") or "human review is required"
+                    ),
+                )
+            ctx.resuming_human_wait = True
         existing_due = self.store.due_tasks(snapshot.game_id, snapshot.turn)
         need_units = (
             observation.canonical.unit_summary.detail_required
@@ -917,11 +926,17 @@ class WorkflowEngine:
             "metrics": ctx.metrics.model_dump(mode="json"),
         }
         tick = validate_workflow_tick(tick_type(**common, **fields))
+        human_wait_context = None
+        if isinstance(tick, AwaitingHumanTick):
+            human_wait_context = self._human_wait_context(snapshot)
+            human_wait_context["blocking_reason"] = tick.blocking_reason
+
         if attempt_update is None:
             self.store.persist_tick_and_runtime_state(
                 tick,
                 active_attempt_id=runtime_active_attempt_id,
                 checkpoint=self._checkpoint,
+                human_wait_context=human_wait_context,
             )
         elif attempt_update.status is AttemptStatus.SUCCEEDED:
             if attempt_update.action_type == "end_turn":
@@ -944,6 +959,7 @@ class WorkflowEngine:
                     active_attempt_id=None,
                     checkpoint=self._checkpoint,
                     attempt_checkpoint="after_attempt_failed_update",
+                    human_wait_context=human_wait_context,
                 )
             else:
                 self.store.finalize_attempt_failure(
@@ -960,6 +976,7 @@ class WorkflowEngine:
                 task_status=task_status,
                 task_error=task_error,
                 checkpoint=self._checkpoint,
+                human_wait_context=human_wait_context,
             )
 
         result = compatibility or TickResult(turn=snapshot.turn, metrics=ctx.metrics)
@@ -1303,6 +1320,64 @@ class WorkflowEngine:
             and (task.expires_turn is None or task.expires_turn >= snapshot.turn)
             for task in self.store.list_tasks(snapshot.game_id, statuses=blocking)
         )
+
+    def _human_wait_resume_reason(
+        self, observation: NormalizedRuntimeObservation
+    ) -> str | None:
+        """Return the durable trigger that permits one human-wait re-evaluation."""
+
+        context = self.store.human_wait_context(observation.snapshot.game_id)
+        if context is None:
+            # Legacy records predate a durable comparison baseline. Reconcile once
+            # from the fresh observation and immediately write a v1 baseline.
+            return "legacy human wait has no durable comparison baseline"
+        if context.get("resume_requested") is True:
+            return "explicit user resume was requested"
+        if (
+            context.get("execution_mode") != ExecutionMode.AUTO.value
+            and self.config.execution_mode is ExecutionMode.AUTO
+        ):
+            return "execution mode changed to auto"
+        if context.get("observation_projection_hash") != self._human_wait_hash(
+            observation.snapshot
+        ):
+            return "current normalized observation materially changed"
+        return None
+
+    def _human_wait_context(self, snapshot: RuntimeSnapshot) -> dict[str, Any]:
+        return {
+            "version": "human-wait/v1",
+            "execution_mode": self.config.execution_mode.value,
+            "observation_projection_version": HUMAN_WAIT_PROJECTION_VERSION,
+            "observation_projection_hash": self._human_wait_hash(snapshot),
+            "requires_unit_details": snapshot.units is not None,
+            "resume_requested": False,
+        }
+
+    @staticmethod
+    def _human_wait_hash(snapshot: RuntimeSnapshot) -> str:
+        """Hash normalized facts that can remove or materially change a wait."""
+
+        projection = {
+            "version": HUMAN_WAIT_PROJECTION_VERSION,
+            "game_id": snapshot.game_id,
+            "turn": snapshot.turn,
+            "cities": snapshot.cities,
+            "tech_civics": snapshot.tech_civics,
+            "units": snapshot.units,
+            "blockers": snapshot.blockers,
+            "notifications": snapshot.notifications,
+            "diplomacy": snapshot.diplomacy,
+            "trades": snapshot.trades,
+        }
+        encoded = json.dumps(
+            projection,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def _end_turn_reflections(
