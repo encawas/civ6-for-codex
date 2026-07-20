@@ -976,17 +976,27 @@ class WorkflowStore:
     def _load(value: str) -> Any:
         return json.loads(value)
 
+    @classmethod
+    def _set_meta_in_connection(
+        cls, conn: sqlite3.Connection, key: str, value: Any
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO workflow_meta(key, value_json) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value_json=excluded.value_json,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (key, cls._dump(value)),
+        )
+
+    @staticmethod
+    def _human_wait_meta_key(game_id: str) -> str:
+        return f"human_wait:{game_id}"
+
     def set_meta(self, key: str, value: Any) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO workflow_meta(key, value_json) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value_json=excluded.value_json,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (key, self._dump(value)),
-            )
+            self._set_meta_in_connection(conn, key, value)
 
     def get_meta(self, key: str, default: Any = None) -> Any:
         with self._connect() as conn:
@@ -994,6 +1004,50 @@ class WorkflowStore:
                 "SELECT value_json FROM workflow_meta WHERE key=?", (key,)
             ).fetchone()
         return default if row is None else self._load(row["value_json"])
+
+    def human_wait_context(self, game_id: str) -> dict[str, Any] | None:
+        context = self.get_meta(self._human_wait_meta_key(game_id))
+        return dict(context) if isinstance(context, dict) else None
+
+    def request_human_resume(self, game_id: str) -> bool:
+        """Durably request one safe re-evaluation of an active human wait."""
+
+        with self._connect() as conn:
+            state = conn.execute(
+                "SELECT state FROM runtime_state WHERE game_id=?", (game_id,)
+            ).fetchone()
+            if state is None or state["state"] != RuntimeState.AWAITING_HUMAN.value:
+                return False
+            key = self._human_wait_meta_key(game_id)
+            row = conn.execute(
+                "SELECT value_json FROM workflow_meta WHERE key=?", (key,)
+            ).fetchone()
+            context = {} if row is None else self._load(row["value_json"])
+            if not isinstance(context, dict):
+                context = {}
+            context.update(
+                {
+                    "version": "human-wait/v1",
+                    "resume_requested": True,
+                    "resume_requested_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            self._set_meta_in_connection(conn, key, context)
+        return True
+
+    def _persist_human_wait_context_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        game_id: str,
+        state: RuntimeState,
+        context: dict[str, Any] | None,
+    ) -> None:
+        key = self._human_wait_meta_key(game_id)
+        if state is not RuntimeState.AWAITING_HUMAN:
+            conn.execute("DELETE FROM workflow_meta WHERE key=?", (key,))
+            return
+        if context is not None:
+            self._set_meta_in_connection(conn, key, context)
 
     def upsert_event(
         self,
@@ -1926,6 +1980,7 @@ class WorkflowStore:
         resolve_failed_task: bool = False,
         checkpoint: Callable[[str], None] | None = None,
         attempt_checkpoint: str | None = None,
+        human_wait_context: dict[str, Any] | None = None,
     ) -> FailedAttemptResolution | None:
         tick = validate_workflow_tick(tick)
         if attempt is not None and attempt.game_session_id != tick.game_session_id:
@@ -1989,6 +2044,12 @@ class WorkflowStore:
                 tick.game_session_id,
                 tick.ending_runtime_state,
                 active_attempt_id,
+            )
+            self._persist_human_wait_context_in_connection(
+                conn,
+                tick.game_session_id,
+                tick.ending_runtime_state,
+                human_wait_context,
             )
             if checkpoint is not None:
                 checkpoint("after_runtime_state_update")
@@ -2711,6 +2772,7 @@ class WorkflowStore:
         plan_bundle_observation_id: str | None = None,
         active_attempt_id: str | None = None,
         cancel_task_ids: Sequence[str] = (),
+        human_wait_context: dict[str, Any] | None = None,
     ) -> None:
         tick = validate_workflow_tick(tick)
         with self._connect() as conn:
@@ -2795,6 +2857,12 @@ class WorkflowStore:
                 tick.game_session_id,
                 tick.ending_runtime_state,
                 active_attempt_id,
+            )
+            self._persist_human_wait_context_in_connection(
+                conn,
+                tick.game_session_id,
+                tick.ending_runtime_state,
+                human_wait_context,
             )
             self._insert_workflow_tick_in_connection(conn, tick)
 

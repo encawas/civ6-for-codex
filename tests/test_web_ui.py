@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from civ6_workflow.config import AppConfig
+from civ6_workflow.domain import RuntimeState
 from civ6_workflow.models import ExecutionMode, PlanBundle, ProposedTask, TaskStatus
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.web_ui import ControlPanelHTTPServer, ControlPanelState
@@ -145,9 +146,7 @@ def test_http_api_requires_token_and_exposes_state(tmp_path: Path, monkeypatch):
         )
         with urlopen(status_request, timeout=3) as response:
             status = json.loads(response.read().decode("utf-8"))
-        assert status["status"]["connection_owner"] == (
-            "frontend_via_local_backend"
-        )
+        assert status["status"]["connection_owner"] == ("frontend_via_local_backend")
 
         probe = Request(
             f"{base}/api/planner/probe",
@@ -175,6 +174,44 @@ def test_http_api_requires_token_and_exposes_state(tmp_path: Path, monkeypatch):
         )
         with urlopen(approve, timeout=3) as response:
             assert json.loads(response.read().decode("utf-8"))["ok"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_http_resume_marks_a_durable_human_wait(tmp_path: Path):
+    panel = _panel(tmp_path)
+    panel.store.save_runtime_state("game-1", RuntimeState.AWAITING_HUMAN)
+    panel.store.set_meta(
+        "human_wait:game-1",
+        {
+            "version": "human-wait/v1",
+            "execution_mode": "confirm",
+            "observation_projection_hash": "test",
+            "resume_requested": False,
+        },
+    )
+    server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        resume = Request(
+            f"{base}/api/workflow/resume",
+            method="POST",
+            data=b"{}",
+            headers={
+                "X-Civ6-Token": "test-token",
+                "Content-Type": "application/json",
+            },
+        )
+        with urlopen(resume, timeout=3) as response:
+            assert json.loads(response.read().decode("utf-8")) == {
+                "ok": True,
+                "resume_requested": True,
+            }
+        assert panel.store.human_wait_context("game-1")["resume_requested"] is True
     finally:
         server.shutdown()
         server.server_close()

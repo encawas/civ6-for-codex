@@ -78,11 +78,15 @@ class PlannerLifecycleCoordinator:
         self.engine = engine
 
     def validate_before_routing(self, ctx, observation, current_events, compatibility):
-        if ctx.starting_state in {
-            RuntimeState.AWAITING_HUMAN,
-            RuntimeState.TURN_TRANSITIONING,
-            RuntimeState.VERIFYING,
-        }:
+        if (
+            ctx.starting_state
+            in {
+                RuntimeState.AWAITING_HUMAN,
+                RuntimeState.TURN_TRANSITIONING,
+                RuntimeState.VERIFYING,
+            }
+            and not ctx.resuming_human_wait
+        ):
             return None
         gap_tick = self._reconcile_persisted_gaps(
             ctx, observation, compatibility, current_events=current_events
@@ -99,13 +103,17 @@ class PlannerLifecycleCoordinator:
         engine = self.engine
         snapshot = observation.snapshot
         game_id = snapshot.game_id
-        if ctx.starting_state in {
-            RuntimeState.SYSTEM_ERROR,
-            RuntimeState.AWAITING_APPROVAL,
-            RuntimeState.AWAITING_HUMAN,
-            RuntimeState.TURN_TRANSITIONING,
-            RuntimeState.VERIFYING,
-        }:
+        if (
+            ctx.starting_state
+            in {
+                RuntimeState.SYSTEM_ERROR,
+                RuntimeState.AWAITING_APPROVAL,
+                RuntimeState.AWAITING_HUMAN,
+                RuntimeState.TURN_TRANSITIONING,
+                RuntimeState.VERIFYING,
+            }
+            and not ctx.resuming_human_wait
+        ):
             return [], None
 
         active = engine.store.active_planner_request(game_id)
@@ -283,31 +291,45 @@ class PlannerLifecycleCoordinator:
             DecisionGapStatus.AWAITING_INFORMATION,
             DecisionGapStatus.PROPOSED,
         }
-        invalidated = []
+        if ctx.resuming_human_wait:
+            candidates.add(DecisionGapStatus.AWAITING_HUMAN)
+
+        updates = []
         cancel_task_ids: set[str] = set()
         for gap in engine.store.list_decision_gaps(snapshot.game_id):
             if gap.decision_gap_id in protected_gap_ids or gap.status not in candidates:
                 continue
             projection = thaw_json(gap.input_projection)
-            if gap.turn_specific and gap.identity_turn_number != snapshot.turn:
-                reason = "turn-specific decision expired before routing"
+            opening_resolution = self._opening_gap_resolution_reason(gap, observation)
+            if opening_resolution is not None:
+                status = DecisionGapStatus.RESOLVED
+                resolution_reason = opening_resolution
+                invalidation_reason = None
+            elif gap.turn_specific and gap.identity_turn_number != snapshot.turn:
+                status = DecisionGapStatus.INVALIDATED
+                resolution_reason = None
+                invalidation_reason = "turn-specific decision expired before routing"
             elif (
                 projection.get("requires_current_event")
                 and gap.stable_identity not in current_identities
             ):
-                reason = "required strategic event disappeared before routing"
+                status = DecisionGapStatus.INVALIDATED
+                resolution_reason = None
+                invalidation_reason = (
+                    "required strategic event disappeared before routing"
+                )
             else:
                 continue
-            invalidated.append(
+            updates.append(
                 gap.model_copy(
                     update={
-                        "status": DecisionGapStatus.INVALIDATED,
+                        "status": status,
                         "observation_id": (
                             engine._active_observation_id or gap.observation_id
                         ),
                         "logical_request_id": None,
-                        "resolution_reason": None,
-                        "invalidation_reason": reason,
+                        "resolution_reason": resolution_reason,
+                        "invalidation_reason": invalidation_reason,
                         "reopen_reason": None,
                         "updated_at": engine._now(),
                     }
@@ -315,17 +337,22 @@ class PlannerLifecycleCoordinator:
             )
             cancel_task_ids.update(self._dependent_task_ids_for_gap(gap))
 
-        if not invalidated:
+        if not updates:
             return None
+        first = updates[0]
         return self._finish(
             ctx,
             snapshot,
             DecisionGapUpdatedTick,
             compatibility=compatibility,
-            decision_gaps=invalidated,
+            decision_gaps=updates,
             cancel_task_ids=tuple(sorted(cancel_task_ids)),
-            decision_gap_id=invalidated[0].decision_gap_id,
-            update_reason=invalidated[0].invalidation_reason,
+            decision_gap_id=first.decision_gap_id,
+            update_reason=(
+                first.resolution_reason
+                or first.invalidation_reason
+                or "persisted decision gap was reconciled"
+            ),
         )
 
     def _dependent_task_ids_for_gap(self, gap):
@@ -894,7 +921,11 @@ class PlannerLifecycleCoordinator:
         eligibility = evaluate_planner_eligibility(
             open_gaps,
             engine.store.list_plan_leases(snapshot.game_id),
-            runtime_state=ctx.starting_state.value,
+            runtime_state=(
+                RuntimeState.ROUTING.value
+                if ctx.resuming_human_wait
+                else ctx.starting_state.value
+            ),
             has_ready_deterministic_task=bool(
                 engine.store.due_tasks(snapshot.game_id, snapshot.turn)
             ),
@@ -2694,6 +2725,10 @@ class PlannerLifecycleCoordinator:
             "metrics": ctx.metrics.model_dump(mode="json"),
         }
         tick = validate_workflow_tick(tick_type(**common, **fields))
+        human_wait_context = None
+        if isinstance(tick, AwaitingHumanTick):
+            human_wait_context = engine._human_wait_context(snapshot)
+            human_wait_context["blocking_reason"] = tick.blocking_reason
         engine.store.persist_phase4_tick(
             tick,
             decision_gaps=decision_gaps,
@@ -2707,6 +2742,7 @@ class PlannerLifecycleCoordinator:
             plan_bundle_auto_action_types=engine.config.auto_action_types,
             plan_bundle_observation_id=engine._active_observation_id,
             cancel_task_ids=cancel_task_ids,
+            human_wait_context=human_wait_context,
         )
         result = compatibility or TickResult(turn=snapshot.turn, metrics=ctx.metrics)
         result.metrics = ctx.metrics
