@@ -4,13 +4,12 @@ import pytest
 
 from civ6_workflow.models import (
     ActionResult,
-    AgentRequest,
     ExecutionMode,
     GameEvent,
-    PlanBundle,
     RuntimeSnapshot,
     StoredTask,
 )
+from civ6_workflow.workflow_protocol import WorkflowAgentRequest, WorkflowPlanBundle
 from civ6_workflow.replay import (
     RecordedAction,
     RecordedPlannerCall,
@@ -38,8 +37,8 @@ def _task(
     )
 
 
-def _request(*, turn: int) -> AgentRequest:
-    return AgentRequest(
+def _request(*, turn: int) -> WorkflowAgentRequest:
+    return WorkflowAgentRequest(
         turn=turn,
         execution_mode=ExecutionMode.AUTO,
         trigger_events=[
@@ -140,9 +139,7 @@ def test_replay_rejects_end_turn_before_recorded_actions():
 
 
 def test_replay_assert_finished_rejects_remaining_frames():
-    game = ReplayGamePort(
-        SnapshotRecording(frames=[_frame(turn=12), _frame(turn=13)])
-    )
+    game = ReplayGamePort(SnapshotRecording(frames=[_frame(turn=12), _frame(turn=13)]))
     asyncio.run(game.read_snapshot())
 
     with pytest.raises(ReplayDataError, match="1 unconsumed snapshot"):
@@ -175,7 +172,7 @@ def test_replay_rejects_planner_request_drift():
         planner_calls=[
             RecordedPlannerCall(
                 request=expected,
-                response=PlanBundle(summary="recorded response"),
+                response=WorkflowPlanBundle(summary="recorded response"),
             )
         ]
     )
@@ -190,7 +187,7 @@ def test_replay_rejects_unconsumed_planner_calls():
         planner_calls=[
             RecordedPlannerCall(
                 request=_request(turn=12),
-                response=PlanBundle(summary="recorded response"),
+                response=WorkflowPlanBundle(summary="recorded response"),
             )
         ]
     )

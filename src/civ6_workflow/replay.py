@@ -5,19 +5,43 @@ from typing import Any, Callable, Literal, Protocol
 
 from pydantic import Field, model_validator
 
+from .actions import ACTION_REGISTRY
 from .models import (
     ActionResult,
-    AgentRequest,
     ExecutionMode,
-    PlanBundle,
     RuntimeSnapshot,
     StoredTask,
     StrictModel,
 )
+from .workflow_protocol import WorkflowAgentRequest, WorkflowPlanBundle
 
 
 class ReplayDataError(RuntimeError):
     pass
+
+
+_SIGNATURE_KEY = "_workflow_task_signature_v1"
+
+
+def _task_signature(task: StoredTask) -> dict[str, Any]:
+    spec = ACTION_REGISTRY.get(task.action_type)
+    if spec is None:
+        tool_name = None
+        tool_arguments = dict(task.arguments)
+    else:
+        tool_name = spec.tool_name
+        tool_arguments = spec.build_arguments(task)
+    return {
+        "task_id": task.task_id,
+        "action_type": task.action_type,
+        "entity_type": task.entity_type,
+        "entity_id": str(task.entity_id),
+        "tool_name": tool_name,
+        "tool_arguments": tool_arguments,
+        "preconditions": task.preconditions,
+        "postconditions": task.postconditions,
+        "invalidators": task.invalidators,
+    }
 
 
 class RecordedAction(StrictModel):
@@ -35,7 +59,7 @@ class ReplayFrame(StrictModel):
 
 class ReplayPlanSeed(StrictModel):
     turn: int = Field(ge=0)
-    bundle: PlanBundle
+    bundle: WorkflowPlanBundle
     mode: ExecutionMode = ExecutionMode.AUTO
     auto_action_types: list[str] = Field(default_factory=list)
 
@@ -51,8 +75,8 @@ class ReplayEngineSettings(StrictModel):
 
 
 class RecordedPlannerCall(StrictModel):
-    request: AgentRequest
-    response: PlanBundle
+    request: WorkflowAgentRequest
+    response: WorkflowPlanBundle
 
 
 class SnapshotRecording(StrictModel):
@@ -62,7 +86,7 @@ class SnapshotRecording(StrictModel):
     planner_calls: list[RecordedPlannerCall] = Field(default_factory=list)
     # Compatibility for early hand-authored fixtures. New live recordings use
     # planner_calls so request drift can be detected.
-    planner_responses: list[PlanBundle] = Field(default_factory=list)
+    planner_responses: list[WorkflowPlanBundle] = Field(default_factory=list)
     seed_plans: list[ReplayPlanSeed] = Field(default_factory=list)
     store_state: dict[str, Any] | None = None
     engine_settings: ReplayEngineSettings | None = None
@@ -192,11 +216,16 @@ class RecordingGamePort:
         if self._current is None:
             raise ReplayDataError("cannot record an action before a snapshot")
         result = await self.delegate.execute_task(task)
+        recorded_result = result.model_copy(deep=True)
+        recorded_result.details = {
+            **recorded_result.details,
+            _SIGNATURE_KEY: _task_signature(task),
+        }
         self._current.actions.append(
             RecordedAction(
                 task_id=task.task_id,
                 action_type=task.action_type,
-                result=result.model_copy(deep=True),
+                result=recorded_result,
             )
         )
         return result
@@ -288,6 +317,14 @@ class ReplayGamePort:
                 f"frame has no recorded result for task {task.task_id}:{task.action_type}"
             )
         expected = self._current.actions[self._next_action_index]
+        recorded_signature = expected.result.details.get(_SIGNATURE_KEY)
+        if recorded_signature is not None:
+            actual_signature = _task_signature(task)
+            if recorded_signature != actual_signature:
+                raise ReplayDataError(
+                    "recorded action semantics do not match workflow execution: "
+                    f"expected={recorded_signature!r}, actual={actual_signature!r}"
+                )
         actual_key = f"{task.task_id}:{task.action_type}"
         expected_key = f"{expected.task_id}:{expected.action_type}"
         if expected.task_id != task.task_id or expected.action_type != task.action_type:
@@ -297,7 +334,12 @@ class ReplayGamePort:
             )
         self._next_action_index += 1
         self.call_count += 1
-        return expected.result.model_copy(deep=True)
+        result = expected.result.model_copy(deep=True)
+        if _SIGNATURE_KEY not in result.details:
+            return result
+        details = dict(result.details)
+        details.pop(_SIGNATURE_KEY, None)
+        return result.model_copy(update={"details": details})
 
     async def end_turn(self, reflections: dict[str, str] | None = None) -> ActionResult:
         if self._current is None or self._current.end_turn_result is None:
@@ -319,7 +361,7 @@ class RecordingPlanner:
         self.delegate = delegate
         self.recording = recording
 
-    async def plan(self, request: AgentRequest) -> PlanBundle:
+    async def plan(self, request: WorkflowAgentRequest) -> WorkflowPlanBundle:
         response = await self.delegate.plan(request)
         self.recording.planner_calls.append(
             RecordedPlannerCall(
@@ -350,7 +392,7 @@ class ReplayPlanner:
                 f"replay ended with {self.remaining_calls} unconsumed planner call(s)"
             )
 
-    async def plan(self, request: AgentRequest) -> PlanBundle:
+    async def plan(self, request: WorkflowAgentRequest) -> WorkflowPlanBundle:
         if self.recording.planner_calls:
             if self._next_response >= len(self.recording.planner_calls):
                 raise ReplayDataError(
@@ -378,7 +420,7 @@ class ReplayPlanner:
         return response.model_copy(deep=True)
 
     @staticmethod
-    def _request_signature(request: AgentRequest) -> dict[str, Any]:
+    def _request_signature(request: WorkflowAgentRequest) -> dict[str, Any]:
         payload = request.model_dump(mode="json")
         payload.pop("request_id", None)
         for event in payload.get("trigger_events", []):
@@ -387,5 +429,5 @@ class ReplayPlanner:
         return payload
 
     @staticmethod
-    def _event_keys(request: AgentRequest) -> list[str]:
+    def _event_keys(request: WorkflowAgentRequest) -> list[str]:
         return [event.dedupe_key for event in request.trigger_events]

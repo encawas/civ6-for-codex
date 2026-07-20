@@ -17,7 +17,7 @@ from civ6_workflow.domain import (
     validate_workflow_tick,
 )
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
-from civ6_workflow.mcp_port import Civ6McpClient, McpServerConfig
+from civ6_workflow.mcp_port import Civ6GamePort, Civ6McpClient, McpServerConfig
 from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
@@ -26,7 +26,6 @@ from civ6_workflow.models import (
     RuntimeSnapshot,
     TaskStatus,
 )
-from civ6_workflow.safe_mcp_port import SafeCiv6GamePort
 from civ6_workflow.store import WorkflowStore
 
 
@@ -518,7 +517,7 @@ def _real_mcp_engine(tmp_path, behavior, *, task=None):
     client = Civ6McpClient(McpServerConfig())
     session = FakeMcpSession(behavior)
     client.session = session
-    game = SafeCiv6GamePort(
+    game = Civ6GamePort(
         client,
         FakeStateApi(),
         allowed_tools=_tools(),
@@ -884,7 +883,7 @@ def _real_mcp_end_turn_engine(tmp_path, behavior):
     client = Civ6McpClient(McpServerConfig())
     session = FakeMcpSession(behavior)
     client.session = session
-    game = SafeCiv6GamePort(
+    game = Civ6GamePort(
         client,
         FakeStateApi(production="UNIT_BUILDER"),
         allowed_tools=_tools(),

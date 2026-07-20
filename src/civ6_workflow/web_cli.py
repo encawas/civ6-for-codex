@@ -7,38 +7,24 @@ from urllib.parse import quote
 
 import typer
 
-from .codex_planner import CodexPlanner
+from .bootstrap import build_store, compose_control_panel, open_live_runtime
 from .config import AppConfig, load_config
-from .engine import WorkflowEngine
-from .mcp_port import Civ6GamePort, Civ6McpClient
-from .state_api import Civ6StateApi
 from .store import WorkflowStore
-from .web_ui import ControlPanelHTTPServer, ControlPanelState
 
 
 def _store(config: AppConfig, config_path: Path) -> WorkflowStore:
-    database_path = Path(config.runtime.database_path)
-    if not database_path.is_absolute():
-        database_path = config_path.parent / database_path
-    return WorkflowStore(database_path)
+    return build_store(config, config_path)
 
 
 async def _run_tick(config: AppConfig, config_path: Path):
-    async with Civ6McpClient(config.mcp_config()) as client:
-        async with Civ6StateApi(config.state_api_config()) as state_api:
-            engine = WorkflowEngine(
-                store=_store(config, config_path),
-                game=Civ6GamePort(
-                    client,
-                    state_api,
-                    allowed_tools=set(config.safety.allowed_tools),
-                ),
-                planner=CodexPlanner(config.codex_config(config_path.parent)),
-                config=config.engine_config(),
-            )
-            return await asyncio.wait_for(
-                engine.tick(), timeout=config.runtime.max_turn_seconds
-            )
+    async with open_live_runtime(
+        config,
+        config_path,
+        planner_base_directory=config_path.parent,
+    ) as runtime:
+        return await asyncio.wait_for(
+            runtime.engine.tick(), timeout=config.runtime.max_turn_seconds
+        )
 
 
 def serve(
@@ -55,17 +41,18 @@ def serve(
 
     config = config.resolve()
     loaded = load_config(config)
-    store = _store(loaded, config)
 
     def run_tick():
         return asyncio.run(_run_tick(loaded, config))
 
-    control = ControlPanelState(
-        config=loaded,
-        store=store,
+    composition = compose_control_panel(
+        loaded,
+        config,
+        address=("127.0.0.1", port),
         run_tick_callback=run_tick,
     )
-    server = ControlPanelHTTPServer(("127.0.0.1", port), control)
+    control = composition.control
+    server = composition.server
     url = f"http://127.0.0.1:{port}/?token={quote(control.token)}"
     typer.echo("Civ6 workflow local backend")
     typer.echo(f"  Open this frontend URL: {url}")

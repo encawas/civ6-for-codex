@@ -270,6 +270,17 @@ class ConditionEvaluator:
                 marker in actual,
                 f"unit {unit_id} type {actual!r} does not contain {marker!r}",
             )
+        if kind == "unit_moved_from":
+            unit_id = str(condition["unit_id"])
+            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
+            if unit is None:
+                return ConditionResult(False, f"unit {unit_id} does not exist")
+            original = (int(condition["x"]), int(condition["y"]))
+            current = (unit.get("x"), unit.get("y"))
+            return ConditionResult(
+                current != original,
+                f"unit {unit_id} did not move from {original}; current={current}",
+            )
         if kind == "unit_absent":
             unit_id = str(condition["unit_id"])
             absent = (

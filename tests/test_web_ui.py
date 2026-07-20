@@ -134,9 +134,7 @@ def test_http_api_requires_token_and_exposes_state(tmp_path: Path, monkeypatch):
             "secret_exposed_to_browser": False,
         }
 
-    monkeypatch.setattr(
-        "civ6_workflow.safe_web_ui.probe_planner_connection", fake_probe
-    )
+    monkeypatch.setattr("civ6_workflow.web_ui.probe_planner_connection", fake_probe)
     panel = _panel(tmp_path)
     server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -287,7 +285,9 @@ def test_game_bound_task_confirmation_and_rejection(tmp_path: Path):
         )
         rejected = _post(base, "/api/games/game-1/tasks/ui-production/reject")
         assert rejected["ok"] is True
-        assert panel.store.task_status("game-1", "ui-production") is TaskStatus.CANCELLED
+        assert (
+            panel.store.task_status("game-1", "ui-production") is TaskStatus.CANCELLED
+        )
 
         with pytest.raises(HTTPError) as exc_info:
             _post(base, "/api/games/other-game/tasks/ui-production/confirm")
@@ -319,13 +319,21 @@ def test_game_bound_lease_approval_and_rejection_are_durable(tmp_path: Path):
         assert record.decision.value == "APPROVED"
 
         second_lease = _awaiting_lease(task_ids=("ui-production",)).model_copy(
-            update={"plan_lease_id": "lease-ui-reject", "decision_gap_ids": ("gap-ui-reject",)}
+            update={
+                "plan_lease_id": "lease-ui-reject",
+                "decision_gap_ids": ("gap-ui-reject",),
+            }
         )
         panel.store.save_plan_lease(second_lease)
         rejected = _post(base, "/api/games/game-1/leases/lease-ui-reject/reject")
         assert rejected["ok"] is True
-        assert panel.store.list_plan_leases("game-1")[1].status is PlanLeaseStatus.INVALIDATED
-        assert panel.store.task_status("game-1", "ui-production") is TaskStatus.CANCELLED
+        assert (
+            panel.store.list_plan_leases("game-1")[1].status
+            is PlanLeaseStatus.INVALIDATED
+        )
+        assert (
+            panel.store.task_status("game-1", "ui-production") is TaskStatus.CANCELLED
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -377,6 +385,7 @@ def test_retry_endpoint_only_requeues_proven_not_sent_attempts(tmp_path: Path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
 
 def test_game_bound_resume_exposes_human_wait_state(tmp_path: Path):
     panel = _panel(tmp_path)

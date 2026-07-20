@@ -6,17 +6,18 @@ import os
 from dataclasses import dataclass
 import shutil
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
-from .models import AgentRequest, PlanBundle
+from .ports import Planner as Planner
+from .workflow_prompt import EXTENDED_SYSTEM_INSTRUCTIONS
+from .workflow_protocol import (
+    WorkflowAgentRequest as AgentRequest,
+    WorkflowPlanBundle as PlanBundle,
+)
 
 
 class PlannerError(RuntimeError):
     pass
-
-
-class Planner(Protocol):
-    async def plan(self, request: AgentRequest) -> PlanBundle: ...
 
 
 @dataclass(slots=True)
@@ -51,22 +52,7 @@ class CodexPlannerConfig:
     env: dict[str, str] | None = None
 
 
-SYSTEM_INSTRUCTIONS = """You are the strategic planning worker for a Civilization VI workflow runtime.
-
-You are not connected to the game. You must not attempt to edit files, run shell commands, call MCP tools, or perform actions directly. The only authoritative state is the JSON request below.
-
-Your job is to return one structured plan bundle for the triggering events. Prefer updating plans for several future turns over creating one immediate action. Use only the action types listed in request.constraints.allowed_action_types. Never invent entity IDs. High-impact or irreversible actions must set requires_confirmation=true. If the supplied state is insufficient, return requires_human_review=true and explain what focused state must be queried; do not guess.
-
-Rules:
-1. Existing approved plans should be preserved unless an event invalidates them.
-2. Ordinary continuation work should become scheduled tasks.
-3. Each entity may have at most one task due on the same turn.
-4. Do not create diplomacy, war, peace, policy, city placement, purchase, city capture, or World Congress actions unless an allowed action type explicitly exists.
-5. Every task needs a concise reason, preconditions, postconditions, invalidators, due_turn, and risk.
-6. Postconditions must prove the game state changed as intended, using only request.constraints.supported_condition_types.
-7. City plans should use a followup_queue of production items. Builder plans should use assigned_unit_id, a stepwise path, and a target with improvement_type.
-8. Return only the JSON object required by the output schema.
-"""
+SYSTEM_INSTRUCTIONS = EXTENDED_SYSTEM_INSTRUCTIONS
 
 
 class CodexPlanner:

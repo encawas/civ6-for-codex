@@ -10,7 +10,10 @@ from typing import Any
 import httpx
 
 from .credentials import CredentialError, resolve_api_credential
-from .models import AgentRequest, PlanBundle
+from .workflow_protocol import (
+    WorkflowAgentRequest as AgentRequest,
+    WorkflowPlanBundle as PlanBundle,
+)
 
 log = logging.getLogger(__name__)
 

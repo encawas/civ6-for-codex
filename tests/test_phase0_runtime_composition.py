@@ -1,5 +1,9 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
+from types import MappingProxyType
 
 import civ6_workflow
 from civ6_workflow import (
@@ -11,97 +15,38 @@ from civ6_workflow import (
     models,
     replay,
     rules,
-    safe_web_ui,
     store,
     validation,
     web_ui,
     workflow_prompt,
 )
-from civ6_workflow.runtime_safety import CommitSafeWorkflowEngine
-from civ6_workflow.safe_rules import SafeDeterministicRuleCompiler
-from civ6_workflow.settler_rules import SettlerDeterministicRuleCompiler
+from civ6_workflow.bootstrap import compose_runtime
+from civ6_workflow.engine import EngineConfig, WorkflowEngine
+from civ6_workflow.store import WorkflowStore
 
 
-BASE_CONDITION_TYPES = {
-    "turn_at_least",
-    "turn_equals",
-    "no_blocker_type",
-    "field_equals",
-    "field_in",
-    "entity_exists",
-    "city_production_equals",
-    "city_has_no_production",
-    "research_unselected",
-    "research_available",
-    "research_equals",
-    "civic_unselected",
-    "civic_available",
-    "civic_equals",
-    "unit_at",
-    "unit_has_moves",
-    "unit_no_moves",
-    "unit_has_build_charge",
-    "unit_build_charges_equals",
-    "unit_can_improve",
-}
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _Game:
+    call_count = 0
+
+
+class _Planner:
+    async def plan(self, request):
+        raise AssertionError("composition test does not invoke the planner")
 
 
 def _identity(value) -> str:
     return f"{value.__module__}.{value.__name__}"
 
 
-def test_imp_001_effective_public_engine_is_commit_safe():
-    """IMP-001 (MIGRATE): package import exposes the commit-safe engine."""
-
-    assert civ6_workflow.WorkflowEngine is CommitSafeWorkflowEngine
-    assert engine.WorkflowEngine is CommitSafeWorkflowEngine
-
-
-def test_imp_002_source_defined_base_engine_remains_distinct():
-    """IMP-002 (REPLACE): hidden composition still wraps a distinct base engine."""
-
-    source_base = next(
-        candidate
-        for candidate in CommitSafeWorkflowEngine.__mro__
-        if candidate.__module__ == "civ6_workflow.engine"
-        and candidate.__name__ == "WorkflowEngine"
-    )
-
-    assert source_base is not engine.WorkflowEngine
-    assert source_base in CommitSafeWorkflowEngine.__mro__
-
-
-def test_imp_003_compiler_inheritance_chain_is_frozen():
-    """IMP-003: compiler overlays retain the exact current inheritance chain."""
-
-    source_compiler = SafeDeterministicRuleCompiler.__base__
-
-    assert SettlerDeterministicRuleCompiler.__base__ is SafeDeterministicRuleCompiler
-    assert source_compiler.__module__ == "civ6_workflow.rules"
-    assert source_compiler.__name__ == "DeterministicRuleCompiler"
-    assert SettlerDeterministicRuleCompiler.__mro__[:3] == (
-        SettlerDeterministicRuleCompiler,
-        SafeDeterministicRuleCompiler,
-        source_compiler,
-    )
-
-
-def test_imp_003_import_time_replacement_inventory_matches_fixture():
-    """IMP-003 (REPLACE): every current replacement is machine-checkable."""
-
-    expected = json.loads(
-        (Path(__file__).parent / "fixtures" / "runtime_composition_v1.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    actual = {
+def _composition_snapshot() -> dict:
+    return {
+        "package.WorkflowEngine": _identity(civ6_workflow.WorkflowEngine),
         "engine.WorkflowEngine": _identity(engine.WorkflowEngine),
         "engine.EngineConfig": _identity(engine.EngineConfig),
         "rules.DeterministicRuleCompiler": _identity(rules.DeterministicRuleCompiler),
-        "rules.compiler_inheritance": [
-            _identity(candidate)
-            for candidate in SettlerDeterministicRuleCompiler.__mro__[:3]
-        ],
         "store.WorkflowStore": _identity(store.WorkflowStore),
         "mcp_port.Civ6GamePort": _identity(mcp_port.Civ6GamePort),
         "conditions.ConditionEvaluator": _identity(conditions.ConditionEvaluator),
@@ -118,9 +63,9 @@ def test_imp_003_import_time_replacement_inventory_matches_fixture():
             "required_arguments": sorted(
                 actions.ACTION_REGISTRY["unit_found_city"].required_arguments
             ),
-            "fixed_arguments": actions.ACTION_REGISTRY[
-                "unit_found_city"
-            ].fixed_arguments,
+            "fixed_arguments": dict(
+                actions.ACTION_REGISTRY["unit_found_city"].fixed_arguments
+            ),
             "retry_classification": actions.ACTION_REGISTRY[
                 "unit_found_city"
             ].retry_classification.value,
@@ -132,12 +77,141 @@ def test_imp_003_import_time_replacement_inventory_matches_fixture():
             codex_planner.SYSTEM_INSTRUCTIONS
             == workflow_prompt.EXTENDED_SYSTEM_INSTRUCTIONS
         ),
-        "control_panel_html_enhanced": (
-            web_ui.CONTROL_PANEL_HTML == safe_web_ui.ENHANCED_CONTROL_PANEL_HTML
-        ),
-        "condition_types": sorted(
-            set(validation.DEFAULT_CONDITION_TYPES) - BASE_CONDITION_TYPES
-        ),
+        "control_panel_html_enhanced": "plannerBtn" in web_ui.CONTROL_PANEL_HTML,
+        "condition_types": sorted(validation.DEFAULT_CONDITION_TYPES),
     }
 
-    assert actual == expected
+
+def test_imp_001_public_engine_is_the_canonical_engine():
+    """IMP-001 (MIGRATED): public and source Engine identities are identical."""
+
+    assert civ6_workflow.WorkflowEngine is WorkflowEngine
+    assert engine.WorkflowEngine is WorkflowEngine
+    assert WorkflowEngine.__module__ == "civ6_workflow.engine"
+    assert WorkflowEngine.__mro__ == (WorkflowEngine, object)
+
+
+def test_imp_002_bootstrap_constructs_the_explicit_runtime_graph(tmp_path: Path):
+    """IMP-002 (REPLACED): runtime dependencies are wired by bootstrap."""
+
+    workflow_store = WorkflowStore(tmp_path / "composition.sqlite3")
+    game = _Game()
+    planner = _Planner()
+
+    composition = compose_runtime(
+        store=workflow_store,
+        game=game,
+        planner=planner,
+        engine_config=EngineConfig(auto_end_turn=False),
+    )
+
+    assert composition.store is workflow_store
+    assert composition.game is game
+    assert composition.planner is planner
+    assert composition.engine.store is workflow_store
+    assert composition.engine.game is game
+    assert composition.engine.planner is planner
+    assert type(composition.engine) is WorkflowEngine
+
+
+def test_imp_003_canonical_composition_matches_fixture():
+    """IMP-003 (REPLACED): the explicit canonical graph is machine-checkable."""
+
+    expected = json.loads(
+        (Path(__file__).parent / "fixtures" / "runtime_composition_v2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert _composition_snapshot() == expected
+    assert isinstance(actions.ACTION_REGISTRY, MappingProxyType)
+
+
+def test_imp_004_import_order_does_not_mutate_runtime_identity():
+    """IMP-004: package import order cannot replace classes or registries."""
+
+    program = """
+import json
+{imports}
+from civ6_workflow import actions, conditions, engine, mcp_port, replay, rules, store, web_ui
+before = {{
+    "engine": id(engine.WorkflowEngine),
+    "rules": id(rules.DeterministicRuleCompiler),
+    "store": id(store.WorkflowStore),
+    "mcp": id(mcp_port.Civ6GamePort),
+    "conditions": id(conditions.ConditionEvaluator),
+    "record": id(replay.RecordingGamePort),
+    "replay": id(replay.ReplayGamePort),
+    "state": id(web_ui.ControlPanelState),
+    "actions": tuple(sorted(actions.ACTION_REGISTRY)),
+}}
+import civ6_workflow
+after = {{
+    "engine": id(engine.WorkflowEngine),
+    "rules": id(rules.DeterministicRuleCompiler),
+    "store": id(store.WorkflowStore),
+    "mcp": id(mcp_port.Civ6GamePort),
+    "conditions": id(conditions.ConditionEvaluator),
+    "record": id(replay.RecordingGamePort),
+    "replay": id(replay.ReplayGamePort),
+    "state": id(web_ui.ControlPanelState),
+    "actions": tuple(sorted(actions.ACTION_REGISTRY)),
+}}
+print(json.dumps({{"stable": before == after, "modules": [
+    engine.WorkflowEngine.__module__,
+    rules.DeterministicRuleCompiler.__module__,
+    store.WorkflowStore.__module__,
+    mcp_port.Civ6GamePort.__module__,
+]}}))
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+    outputs = []
+    for imports in (
+        "import civ6_workflow.engine\nimport civ6_workflow.rules",
+        "import civ6_workflow\nimport civ6_workflow.bootstrap",
+    ):
+        process = subprocess.run(
+            [sys.executable, "-c", program.format(imports=imports)],
+            cwd=PROJECT_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        outputs.append(json.loads(process.stdout))
+
+    assert outputs == [
+        {
+            "stable": True,
+            "modules": [
+                "civ6_workflow.engine",
+                "civ6_workflow.rules",
+                "civ6_workflow.store",
+                "civ6_workflow.mcp_port",
+            ],
+        },
+        {
+            "stable": True,
+            "modules": [
+                "civ6_workflow.engine",
+                "civ6_workflow.rules",
+                "civ6_workflow.store",
+                "civ6_workflow.mcp_port",
+            ],
+        },
+    ]
+
+
+def test_imp_004_legacy_patch_modules_are_removed():
+    production_modules = {
+        path.name for path in (PROJECT_ROOT / "src" / "civ6_workflow").glob("*.py")
+    }
+
+    assert not {name for name in production_modules if name.startswith("safe_")}
+    assert {
+        "workflow_engine.py",
+        "runtime_safety.py",
+        "settler_rules.py",
+        "workflow_conditions.py",
+    }.isdisjoint(production_modules)

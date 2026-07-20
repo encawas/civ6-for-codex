@@ -14,7 +14,7 @@ from .models import (
     RuntimeSnapshot,
 )
 from .observation_normalization import NormalizedRuntimeObservation
-from .store import WorkflowStore
+from .ports import WorkflowStorePort
 
 
 @dataclass(slots=True)
@@ -26,7 +26,7 @@ class ProgressionCompilation:
 class ProgressionRuleCompiler:
     """Compile approved research and civic queues into one verifiable choice."""
 
-    def __init__(self, store: WorkflowStore):
+    def __init__(self, store: WorkflowStorePort):
         self.store = store
 
     def compile(

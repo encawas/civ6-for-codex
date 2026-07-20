@@ -8,11 +8,11 @@ from civ6_workflow.engine import EngineConfig, WorkflowEngine
 from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
-    PlanBundle,
     ProposedTask,
     RuntimeSnapshot,
     TaskStatus,
 )
+from civ6_workflow.workflow_protocol import WorkflowPlanBundle
 from civ6_workflow.replay import (
     RecordedAction,
     ReplayDataError,
@@ -106,7 +106,7 @@ def test_replay_store_state_restores_exact_task_status(tmp_path: Path):
     source.save_plan_bundle(
         "game-1",
         10,
-        PlanBundle(
+        WorkflowPlanBundle(
             summary="state export",
             city_plan_updates=[{"city_id": 1, "followup_queue": ["UNIT_BUILDER"]}],
             tasks=[_production_task()],
@@ -141,7 +141,7 @@ def test_new_builder_is_bound_but_baseline_builder_is_not(tmp_path: Path):
     store.save_plan_bundle(
         "game-1",
         30,
-        PlanBundle(
+        WorkflowPlanBundle(
             plan_id="builder-plan",
             summary="reserve builder from city one",
             builder_plan_updates=[
@@ -231,7 +231,9 @@ def test_json_recording_round_trip_replays_verified_task(tmp_path: Path):
     )
     seed = ReplayPlanSeed(
         turn=10,
-        bundle=PlanBundle(summary="seed replay task", tasks=[_production_task()]),
+        bundle=WorkflowPlanBundle(
+            summary="seed replay task", tasks=[_production_task()]
+        ),
         auto_action_types=["city_set_production"],
     )
     tape = SnapshotRecording(
@@ -372,7 +374,7 @@ def test_recorded_explicit_rejection_fails_without_retry(tmp_path: Path):
             ReplayFrame(snapshot=snapshot),
         ],
         planner_responses=[
-            PlanBundle(
+            WorkflowPlanBundle(
                 summary="repeated failure needs review",
                 requires_human_review=True,
             )
@@ -382,7 +384,7 @@ def test_recorded_explicit_rejection_fails_without_retry(tmp_path: Path):
     store.save_plan_bundle(
         "game-1",
         10,
-        PlanBundle(summary="seed failing task", tasks=[_production_task()]),
+        WorkflowPlanBundle(summary="seed failing task", tasks=[_production_task()]),
         mode=ExecutionMode.AUTO,
         auto_action_types={"city_set_production"},
     )

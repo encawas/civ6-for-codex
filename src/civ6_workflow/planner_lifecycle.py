@@ -54,7 +54,6 @@ from .domain import (
     validate_workflow_tick,
 )
 from .models import (
-    AgentRequest,
     EventLevel,
     ExecutionMode,
     GameEvent,
@@ -64,6 +63,7 @@ from .models import (
 from .validation import PlanValidationContext, validate_plan_bundle
 from .workflow_protocol import (
     InformationRequest,
+    WorkflowAgentRequest as AgentRequest,
     ResolutionDisposition,
     WorkflowPlanBundle,
     validate_event_resolution_contract,

@@ -114,6 +114,8 @@ class PlanBundle(StrictModel):
     cancel_task_ids: list[str] = Field(default_factory=list)
     next_review_turn: int | None = Field(default=None, ge=0)
     requires_human_review: bool = False
+    information_requests: list[Any] = Field(default_factory=list, max_length=8)
+    event_resolutions: list[Any] = Field(default_factory=list, max_length=100)
 
 
 class AgentRequest(StrictModel):
@@ -125,6 +127,7 @@ class AgentRequest(StrictModel):
     relevant_state: dict[str, Any] = Field(default_factory=dict)
     current_plans: dict[str, Any] = Field(default_factory=dict)
     constraints: dict[str, Any] = Field(default_factory=dict)
+    information_results: dict[str, Any] = Field(default_factory=dict)
 
 
 class ActionResult(StrictModel):
@@ -158,6 +161,14 @@ class TickMetrics(StrictModel):
     mcp_call_count: int = 0
     mutation_count: int = 0
     agent_call_count: int = 0
+    agent_attempt_count: int = Field(default=0, ge=0)
+    agent_success_count: int = Field(default=0, ge=0)
+    information_query_count: int = Field(default=0, ge=0)
+    logical_planner_request_count: int = Field(default=0, ge=0)
+    provider_attempt_count: int = Field(default=0, ge=0)
+    information_round_count: int = Field(default=0, ge=0)
+    duplicate_request_suppression_count: int = Field(default=0, ge=0)
+    planner_context_bytes: int = Field(default=0, ge=0)
 
 
 class TickResult(StrictModel):

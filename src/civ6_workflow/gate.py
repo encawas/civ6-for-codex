@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .models import EventLevel, GameEvent
-from .store import WorkflowStore
+from .ports import WorkflowStorePort
 
 
 @dataclass(slots=True)
@@ -37,7 +37,7 @@ class GateResult:
 
 
 class EventGate:
-    def __init__(self, store: WorkflowStore, config: GateConfig | None = None):
+    def __init__(self, store: WorkflowStorePort, config: GateConfig | None = None):
         self.store = store
         self.config = config or GateConfig()
 

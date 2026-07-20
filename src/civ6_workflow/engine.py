@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from types import TracebackType
+from typing import Any, BinaryIO
 from uuid import uuid4
 
 from .actions import (
@@ -15,7 +18,7 @@ from .actions import (
     resolve_action,
     resolve_action_spec,
 )
-from .codex_planner import Planner
+from .agent_projection import project_agent_context
 from .conditions import ConditionEvaluator, extract_known_entities
 from .domain import (
     ActionAttempt,
@@ -41,39 +44,50 @@ from .domain import (
     validate_workflow_tick,
 )
 from .events import events_from_snapshot
-from .gate import EventGate
-from .mcp_port import BoundedGamePort, GamePort, MutationBudget
+from .gate import EventGate, GateConfig
+from .ports import (
+    BoundedGamePort,
+    GamePort,
+    MutationBudget,
+    Planner,
+    WorkflowStorePort,
+)
 from .models import (
-    AgentRequest,
     EventLevel,
     ExecutionMode,
     GameEvent,
     MutationDeliveryStatus,
-    PlanBundle,
     RuntimeSnapshot,
     StoredTask,
     TaskStatus,
-    TickMetrics,
     TickResult,
 )
 from .observation_normalization import (
     NormalizedRuntimeObservation,
     normalize_runtime_snapshot,
 )
+from .planner_lifecycle import PlannerLifecycleCoordinator
 from .progression import ProgressionRuleCompiler
 from .recovery import recover_turn_rewind
 from .rules import DeterministicRuleCompiler
-from .store import WorkflowStore
 from .validation import PlanValidationContext, validate_plan_bundle
 from .verification import (
     VerificationEvidence,
     evaluate_action_verification,
 )
-from .workflow_protocol import LEASE_CONDITION_TYPES
+from .workflow_protocol import (
+    LEASE_CONDITION_TYPES,
+    WorkflowAgentRequest as AgentRequest,
+    WorkflowPlanBundle as PlanBundle,
+    WorkflowTickMetrics as TickMetrics,
+    validate_event_resolution_contract,
+)
+from .workflow_queries import InformationQueryRouter
 
 
 END_TURN_AUTHORIZATION_PROJECTION_VERSION = "end-turn-authorization/v1"
 HUMAN_WAIT_PROJECTION_VERSION = "human-wait-observation/v1"
+_TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 
 
 @dataclass(slots=True)
@@ -82,6 +96,7 @@ class EngineConfig:
     auto_end_turn: bool = False
     max_agent_calls_per_turn: int = 1
     repeated_failure_threshold: int = 2
+    default_cooldown_turns: int = 2
     verification_attempts: int = 3
     verification_delay_seconds: float = 0.25
     auto_action_types: set[str] = field(default_factory=lambda: set(ACTION_REGISTRY))
@@ -117,13 +132,70 @@ class FatalTickPersistenceError(RuntimeError):
     """The runtime could not persist even a SYSTEM_ERROR audit Tick."""
 
 
+class _TickFileLock:
+    """User-global non-blocking lock for one complete workflow Tick."""
+
+    def __init__(self, lock_path: Path | None = None):
+        self.path = lock_path or (Path.home() / ".civ6-workflow" / "runtime.tick.lock")
+        self.handle: BinaryIO | None = None
+
+    def __enter__(self) -> "_TickFileLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                "another civ6-workflow process is already executing a game tick "
+                f"under this user account ({self.path})"
+            ) from exc
+        self.handle = handle
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        handle = self.handle
+        self.handle = None
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 class WorkflowEngine:
     """Canonical bounded runtime; TickResult is only a compatibility envelope."""
 
     def __init__(
         self,
         *,
-        store: WorkflowStore,
+        store: WorkflowStorePort,
         game: GamePort,
         planner: Planner,
         config: EngineConfig | None = None,
@@ -136,10 +208,17 @@ class WorkflowEngine:
         self.config = config or EngineConfig()
         self.clock = clock
         self.crash_injector = crash_injector
-        self.gate = EventGate(store)
+        self.gate = EventGate(
+            store,
+            GateConfig(
+                default_cooldown_turns=max(0, int(self.config.default_cooldown_turns))
+            ),
+        )
         self.conditions = ConditionEvaluator()
         self.rules = DeterministicRuleCompiler(store)
         self.progression = ProgressionRuleCompiler(store)
+        self.information_queries = InformationQueryRouter(self.game)
+        self.planner_lifecycle = PlannerLifecycleCoordinator(self)
         self._available_tools: set[str] | None = None
         self._active_observation_id: str | None = None
 
@@ -153,6 +232,42 @@ class WorkflowEngine:
         self.store.set_meta(self._end_turn_retry_key(attempt), True)
 
     async def tick(self) -> TickResult:
+        with _TickFileLock():
+            self.store.prepare_execution_mode(self.config.execution_mode)
+            result = await self._tick_once()
+            game_id = self.store.get_meta("last_game_id")
+            no_safe_action = (
+                isinstance(result.workflow_tick, dict)
+                and result.workflow_tick.get("outcome") == "NO_SAFE_ACTION"
+            )
+            if (
+                isinstance(game_id, str)
+                and not result.paused
+                and not result.turn_ended
+                and not result.agent_invoked
+                and any(event.blocking for event in result.events)
+                and (
+                    no_safe_action
+                    or self.store.agent_called_for_turn(game_id, result.turn)
+                )
+                and not self.store.due_tasks(game_id, result.turn)
+            ):
+                result.paused = True
+                result.pause_reason = (
+                    "A blocking workflow event remains after this turn's planning "
+                    "call and no executable recovery task exists; human review is "
+                    "required."
+                )
+            if isinstance(game_id, str) and self._uncertain_tasks(game_id):
+                result.paused = True
+                if not result.pause_reason:
+                    result.pause_reason = (
+                        "An irreversible action has an uncertain commit outcome; "
+                        "reconcile the live game state before retrying."
+                    )
+            return result
+
+    async def _tick_once(self) -> TickResult:
         ctx = _TickContext(
             tick_id=f"tick_{uuid4().hex}",
             started_at=self._now(),
@@ -1090,47 +1205,126 @@ class WorkflowEngine:
             return float(self.clock.monotonic())
         return time.perf_counter()
 
-    async def _pre_route_decision_runtime(
-        self,
-        ctx: _TickContext,
-        observation: NormalizedRuntimeObservation,
-        current_events: list[GameEvent],
-    ) -> TickResult | None:
-        return None
+    async def _pre_route_decision_runtime(self, ctx, observation, current_events):
+        compatibility = TickResult(
+            turn=observation.snapshot.turn,
+            metrics=ctx.metrics,
+            events=[],
+        )
+        return self.planner_lifecycle.validate_before_routing(
+            ctx, observation, current_events, compatibility
+        )
 
     async def _advance_decision_runtime(
         self,
-        ctx: _TickContext,
-        observation: NormalizedRuntimeObservation,
-        agent_events: list[GameEvent],
-        compatibility: TickResult,
-        current_events: list[GameEvent] | None = None,
-    ) -> tuple[list[GameEvent], TickResult | None]:
-        """Compatibility hook implemented by the canonical Phase 4 engine."""
-
-        return agent_events, None
+        ctx,
+        observation,
+        agent_events,
+        compatibility,
+        current_events=None,
+    ):
+        return await self.planner_lifecycle.advance(
+            ctx,
+            observation,
+            agent_events,
+            compatibility,
+            current_events=current_events,
+        )
 
     async def _invoke_planner(
         self,
-        snapshot: RuntimeSnapshot,
-        agent_events: list[GameEvent],
+        snapshot,
+        agent_events,
         result: TickResult,
         metrics: TickMetrics,
     ) -> None:
+        if self.store.unresolved_action_attempt(snapshot.game_id) is not None:
+            return
+        backoff = self._active_backoff()
+        if backoff is not None:
+            result.paused = True
+            result.pause_reason = (
+                "Planner provider is in transient backoff for "
+                f"{backoff['remaining_seconds']:.1f}s: {backoff.get('category')}"
+            )
+            return
+
         request = self._build_agent_request(snapshot, agent_events)
         result.planner_request_id = request.request_id
-        started = self._monotonic()
+        planner_started = time.perf_counter()
+        current_request = request
         bundle: PlanBundle | None = None
+        result.agent_invoked = True
+
         try:
-            bundle = await self.planner.plan(request)
-            validate_plan_bundle(
+            prefetched = self.information_queries.prefetch(agent_events)
+            if prefetched:
+                prefetched_results = await self.information_queries.execute(prefetched)
+                metrics.information_query_count += len(prefetched_results)
+                request = request.model_copy(
+                    update={"information_results": prefetched_results}
+                )
+                current_request = request
+                self.store.set_meta(
+                    "last_information_results",
+                    {
+                        "turn": snapshot.turn,
+                        "phase": "prefetch",
+                        "results": prefetched_results,
+                    },
+                )
+
+            bundle = await self._plan_once(request, metrics)
+            self._validate_planner_bundle(
                 bundle,
-                PlanValidationContext(
-                    current_turn=snapshot.turn,
-                    allowed_action_types=self.config.allowed_action_types,
-                    known_entities=extract_known_entities(snapshot),
-                ),
+                request,
+                snapshot,
+                agent_events,
+                allow_information_requests=True,
             )
+
+            if getattr(bundle, "information_requests", []):
+                self.store.set_meta(
+                    "last_information_phase_bundle",
+                    bundle.model_dump(mode="json"),
+                )
+                focused_results = await self.information_queries.execute(
+                    bundle.information_requests
+                )
+                metrics.information_query_count += len(focused_results)
+                combined = dict(getattr(request, "information_results", {}))
+                combined.update(focused_results)
+                payload = request.model_dump(mode="python")
+                payload.update(
+                    {
+                        "request_id": f"req_{uuid4().hex}",
+                        "information_results": combined,
+                        "constraints": {
+                            **request.constraints,
+                            "planning_phase": "final",
+                            "allow_information_requests": False,
+                        },
+                    }
+                )
+                current_request = AgentRequest.model_validate(payload)
+                self.store.set_meta(
+                    "last_information_results",
+                    {
+                        "turn": snapshot.turn,
+                        "phase": "planner_requested",
+                        "results": combined,
+                    },
+                )
+                bundle = await self._plan_once(current_request, metrics)
+
+            self._validate_planner_bundle(
+                bundle,
+                current_request,
+                snapshot,
+                agent_events,
+                allow_information_requests=False,
+            )
+
             self.store.save_plan_bundle(
                 snapshot.game_id,
                 snapshot.turn,
@@ -1139,37 +1333,167 @@ class WorkflowEngine:
                 auto_action_types=self.config.auto_action_types,
                 observation_id=self._active_observation_id,
             )
+            self.store.set_meta(
+                "last_event_resolutions",
+                {
+                    "turn": snapshot.turn,
+                    "plan_id": bundle.plan_id,
+                    "resolutions": [
+                        item.model_dump(mode="json")
+                        for item in getattr(bundle, "event_resolutions", [])
+                    ],
+                },
+            )
             self.store.mark_events_sent_to_agent(
                 snapshot.game_id,
                 [event.dedupe_key for event in agent_events],
                 snapshot.turn,
             )
-            metrics.agent_call_count = 1
-            result.agent_invoked = True
             result.plan_id = bundle.plan_id
             if bundle.requires_human_review:
                 result.paused = True
                 result.pause_reason = "Planner requested human review"
+
             self.store.record_agent_run(
                 snapshot.game_id,
-                request,
+                current_request,
                 response=bundle,
                 success=True,
                 error=None,
-                duration_seconds=self._monotonic() - started,
+                duration_seconds=time.perf_counter() - planner_started,
             )
+            self._clear_backoff()
         except Exception as exc:
+            failure = self._classify_planner_failure(exc)
             result.paused = True
-            result.pause_reason = f"Agent planning failed: {exc}"
+            result.pause_reason = (
+                f"Agent planning failed [{failure['category']}]: "
+                f"{failure['final_error']}"
+            )
             self.store.record_agent_run(
                 snapshot.game_id,
-                request,
+                current_request,
                 response=bundle,
                 success=False,
-                error=str(exc),
-                duration_seconds=self._monotonic() - started,
+                error=json.dumps(failure, ensure_ascii=False, separators=(",", ":")),
+                duration_seconds=time.perf_counter() - planner_started,
             )
-        metrics.agent_seconds = self._monotonic() - started
+            if failure["transient"]:
+                self._set_backoff(failure)
+        finally:
+            diagnostics = getattr(self.planner, "last_diagnostics", None)
+            if isinstance(diagnostics, dict):
+                self.store.set_meta("last_planner_diagnostics", diagnostics)
+            metrics.agent_seconds = time.perf_counter() - planner_started
+
+    async def _plan_once(
+        self, request: AgentRequest, metrics: TickMetrics
+    ) -> PlanBundle:
+        metrics.agent_attempt_count += 1
+        # Backward-compatible metric now means attempted planner calls, not only
+        # successful calls.
+        metrics.agent_call_count = metrics.agent_attempt_count
+        bundle = await self.planner.plan(request)
+        metrics.agent_success_count += 1
+        return bundle
+
+    def _validate_planner_bundle(
+        self,
+        bundle: PlanBundle,
+        request: AgentRequest,
+        snapshot,
+        agent_events,
+        *,
+        allow_information_requests: bool,
+    ) -> None:
+        max_tasks = int(request.constraints.get("max_tasks", 8))
+        validate_plan_bundle(
+            bundle,
+            PlanValidationContext(
+                current_turn=snapshot.turn,
+                allowed_action_types=self.config.allowed_action_types,
+                known_entities=extract_known_entities(snapshot),
+                max_tasks=max_tasks,
+            ),
+        )
+        known_task_ids = {
+            task.task_id for task in self.store.list_tasks(snapshot.game_id)
+        }
+        validate_event_resolution_contract(
+            PlanBundle.model_validate(bundle.model_dump(mode="python")),
+            agent_events,
+            known_task_ids=known_task_ids,
+            allow_information_requests=allow_information_requests,
+        )
+
+    def _active_backoff(self) -> dict[str, Any] | None:
+        value = self.store.get_meta("planner_provider_backoff")
+        if not isinstance(value, dict):
+            return None
+        until = float(value.get("until_epoch", 0) or 0)
+        remaining = until - time.time()
+        if remaining <= 0:
+            return None
+        return {**value, "remaining_seconds": remaining}
+
+    def _classify_planner_failure(self, exc: Exception) -> dict[str, Any]:
+        diagnostics = getattr(self.planner, "last_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        status = diagnostics.get("http_status")
+        try:
+            status = None if status is None else int(status)
+        except (TypeError, ValueError):
+            status = None
+        text = str(exc)
+        lowered = text.lower()
+        transient = status in _TRANSIENT_HTTP or any(
+            marker in lowered
+            for marker in (
+                "timeout",
+                "timed out",
+                "transport failed",
+                "connection reset",
+                "temporarily unavailable",
+            )
+        )
+        if transient:
+            category = "transient_provider_failure"
+        elif status in {401, 403}:
+            category = "authentication_failure"
+        elif status == 404:
+            category = "model_or_endpoint_not_found"
+        elif "planbundle" in lowered or "event resolution" in lowered:
+            category = "planner_contract_failure"
+        else:
+            category = "planner_failure"
+        return {
+            "category": category,
+            "transient": transient,
+            "provider": diagnostics.get("backend", "unknown"),
+            "http_status": status,
+            "request_id": diagnostics.get("request_id"),
+            "retry_count": diagnostics.get("attempt_count", 0),
+            "final_error": text[-1000:],
+        }
+
+    def _set_backoff(self, failure: dict[str, Any]) -> None:
+        count = int(self.store.get_meta("planner_transient_failure_count", 0) or 0) + 1
+        delay = min(120.0, 5.0 * (2 ** min(count - 1, 5)))
+        self.store.set_meta("planner_transient_failure_count", count)
+        self.store.set_meta(
+            "planner_provider_backoff",
+            {
+                **failure,
+                "failure_count": count,
+                "delay_seconds": delay,
+                "until_epoch": time.time() + delay,
+            },
+        )
+
+    def _clear_backoff(self) -> None:
+        self.store.set_meta("planner_transient_failure_count", 0)
+        self.store.set_meta("planner_provider_backoff", {})
 
     @staticmethod
     def _normalize_snapshot(
@@ -1214,19 +1538,18 @@ class WorkflowEngine:
                 return evaluation.reason
         return None
 
-    @staticmethod
     def _suppress_recoverable_blockers(
-        events: list[GameEvent], retrying_tasks: list[StoredTask]
+        self, events: list[GameEvent], retrying_tasks: list[StoredTask]
     ) -> list[GameEvent]:
-        if not retrying_tasks:
-            return events
         production_city_ids = {
             str(task.entity_id)
             for task in retrying_tasks
             if task.action_type == "city_set_production"
         }
-        has_research = any(t.action_type == "set_research" for t in retrying_tasks)
-        has_civic = any(t.action_type == "set_civic" for t in retrying_tasks)
+        has_research = any(
+            task.action_type == "set_research" for task in retrying_tasks
+        )
+        has_civic = any(task.action_type == "set_civic" for task in retrying_tasks)
         retained: list[GameEvent] = []
         for event in events:
             if (
@@ -1243,19 +1566,58 @@ class WorkflowEngine:
                 if has_civic and kind == "ENDTURN_BLOCKING_CIVIC":
                     continue
             retained.append(event)
-        return retained
+
+        game_id = self.store.get_meta("last_game_id")
+        if not isinstance(game_id, str):
+            return retained
+        active_statuses = {
+            TaskStatus.PENDING,
+            TaskStatus.READY,
+            TaskStatus.RUNNING,
+            TaskStatus.AWAITING_CONFIRMATION,
+        }
+        unit_actions = {
+            "unit_move",
+            "builder_improve",
+            "unit_heal",
+            "unit_fortify",
+            "unit_skip",
+        }
+        active_tasks = self.store.list_tasks(game_id)
+        has_unit_recovery = any(
+            task.action_type in unit_actions and task.status in active_statuses
+            for task in active_tasks
+        )
+        has_settler_recovery = any(
+            task.action_type == "unit_found_city" and task.status in active_statuses
+            for task in active_tasks
+        )
+        if not (has_unit_recovery or has_settler_recovery):
+            return retained
+        return [
+            event
+            for event in retained
+            if not (
+                event.event_type == "end_turn_blocker"
+                and str(event.payload.get("blocking_type", ""))
+                == "ENDTURN_BLOCKING_UNITS"
+            )
+        ]
 
     def _build_agent_request(
         self, snapshot: RuntimeSnapshot, events: list[GameEvent]
     ) -> AgentRequest:
         context = self.store.current_context(snapshot.game_id)
+        relevant_state, relevant_plans, max_tasks = project_agent_context(
+            snapshot, events, context
+        )
         return AgentRequest(
             turn=snapshot.turn,
             execution_mode=self.config.execution_mode,
             trigger_events=events,
-            current_strategy=context["strategy"],
-            current_plans=context,
-            relevant_state=snapshot.model_dump(mode="json"),
+            current_strategy=context.get("strategy", {}),
+            current_plans=relevant_plans,
+            relevant_state=relevant_state,
             constraints={
                 "allowed_action_types": sorted(self.config.allowed_action_types),
                 "supported_condition_types": [
@@ -1274,6 +1636,8 @@ class WorkflowEngine:
                     "civic_available",
                     "civic_equals",
                     "unit_at",
+                    "unit_has_moves",
+                    "unit_no_moves",
                     "unit_has_build_charge",
                     "unit_build_charges_equals",
                     "unit_can_improve",
@@ -1284,7 +1648,7 @@ class WorkflowEngine:
                     "civic_queue": "ordered CIVIC_* type names",
                 },
                 "task_postconditions_required": True,
-                "max_tasks": 100,
+                "max_tasks": max_tasks,
                 "max_agent_calls_this_turn": self.config.max_agent_calls_per_turn,
                 "forbidden_domains": [
                     "declare_war",
@@ -1296,8 +1660,30 @@ class WorkflowEngine:
                     "city_placement",
                     "purchase",
                 ],
+                "event_resolution_required": True,
+                "planning_phase": "initial",
+                "allow_information_requests": True,
+                "allowed_information_tools": [
+                    "get_settle_advisor",
+                    "get_global_settle_advisor",
+                    "get_pathing_estimate",
+                    "get_unit_promotions",
+                    "get_district_advisor",
+                    "get_city_production",
+                    "get_map_area",
+                    "get_policies",
+                    "get_trade_options",
+                    "get_pantheon_beliefs",
+                    "get_religion_beliefs",
+                    "get_dedications",
+                    "get_city_states",
+                    "get_builder_tasks",
+                ],
             },
         )
+
+    def _uncertain_tasks(self, game_id: str) -> list[StoredTask]:
+        return self.store.list_tasks(game_id, statuses=[TaskStatus.UNCERTAIN])
 
     def _may_end_turn(self, snapshot: RuntimeSnapshot, result: TickResult) -> bool:
         if self.config.execution_mode is ExecutionMode.READONLY:

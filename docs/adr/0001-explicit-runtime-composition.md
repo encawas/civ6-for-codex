@@ -44,6 +44,63 @@ Domain and application modules must not mutate imported modules or registries.
 
 Public package imports may re-export canonical types, but they must not change the identity or behavior of previously imported objects.
 
+## Implemented composition
+
+Issue #8 establishes `bootstrap.py` as the only production composition root. It
+exports the following construction paths:
+
+| API | Responsibility |
+|---|---|
+| `compose_runtime` | Build the canonical Engine from injected Store, GamePort, Planner, configuration, clock, and crash boundary. |
+| `compose_live_runtime` | Select the concrete SQLite, Civ6 MCP/HTTP, and planner adapters for an already-open live session. |
+| `open_live_runtime` | Own one live MCP and state-API resource lifetime. |
+| `compose_recording_runtime` | Wrap the same live graph with recording adapters. |
+| `compose_replay_runtime` | Restore replay state and build the same Engine with replay adapters. |
+| `compose_control_panel` | Build the control-plane state and HTTP adapter over the canonical Store. |
+
+The CLI, long-running CLI loop, recording command, replay command, and control
+panel all delegate construction to these APIs. Their existing resource lifetime
+semantics remain explicit: the long-running CLI reuses one live session, while a
+single Tick and a control-panel Tick open and close one session.
+
+The dependency direction is:
+
+```text
+CLI / control panel / replay entry points
+-> bootstrap composition root
+-> concrete adapters (SQLite, MCP/HTTP, planner, web)
+-> application Engine and policies
+-> domain contracts
+```
+
+Domain modules do not import concrete adapters. Application services receive
+GamePort and Planner protocols plus the injected Store boundary; adapter
+selection is confined to bootstrap.
+
+## Canonical implementations
+
+The retained behavior from the former shadow layers now lives in these modules:
+
+| Former layer | Canonical destination |
+|---|---|
+| `safe_engine`, `workflow_engine`, `runtime_safety` | `engine.WorkflowEngine` and `EngineConfig` |
+| `safe_rules`, `settler_rules` | `rules.DeterministicRuleCompiler` |
+| `workflow_conditions` | `conditions.ConditionEvaluator` |
+| `safe_store` | `store.WorkflowStore` |
+| `safe_mcp_port` | `mcp_port.Civ6GamePort` |
+| `safe_replay` | `replay.RecordingGamePort` and `ReplayGamePort` |
+| `safe_web_ui` | `web_ui.ControlPanelState`, handler, server, and HTML |
+| package registry/model/prompt replacement | definitions or explicit imports in `actions`, `validation`, `workflow_protocol`, and `codex_planner` |
+
+Those shadow modules are deleted. The package initializer is a passive public
+re-export and performs no module assignment or registry mutation.
+
+## Preserved semantics
+
+This decision changes composition and source ownership only. It does not change
+the SQLite user version, game action contracts, planner-call policy, approval
+policy, retry classification, one-mutation Tick budget, or fresh-observation
+verification boundary.
 ## Consequences
 
 ### Positive

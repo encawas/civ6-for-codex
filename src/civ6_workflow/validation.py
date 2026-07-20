@@ -33,6 +33,10 @@ DEFAULT_CONDITION_TYPES = {
     "unit_has_build_charge",
     "unit_build_charges_equals",
     "unit_can_improve",
+    "unit_absent",
+    "unit_moved_from",
+    "unit_type_contains",
+    "city_count_at_least",
 }
 
 ACTION_ENTITY_TYPES = {
@@ -44,6 +48,7 @@ ACTION_ENTITY_TYPES = {
     "unit_heal": {"unit"},
     "unit_fortify": {"unit"},
     "unit_skip": {"unit"},
+    "unit_found_city": {"unit"},
 }
 
 
