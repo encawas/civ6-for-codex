@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -9,8 +10,24 @@ from urllib.request import Request, urlopen
 import pytest
 
 from civ6_workflow.config import AppConfig
-from civ6_workflow.domain import RuntimeState
-from civ6_workflow.models import ExecutionMode, PlanBundle, ProposedTask, TaskStatus
+from civ6_workflow.domain import (
+    ActionAttempt,
+    ApprovalStatus,
+    AttemptStatus,
+    ContinuationPolicy,
+    LeaseValidationResult,
+    PlanLease,
+    PlanLeaseStatus,
+    RetryClassification,
+    RuntimeState,
+)
+from civ6_workflow.models import (
+    ExecutionMode,
+    MutationDeliveryStatus,
+    PlanBundle,
+    ProposedTask,
+    TaskStatus,
+)
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.web_ui import ControlPanelHTTPServer, ControlPanelState
 
@@ -211,6 +228,184 @@ def test_http_resume_marks_a_durable_human_wait(tmp_path: Path):
                 "ok": True,
                 "resume_requested": True,
             }
+        assert panel.store.human_wait_context("game-1")["resume_requested"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def _post(base: str, path: str) -> dict:
+    request = Request(
+        f"{base}{path}",
+        method="POST",
+        data=b"{}",
+        headers={
+            "X-Civ6-Token": "test-token",
+            "Content-Type": "application/json",
+        },
+    )
+    with urlopen(request, timeout=3) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _awaiting_lease(*, task_ids: tuple[str, ...] = ()) -> PlanLease:
+    return PlanLease(
+        plan_lease_id="lease-ui-approval",
+        plan_id="plan-ui-approval",
+        game_session_id="game-1",
+        decision_gap_ids=("gap-ui-approval",),
+        scope="city:1",
+        plan_revision=1,
+        task_ids=task_ids,
+        created_from_observation_id="obs-ui",
+        status=PlanLeaseStatus.AWAITING_APPROVAL,
+        approval_status=ApprovalStatus.REQUIRED,
+        valid_from_turn=10,
+        valid_until_turn=11,
+        continuation_policy=ContinuationPolicy.REQUIRE_REVIEW,
+        relevant_input_hash="ui-input",
+        last_validated_observation_id="obs-ui",
+        last_validation_result=LeaseValidationResult.VALID,
+    )
+
+
+def test_game_bound_task_confirmation_and_rejection(tmp_path: Path):
+    panel = _panel(tmp_path)
+    server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        confirmed = _post(base, "/api/games/game-1/tasks/ui-production/confirm")
+        assert confirmed["ok"] is True
+        assert confirmed["game_id"] == "game-1"
+        assert panel.store.task_status("game-1", "ui-production") is TaskStatus.READY
+
+        panel.store.set_task_status(
+            "game-1", "ui-production", TaskStatus.AWAITING_CONFIRMATION
+        )
+        rejected = _post(base, "/api/games/game-1/tasks/ui-production/reject")
+        assert rejected["ok"] is True
+        assert panel.store.task_status("game-1", "ui-production") is TaskStatus.CANCELLED
+
+        with pytest.raises(HTTPError) as exc_info:
+            _post(base, "/api/games/other-game/tasks/ui-production/confirm")
+        assert exc_info.value.code == 409
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_game_bound_lease_approval_and_rejection_are_durable(tmp_path: Path):
+    panel = _panel(tmp_path)
+    lease = _awaiting_lease(task_ids=("ui-production",))
+    panel.store.save_plan_lease(lease)
+    server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        approved = _post(base, "/api/games/game-1/leases/lease-ui-approval/approve")
+        assert approved["ok"] is True
+        record = panel.store.latest_approval_record(
+            "game-1",
+            proposal_type="decision_gap",
+            proposal_id="gap-ui-approval",
+            proposal_revision=1,
+        )
+        assert record is not None
+        assert record.decision.value == "APPROVED"
+
+        second_lease = _awaiting_lease(task_ids=("ui-production",)).model_copy(
+            update={"plan_lease_id": "lease-ui-reject", "decision_gap_ids": ("gap-ui-reject",)}
+        )
+        panel.store.save_plan_lease(second_lease)
+        rejected = _post(base, "/api/games/game-1/leases/lease-ui-reject/reject")
+        assert rejected["ok"] is True
+        assert panel.store.list_plan_leases("game-1")[1].status is PlanLeaseStatus.INVALIDATED
+        assert panel.store.task_status("game-1", "ui-production") is TaskStatus.CANCELLED
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_retry_endpoint_only_requeues_proven_not_sent_attempts(tmp_path: Path):
+    panel = _panel(tmp_path)
+    panel.store.set_task_status("game-1", "ui-production", TaskStatus.FAILED)
+    attempt = ActionAttempt(
+        action_attempt_id="attempt-ui-retry",
+        task_id="ui-production",
+        attempt_number=1,
+        request_id="request-ui-retry",
+        idempotency_key="task-ui-retry",
+        prepared_from_observation_id="obs-ui",
+        prepared_at=datetime.now(UTC),
+        status=AttemptStatus.FAILED,
+        retry_classification=RetryClassification.SAFE_IF_PROVEN_NOT_SENT,
+        normalized_arguments={"city_id": 1},
+        transport_result={
+            "delivery_status": MutationDeliveryStatus.PROVEN_NOT_SENT.value
+        },
+        game_session_id="game-1",
+        action_type="city_set_production",
+    )
+    panel.store.save_action_attempt(attempt)
+    assert panel.snapshot()["human_actions"]["retryable_attempts"] == [
+        {
+            "action_attempt_id": "attempt-ui-retry",
+            "task_id": "ui-production",
+            "action_type": "city_set_production",
+            "reason": "attempt is proven not committed",
+        }
+    ]
+
+    server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        retried = _post(base, "/api/games/game-1/attempts/attempt-ui-retry/retry")
+        assert retried["ok"] is True
+        task = panel.store.get_task("game-1", "ui-production")
+        assert task is not None
+        assert task.status is TaskStatus.READY
+        assert task.retry_count == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+def test_game_bound_resume_exposes_human_wait_state(tmp_path: Path):
+    panel = _panel(tmp_path)
+    panel.store.save_runtime_state("game-1", RuntimeState.AWAITING_HUMAN)
+    panel.store.set_meta(
+        "human_wait:game-1",
+        {
+            "version": "human-wait/v1",
+            "blocking_reason": "input requires review",
+            "resume_requested": False,
+        },
+    )
+    state = panel.snapshot()
+    assert state["human_actions"]["runtime_state"] == "AWAITING_HUMAN"
+    assert state["human_actions"]["human_wait"]["blocking_reason"] == (
+        "input requires review"
+    )
+
+    server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        resumed = _post(base, "/api/games/game-1/workflow/resume")
+        assert resumed == {
+            "ok": True,
+            "reason": "resume recorded; the next tick will re-evaluate the wait",
+            "game_id": "game-1",
+        }
         assert panel.store.human_wait_context("game-1")["resume_requested"] is True
     finally:
         server.shutdown()
