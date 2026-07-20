@@ -1,4 +1,7 @@
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,9 +16,10 @@ def _load_installer():
     return module
 
 
-def _fake_checkout(tmp_path: Path) -> Path:
+def _fake_checkout(tmp_path: Path, *, host: str = "127.0.0.1") -> Path:
     source = tmp_path / "src" / "civ_mcp"
     source.mkdir(parents=True)
+    (source / "uvicorn.py").write_text("# test stub\n", encoding="utf-8")
     (source / "web_api.py").write_text(
         "from civ_mcp.game_state import GameState\n\n"
         "def create_app(gs):\n"
@@ -24,11 +28,22 @@ def _fake_checkout(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (source / "server.py").write_text(
+        "import json\n"
+        "import logging\n"
+        "import sys\n"
         "import uvicorn\n\n"
         "async def lifespan():\n"
         "    web_app = object()\n"
-        '    uvi_config = uvicorn.Config(web_app, host="0.0.0.0", port=8000, log_level="info")\n'
-        "    return uvi_config\n",
+        f'    uvi_config = uvicorn.Config(web_app, host="{host}", port=8000, log_level="info")\n'
+        "    return uvi_config\n\n"
+        "def main():\n"
+        "    logging.basicConfig(level=logging.INFO)\n"
+        "    for tick in range(1, 4):\n"
+        "        logging.getLogger(__name__).info('tick %s', tick)\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': tick, 'result': {}}) + '\\n')\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
         encoding="utf-8",
     )
     return source
@@ -69,3 +84,28 @@ def test_overlay_rejects_unreviewed_git_commit(tmp_path: Path, monkeypatch):
         module.apply_overlay(tmp_path)
 
     module.apply_overlay(tmp_path, allow_unsupported_upstream=True)
+
+
+def test_overlay_keeps_stdout_json_rpc_only(tmp_path: Path):
+    module = _load_installer()
+    source = _fake_checkout(tmp_path, host="0.0.0.0")
+    module.apply_overlay(tmp_path)
+
+    process = subprocess.run(
+        [sys.executable, str(source / "server.py")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stdout_lines = [line for line in process.stdout.splitlines() if line]
+    assert [json.loads(line) for line in stdout_lines] == [
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 2, "result": {}},
+        {"jsonrpc": "2.0", "id": 3, "result": {}},
+    ]
+    assert "tick 1" in process.stderr
+    assert "tick 2" in process.stderr
+    assert "tick 3" in process.stderr
+    assert "tick 1" not in process.stdout
+    assert "tick 2" not in process.stdout
+    assert "tick 3" not in process.stdout
