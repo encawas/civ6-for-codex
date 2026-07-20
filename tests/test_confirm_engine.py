@@ -39,7 +39,7 @@ class _Game:
         self.executed.append(task.task_id)
         return ActionResult(success=True, message="unexpected execution")
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         self.call_count += 1
         return ActionResult(success=True, message="unexpected end turn")
 

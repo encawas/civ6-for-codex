@@ -45,6 +45,7 @@ class SafeCiv6GamePort(BaseCiv6GamePort):
                 details={
                     "tool_name": exc.tool_name,
                     "error_type": type(exc).__name__,
+                    "rejection_code": exc.rejection_code,
                 },
                 delivery_status=MutationDeliveryStatus.EXPLICITLY_REJECTED,
             )

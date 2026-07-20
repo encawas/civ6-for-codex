@@ -105,9 +105,9 @@ class RecordingGamePort:
         )
         return await self.delegate.execute_task(task)
 
-    async def end_turn(self) -> ActionResult:
+    async def end_turn(self, reflections: dict[str, str] | None = None) -> ActionResult:
         self._record(GameCallKind.END_TURN_MUTATION, "end_turn")
-        return await self.delegate.end_turn()
+        return await self.delegate.end_turn(reflections)
 
     async def list_tools(self) -> set[str]:
         self._record(GameCallKind.READ, "list_tools")
@@ -181,7 +181,7 @@ class ScriptedSnapshotSource:
             return self._action_results.pop(0).model_copy(deep=True)
         return ActionResult(success=True, message=f"scripted {task.action_type}")
 
-    async def end_turn(self) -> ActionResult:
+    async def end_turn(self, reflections: dict[str, str] | None = None) -> ActionResult:
         self.call_count += 1
         if self._end_turn_results:
             return self._end_turn_results.pop(0).model_copy(deep=True)

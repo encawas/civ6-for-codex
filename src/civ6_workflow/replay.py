@@ -104,7 +104,9 @@ class SnapshotRecording(StrictModel):
             }
             for table, rows in tables.items():
                 if not isinstance(rows, list):
-                    raise ValueError(f"recording table {table!r} must contain a row list")
+                    raise ValueError(
+                        f"recording table {table!r} must contain a row list"
+                    )
                 for row in rows:
                     if not isinstance(row, dict) or not row:
                         raise ValueError(
@@ -147,11 +149,13 @@ class RecordableGamePort(Protocol):
     @property
     def call_count(self) -> int: ...
 
-    async def read_snapshot(self, *, include_units: bool = False) -> RuntimeSnapshot: ...
+    async def read_snapshot(
+        self, *, include_units: bool = False
+    ) -> RuntimeSnapshot: ...
 
     async def execute_task(self, task: StoredTask) -> ActionResult: ...
 
-    async def end_turn(self) -> ActionResult: ...
+    async def end_turn(self, reflections: dict[str, str]) -> ActionResult: ...
 
     async def list_tools(self) -> set[str]: ...
 
@@ -197,10 +201,10 @@ class RecordingGamePort:
         )
         return result
 
-    async def end_turn(self) -> ActionResult:
+    async def end_turn(self, reflections: dict[str, str]) -> ActionResult:
         if self._current is None:
             raise ReplayDataError("cannot record end_turn before a snapshot")
-        result = await self.delegate.end_turn()
+        result = await self.delegate.end_turn(reflections)
         self._current.end_turn_result = result.model_copy(deep=True)
         return result
 
@@ -276,7 +280,9 @@ class ReplayGamePort:
         if self._current is None:
             raise ReplayDataError("cannot replay an action before a snapshot")
         if self._end_turn_used:
-            raise ReplayDataError("cannot execute a task after end_turn in the same frame")
+            raise ReplayDataError(
+                "cannot execute a task after end_turn in the same frame"
+            )
         if self._next_action_index >= len(self._current.actions):
             raise ReplayDataError(
                 f"frame has no recorded result for task {task.task_id}:{task.action_type}"
@@ -293,7 +299,7 @@ class ReplayGamePort:
         self.call_count += 1
         return expected.result.model_copy(deep=True)
 
-    async def end_turn(self) -> ActionResult:
+    async def end_turn(self, reflections: dict[str, str] | None = None) -> ActionResult:
         if self._current is None or self._current.end_turn_result is None:
             raise ReplayDataError("frame has no recorded end_turn result")
         if self._next_action_index < len(self._current.actions):

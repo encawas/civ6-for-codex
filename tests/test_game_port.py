@@ -37,11 +37,15 @@ class FakeStateApi:
 def _port(bundled):
     mcp = FakeMcpClient()
     state = FakeStateApi(bundled)
-    return Civ6GamePort(
+    return (
+        Civ6GamePort(
+            mcp,
+            state,
+            allowed_tools={"set_city_production", "unit_action", "end_turn"},
+        ),
         mcp,
         state,
-        allowed_tools={"set_city_production", "unit_action", "end_turn"},
-    ), mcp, state
+    )
 
 
 def test_one_bundled_http_read_builds_runtime_snapshot():
@@ -70,9 +74,7 @@ def test_one_bundled_http_read_builds_runtime_snapshot():
 
         assert snapshot.turn == 25
         assert snapshot.game_id == "CIVILIZATION_CHINA:1234"
-        assert snapshot.blockers == [
-            {"type": "city_no_production", "city_ids": ["2"]}
-        ]
+        assert snapshot.blockers == [{"type": "city_no_production", "city_ids": ["2"]}]
         assert state.paths == ["/api/workflow/snapshot?include_units=false"]
         assert mcp.calls == []
 
@@ -107,5 +109,24 @@ def test_exact_end_turn_blocker_is_preserved():
                 "message": "Policies must be assigned",
             }
         ]
+
+    asyncio.run(scenario())
+
+
+def test_end_turn_forwards_auditable_reflections():
+    async def scenario():
+        port, mcp, _ = _port({})
+        reflections = {
+            "tactical": "Turn 10: unit orders complete.",
+            "strategic": "One city is producing a builder.",
+            "tooling": "No tool errors observed.",
+            "planning": "Reobserve after the turn transition.",
+            "hypothesis": "No new mandatory blocker will appear.",
+        }
+
+        result = await port.end_turn(reflections)
+
+        assert result.success is True
+        assert mcp.calls == [("end_turn", reflections)]
 
     asyncio.run(scenario())
