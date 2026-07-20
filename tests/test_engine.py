@@ -167,7 +167,7 @@ def test_ordinary_turn_executes_task_without_agent(tmp_path: Path):
     asyncio.run(scenario())
 
 
-def test_blocked_task_retries_once_then_escalates(tmp_path: Path):
+def test_blocked_task_opens_city_decision_before_human_review(tmp_path: Path):
     async def scenario():
         store = WorkflowStore(tmp_path / "workflow.sqlite3")
         store.save_plan_bundle(
@@ -203,13 +203,22 @@ def test_blocked_task_retries_once_then_escalates(tmp_path: Path):
         assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
         assert first.turn_ended is False
 
-        second = await engine.tick()
+        decision = await engine.tick()
         assert planner.calls == 0
-        assert second.agent_invoked is False
-        assert second.workflow_tick["outcome"] == "AWAITING_HUMAN"
-        assert second.paused is True
+        assert decision.agent_invoked is False
+        assert decision.workflow_tick["outcome"] == "DECISION_GAP_CREATED"
+        assert decision.paused is False
         assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
-        assert second.turn_ended is False
+        assert decision.turn_ended is False
+
+        requested = await engine.tick()
+        assert planner.calls == 0
+        assert requested.workflow_tick["outcome"] == "LOGICAL_PLANNER_REQUEST_CREATED"
+
+        reviewed = await engine.tick()
+        assert planner.calls == 1
+        assert reviewed.workflow_tick["outcome"] == "AWAITING_HUMAN"
+        assert reviewed.paused is True
 
     asyncio.run(scenario())
 

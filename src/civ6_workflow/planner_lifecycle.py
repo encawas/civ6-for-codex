@@ -20,6 +20,7 @@ from .decisioning import (
     hash_decision_input,
     evaluate_plan_lease,
     evaluate_planner_eligibility,
+    opening_decision_events,
     stable_decision_identity,
 )
 from .domain import (
@@ -145,7 +146,18 @@ class PlannerLifecycleCoordinator:
                 ctx, observation, active, compatibility
             )
 
-        decision_events = current_events if current_events is not None else agent_events
+        decision_events = list(
+            current_events if current_events is not None else agent_events
+        )
+        if engine.config.max_agent_calls_per_turn > 0 and not any(
+            event.event_type in STRATEGIC_GAP_TYPES for event in decision_events
+        ):
+            decision_events.extend(
+                opening_decision_events(
+                    observation,
+                    existing_events=decision_events,
+                )
+            )
         strategic = [
             event
             for event in decision_events

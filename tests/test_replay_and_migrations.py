@@ -367,7 +367,9 @@ def test_recorded_explicit_rejection_fails_without_retry(tmp_path: Path):
         ],
         frames=[
             ReplayFrame(snapshot=snapshot, actions=[failed_action]),
-            ReplayFrame(snapshot=snapshot, actions=[failed_action]),
+            ReplayFrame(snapshot=snapshot),
+            ReplayFrame(snapshot=snapshot),
+            ReplayFrame(snapshot=snapshot),
         ],
         planner_responses=[
             PlanBundle(
@@ -404,8 +406,17 @@ def test_recorded_explicit_rejection_fails_without_retry(tmp_path: Path):
     assert first.workflow_tick["outcome"] == "MUTATION_REJECTED"
     assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
 
-    second = asyncio.run(engine.tick())
-    assert second.agent_invoked is False
-    assert second.workflow_tick["outcome"] == "AWAITING_HUMAN"
-    assert second.paused is True
+    decision = asyncio.run(engine.tick())
+    assert decision.agent_invoked is False
+    assert decision.workflow_tick["outcome"] == "DECISION_GAP_CREATED"
+    assert decision.paused is False
     assert store.task_status("game-1", "set-production") is TaskStatus.FAILED
+
+    requested = asyncio.run(engine.tick())
+    assert requested.agent_invoked is False
+    assert requested.workflow_tick["outcome"] == "LOGICAL_PLANNER_REQUEST_CREATED"
+
+    reviewed = asyncio.run(engine.tick())
+    assert reviewed.agent_invoked is True
+    assert reviewed.workflow_tick["outcome"] == "AWAITING_HUMAN"
+    assert reviewed.paused is True
