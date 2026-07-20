@@ -1,9 +1,14 @@
 import asyncio
+from datetime import UTC, datetime
+
+import pytest
 
 from civ6_workflow.decisioning import opening_decision_events
 from civ6_workflow.domain import (
     DecisionGapStatus,
     PlannerRequestStatus,
+    ProviderAttempt,
+    ProviderAttemptStatus,
     SlotState,
     TickOutcomeKind,
 )
@@ -357,5 +362,227 @@ def test_restarted_opening_request_closes_when_player_fills_city_slot(tmp_path):
         assert gap.status is DecisionGapStatus.RESOLVED
         assert planner.calls == 0
         assert restarted.store.list_provider_attempts(request_id) == []
+
+    asyncio.run(scenario())
+
+
+async def _create_successor_after_partial_resolution(
+    engine,
+    game,
+    *,
+    research,
+    production,
+):
+    original_request_id = await _create_opening_request(engine)
+    game.snapshot = _snapshot(research=research, production=production)
+    closed = await engine.tick()
+    successor = await engine.tick()
+    return original_request_id, closed, successor
+
+
+def test_partial_research_resolution_creates_city_successor_request(tmp_path):
+    """A pre-provider partial resolution releases budget for the remaining city gap."""
+
+    async def scenario():
+        planner = _HumanReviewPlanner()
+        engine, game, _ = _engine(tmp_path, _snapshot(), planner=planner)
+        (
+            original_id,
+            closed,
+            successor,
+        ) = await _create_successor_after_partial_resolution(
+            engine,
+            game,
+            research="TECH_MINING",
+            production=None,
+        )
+
+        gaps = {
+            gap.gap_type: gap
+            for gap in engine.store.list_decision_gaps("opening-routing")
+        }
+        successor_id = successor.workflow_tick["planner_request_id"]
+        assert closed.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
+        assert (
+            engine.store.get_planner_request(original_id).status
+            is PlannerRequestStatus.SUPERSEDED
+        )
+        assert gaps["research_direction_required"].status is DecisionGapStatus.RESOLVED
+        assert gaps["city_role_required"].status is DecisionGapStatus.REQUESTED
+        assert (
+            successor.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        assert successor_id != original_id
+        assert engine.store.get_planner_request(successor_id).decision_gap_ids == (
+            gaps["city_role_required"].decision_gap_id,
+        )
+        assert engine.store.logical_request_count_for_turn("opening-routing", 1) == 2
+        assert (
+            engine.store.provider_budget_request_count_for_turn("opening-routing", 1)
+            == 1
+        )
+        assert planner.calls == 0
+
+        planned = await engine.tick()
+        assert planned.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert planner.calls == 1
+        assert len(engine.store.list_provider_attempts(original_id)) == 0
+
+        await engine.tick()
+        assert engine.store.logical_request_count_for_turn("opening-routing", 1) == 2
+        assert planner.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_partial_city_resolution_creates_research_successor_request(tmp_path):
+    """A pre-provider partial resolution releases budget for the remaining research gap."""
+
+    async def scenario():
+        planner = _HumanReviewPlanner()
+        engine, game, _ = _engine(tmp_path, _snapshot(), planner=planner)
+        (
+            original_id,
+            closed,
+            successor,
+        ) = await _create_successor_after_partial_resolution(
+            engine,
+            game,
+            research=None,
+            production="BUILDING_MONUMENT",
+        )
+
+        gaps = {
+            gap.gap_type: gap
+            for gap in engine.store.list_decision_gaps("opening-routing")
+        }
+        successor_id = successor.workflow_tick["planner_request_id"]
+        assert closed.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
+        assert (
+            engine.store.get_planner_request(original_id).status
+            is PlannerRequestStatus.SUPERSEDED
+        )
+        assert gaps["city_role_required"].status is DecisionGapStatus.RESOLVED
+        assert gaps["research_direction_required"].status is DecisionGapStatus.REQUESTED
+        assert (
+            successor.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        assert successor_id != original_id
+        assert engine.store.get_planner_request(successor_id).decision_gap_ids == (
+            gaps["research_direction_required"].decision_gap_id,
+        )
+        assert engine.store.logical_request_count_for_turn("opening-routing", 1) == 2
+        assert (
+            engine.store.provider_budget_request_count_for_turn("opening-routing", 1)
+            == 1
+        )
+        assert planner.calls == 0
+
+        planned = await engine.tick()
+        assert planned.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert planner.calls == 1
+        assert len(engine.store.list_provider_attempts(original_id)) == 0
+
+        await engine.tick()
+        assert engine.store.logical_request_count_for_turn("opening-routing", 1) == 2
+        assert planner.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_partial_resolution_after_restart_keeps_successor_budget(tmp_path):
+    """Restart keeps the pre-provider successor allowance and request audit chain."""
+
+    async def scenario():
+        planner = _HumanReviewPlanner()
+        engine, game, _ = _engine(tmp_path, _snapshot(), planner=planner)
+        original_id = await _create_opening_request(engine)
+        game.snapshot = _snapshot(research="TECH_MINING", production=None)
+        restarted = WorkflowEngine(
+            store=WorkflowStore(tmp_path / "opening-routing.sqlite3"),
+            game=game,
+            planner=planner,
+            config=engine.config,
+        )
+
+        closed = await restarted.tick()
+        successor = await restarted.tick()
+        planned = await restarted.tick()
+
+        assert closed.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
+        assert (
+            restarted.store.get_planner_request(original_id).status
+            is PlannerRequestStatus.SUPERSEDED
+        )
+        assert (
+            successor.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        assert planned.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert restarted.store.logical_request_count_for_turn("opening-routing", 1) == 2
+        assert planner.calls == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "provider_status",
+    [
+        ProviderAttemptStatus.STARTED,
+        ProviderAttemptStatus.SUCCEEDED,
+        ProviderAttemptStatus.FAILED,
+    ],
+)
+def test_provider_attempt_history_keeps_partial_resolution_budget(
+    tmp_path,
+    provider_status,
+):
+    """Any provider-attempt history keeps the original turn budget consumed."""
+
+    async def scenario():
+        planner = _HumanReviewPlanner()
+        engine, game, _ = _engine(tmp_path, _snapshot(), planner=planner)
+        request_id = await _create_opening_request(engine)
+        request = engine.store.get_planner_request(request_id)
+        now = datetime.now(UTC)
+        attempt = ProviderAttempt(
+            provider_attempt_id=f"provider-budget-{provider_status.value}",
+            planner_request_id=request_id,
+            attempt_number=1,
+            provider_request_id="provider-wire-1",
+            status=provider_status,
+            started_at=now,
+            completed_at=(
+                None if provider_status is ProviderAttemptStatus.STARTED else now
+            ),
+            latency_seconds=(
+                None if provider_status is ProviderAttemptStatus.STARTED else 0.0
+            ),
+            failure_category=(
+                None if provider_status is not ProviderAttemptStatus.FAILED else "test"
+            ),
+        )
+        if provider_status is ProviderAttemptStatus.STARTED:
+            engine.store.start_provider_attempt("opening-routing", request, attempt)
+        else:
+            engine.store.save_provider_attempt("opening-routing", attempt)
+
+        game.snapshot = _snapshot(research="TECH_MINING", production=None)
+        closed = await engine.tick()
+        await engine.tick()
+
+        assert closed.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
+        assert (
+            engine.store.get_planner_request(request_id).status
+            is PlannerRequestStatus.SUPERSEDED
+        )
+        assert (
+            engine.store.provider_budget_request_count_for_turn("opening-routing", 1)
+            == 1
+        )
+        assert engine.store.logical_request_count_for_turn("opening-routing", 1) == 1
+        assert planner.calls == 0
 
     asyncio.run(scenario())

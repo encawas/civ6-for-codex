@@ -901,7 +901,7 @@ class PlannerLifecycleCoordinator:
             active_attempt=(
                 engine.store.unresolved_action_attempt(snapshot.game_id) is not None
             ),
-            logical_requests_this_turn=engine.store.logical_request_count_for_turn(
+            logical_requests_this_turn=engine.store.provider_budget_request_count_for_turn(
                 snapshot.game_id, snapshot.turn
             ),
             active_logical_request=False,
