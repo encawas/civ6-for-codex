@@ -62,7 +62,7 @@ class StatefulGame:
         self.mutations += 1
         return self.result
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         self.call_count += 1
         self.end_turn_calls += 1
         return self.result
@@ -443,8 +443,9 @@ def test_startup_recovers_missing_terminal_end_turn_audit(tmp_path: Path):
 
 
 class FakeStateApi:
-    def __init__(self):
+    def __init__(self, *, production="NONE"):
         self.call_count = 0
+        self.production = production
 
     async def get_optional(self, path):
         self.call_count += 1
@@ -452,7 +453,7 @@ class FakeStateApi:
             "overview": {"turn": 10},
             "identity": {"civ": "game", "seed": 1},
             "tech_civics": {},
-            "cities": [{"city_id": 1, "currently_building": "NONE"}],
+            "cities": [{"city_id": 1, "currently_building": self.production}],
             "units": [],
             "notifications": [],
             "end_turn_blockers": [],
@@ -477,6 +478,20 @@ class FakeMcpSession:
             return SimpleNamespace(
                 isError=True,
                 content=[SimpleNamespace(text="server rejected mutation")],
+                structuredContent=None,
+            )
+        if self.behavior == "empty_reflections":
+            return SimpleNamespace(
+                isError=False,
+                content=[
+                    SimpleNamespace(
+                        text=(
+                            "Empty reflections: tactical, strategic, tooling, planning, hypothesis. "
+                            "Provide non-empty entries for all 5 fields: tactical, strategic, "
+                            "tooling, planning, hypothesis."
+                        )
+                    )
+                ],
                 structuredContent=None,
             )
         if self.behavior == "timeout":
@@ -826,3 +841,52 @@ def test_unit_moved_to_third_location_is_conflict_not_noncommit(tmp_path):
         assert len(store.list_action_attempts("game-1")) == 1
 
     asyncio.run(scenario())
+
+
+def test_real_mcp_empty_reflections_is_an_explicit_end_turn_rejection(tmp_path):
+    async def scenario():
+        store, session, runtime = _real_mcp_end_turn_engine(
+            tmp_path, "empty_reflections"
+        )
+
+        result = await runtime.tick()
+        attempt = store.list_action_attempts("game:1")[0]
+
+        assert result.workflow_tick["outcome"] == "MUTATION_REJECTED"
+        assert attempt.status is AttemptStatus.FAILED
+        assert attempt.transport_result["delivery_status"] == "explicitly_rejected"
+        assert attempt.tool_result["success"] is False
+        assert attempt.tool_result["details"]["rejection_code"] == (
+            "end_turn_reflections_required"
+        )
+        assert session.action_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_real_mcp_end_turn_acknowledgement_remains_verifying(tmp_path):
+    async def scenario():
+        store, session, runtime = _real_mcp_end_turn_engine(tmp_path, "ack")
+
+        result = await runtime.tick()
+        attempt = store.list_action_attempts("game:1")[0]
+
+        assert result.workflow_tick["outcome"] == "TURN_TRANSITION_STARTED"
+        assert attempt.status is AttemptStatus.VERIFYING
+        assert attempt.transport_result["delivery_status"] == "acknowledged"
+        assert session.action_calls == 1
+
+    asyncio.run(scenario())
+
+
+def _real_mcp_end_turn_engine(tmp_path, behavior):
+    store = WorkflowStore(tmp_path / f"end-turn-{behavior}.sqlite3")
+    client = Civ6McpClient(McpServerConfig())
+    session = FakeMcpSession(behavior)
+    client.session = session
+    game = SafeCiv6GamePort(
+        client,
+        FakeStateApi(production="UNIT_BUILDER"),
+        allowed_tools=_tools(),
+    )
+    return store, session, _engine(store, game, auto_end_turn=True)

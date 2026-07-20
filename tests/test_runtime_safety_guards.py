@@ -172,7 +172,7 @@ class _RecordingDelegate:
         self.call_count += 1
         return ActionResult(success=True, message="ok")
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         self.call_count += 1
         return ActionResult(success=True, message="ok")
 

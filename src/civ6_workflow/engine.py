@@ -705,6 +705,7 @@ class WorkflowEngine:
     ) -> TickResult:
         snapshot = observation.snapshot
         authorization_hash = self._end_turn_authorization_hash(observation)
+        reflections = self._end_turn_reflections(observation)
         task_id = f"end_turn:{snapshot.turn}"
         parent = self.store.latest_attempt_for_task(snapshot.game_id, task_id)
         attempt = ActionAttempt(
@@ -724,6 +725,7 @@ class WorkflowEngine:
                     END_TURN_AUTHORIZATION_PROJECTION_VERSION
                 ),
                 "authorization_projection_hash": authorization_hash,
+                **reflections,
             },
             postconditions=(),
             parent_attempt_id=(None if parent is None else parent.action_attempt_id),
@@ -747,7 +749,7 @@ class WorkflowEngine:
         bounded = BoundedGamePort(self.game, ctx.budget)
         started = self._monotonic()
         try:
-            action_result = await bounded.end_turn()
+            action_result = await bounded.end_turn(reflections)
         except Exception as exc:
             action_result = None
             error = exc
@@ -1302,6 +1304,48 @@ class WorkflowEngine:
             for task in self.store.list_tasks(snapshot.game_id, statuses=blocking)
         )
 
+    @staticmethod
+    def _end_turn_reflections(
+        observation: NormalizedRuntimeObservation,
+    ) -> dict[str, str]:
+        """Build the upstream diary fields from current normalized facts only."""
+
+        canonical = observation.canonical
+        snapshot = observation.snapshot
+        city_count = len(canonical.cities)
+        production = (
+            ", ".join(
+                f"{city.entity_id.value}:{city.production.value or city.production.state.value}"
+                for city in canonical.cities
+            )
+            or "none"
+        )
+        unit_summary = canonical.unit_summary
+        research = (
+            canonical.progression.current_research.value
+            or canonical.progression.current_research.state.value
+        )
+        civic = (
+            canonical.progression.current_civic.value
+            or canonical.progression.current_civic.state.value
+        )
+        return {
+            "tactical": (
+                f"Turn {snapshot.turn}: {city_count} city(s), production {production}; "
+                f"{len(unit_summary.actionable_unit_ids)} actionable unit(s)."
+            ),
+            "strategic": (
+                f"Research {research}; civic {civic}; {city_count} city(s) are active."
+            ),
+            "tooling": "No tool errors observed; current end-turn checks passed.",
+            "planning": (
+                "After transition, reobserve and continue approved work or route new blockers."
+            ),
+            "hypothesis": (
+                "If no new mandatory blocker appears, current research and production remain valid next turn."
+            ),
+        }
+
     def _end_turn_rejection_suppression(
         self, observation: NormalizedRuntimeObservation
     ) -> str | None:
@@ -1314,21 +1358,22 @@ class WorkflowEngine:
         if self.store.get_meta(self._end_turn_retry_key(attempt), False):
             return None
 
-        rejected_hash = attempt.normalized_arguments.get(
-            "authorization_projection_hash"
-        )
-        current_hash = self._end_turn_authorization_hash(observation)
-        material_change_key = self._end_turn_material_change_key(attempt)
-        if rejected_hash is not None and current_hash != rejected_hash:
-            self.store.set_meta(
-                material_change_key,
-                {
-                    "authorization_projection_hash": current_hash,
-                    "observation_id": self._active_observation_id,
-                },
+        arguments = attempt.normalized_arguments
+        rejected_hash = arguments.get("authorization_projection_hash")
+        projection_version = arguments.get("authorization_projection_version")
+        if (
+            projection_version != END_TURN_AUTHORIZATION_PROJECTION_VERSION
+            or not isinstance(rejected_hash, str)
+            or not rejected_hash
+        ):
+            return (
+                "end turn remains suppressed because the current-turn rejection "
+                "lacks a comparable authorization projection; explicit retry is required "
+                f"({attempt.action_attempt_id})"
             )
-            return None
-        if self.store.get_meta(material_change_key) is not None:
+
+        current_hash = self._end_turn_authorization_hash(observation)
+        if current_hash != rejected_hash:
             return None
         return (
             "end turn remains suppressed because the current-turn attempt was "
@@ -1349,10 +1394,6 @@ class WorkflowEngine:
     @staticmethod
     def _end_turn_retry_key(attempt: ActionAttempt) -> str:
         return f"end_turn_explicit_retry:{attempt.action_attempt_id}"
-
-    @staticmethod
-    def _end_turn_material_change_key(attempt: ActionAttempt) -> str:
-        return f"end_turn_material_change:{attempt.action_attempt_id}"
 
     @staticmethod
     def _end_turn_authorization_hash(

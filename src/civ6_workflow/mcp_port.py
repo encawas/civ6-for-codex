@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -33,9 +34,19 @@ class GamePort(Protocol):
 
     async def execute_task(self, task: StoredTask) -> ActionResult: ...
 
-    async def end_turn(self) -> ActionResult: ...
+    async def end_turn(self, reflections: dict[str, str]) -> ActionResult: ...
 
     async def list_tools(self) -> set[str]: ...
+
+
+_EMPTY_REFLECTIONS_RESPONSE = re.compile(
+    r"^Empty reflections: (?:tactical|strategic|tooling|planning|hypothesis)"
+    r"(?:, (?:tactical|strategic|tooling|planning|hypothesis))*\. "
+    r"Provide non-empty entries for all 5 fields: tactical, strategic, tooling, "
+    r"planning, hypothesis\.$"
+)
+_CANNOT_END_TURN_RESPONSE = re.compile(r"^Cannot end turn: .+$", re.DOTALL)
+_TURN_PAUSED_RESPONSE = re.compile(r"^Turn paused(?: —| -|:).+$", re.DOTALL)
 
 
 class MutationBudgetExceeded(RuntimeError):
@@ -45,9 +56,16 @@ class MutationBudgetExceeded(RuntimeError):
 class McpToolRejectedError(RuntimeError):
     """The MCP server received the request and explicitly rejected it."""
 
-    def __init__(self, tool_name: str, message: str):
+    def __init__(
+        self,
+        tool_name: str,
+        message: str,
+        *,
+        rejection_code: str | None = None,
+    ):
         super().__init__(message)
         self.tool_name = tool_name
+        self.rejection_code = rejection_code
 
 
 @dataclass(slots=True)
@@ -81,9 +99,9 @@ class BoundedGamePort:
         self.budget.consume(task.action_type)
         return await self.delegate.execute_task(task)
 
-    async def end_turn(self) -> ActionResult:
+    async def end_turn(self, reflections: dict[str, str] | None = None) -> ActionResult:
         self.budget.consume("end_turn")
-        return await self.delegate.end_turn()
+        return await self.delegate.end_turn(reflections or {})
 
     async def list_tools(self) -> set[str]:
         return await self.delegate.list_tools()
@@ -143,7 +161,9 @@ class Civ6McpClient:
         if is_error:
             text = self._extract_text(result.content)
             raise McpToolRejectedError(
-                name, text or f"MCP tool {name} returned an error"
+                name,
+                text or f"MCP tool {name} returned an error",
+                rejection_code="mcp_is_error",
             )
         structured = getattr(result, "structuredContent", None)
         if structured is None:
@@ -151,12 +171,34 @@ class Civ6McpClient:
         if structured is not None:
             return structured
         text = self._extract_text(result.content)
+        rejection_code = self._semantic_rejection_code(name, text)
+        if rejection_code is not None:
+            raise McpToolRejectedError(name, text, rejection_code=rejection_code)
         if not text:
             return {}
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             return {"text": text}
+
+    @staticmethod
+    def _semantic_rejection_code(tool_name: str, text: str) -> str | None:
+        """Recognize documented upstream business outcomes at the MCP boundary.
+
+        civ-mcp currently returns these end-turn validation outcomes as successful
+        MCP envelopes containing a textual result. Full response grammars keep
+        this adapter logic separate from transport exception handling.
+        """
+
+        if tool_name != "end_turn" or not text:
+            return None
+        if _EMPTY_REFLECTIONS_RESPONSE.fullmatch(text):
+            return "end_turn_reflections_required"
+        if _CANNOT_END_TURN_RESPONSE.fullmatch(text):
+            return "end_turn_blocked"
+        if _TURN_PAUSED_RESPONSE.fullmatch(text):
+            return "end_turn_paused"
+        return None
 
     @staticmethod
     def _extract_text(content: list[Any]) -> str:
@@ -301,6 +343,7 @@ class Civ6GamePort:
                 details={
                     "tool_name": exc.tool_name,
                     "error_type": type(exc).__name__,
+                    "rejection_code": exc.rejection_code,
                 },
                 delivery_status=MutationDeliveryStatus.EXPLICITLY_REJECTED,
             )
@@ -313,7 +356,7 @@ class Civ6GamePort:
             )
         return self._normalize_action_result(raw)
 
-    async def end_turn(self) -> ActionResult:
+    async def end_turn(self, reflections: dict[str, str]) -> ActionResult:
         if "end_turn" not in self.allowed_tools:
             return ActionResult(
                 success=False,
@@ -322,7 +365,7 @@ class Civ6GamePort:
                 delivery_status=MutationDeliveryStatus.PROVEN_NOT_SENT,
             )
         try:
-            raw = await self.client.call_tool("end_turn")
+            raw = await self.client.call_tool("end_turn", reflections)
         except McpToolRejectedError as exc:
             return ActionResult(
                 success=False,
@@ -331,6 +374,7 @@ class Civ6GamePort:
                 details={
                     "tool_name": exc.tool_name,
                     "error_type": type(exc).__name__,
+                    "rejection_code": exc.rejection_code,
                 },
                 delivery_status=MutationDeliveryStatus.EXPLICITLY_REJECTED,
             )

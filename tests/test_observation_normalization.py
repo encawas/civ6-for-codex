@@ -343,7 +343,7 @@ class _ReadPolicyGame:
     async def execute_task(self, task):
         raise AssertionError("read-only policy test must not mutate the game")
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         raise AssertionError("read-only policy test must not end the turn")
 
     async def list_tools(self):

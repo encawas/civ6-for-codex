@@ -55,7 +55,7 @@ class _GameWithUnverifiedImprovement:
         # Simulate a server acknowledgement whose state change cannot be observed.
         return ActionResult(success=True, message="accepted")
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         self.call_count += 1
         return ActionResult(success=True, message="unexpected")
 

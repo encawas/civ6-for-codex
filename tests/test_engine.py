@@ -63,7 +63,7 @@ class FakeGame:
             ]
         return ActionResult(success=True, message="ok")
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         self.call_count += 1
         self.end_turn_calls += 1
         return ActionResult(success=True, message="advanced")

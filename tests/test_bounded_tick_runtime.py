@@ -62,7 +62,7 @@ class Game:
             self.inspect_send(task)
         return self.result
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         self.call_count += 1
         self.end_turn_calls += 1
         if self.inspect_send is not None:

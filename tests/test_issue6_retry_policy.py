@@ -61,7 +61,7 @@ class Game:
         self.mutations += 1
         return self.result
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         self.call_count += 1
         self.end_turn_calls += 1
         return self.result

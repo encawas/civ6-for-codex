@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 from civ6_workflow.domain import AttemptStatus, TickOutcomeKind
@@ -29,6 +30,7 @@ class Game:
         self.call_count = 0
         self.reads = 0
         self.end_turn_calls = 0
+        self.end_turn_reflections = []
 
     async def read_snapshot(self, *, include_units=False):
         self.call_count += 1
@@ -39,9 +41,10 @@ class Game:
     async def execute_task(self, task):
         raise AssertionError("this regression must not execute a task")
 
-    async def end_turn(self):
+    async def end_turn(self, reflections=None):
         self.call_count += 1
         self.end_turn_calls += 1
+        self.end_turn_reflections.append(dict(reflections or {}))
         return self.result
 
     async def list_tools(self):
@@ -217,5 +220,77 @@ def test_explicit_user_retry_authorizes_only_latest_rejection(tmp_path: Path):
         assert store.get_meta(
             f"end_turn_explicit_retry:{rejected_attempt.action_attempt_id}"
         )
+
+    asyncio.run(scenario())
+
+
+def test_legacy_end_turn_rejection_without_hash_requires_explicit_retry(tmp_path: Path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "legacy-hash.sqlite3")
+        game = Game([snapshot(), snapshot()], explicit_rejection())
+        runtime = engine(store, game)
+
+        await runtime.tick()
+        attempt = store.list_action_attempts("game-1")[0]
+        with store._connect() as connection:
+            row = connection.execute(
+                "SELECT attempt_json FROM action_attempts WHERE action_attempt_id=?",
+                (attempt.action_attempt_id,),
+            ).fetchone()
+            legacy_json = json.loads(row["attempt_json"])
+            legacy_json["normalized_arguments"] = {}
+            connection.execute(
+                """
+                UPDATE action_attempts
+                SET normalized_arguments_json=?, attempt_json=?
+                WHERE action_attempt_id=?
+                """,
+                (
+                    json.dumps({}),
+                    json.dumps(legacy_json),
+                    attempt.action_attempt_id,
+                ),
+            )
+        suppressed = await runtime.tick()
+
+        assert suppressed.workflow_tick["outcome"] == TickOutcomeKind.NO_SAFE_ACTION
+        assert (
+            "lacks a comparable authorization projection"
+            in (suppressed.workflow_tick["blocking_reason"])
+        )
+        assert game.end_turn_calls == 1
+        assert len(store.list_action_attempts("game-1")) == 1
+
+    asyncio.run(scenario())
+
+
+def test_transient_authorization_change_does_not_permanently_unlock_rejection(
+    tmp_path: Path,
+):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "transient-change.sqlite3")
+        game = Game(
+            [
+                snapshot(production="UNIT_BUILDER"),
+                snapshot(production="UNIT_SETTLER"),
+                snapshot(production="UNIT_BUILDER"),
+            ],
+            explicit_rejection(),
+        )
+        runtime = engine(store, game)
+
+        await runtime.tick()
+        runtime.config.auto_end_turn = False
+        await runtime.tick()
+        runtime.config.auto_end_turn = True
+        suppressed = await runtime.tick()
+
+        assert suppressed.workflow_tick["outcome"] == TickOutcomeKind.NO_SAFE_ACTION
+        assert (
+            "authorization state is unchanged"
+            in (suppressed.workflow_tick["blocking_reason"])
+        )
+        assert game.end_turn_calls == 1
+        assert len(store.list_action_attempts("game-1")) == 1
 
     asyncio.run(scenario())
