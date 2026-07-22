@@ -1,4 +1,13 @@
-from civ6_workflow.actions import resolve_action
+import json
+
+import pytest
+
+from civ6_workflow.actions import (
+    ACTION_REGISTRY,
+    ActionValidationError,
+    action_argument_contracts,
+    resolve_action,
+)
 from civ6_workflow.models import StoredTask
 
 
@@ -53,3 +62,46 @@ def test_research_and_civic_share_upstream_tool_with_fixed_category():
         "tech_or_civic": "CIVIC_CRAFTSMANSHIP",
         "category": "civic",
     }
+
+
+def test_action_argument_contracts_are_stable_and_match_registry():
+    contracts = action_argument_contracts()
+
+    assert list(contracts) == sorted(contracts)
+    assert contracts["set_research"] == {
+        "required": ["tech_or_civic"],
+        "optional": [],
+        "injected_by_runtime": {"category": "tech"},
+    }
+    for action_type, contract in contracts.items():
+        spec = ACTION_REGISTRY[action_type]
+        assert contract["required"] == sorted(spec.required_arguments)
+        assert contract["optional"] == sorted(spec.optional_arguments)
+        assert list(contract["injected_by_runtime"]) == sorted(
+            contract["injected_by_runtime"]
+        )
+        assert not (
+            set(contract["injected_by_runtime"])
+            & (set(contract["required"]) | set(contract["optional"]))
+        )
+
+    first = json.dumps(contracts, separators=(",", ":"))
+    second = json.dumps(action_argument_contracts(), separators=(",", ":"))
+    assert first == second
+
+
+def test_action_argument_contract_projection_is_filtered_and_defensive():
+    first = action_argument_contracts({"set_research"})
+    first["set_research"]["required"].append("pollution")
+    first["set_research"]["injected_by_runtime"]["category"] = "pollution"
+
+    second = action_argument_contracts({"set_research"})
+    assert list(second) == ["set_research"]
+    assert second["set_research"]["required"] == ["tech_or_civic"]
+    assert second["set_research"]["injected_by_runtime"] == {"category": "tech"}
+    assert ACTION_REGISTRY["set_research"].fixed_arguments["category"] == "tech"
+
+
+def test_action_argument_contract_projection_rejects_unknown_actions():
+    with pytest.raises(ActionValidationError, match="unsupported action types"):
+        action_argument_contracts({"unknown_action"})

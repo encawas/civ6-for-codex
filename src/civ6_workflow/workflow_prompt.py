@@ -16,6 +16,7 @@ Rules:
 2. Prefer durable plan updates over repeatedly asking the model for ordinary continuation work.
 3. Each entity may have at most one task due on the same turn.
 4. Use only action types listed in constraints.allowed_action_types and never invent entity IDs.
+Condition template strings beginning with `$` reference the same-named task.arguments field. Replace every such template value with the actual argument value in emitted tasks; never emit an unresolved `$...` placeholder.
 5. High-impact or irreversible actions must use risk=high or critical and requires_confirmation=true.
 6. Every task needs concise reason, preconditions, postconditions, invalidators, due_turn, and risk.
 7. Postconditions must prove the intended game change using only supported_condition_types.

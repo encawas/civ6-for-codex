@@ -15,6 +15,7 @@ from .actions import (
     ACTION_REGISTRY,
     END_TURN_ACTION_SPEC,
     ActionValidationError,
+    action_argument_contracts,
     resolve_action,
     resolve_action_spec,
 )
@@ -70,7 +71,13 @@ from .planner_lifecycle import PlannerLifecycleCoordinator
 from .progression import ProgressionRuleCompiler
 from .recovery import recover_turn_rewind
 from .rules import DeterministicRuleCompiler
-from .validation import PlanValidationContext, validate_plan_bundle
+from .validation import (
+    PlanValidationContext,
+    action_entity_type_contracts,
+    condition_contracts,
+    entity_id_argument_contracts,
+    validate_plan_bundle,
+)
 from .verification import (
     VerificationEvidence,
     evaluate_action_verification,
@@ -80,6 +87,7 @@ from .workflow_protocol import (
     WorkflowAgentRequest as AgentRequest,
     WorkflowPlanBundle as PlanBundle,
     WorkflowTickMetrics as TickMetrics,
+    information_tool_argument_contracts,
     validate_event_resolution_contract,
 )
 from .workflow_queries import InformationQueryRouter
@@ -1611,6 +1619,12 @@ class WorkflowEngine:
         relevant_state, relevant_plans, max_tasks = project_agent_context(
             snapshot, events, context
         )
+        allowed_action_types = set(self.config.allowed_action_types)
+        argument_contracts = action_argument_contracts(allowed_action_types)
+        entity_type_contracts = action_entity_type_contracts(allowed_action_types)
+        entity_id_contracts = entity_id_argument_contracts(entity_type_contracts)
+        required_condition_contracts = condition_contracts(allowed_action_types)
+        information_contracts = information_tool_argument_contracts()
         return AgentRequest(
             turn=snapshot.turn,
             execution_mode=self.config.execution_mode,
@@ -1619,7 +1633,11 @@ class WorkflowEngine:
             current_plans=relevant_plans,
             relevant_state=relevant_state,
             constraints={
-                "allowed_action_types": sorted(self.config.allowed_action_types),
+                "allowed_action_types": sorted(allowed_action_types),
+                "action_argument_contracts": argument_contracts,
+                "action_entity_types": entity_type_contracts,
+                "entity_id_arguments": entity_id_contracts,
+                "condition_contracts": required_condition_contracts,
                 "supported_condition_types": [
                     "turn_at_least",
                     "turn_equals",
@@ -1663,22 +1681,8 @@ class WorkflowEngine:
                 "event_resolution_required": True,
                 "planning_phase": "initial",
                 "allow_information_requests": True,
-                "allowed_information_tools": [
-                    "get_settle_advisor",
-                    "get_global_settle_advisor",
-                    "get_pathing_estimate",
-                    "get_unit_promotions",
-                    "get_district_advisor",
-                    "get_city_production",
-                    "get_map_area",
-                    "get_policies",
-                    "get_trade_options",
-                    "get_pantheon_beliefs",
-                    "get_religion_beliefs",
-                    "get_dedications",
-                    "get_city_states",
-                    "get_builder_tasks",
-                ],
+                "allowed_information_tools": list(information_contracts),
+                "information_tool_arguments": information_contracts,
             },
         )
 

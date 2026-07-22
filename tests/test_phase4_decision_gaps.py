@@ -42,6 +42,7 @@ from civ6_workflow.engine import (
     InjectedCrashBoundary,
     WorkflowEngine,
 )
+from civ6_workflow.planner_lifecycle import PLANNER_INPUT_CONTRACT_REVISION
 from civ6_workflow.models import (
     ActionResult,
     EventLevel,
@@ -59,6 +60,7 @@ from civ6_workflow.store import WorkflowStore
 from civ6_workflow.workflow_protocol import (
     EventResolution,
     LeaseContract,
+    READ_ONLY_QUERY_SPECS,
     ResolutionDisposition,
     WorkflowPlanBundle,
 )
@@ -658,6 +660,158 @@ def _engine(tmp_path, planner):
         ),
     )
     return engine, game, recording
+
+
+def test_planner_receives_filtered_canonical_input_contracts(tmp_path):
+    async def scenario():
+        engine, _, planner = _engine(tmp_path, _ResolvingPlanner())
+        engine.config.allowed_action_types = {"set_research"}
+
+        await engine.tick()
+        await engine.tick()
+        await engine.tick()
+
+        assert len(planner.requests) == 1
+        constraints = planner.requests[0].constraints
+        assert set(constraints["action_argument_contracts"]) == {"set_research"}
+        assert set(constraints["action_entity_types"]) == {"set_research"}
+        assert set(constraints["condition_contracts"]) == {"set_research"}
+        assert constraints["entity_id_arguments"] == {
+            "research": "tech_or_civic"
+        }
+        assert set(constraints["allowed_action_types"]) == {"set_research"}
+        assert set(constraints["allowed_information_tools"]) == set(
+            constraints["information_tool_arguments"]
+        ) == set(READ_ONLY_QUERY_SPECS)
+        assert "unit_move" not in constraints["action_argument_contracts"]
+        assert "builder_improve" not in constraints["action_entity_types"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "legacy_status",
+    [
+        PlannerRequestStatus.PENDING,
+        PlannerRequestStatus.READY_TO_CONTINUE,
+        PlannerRequestStatus.AWAITING_INFORMATION,
+        PlannerRequestStatus.BACKOFF,
+    ],
+)
+def test_legacy_active_request_is_superseded_and_rebuilt_with_contracts(
+    tmp_path, legacy_status
+):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _ResolvingPlanner())
+        await engine.tick()
+        gap = engine.store.list_decision_gaps("opening")[0]
+        group = batch_compatible_gaps(
+            "opening", gap.observation_id, [gap], now=datetime.now(UTC)
+        )
+        request_id = f"legacy-{legacy_status.value.lower()}"
+        gap_status = (
+            DecisionGapStatus.AWAITING_INFORMATION
+            if legacy_status is PlannerRequestStatus.AWAITING_INFORMATION
+            else DecisionGapStatus.REQUESTED
+        )
+        requested_gap = gap.model_copy(
+            update={"status": gap_status, "logical_request_id": request_id}
+        )
+        old_payload = engine._build_agent_request(
+            game.snapshot, [_settler_event()]
+        ).model_dump(mode="json")
+        old_constraints = dict(old_payload["constraints"])
+        for key in (
+            "action_argument_contracts",
+            "action_entity_types",
+            "entity_id_arguments",
+            "condition_contracts",
+            "information_tool_arguments",
+        ):
+            old_constraints.pop(key)
+        old_payload["constraints"] = old_constraints
+        pending_information_requests = (
+            (
+                {
+                    "request_id": "legacy-info",
+                    "event_dedupe_key": gap.cooldown_key,
+                    "query_type": "settler_select_site",
+                    "tool_name": "get_settle_advisor",
+                    "arguments": {"unit_id": 7},
+                    "purpose": "legacy request",
+                },
+            )
+            if legacy_status is PlannerRequestStatus.AWAITING_INFORMATION
+            else ()
+        )
+        request = PlannerRequest(
+            planner_request_id=request_id,
+            game_session_id="opening",
+            turn_number=1,
+            observation_id=gap.observation_id,
+            decision_gap_ids=(gap.decision_gap_id,),
+            decision_group_id=group.decision_group_id,
+            input_projection_hash=group.input_projection_hash,
+            input_projection={
+                "decision_group_id": group.decision_group_id,
+                "gaps": [gap.model_dump(mode="json")["input_projection"]],
+            },
+            request_payload=old_payload,
+            plan_revision_refs=gap.relevant_plan_revisions,
+            policy_revision="planner-call-policy/v1",
+            approval_contract_hash=engine.planner_lifecycle._contract_hash(
+                [gap.model_dump(mode="json")["input_projection"]["approval"]]
+            ),
+            allowed_actions_hash=engine.planner_lifecycle._contract_hash(
+                sorted(engine.config.allowed_action_types)
+            ),
+            model_settings={"provider": "legacy"},
+            status=legacy_status,
+            created_at=datetime.now(UTC),
+            pending_information_requests=pending_information_requests,
+        )
+        engine.store.save_decision_gap(requested_gap, turn=1)
+        engine.store.save_planner_request(request)
+
+        superseded = await engine.tick()
+
+        assert (
+            superseded.workflow_tick["outcome"]
+            == TickOutcomeKind.DECISION_GAP_UPDATED
+        )
+        stored_old = engine.store.get_planner_request(request_id)
+        assert stored_old.status is PlannerRequestStatus.SUPERSEDED
+        assert stored_old.failure_category == "stale_planning_input"
+        assert engine.store.list_provider_attempts(request_id) == []
+        assert planner.summary.logical_requests == 0
+        assert planner.summary.provider_attempts == 0
+        reopened = engine.store.get_decision_gap("opening", gap.decision_gap_id)
+        assert reopened.status is DecisionGapStatus.OPEN
+        assert reopened.logical_request_id is None
+        assert reopened.reopen_reason == "planner input contract revision changed"
+
+        created = await engine.tick()
+
+        assert (
+            created.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        new_request = engine.store.get_planner_request(
+            created.workflow_tick["planner_request_id"]
+        )
+        assert new_request.policy_revision == PLANNER_INPUT_CONTRACT_REVISION
+        assert new_request.planner_request_id != request_id
+        assert {
+            "action_argument_contracts",
+            "action_entity_types",
+            "entity_id_arguments",
+            "condition_contracts",
+            "information_tool_arguments",
+        } <= set(new_request.request_payload["constraints"])
+        assert planner.summary.logical_requests == 0
+        assert planner.summary.provider_attempts == 0
+
+    asyncio.run(scenario())
 
 
 def test_ai_001_003_phase4_vertical_chain_and_zero_mutation(tmp_path):
@@ -1836,7 +1990,9 @@ def test_issue7_independent_gap_items_commit_partial_success(tmp_path):
             observation_id="obs-partial",
             decision_gap_ids=group.decision_gap_ids,
             decision_group_id=group.decision_group_id,
-            input_projection_hash=group.input_projection_hash,
+            input_projection_hash=engine.planner_lifecycle._planner_input_hash(
+                group.input_projection_hash
+            ),
             input_projection={
                 "decision_group_id": group.decision_group_id,
                 "gaps": [
@@ -1850,7 +2006,7 @@ def test_issue7_independent_gap_items_commit_partial_success(tmp_path):
                 for gap in requested_gaps
                 for revision in gap.relevant_plan_revisions
             ),
-            policy_revision="planner-call-policy/v1",
+            policy_revision=PLANNER_INPUT_CONTRACT_REVISION,
             approval_contract_hash=engine.planner_lifecycle._contract_hash(
                 approval_contract
             ),
@@ -2479,7 +2635,9 @@ def test_issue7_atomic_multi_gap_failure_persists_no_partial_outputs(tmp_path):
             observation_id="obs-atomic",
             decision_gap_ids=group.decision_gap_ids,
             decision_group_id=group.decision_group_id,
-            input_projection_hash=group.input_projection_hash,
+            input_projection_hash=engine.planner_lifecycle._planner_input_hash(
+                group.input_projection_hash
+            ),
             input_projection={
                 "decision_group_id": group.decision_group_id,
                 "gaps": [
@@ -2489,7 +2647,7 @@ def test_issue7_atomic_multi_gap_failure_persists_no_partial_outputs(tmp_path):
             },
             request_payload=provider_request.model_dump(mode="json"),
             plan_revision_refs=(),
-            policy_revision="planner-call-policy/v1",
+            policy_revision=PLANNER_INPUT_CONTRACT_REVISION,
             approval_contract_hash=engine.planner_lifecycle._contract_hash(
                 [
                     gap.model_dump(mode="json")["input_projection"]["approval"]
@@ -2569,11 +2727,13 @@ def test_issue7_turn_specific_active_request_expires_before_provider_call(tmp_pa
             observation_id="obs-tactical-request",
             decision_gap_ids=(gap.decision_gap_id,),
             decision_group_id=group.decision_group_id,
-            input_projection_hash=group.input_projection_hash,
+            input_projection_hash=engine.planner_lifecycle._planner_input_hash(
+                group.input_projection_hash
+            ),
             input_projection=gap.model_dump(mode="json")["input_projection"],
             request_payload=provider_request.model_dump(mode="json"),
             plan_revision_refs=gap.relevant_plan_revisions,
-            policy_revision="planner-call-policy/v1",
+            policy_revision=PLANNER_INPUT_CONTRACT_REVISION,
             approval_contract_hash=engine.planner_lifecycle._contract_hash(
                 [gap.model_dump(mode="json")["input_projection"]["approval"]]
             ),

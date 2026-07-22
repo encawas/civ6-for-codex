@@ -1,9 +1,15 @@
 import asyncio
+import json
 
 import pytest
 
 from civ6_workflow.models import EventLevel, GameEvent, RiskLevel
-from civ6_workflow.workflow_protocol import InformationRequest, WorkflowProtocolError
+from civ6_workflow.workflow_protocol import (
+    READ_ONLY_QUERY_SPECS,
+    InformationRequest,
+    WorkflowProtocolError,
+    information_tool_argument_contracts,
+)
 from civ6_workflow.workflow_queries import InformationQueryRouter
 
 
@@ -48,3 +54,34 @@ def test_non_read_only_query_is_rejected():
     )
     with pytest.raises(WorkflowProtocolError, match="non-whitelisted"):
         asyncio.run(router.execute([request]))
+
+
+def test_information_tool_argument_contracts_are_stable_and_complete():
+    contracts = information_tool_argument_contracts()
+
+    assert list(contracts) == sorted(contracts)
+    assert set(contracts) == set(READ_ONLY_QUERY_SPECS)
+    assert contracts["get_map_area"] == {
+        "required": ["center_x", "center_y"],
+        "optional": ["radius"],
+    }
+    for contract in contracts.values():
+        assert contract["required"] == sorted(contract["required"])
+        assert contract["optional"] == sorted(contract["optional"])
+
+    first = json.dumps(contracts, separators=(",", ":"))
+    second = json.dumps(
+        information_tool_argument_contracts(), separators=(",", ":")
+    )
+    assert first == second
+
+
+def test_information_tool_argument_contracts_are_defensive_copies():
+    first = information_tool_argument_contracts()
+    first["get_map_area"]["required"].append("pollution")
+
+    second = information_tool_argument_contracts()
+    assert second["get_map_area"]["required"] == ["center_x", "center_y"]
+    assert READ_ONLY_QUERY_SPECS["get_map_area"].required_arguments == frozenset(
+        {"center_x", "center_y"}
+    )
