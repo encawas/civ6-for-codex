@@ -26,6 +26,8 @@ from civ6_workflow.domain import (
     DecisionGapStatus,
     PlannerRequest,
     PlannerRequestStatus,
+    PlannerRequestTarget,
+    PlannerRequestTargetKind,
     ProviderAttemptStatus,
     LeaseValidationResult,
     ProviderAttempt,
@@ -36,6 +38,7 @@ from civ6_workflow.domain import (
     RuntimeState,
     TickOutcomeKind,
     SubjectRef,
+    canonical_json_hash,
 )
 from civ6_workflow.engine import (
     EngineConfig,
@@ -666,6 +669,69 @@ def _engine(tmp_path, planner):
     return engine, game, recording
 
 
+def test_nonlegacy_request_waits_before_legacy_stale_routing(tmp_path):
+    async def scenario():
+        snapshot = RuntimeSnapshot(
+            turn=1,
+            game_id="opening",
+            overview={"turn": 1, "player_id": 1, "num_cities": 1, "num_units": 0},
+            cities=[{"city_id": 1, "currently_building": "UNIT_SCOUT"}],
+            units=[],
+            blockers=[],
+        )
+        game = _Game(snapshot)
+        delegate = _ResolvingPlanner()
+        planner = RecordingPlanner(delegate)
+        store = WorkflowStore(tmp_path / "nonlegacy-guard.sqlite3")
+        engine = WorkflowEngine(
+            store=store,
+            game=game,
+            planner=planner,
+            config=EngineConfig(
+                execution_mode=ExecutionMode.AUTO,
+                auto_end_turn=False,
+                max_agent_calls_per_turn=1,
+            ),
+        )
+        request = PlannerRequest(
+            planner_request_id="mission-repair-pending",
+            game_session_id="opening",
+            turn_number=1,
+            observation_id="obs-before-phase1b",
+            target=PlannerRequestTarget(
+                kind=PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+                strategic_contract_id="contract-1",
+                base_contract_revision=1,
+                strategic_scope="research",
+            ),
+            input_projection_hash="repair-input",
+            policy_revision="stale-policy-that-must-not-be-checked",
+            model_settings={"provider": "test"},
+            status=PlannerRequestStatus.PENDING,
+            created_at=datetime.now(UTC),
+        )
+        store.save_planner_request(request)
+        budget_before = store.provider_budget_request_count_for_turn("opening", 1)
+
+        result = await engine.tick()
+
+        assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert result.workflow_tick["blocking_reason"] == (
+            "non-legacy planner request routing is not enabled before Phase 1B"
+        )
+        assert store.get_planner_request(request.planner_request_id) == request
+        assert store.list_provider_attempts(request.planner_request_id) == []
+        assert store.list_information_rounds(request.planner_request_id) == []
+        assert store.list_decision_gaps("opening") == []
+        assert store.list_plan_leases("opening") == []
+        assert store.provider_budget_request_count_for_turn("opening", 1) == (
+            budget_before
+        )
+        assert delegate.calls == 0
+
+    asyncio.run(scenario())
+
+
 _PLANNER_CONTRACT_KEYS = {
     "action_argument_contracts",
     "action_entity_types",
@@ -1262,28 +1328,31 @@ def test_planner_input_hash_versions_call_policy_and_contract(tmp_path):
     assert len(set(hashes)) == 3
 
     now = datetime.now(UTC)
+    target_keys = []
     for index, (revision, input_hash) in enumerate(
         zip(revisions, hashes, strict=True), start=1
     ):
-        engine.store.save_planner_request(
-            PlannerRequest(
-                planner_request_id=f"versioned-request-{index}",
-                game_session_id="opening",
-                turn_number=1,
-                observation_id="obs-versioned",
-                decision_gap_ids=("gap-versioned",),
-                decision_group_id="group-versioned",
-                input_projection_hash=input_hash,
-                policy_revision=revision,
-                model_settings={"provider": "test"},
-                status=PlannerRequestStatus.PENDING,
-                created_at=now,
-            )
+        request = PlannerRequest(
+            planner_request_id=f"versioned-request-{index}",
+            game_session_id="opening",
+            turn_number=1,
+            observation_id="obs-versioned",
+            decision_gap_ids=("gap-versioned",),
+            decision_group_id="group-versioned",
+            input_projection_hash=input_hash,
+            policy_revision=revision,
+            model_settings={"provider": "test"},
+            status=PlannerRequestStatus.PENDING,
+            created_at=now,
         )
+        target_keys.append(request.target.target_key)
+        engine.store.save_planner_request(request)
 
-    for index, input_hash in enumerate(hashes, start=1):
+    for index, (target_key, input_hash) in enumerate(
+        zip(target_keys, hashes, strict=True), start=1
+    ):
         stored = engine.store.planner_request_for_input(
-            "opening", "group-versioned", input_hash
+            "opening", target_key, input_hash
         )
         assert stored.planner_request_id == f"versioned-request-{index}"
 
@@ -1302,6 +1371,21 @@ def test_ai_001_003_phase4_vertical_chain_and_zero_mutation(tmp_path):
         assert (
             second.workflow_tick["outcome"]
             == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        created_request = engine.store.get_planner_request(
+            second.workflow_tick["planner_request_id"]
+        )
+        assert (
+            created_request.target.kind
+            is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+        )
+        assert created_request.decision_group_id is not None
+        assert created_request.decision_gap_ids == tuple(
+            second.workflow_tick["decision_gap_ids"]
+        )
+        assert (
+            second.workflow_tick["request_target_kind"]
+            == PlannerRequestTargetKind.LEGACY_DECISION_GROUP
         )
         assert planner.summary.logical_requests == 0
 
@@ -1754,6 +1838,11 @@ def test_issue7_post_commit_crash_does_not_repeat_provider(tmp_path):
             engine.store.get_planner_request(request_id).status
             is PlannerRequestStatus.COMPLETED
         )
+        committed_request = engine.store.get_planner_request(request_id)
+        assert committed_request.response_payload is not None
+        assert committed_request.response_hash == canonical_json_hash(
+            committed_request.response_payload
+        )
         assert (
             engine.store.list_provider_attempts(request_id)[0].status
             is ProviderAttemptStatus.SUCCEEDED
@@ -1767,6 +1856,7 @@ def test_issue7_post_commit_crash_does_not_repeat_provider(tmp_path):
         )
         await restarted.tick()
         assert delegate.calls == calls
+        assert restarted.store.get_planner_request(request_id) == committed_request
 
     asyncio.run(scenario())
 
@@ -2096,6 +2186,7 @@ def test_issue7_v6_phase4_identity_migration_is_idempotent(tmp_path):
                 "SELECT request_json FROM logical_planner_requests"
             ).fetchone()["request_json"]
         )
+        request_json.pop("target")
         request_json["decision_group_id"] = old_group_id
         request_json["decision_gap_ids"] = [old_gap_id]
         conn.execute(
@@ -2128,7 +2219,7 @@ def test_issue7_v6_phase4_identity_migration_is_idempotent(tmp_path):
     again = WorkflowStore(path)
     assert again.get_planner_request(request.planner_request_id) == migrated_request
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
 
 
 def _settler_domain_lease_for_completion():
@@ -2501,6 +2592,17 @@ def test_issue7_independent_gap_items_commit_partial_success(tmp_path):
         )
         stored_request = engine.store.get_planner_request(logical_id)
         assert stored_request.status is PlannerRequestStatus.PARTIALLY_COMPLETED
+        assert stored_request.response_hash == canonical_json_hash(
+            stored_request.response_payload
+        )
+        assert {
+            task["task_id"] for task in stored_request.response_payload["tasks"]
+        } == {"produce-A", "produce-B"}
+        assert [
+            attempt.status
+            for attempt in engine.store.list_provider_attempts(logical_id)
+        ] == [ProviderAttemptStatus.SUCCEEDED]
+        assert result.workflow_tick["planner_request_id"] == logical_id
         stored_gaps = {
             gap.scope: gap for gap in engine.store.list_decision_gaps("opening")
         }

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,12 +27,15 @@ from .domain import (
     PlanLeaseStatus,
     PlannerRequest,
     PlannerRequestStatus,
+    PlannerRequestTarget,
+    PlannerRequestTargetKind,
     ProviderAttempt,
     RuntimeState,
     TurnTransitionConfirmedTick,
     WorkflowTick,
     validate_workflow_tick,
     ProviderAttemptStatus,
+    canonical_json,
 )
 from .models import (
     AgentRequest,
@@ -187,6 +190,8 @@ CREATE TABLE IF NOT EXISTS decision_groups (
 CREATE TABLE IF NOT EXISTS logical_planner_requests (
     planner_request_id TEXT PRIMARY KEY,
     game_id TEXT NOT NULL,
+    request_target_kind TEXT NOT NULL,
+    request_target_key TEXT NOT NULL,
     decision_group_id TEXT,
     turn INTEGER NOT NULL,
     status TEXT NOT NULL,
@@ -195,8 +200,7 @@ CREATE TABLE IF NOT EXISTS logical_planner_requests (
     decision_gap_ids_json TEXT NOT NULL,
     request_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    completed_at TEXT,
-    UNIQUE (game_id, decision_group_id, input_projection_hash)
+    completed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_logical_requests_game_status
@@ -412,6 +416,12 @@ class WorkflowStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version > 8:
+                raise ValueError(
+                    f"unsupported workflow database version {version}; "
+                    "maximum supported version is 8"
+                )
             conn.executescript(SCHEMA)
             self._migrate(conn)
 
@@ -610,9 +620,34 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version < 7:
+        if version > 8:
+            raise ValueError(
+                f"unsupported workflow database version {version}; "
+                "maximum supported version is 8"
+            )
+        upgraded_from_pre_v7 = version < 7
+        if upgraded_from_pre_v7:
             WorkflowStore._migrate_phase4_v7(conn)
-        conn.execute("PRAGMA user_version=7")
+            conn.execute("PRAGMA user_version=7")
+            version = 7
+        if version < 8:
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                WorkflowStore._migrate_phase1a_v8(
+                    conn,
+                    validate_existing_target_columns=not upgraded_from_pre_v7,
+                )
+                conn.execute("PRAGMA user_version=8")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
+        else:
+            WorkflowStore._validate_phase1a_v8(conn)
 
     @staticmethod
     def _migrate_phase4_v7(conn: sqlite3.Connection) -> None:
@@ -799,6 +834,266 @@ class WorkflowStore:
                     "UPDATE workflow_ticks SET tick_json=? WHERE tick_id=?",
                     (WorkflowStore._dump(payload), row["tick_id"]),
                 )
+
+    @classmethod
+    def _planner_request_from_row(
+        cls, row: Mapping[str, Any]
+    ) -> PlannerRequest:
+        stored = dict(row)
+        normalized = cls._normalize_planner_request_row(stored)
+        for column in (
+            "request_target_kind",
+            "request_target_key",
+            "decision_group_id",
+            "decision_gap_ids_json",
+            "request_json",
+        ):
+            if stored.get(column) != normalized.get(column):
+                request_id = stored.get("planner_request_id", "<unknown>")
+                raise ValueError(
+                    f"logical PlannerRequest {request_id} {column} "
+                    "is not canonical"
+                )
+        return PlannerRequest.model_validate_json(str(stored["request_json"]))
+
+    @classmethod
+    def _normalize_planner_request_row(
+        cls,
+        row: Mapping[str, Any],
+        *,
+        validate_existing_target_columns: bool = True,
+    ) -> dict[str, Any]:
+        """Canonicalize one v7/v8 request row for migration and replay import."""
+
+        normalized = dict(row)
+        try:
+            request = PlannerRequest.model_validate_json(
+                str(normalized["request_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid logical PlannerRequest JSON") from exc
+
+        relational_checks = {
+            "game_id": request.game_session_id,
+            "input_projection_hash": request.input_projection_hash,
+            "input_projection_version": request.input_projection_version,
+            "status": request.status.value,
+        }
+        for column, expected in relational_checks.items():
+            if column in normalized and str(normalized[column]) != expected:
+                raise ValueError(
+                    f"logical PlannerRequest {request.planner_request_id} "
+                    f"{column} conflicts with request_json"
+                )
+
+        try:
+            relation_gap_ids = json.loads(
+                str(normalized.get("decision_gap_ids_json", "[]"))
+            )
+        except Exception as exc:
+            raise ValueError("invalid decision_gap_ids_json") from exc
+        if not isinstance(relation_gap_ids, list):
+            raise ValueError("decision_gap_ids_json must contain a JSON array")
+        relation_group_id = normalized.get("decision_group_id")
+        if request.target.kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+            relation_target = PlannerRequestTarget(
+                kind=PlannerRequestTargetKind.LEGACY_DECISION_GROUP,
+                decision_group_id=(
+                    None if relation_group_id is None else str(relation_group_id)
+                ),
+                decision_gap_ids=tuple(relation_gap_ids),
+            )
+            if (
+                relation_target.decision_group_id != request.decision_group_id
+                or relation_target.decision_gap_ids != request.decision_gap_ids
+            ):
+                raise ValueError(
+                    f"logical PlannerRequest {request.planner_request_id} "
+                    "legacy target columns conflict with request_json"
+                )
+        elif relation_group_id is not None or relation_gap_ids:
+            raise ValueError(
+                f"logical PlannerRequest {request.planner_request_id} "
+                "non-legacy target has legacy relational identity"
+            )
+
+        expected_kind = request.target.kind.value
+        expected_key = request.target.target_key
+        for column, expected in (
+            ("request_target_kind", expected_kind),
+            ("request_target_key", expected_key),
+        ):
+            existing = normalized.get(column)
+            if (
+                validate_existing_target_columns
+                and existing is not None
+                and str(existing) != expected
+            ):
+                raise ValueError(
+                    f"logical PlannerRequest {request.planner_request_id} "
+                    f"{column} conflicts with canonical target"
+                )
+
+        normalized.update(
+            {
+                "request_target_kind": expected_kind,
+                "request_target_key": expected_key,
+                "decision_group_id": request.decision_group_id,
+                "decision_gap_ids_json": canonical_json(
+                    list(request.decision_gap_ids)
+                ),
+                "request_json": canonical_json(request.model_dump(mode="json")),
+            }
+        )
+        return normalized
+
+    @classmethod
+    def _migrate_phase1a_v8(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        validate_existing_target_columns: bool = True,
+    ) -> None:
+        normalized_rows = [
+            cls._normalize_planner_request_row(
+                row,
+                validate_existing_target_columns=validate_existing_target_columns,
+            )
+            for row in conn.execute(
+                "SELECT * FROM logical_planner_requests "
+                "ORDER BY planner_request_id"
+            ).fetchall()
+        ]
+        identities: set[tuple[str, str, str]] = set()
+        for row in normalized_rows:
+            identity = (
+                str(row["game_id"]),
+                str(row["request_target_key"]),
+                str(row["input_projection_hash"]),
+            )
+            if identity in identities:
+                raise ValueError(
+                    "v8 migration found duplicate canonical PlannerRequest identity"
+                )
+            identities.add(identity)
+
+        conn.execute("DROP TABLE IF EXISTS logical_planner_requests_v8")
+        conn.execute(
+            """
+            CREATE TABLE logical_planner_requests_v8 (
+                planner_request_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                request_target_kind TEXT NOT NULL,
+                request_target_key TEXT NOT NULL,
+                decision_group_id TEXT,
+                turn INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                input_projection_hash TEXT NOT NULL,
+                input_projection_version TEXT NOT NULL,
+                decision_gap_ids_json TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+        for row in normalized_rows:
+            conn.execute(
+                """
+                INSERT INTO logical_planner_requests_v8(
+                    planner_request_id, game_id, request_target_kind,
+                    request_target_key, decision_group_id, turn, status,
+                    input_projection_hash, input_projection_version,
+                    decision_gap_ids_json, request_json, created_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["planner_request_id"],
+                    row["game_id"],
+                    row["request_target_kind"],
+                    row["request_target_key"],
+                    row["decision_group_id"],
+                    row["turn"],
+                    row["status"],
+                    row["input_projection_hash"],
+                    row["input_projection_version"],
+                    row["decision_gap_ids_json"],
+                    row["request_json"],
+                    row["created_at"],
+                    row["completed_at"],
+                ),
+            )
+
+        conn.execute("DROP TABLE logical_planner_requests")
+        conn.execute(
+            "ALTER TABLE logical_planner_requests_v8 "
+            "RENAME TO logical_planner_requests"
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_logical_requests_game_status
+            ON logical_planner_requests (game_id, status, turn)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_logical_requests_target_input
+            ON logical_planner_requests(
+                game_id, request_target_key, input_projection_hash
+            )
+            """
+        )
+        if conn.execute("PRAGMA foreign_key_check").fetchall():
+            raise ValueError("v8 migration would violate PlannerRequest foreign keys")
+        cls._validate_phase1a_v8(conn)
+
+    @classmethod
+    def _validate_phase1a_v8(cls, conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(logical_planner_requests)"
+            ).fetchall()
+        }
+        required = {"request_target_kind", "request_target_key"}
+        if not required.issubset(columns):
+            raise ValueError("workflow database v8 is missing PlannerRequest columns")
+        null_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS value FROM logical_planner_requests
+                WHERE request_target_kind IS NULL OR request_target_key IS NULL
+                   OR request_target_kind='' OR request_target_key=''
+                """
+            ).fetchone()["value"]
+        )
+        if null_count:
+            raise ValueError("workflow database v8 has incomplete PlannerRequest keys")
+        for row in conn.execute(
+            "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
+        ).fetchall():
+            cls._planner_request_from_row(row)
+
+        indexes = {
+            str(row["name"]): int(row["unique"])
+            for row in conn.execute(
+                "PRAGMA index_list(logical_planner_requests)"
+            ).fetchall()
+        }
+        index_name = "idx_logical_requests_target_input"
+        if indexes.get(index_name) != 1:
+            raise ValueError("workflow database v8 is missing target identity index")
+        index_columns = [
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+        ]
+        if index_columns != [
+            "game_id",
+            "request_target_key",
+            "input_projection_hash",
+        ]:
+            raise ValueError("workflow database v8 target identity index is invalid")
 
     @staticmethod
     def _repair_failed_attempt_tasks(conn: sqlite3.Connection) -> None:
@@ -2745,13 +3040,42 @@ class WorkflowStore:
     def _save_planner_request_in_connection(
         conn: sqlite3.Connection, request: PlannerRequest
     ) -> None:
+        existing_row = conn.execute(
+            """
+            SELECT * FROM logical_planner_requests
+            WHERE planner_request_id=?
+            """,
+            (request.planner_request_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = WorkflowStore._planner_request_from_row(existing_row)
+            immutable_identity = (
+                existing.game_session_id,
+                existing.target,
+                existing.input_projection_hash,
+                existing.input_projection_version,
+                existing.created_at,
+            )
+            candidate_identity = (
+                request.game_session_id,
+                request.target,
+                request.input_projection_hash,
+                request.input_projection_version,
+                request.created_at,
+            )
+            if candidate_identity != immutable_identity:
+                raise ValueError(
+                    "PlannerRequest identity fields are immutable after creation"
+                )
+
         conn.execute(
             """
             INSERT INTO logical_planner_requests(
-                planner_request_id, game_id, decision_group_id, turn, status,
+                planner_request_id, game_id, request_target_kind,
+                request_target_key, decision_group_id, turn, status,
                 input_projection_hash, input_projection_version,
                 decision_gap_ids_json, request_json, created_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(planner_request_id) DO UPDATE SET
                 status=excluded.status,
                 request_json=excluded.request_json,
@@ -2760,13 +3084,15 @@ class WorkflowStore:
             (
                 request.planner_request_id,
                 request.game_session_id,
+                request.target.kind.value,
+                request.target.target_key,
                 request.decision_group_id,
                 request.turn_number,
                 request.status.value,
                 request.input_projection_hash,
                 request.input_projection_version,
-                WorkflowStore._dump(list(request.decision_gap_ids)),
-                request.model_dump_json(),
+                canonical_json(list(request.decision_gap_ids)),
+                canonical_json(request.model_dump(mode="json")),
                 request.created_at.isoformat(),
                 (
                     None
@@ -2840,16 +3166,12 @@ class WorkflowStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT request_json FROM logical_planner_requests
+                SELECT * FROM logical_planner_requests
                 WHERE planner_request_id=?
                 """,
                 (planner_request_id,),
             ).fetchone()
-        return (
-            None
-            if row is None
-            else PlannerRequest.model_validate_json(row["request_json"])
-        )
+        return None if row is None else self._planner_request_from_row(row)
 
     def active_planner_request(self, game_id: str) -> PlannerRequest | None:
         terminal = tuple(
@@ -2867,38 +3189,30 @@ class WorkflowStore:
         with self._connect() as conn:
             row = conn.execute(
                 f"""
-                SELECT request_json FROM logical_planner_requests
+                SELECT * FROM logical_planner_requests
                 WHERE game_id=? AND status NOT IN ({placeholders})
                 ORDER BY created_at LIMIT 1
                 """,
                 (game_id, *terminal),
             ).fetchone()
-        return (
-            None
-            if row is None
-            else PlannerRequest.model_validate_json(row["request_json"])
-        )
+        return None if row is None else self._planner_request_from_row(row)
 
     def planner_request_for_input(
         self,
         game_id: str,
-        decision_group_id: str,
+        request_target_key: str,
         input_projection_hash: str,
     ) -> PlannerRequest | None:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT request_json FROM logical_planner_requests
-                WHERE game_id=? AND decision_group_id=?
+                SELECT * FROM logical_planner_requests
+                WHERE game_id=? AND request_target_key=?
                   AND input_projection_hash=?
                 """,
-                (game_id, decision_group_id, input_projection_hash),
+                (game_id, request_target_key, input_projection_hash),
             ).fetchone()
-        return (
-            None
-            if row is None
-            else PlannerRequest.model_validate_json(row["request_json"])
-        )
+        return None if row is None else self._planner_request_from_row(row)
 
     def logical_request_count_for_turn(self, game_id: str, turn: int) -> int:
         with self._connect() as conn:
@@ -2924,7 +3238,7 @@ class WorkflowStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT request.request_json,
+                SELECT request.*,
                        COUNT(attempt.provider_attempt_id) AS attempt_count,
                        SUM(
                            CASE
@@ -2944,7 +3258,7 @@ class WorkflowStore:
 
         consumed = 0
         for row in rows:
-            request = PlannerRequest.model_validate_json(row["request_json"])
+            request = self._planner_request_from_row(row)
             attempt_count = int(row["attempt_count"])
             if request.status is PlannerRequestStatus.SUPERSEDED:
                 if attempt_count == 0:
@@ -3449,6 +3763,8 @@ class WorkflowStore:
                 for row in rows:
                     if not isinstance(row, dict) or not row:
                         raise ValueError(f"invalid replay row for {table}")
+                    if table == "logical_planner_requests":
+                        row = self._normalize_planner_request_row(row)
                     unknown = set(row) - known_columns
                     if unknown:
                         raise ValueError(
@@ -3457,8 +3773,13 @@ class WorkflowStore:
                     columns = sorted(row)
                     placeholders = ",".join("?" for _ in columns)
                     column_sql = ",".join(columns)
+                    insert = (
+                        "INSERT"
+                        if table == "logical_planner_requests"
+                        else "INSERT OR REPLACE"
+                    )
                     conn.execute(
-                        f"INSERT OR REPLACE INTO {table} ({column_sql}) "
+                        f"{insert} INTO {table} ({column_sql}) "
                         f"VALUES ({placeholders})",
                         tuple(row[column] for column in columns),
                     )
