@@ -503,7 +503,7 @@ def test_act_006_007_retry_registry_is_explicit_and_not_request_deduped():
         spec.retry_classification is not RetryClassification.IDEMPOTENT_OR_DEDUPED
         for spec in ACTION_REGISTRY.values()
     )
-    with pytest.raises(TypeError, match="frozen"):
+    with pytest.raises(TypeError):
         ACTION_REGISTRY["late_action"] = ACTION_REGISTRY["unit_skip"]
 
 

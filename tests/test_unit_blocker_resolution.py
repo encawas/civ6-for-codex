@@ -117,3 +117,33 @@ def test_unit_move_conditions_verify_remaining_orders():
     assert evaluator.evaluate({"type": "unit_has_moves", "unit_id": 9}, active).valid
     assert not evaluator.evaluate({"type": "unit_no_moves", "unit_id": 9}, active).valid
     assert evaluator.evaluate({"type": "unit_no_moves", "unit_id": 9}, spent).valid
+
+
+def test_canonical_evaluator_handles_settler_movement_evidence():
+    evaluator = ConditionEvaluator()
+    original = _snapshot(
+        {
+            "unit_id": 9,
+            "unit_type": "UNIT_SETTLER",
+            "x": 4,
+            "y": 5,
+            "moves_remaining": 2,
+        }
+    )
+    moved = original.model_copy(
+        update={
+            "units": [
+                {
+                    "unit_id": 9,
+                    "unit_type": "UNIT_SETTLER",
+                    "x": 5,
+                    "y": 5,
+                    "moves_remaining": 1,
+                }
+            ]
+        }
+    )
+    condition = {"type": "unit_moved_from", "unit_id": 9, "x": 4, "y": 5}
+
+    assert not evaluator.evaluate(condition, original).valid
+    assert evaluator.evaluate(condition, moved).valid

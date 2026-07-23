@@ -23,10 +23,7 @@ from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.progression import ProgressionRuleCompiler
 from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
-from civ6_workflow.workflow_conditions import (
-    BaseConditionEvaluator,
-    WorkflowConditionEvaluator,
-)
+from civ6_workflow.conditions import ConditionEvaluator
 
 
 EMPTY_PRODUCTION_VALUES = [
@@ -160,7 +157,6 @@ def test_obs_003_raw_payload_is_audit_only_and_rules_have_no_empty_spelling_list
     repository = Path(__file__).parents[1]
     rule_files = [
         repository / "src" / "civ6_workflow" / "rules.py",
-        repository / "src" / "civ6_workflow" / "safe_rules.py",
         repository / "src" / "civ6_workflow" / "progression.py",
     ]
 
@@ -478,7 +474,7 @@ def test_evaluate_all_normalizes_once_for_multiple_conditions(monkeypatch):
     call_count = _count_normalizations(monkeypatch)
     snapshot = _city_snapshot("nothing")
 
-    result = BaseConditionEvaluator().evaluate_all(
+    result = ConditionEvaluator().evaluate_all(
         [
             {"type": "turn_equals", "turn": 10},
             {
@@ -498,7 +494,7 @@ def test_evaluate_all_normalizes_once_for_multiple_conditions(monkeypatch):
 def test_workflow_parent_condition_normalizes_once(monkeypatch):
     call_count = _count_normalizations(monkeypatch)
 
-    result = WorkflowConditionEvaluator().evaluate(
+    result = ConditionEvaluator().evaluate(
         {"type": "turn_equals", "turn": 10},
         _city_snapshot("nothing"),
     )
@@ -510,7 +506,7 @@ def test_workflow_parent_condition_normalizes_once(monkeypatch):
 def test_entity_exists_does_not_normalize_twice(monkeypatch):
     call_count = _count_normalizations(monkeypatch)
 
-    result = BaseConditionEvaluator().evaluate(
+    result = ConditionEvaluator().evaluate(
         {"type": "entity_exists", "entity_type": "city", "entity_id": 1},
         _city_snapshot("nothing"),
     )
@@ -614,7 +610,7 @@ def test_compatibility_projection_preserves_unknown_fields_and_typed_facts():
 def test_field_conditions_read_normalized_projection_not_raw_audit():
     raw = _city_snapshot("nothing")
     observation = normalize_runtime_snapshot(raw)
-    evaluator = BaseConditionEvaluator()
+    evaluator = ConditionEvaluator()
 
     assert (
         observation.canonical.raw_observation["cities"][0]["currently_building"]

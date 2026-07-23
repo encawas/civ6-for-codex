@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from .models import EventLevel, GameEvent, RiskLevel, RuntimeSnapshot
-from .store import WorkflowStore
+from .ports import WorkflowStorePort
 
 
 def recover_turn_rewind(
-    store: WorkflowStore, snapshot: RuntimeSnapshot
+    store: WorkflowStorePort, snapshot: RuntimeSnapshot
 ) -> GameEvent | None:
     """Clear future-derived workflow state when a loaded save moves backwards.
 

@@ -8,7 +8,11 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Iterable, Iterator
 
-from .models import ActionResult, AgentRequest, PlanBundle, RuntimeSnapshot, StoredTask
+from .models import ActionResult, RuntimeSnapshot, StoredTask
+from .workflow_protocol import (
+    WorkflowAgentRequest as AgentRequest,
+    WorkflowPlanBundle as PlanBundle,
+)
 
 
 class GameCallKind(StrEnum):

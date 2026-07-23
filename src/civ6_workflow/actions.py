@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, MutableMapping
 from dataclasses import InitVar, dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -73,86 +72,57 @@ class ActionSpec:
         return {**translated, **self.fixed_arguments}
 
 
-_ACTION_REGISTRY = {
-    "city_set_production": ActionSpec(
-        tool_name="set_city_production",
-        required_arguments=frozenset({"city_id", "item_type", "item_name"}),
-        optional_arguments=frozenset({"target_x", "target_y"}),
-    ),
-    "set_research": ActionSpec(
-        tool_name="set_research",
-        required_arguments=frozenset({"tech_or_civic"}),
-        fixed_arguments={"category": "tech"},
-    ),
-    "set_civic": ActionSpec(
-        tool_name="set_research",
-        required_arguments=frozenset({"tech_or_civic"}),
-        fixed_arguments={"category": "civic"},
-    ),
-    "unit_move": ActionSpec(
-        tool_name="unit_action",
-        required_arguments=frozenset({"unit_id", "target_x", "target_y"}),
-        fixed_arguments={"action": "move"},
-    ),
-    "builder_improve": ActionSpec(
-        tool_name="unit_action",
-        required_arguments=frozenset({"unit_id", "improvement_type"}),
-        fixed_arguments={"action": "improve"},
-        argument_aliases={"improvement_type": "improvement"},
-        retry_classification=RetryClassification.NEVER_BLIND_RETRY,
-    ),
-    "unit_found_city": ActionSpec(
-        tool_name="unit_action",
-        required_arguments=frozenset({"unit_id"}),
-        fixed_arguments={"action": "found_city"},
-        retry_classification=RetryClassification.NEVER_BLIND_RETRY,
-    ),
-    "unit_heal": ActionSpec(
-        tool_name="unit_action",
-        required_arguments=frozenset({"unit_id"}),
-        fixed_arguments={"action": "heal"},
-    ),
-    "unit_fortify": ActionSpec(
-        tool_name="unit_action",
-        required_arguments=frozenset({"unit_id"}),
-        fixed_arguments={"action": "fortify"},
-    ),
-    "unit_skip": ActionSpec(
-        tool_name="unit_action",
-        required_arguments=frozenset({"unit_id"}),
-        fixed_arguments={"action": "skip"},
-    ),
-}
-
-
-class BootstrapActionRegistry(MutableMapping[str, ActionSpec]):
-    """One canonical registry that freezes after the legacy bootstrap write."""
-
-    def __init__(self, initial: Mapping[str, ActionSpec]):
-        self._items = dict(initial)
-        self._frozen = False
-
-    def __getitem__(self, key: str) -> ActionSpec:
-        return self._items[key]
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._items)
-
-    def __len__(self) -> int:
-        return len(self._items)
-
-    def __setitem__(self, key: str, value: ActionSpec) -> None:
-        if self._frozen or key != "unit_found_city":
-            raise TypeError("action registry is frozen after bootstrap")
-        self._items[key] = value
-        self._frozen = True
-
-    def __delitem__(self, key: str) -> None:
-        raise TypeError("action registry is frozen after bootstrap")
-
-
-ACTION_REGISTRY: MutableMapping[str, ActionSpec] = BootstrapActionRegistry(
-    _ACTION_REGISTRY
+ACTION_REGISTRY: Mapping[str, ActionSpec] = MappingProxyType(
+    {
+        "city_set_production": ActionSpec(
+            tool_name="set_city_production",
+            required_arguments=frozenset({"city_id", "item_type", "item_name"}),
+            optional_arguments=frozenset({"target_x", "target_y"}),
+        ),
+        "set_research": ActionSpec(
+            tool_name="set_research",
+            required_arguments=frozenset({"tech_or_civic"}),
+            fixed_arguments={"category": "tech"},
+        ),
+        "set_civic": ActionSpec(
+            tool_name="set_research",
+            required_arguments=frozenset({"tech_or_civic"}),
+            fixed_arguments={"category": "civic"},
+        ),
+        "unit_move": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id", "target_x", "target_y"}),
+            fixed_arguments={"action": "move"},
+        ),
+        "builder_improve": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id", "improvement_type"}),
+            fixed_arguments={"action": "improve"},
+            argument_aliases={"improvement_type": "improvement"},
+            retry_classification=RetryClassification.NEVER_BLIND_RETRY,
+        ),
+        "unit_found_city": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id"}),
+            fixed_arguments={"action": "found_city"},
+            retry_classification=RetryClassification.NEVER_BLIND_RETRY,
+        ),
+        "unit_heal": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id"}),
+            fixed_arguments={"action": "heal"},
+        ),
+        "unit_fortify": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id"}),
+            fixed_arguments={"action": "fortify"},
+        ),
+        "unit_skip": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id"}),
+            fixed_arguments={"action": "skip"},
+        ),
+    }
 )
 
 END_TURN_ACTION_SPEC = ActionSpec(

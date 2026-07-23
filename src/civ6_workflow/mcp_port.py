@@ -5,7 +5,7 @@ import os
 import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
 from .actions import ActionValidationError, resolve_action
 from .domain.observations import SlotState, normalize_slot
@@ -15,7 +15,18 @@ from .models import (
     RuntimeSnapshot,
     StoredTask,
 )
+from .ports import (
+    BoundedGamePort as BoundedGamePort,
+    GamePort as GamePort,
+    MutationBudget as MutationBudget,
+    MutationBudgetExceeded as MutationBudgetExceeded,
+)
 from .state_api import Civ6StateApi
+from .workflow_protocol import (
+    READ_ONLY_QUERY_SPECS,
+    InformationRequest,
+    validate_information_request,
+)
 
 
 @dataclass(slots=True)
@@ -23,20 +34,6 @@ class McpServerConfig:
     command: str = "civ-mcp"
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-
-
-class GamePort(Protocol):
-    call_count: int
-
-    async def read_snapshot(
-        self, *, include_units: bool = False
-    ) -> RuntimeSnapshot: ...
-
-    async def execute_task(self, task: StoredTask) -> ActionResult: ...
-
-    async def end_turn(self, reflections: dict[str, str]) -> ActionResult: ...
-
-    async def list_tools(self) -> set[str]: ...
 
 
 _EMPTY_REFLECTIONS_RESPONSE = re.compile(
@@ -47,10 +44,6 @@ _EMPTY_REFLECTIONS_RESPONSE = re.compile(
 )
 _CANNOT_END_TURN_RESPONSE = re.compile(r"^Cannot end turn: .+$", re.DOTALL)
 _TURN_PAUSED_RESPONSE = re.compile(r"^Turn paused(?: —| -|:).+$", re.DOTALL)
-
-
-class MutationBudgetExceeded(RuntimeError):
-    pass
 
 
 class McpToolRejectedError(RuntimeError):
@@ -66,45 +59,6 @@ class McpToolRejectedError(RuntimeError):
         super().__init__(message)
         self.tool_name = tool_name
         self.rejection_code = rejection_code
-
-
-@dataclass(slots=True)
-class MutationBudget:
-    limit: int = 1
-    used: int = 0
-
-    def consume(self, operation: str) -> None:
-        if self.used >= self.limit:
-            raise MutationBudgetExceeded(
-                f"mutation budget exhausted before {operation}"
-            )
-        self.used += 1
-
-
-class BoundedGamePort:
-    """Per-tick structural guard around every mutating game-port call."""
-
-    def __init__(self, delegate: GamePort, budget: MutationBudget):
-        self.delegate = delegate
-        self.budget = budget
-
-    @property
-    def call_count(self) -> int:
-        return self.delegate.call_count
-
-    async def read_snapshot(self, *, include_units: bool = False) -> RuntimeSnapshot:
-        return await self.delegate.read_snapshot(include_units=include_units)
-
-    async def execute_task(self, task: StoredTask) -> ActionResult:
-        self.budget.consume(task.action_type)
-        return await self.delegate.execute_task(task)
-
-    async def end_turn(self, reflections: dict[str, str] | None = None) -> ActionResult:
-        self.budget.consume("end_turn")
-        return await self.delegate.end_turn(reflections or {})
-
-    async def list_tools(self) -> set[str]:
-        return await self.delegate.list_tools()
 
 
 class Civ6McpClient:
@@ -310,7 +264,7 @@ class Civ6GamePort:
                 {"type": "city_no_production", "city_ids": missing_production}
             )
 
-        return RuntimeSnapshot(
+        snapshot = RuntimeSnapshot(
             turn=turn,
             game_id=game_id,
             overview=self._ensure_dict(overview),
@@ -322,6 +276,10 @@ class Civ6GamePort:
             units=units,
             blockers=blockers,
         )
+        if snapshot.units is not None or not self._has_unit_blocker(snapshot.blockers):
+            return snapshot
+        units = await self.state_api.get("/api/units")
+        return snapshot.model_copy(update={"units": units})
 
     async def execute_task(self, task: StoredTask) -> ActionResult:
         try:
@@ -350,8 +308,11 @@ class Civ6GamePort:
         except Exception as exc:
             return ActionResult(
                 success=False,
-                message=str(exc),
-                details={"error_type": type(exc).__name__},
+                message=f"{type(exc).__name__}: {exc}",
+                details={
+                    "tool_name": tool_name,
+                    "error_type": type(exc).__name__,
+                },
                 delivery_status=MutationDeliveryStatus.UNKNOWN,
             )
         return self._normalize_action_result(raw)
@@ -386,6 +347,32 @@ class Civ6GamePort:
                 delivery_status=MutationDeliveryStatus.UNKNOWN,
             )
         return self._normalize_action_result(raw)
+
+    async def query_tool(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> Any:
+        if name not in READ_ONLY_QUERY_SPECS:
+            raise RuntimeError(f"read-only workflow query is not allowed: {name}")
+        request = InformationRequest(
+            event_dedupe_key="internal-query-validation",
+            query_type=name,
+            tool_name=name,
+            arguments=arguments or {},
+            purpose="Validate and execute a focused read-only workflow query.",
+        )
+        validate_information_request(request)
+        available = await self.list_tools()
+        if name not in available:
+            raise RuntimeError(f"civ6-mcp is missing read-only query tool: {name}")
+        return await self.client.call_tool(name, arguments or {})
+
+    @staticmethod
+    def _has_unit_blocker(blockers: Any) -> bool:
+        return any(
+            isinstance(blocker, dict)
+            and str(blocker.get("blocking_type", "")) == "ENDTURN_BLOCKING_UNITS"
+            for blocker in blockers
+        )
 
     @staticmethod
     def _normalize_action_result(raw: Any) -> ActionResult:

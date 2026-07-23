@@ -9,20 +9,16 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .actions import ACTION_REGISTRY
-from .codex_planner import CodexPlanner
-from .config import AppConfig, load_config
-from .engine import EngineConfig, WorkflowEngine
-from .mcp_port import Civ6GamePort, Civ6McpClient
-from .models import ExecutionMode, RuntimeSnapshot, TaskStatus
-from .replay import (
-    RecordingGamePort,
-    RecordingPlanner,
-    ReplayEngineSettings,
-    ReplayGamePort,
-    ReplayPlanner,
-    SnapshotRecording,
+from .bootstrap import (
+    build_store,
+    compose_live_runtime,
+    compose_recording_runtime,
+    compose_replay_runtime,
 )
+from .config import AppConfig, load_config
+from .mcp_port import Civ6McpClient
+from .models import RuntimeSnapshot, TaskStatus
+from .replay import ReplayEngineSettings, SnapshotRecording
 from .state_api import Civ6StateApi
 from .store import WorkflowStore
 
@@ -32,10 +28,7 @@ console = Console()
 
 
 def _store(config: AppConfig, config_path: Path) -> WorkflowStore:
-    database_path = Path(config.runtime.database_path)
-    if not database_path.is_absolute():
-        database_path = config_path.parent / database_path
-    return WorkflowStore(database_path)
+    return build_store(config, config_path)
 
 
 def _engine(
@@ -43,17 +36,8 @@ def _engine(
     config_path: Path,
     client: Civ6McpClient,
     state_api: Civ6StateApi,
-) -> WorkflowEngine:
-    return WorkflowEngine(
-        store=_store(config, config_path),
-        game=Civ6GamePort(
-            client,
-            state_api,
-            allowed_tools=set(config.safety.allowed_tools),
-        ),
-        planner=CodexPlanner(config.codex_config()),
-        config=config.engine_config(),
-    )
+):
+    return compose_live_runtime(config, config_path, client, state_api).engine
 
 
 async def _run_tick(config: AppConfig, config_path: Path):
@@ -125,7 +109,9 @@ def doctor(config: Path = typer.Option(Path("config.toml"), exists=True)) -> Non
             (
                 "configured MCP tools",
                 not missing_tools and bool(tools),
-                "ok" if not missing_tools and tools else f"missing: {sorted(missing_tools)}",
+                "ok"
+                if not missing_tools and tools
+                else f"missing: {sorted(missing_tools)}",
             )
         )
         core_paths = {"/api/overview", "/api/cities", "/api/units"}
@@ -146,7 +132,9 @@ def doctor(config: Path = typer.Option(Path("config.toml"), exists=True)) -> Non
             "/api/tech-civics",
             "/api/workflow/snapshot?include_units=false",
         }
-        missing_overlay = sorted(path for path in overlay_paths if not endpoints.get(path))
+        missing_overlay = sorted(
+            path for path in overlay_paths if not endpoints.get(path)
+        )
         rows.append(
             (
                 "workflow overlay endpoints",
@@ -242,23 +230,15 @@ def record(
         results: list[dict] = []
         async with Civ6McpClient(loaded.mcp_config()) as client:
             async with Civ6StateApi(loaded.state_api_config()) as state_api:
-                live_game = Civ6GamePort(
+                engine = compose_recording_runtime(
+                    loaded,
+                    config,
                     client,
                     state_api,
-                    allowed_tools=set(loaded.safety.allowed_tools),
-                )
-                engine = WorkflowEngine(
+                    tape,
                     store=store,
-                    game=RecordingGamePort(
-                        live_game,
-                        tape,
-                        on_first_snapshot=capture_store_state,
-                    ),
-                    planner=RecordingPlanner(
-                        CodexPlanner(loaded.codex_config()), tape
-                    ),
-                    config=loaded.engine_config(),
-                )
+                    on_first_snapshot=capture_store_state,
+                ).engine
                 for _ in range(max_ticks):
                     result = await asyncio.wait_for(
                         engine.tick(), timeout=loaded.runtime.max_turn_seconds
@@ -294,63 +274,22 @@ def replay(
     tape = SnapshotRecording.load(recording)
     if not tape.frames:
         raise typer.BadParameter("recording contains no snapshot frames")
-    game_id = tape.frames[0].snapshot.game_id
     temporary = None
     if database is None:
         temporary = tempfile.TemporaryDirectory(prefix="civ6-replay-")
         database = Path(temporary.name) / "workflow.sqlite3"
-    store = WorkflowStore(database)
-    if tape.store_state is not None:
-        store.import_replay_state(tape.store_state)
-    settings = tape.engine_settings
-    action_types = (
-        set(settings.allowed_action_types) if settings else set(ACTION_REGISTRY)
+    composition = compose_replay_runtime(
+        tape,
+        database,
+        auto_end_turn=auto_end_turn,
     )
-    auto_action_types = (
-        set(settings.auto_action_types) if settings else set(ACTION_REGISTRY)
-    )
-    for seed in tape.seed_plans:
-        store.save_plan_bundle(
-            game_id,
-            seed.turn,
-            seed.bundle,
-            mode=seed.mode,
-            auto_action_types=set(seed.auto_action_types) or auto_action_types,
-        )
-    game = ReplayGamePort(tape)
-    planner = ReplayPlanner(tape)
-    engine = WorkflowEngine(
-        store=store,
-        game=game,
-        planner=planner,
-        config=EngineConfig(
-            execution_mode=(
-                settings.execution_mode if settings else ExecutionMode.AUTO
-            ),
-            auto_end_turn=auto_end_turn,
-            max_agent_calls_per_turn=(
-                settings.max_agent_calls_per_turn if settings else 1
-            ),
-            repeated_failure_threshold=(
-                settings.repeated_failure_threshold if settings else 2
-            ),
-            verification_attempts=(
-                settings.verification_attempts if settings else 3
-            ),
-            auto_action_types=auto_action_types,
-            allowed_action_types=action_types,
-            allowed_tools=(
-                set(settings.allowed_tools) if settings else set(tape.tools)
-            ),
-            verification_delay_seconds=0,
-        ),
-    )
+    game = composition.game
+    planner = composition.planner
+    engine = composition.engine
 
     async def loop() -> list[dict]:
         results: list[dict] = []
-        while game.remaining_frames and (
-            max_ticks is None or len(results) < max_ticks
-        ):
+        while game.remaining_frames and (max_ticks is None or len(results) < max_ticks):
             result = await engine.tick()
             results.append(result.model_dump(mode="json"))
             if result.paused:

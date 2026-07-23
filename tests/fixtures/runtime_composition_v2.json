@@ -1,0 +1,59 @@
+{
+  "package.WorkflowEngine": "civ6_workflow.engine.WorkflowEngine",
+  "engine.WorkflowEngine": "civ6_workflow.engine.WorkflowEngine",
+  "engine.EngineConfig": "civ6_workflow.engine.EngineConfig",
+  "rules.DeterministicRuleCompiler": "civ6_workflow.rules.DeterministicRuleCompiler",
+  "store.WorkflowStore": "civ6_workflow.store.WorkflowStore",
+  "mcp_port.Civ6GamePort": "civ6_workflow.mcp_port.Civ6GamePort",
+  "conditions.ConditionEvaluator": "civ6_workflow.conditions.ConditionEvaluator",
+  "replay.RecordingGamePort": "civ6_workflow.replay.RecordingGamePort",
+  "replay.ReplayGamePort": "civ6_workflow.replay.ReplayGamePort",
+  "web_ui.ControlPanelState": "civ6_workflow.web_ui.ControlPanelState",
+  "web_ui.ControlPanelHandler": "civ6_workflow.web_ui.ControlPanelHandler",
+  "web_ui.ControlPanelHTTPServer": "civ6_workflow.web_ui.ControlPanelHTTPServer",
+  "models.PlanBundle": "civ6_workflow.models.PlanBundle",
+  "models.AgentRequest": "civ6_workflow.models.AgentRequest",
+  "models.TickMetrics": "civ6_workflow.models.TickMetrics",
+  "unit_found_city_spec": {
+    "tool_name": "unit_action",
+    "required_arguments": [
+      "unit_id"
+    ],
+    "fixed_arguments": {
+      "action": "found_city"
+    },
+    "retry_classification": "NEVER_BLIND_RETRY"
+  },
+  "unit_found_city_entity_types": [
+    "unit"
+  ],
+  "codex_system_instructions_extended": true,
+  "control_panel_html_enhanced": true,
+  "condition_types": [
+    "all_of",
+    "city_count_at_least",
+    "city_has_no_production",
+    "city_production_equals",
+    "civic_available",
+    "civic_equals",
+    "civic_unselected",
+    "entity_exists",
+    "field_equals",
+    "field_in",
+    "no_blocker_type",
+    "research_available",
+    "research_equals",
+    "research_unselected",
+    "turn_at_least",
+    "turn_equals",
+    "unit_absent",
+    "unit_at",
+    "unit_build_charges_equals",
+    "unit_can_improve",
+    "unit_has_build_charge",
+    "unit_has_moves",
+    "unit_moved_from",
+    "unit_no_moves",
+    "unit_type_contains"
+  ]
+}

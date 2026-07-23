@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from .conditions import find_entity
-from .domain.observations import SlotState
+from .domain.observations import SlotState, UnitDetailReason
 from .models import (
     EventLevel,
     GameEvent,
@@ -12,9 +14,31 @@ from .models import (
     ProposedTask,
     RiskLevel,
     RuntimeSnapshot,
+    TaskStatus,
 )
 from .observation_normalization import NormalizedRuntimeObservation
-from .store import WorkflowStore
+from .ports import WorkflowStorePort
+
+
+_TERMINAL_TASKS = {
+    TaskStatus.DONE,
+    TaskStatus.CANCELLED,
+    TaskStatus.EXPIRED,
+    TaskStatus.ESCALATED,
+}
+_SPECIAL_CIVILIAN_MARKERS = (
+    "SETTLER",
+    "GREAT_",
+    "SPY",
+    "TRADER",
+    "MISSIONARY",
+    "APOSTLE",
+    "GURU",
+    "INQUISITOR",
+    "ARCHAEOLOGIST",
+    "NATURALIST",
+    "ROCK_BAND",
+)
 
 
 @dataclass(slots=True)
@@ -26,7 +50,7 @@ class RuleCompilation:
 class DeterministicRuleCompiler:
     """Turn approved structured plans into small, verifiable current-turn tasks."""
 
-    def __init__(self, store: WorkflowStore):
+    def __init__(self, store: WorkflowStorePort):
         self.store = store
 
     def compile(self, observation: NormalizedRuntimeObservation) -> RuleCompilation:
@@ -51,12 +75,40 @@ class DeterministicRuleCompiler:
         tasks.extend(
             self._compile_builders(snapshot, context.get("builders", {}), events)
         )
+        base_task_count = len(tasks)
+
+        has_unit_blocker = self._has_unit_blocker(observation)
+        zero_city = (
+            UnitDetailReason.ZERO_CITIES
+            in observation.canonical.unit_summary.detail_reasons
+        )
+        unit_tasks: list[ProposedTask] = []
+        if (has_unit_blocker or zero_city) and snapshot.units is not None:
+            unit_context = self.store.current_context(snapshot.game_id)
+            unit_tasks, unit_events = self._compile_unit_blocker(
+                snapshot,
+                unit_context,
+                unit_blocker_present=has_unit_blocker,
+            )
+            tasks.extend(unit_tasks)
+            events.extend(unit_events)
+
         if not tasks:
             return RuleCompilation(events=events)
+        if unit_tasks and base_task_count == 0:
+            plan_id = f"rules_units_turn_{snapshot.turn}"
+            summary = "Deterministic unit orders compiled for the end-turn blocker."
+        else:
+            plan_id = f"rules_turn_{snapshot.turn}"
+            summary = "Deterministic tasks compiled from approved plans."
+            if unit_tasks:
+                summary += (
+                    " Deterministic unit orders resolve ordinary end-turn blockers."
+                )
         return RuleCompilation(
             bundle=PlanBundle(
-                plan_id=f"rules_turn_{snapshot.turn}",
-                summary="Deterministic tasks compiled from approved plans.",
+                plan_id=plan_id,
+                summary=summary,
                 tasks=tasks,
             ),
             events=events,
@@ -65,6 +117,460 @@ class DeterministicRuleCompiler:
     def needs_units(self, game_id: str) -> bool:
         context = self.store.current_context(game_id)
         return bool(context.get("builders") or context.get("units"))
+
+    def _compile_unit_blocker(
+        self,
+        snapshot: RuntimeSnapshot,
+        context: dict[str, Any],
+        *,
+        unit_blocker_present: bool,
+    ) -> tuple[list[ProposedTask], list[GameEvent]]:
+        tasks, events = self._compile_standard_unit_blocker(
+            snapshot,
+            context,
+            unit_blocker_present=unit_blocker_present,
+        )
+        unit_plans = context.get("units", {})
+        if not isinstance(unit_plans, dict):
+            unit_plans = {}
+
+        retained: list[GameEvent] = []
+        for event in events:
+            if event.event_type != "special_unit_orders_required":
+                retained.append(event)
+                continue
+            unit = (
+                event.payload.get("unit") if isinstance(event.payload, dict) else None
+            )
+            if not isinstance(unit, dict):
+                retained.append(event)
+                continue
+            unit_type = str(
+                unit.get("unit_type", unit.get("type", unit.get("name", "")))
+            ).upper()
+            if "SETTLER" not in unit_type:
+                retained.append(event)
+                continue
+
+            raw_id = unit.get("unit_id", unit.get("id", event.entity_id))
+            unit_id = str(raw_id)
+            plan = unit_plans.get(unit_id)
+            if (
+                not isinstance(plan, dict)
+                or str(plan.get("goal", "")).lower() != "found_city"
+            ):
+                retained.append(self._settler_selection_event(snapshot, unit, raw_id))
+                continue
+
+            task, review_event = self._compile_settler_plan(snapshot, unit, plan)
+            if task is not None:
+                tasks.append(task)
+            if review_event is not None:
+                retained.append(review_event)
+
+        return tasks, retained
+
+    def _compile_settler_plan(
+        self,
+        snapshot: RuntimeSnapshot,
+        unit: dict[str, Any],
+        plan: dict[str, Any],
+    ) -> tuple[ProposedTask | None, GameEvent | None]:
+        raw_id = unit.get("unit_id", unit.get("id"))
+        unit_id = str(raw_id)
+        target = self._point(plan.get("target"))
+        if target is None:
+            return None, self._settler_review_event(
+                snapshot,
+                unit,
+                "settler_plan_requires_review",
+                "Settler plan has no valid target coordinates.",
+                plan_revision=plan.get(
+                    "revision", plan.get("_plan_id", plan.get("plan_id", "unknown"))
+                ),
+            )
+
+        current = (int(unit.get("x", -1)), int(unit.get("y", -1)))
+        plan_id = str(plan.get("_plan_id", "unknown"))
+        if current != target:
+            task_id = (
+                f"settler-move:{unit_id}:{target[0]}:{target[1]}:"
+                f"{current[0]}:{current[1]}"
+            )
+            if self.store.task_status(snapshot.game_id, task_id) is not None:
+                return None, None
+            return (
+                ProposedTask(
+                    task_id=task_id,
+                    action_type="unit_move",
+                    entity_type="unit",
+                    entity_id=raw_id,
+                    due_turn=snapshot.turn,
+                    expires_turn=snapshot.turn,
+                    arguments={
+                        "unit_id": raw_id,
+                        "target_x": target[0],
+                        "target_y": target[1],
+                    },
+                    preconditions=[
+                        {
+                            "type": "entity_exists",
+                            "entity_type": "unit",
+                            "entity_id": raw_id,
+                        },
+                        {"type": "unit_has_moves", "unit_id": raw_id},
+                        {
+                            "type": "unit_type_contains",
+                            "unit_id": raw_id,
+                            "marker": "SETTLER",
+                        },
+                        {
+                            "type": "unit_at",
+                            "unit_id": raw_id,
+                            "x": current[0],
+                            "y": current[1],
+                        },
+                    ],
+                    postconditions=[
+                        {
+                            "type": "unit_moved_from",
+                            "unit_id": raw_id,
+                            "x": current[0],
+                            "y": current[1],
+                        }
+                    ],
+                    invalidators=[],
+                    risk=RiskLevel.HIGH,
+                    requires_confirmation=True,
+                    reason=(
+                        f"Advance the approved settler plan {plan_id} toward "
+                        f"the selected site {target}."
+                    ),
+                ),
+                None,
+            )
+
+        city_count = len(self._city_rows(snapshot.cities))
+        task_id = f"settler-found-city:{unit_id}:{target[0]}:{target[1]}"
+        if self.store.task_status(snapshot.game_id, task_id) is not None:
+            return None, None
+        return (
+            ProposedTask(
+                task_id=task_id,
+                action_type="unit_found_city",
+                entity_type="unit",
+                entity_id=raw_id,
+                due_turn=snapshot.turn,
+                expires_turn=snapshot.turn,
+                arguments={"unit_id": raw_id},
+                preconditions=[
+                    {
+                        "type": "entity_exists",
+                        "entity_type": "unit",
+                        "entity_id": raw_id,
+                    },
+                    {
+                        "type": "unit_type_contains",
+                        "unit_id": raw_id,
+                        "marker": "SETTLER",
+                    },
+                    {
+                        "type": "unit_at",
+                        "unit_id": raw_id,
+                        "x": target[0],
+                        "y": target[1],
+                    },
+                ],
+                postconditions=[
+                    {"type": "unit_absent", "unit_id": raw_id},
+                    {"type": "city_count_at_least", "count": city_count + 1},
+                ],
+                invalidators=[],
+                risk=RiskLevel.HIGH,
+                requires_confirmation=True,
+                reason=f"Found a city at the approved settlement site {target}.",
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _settler_selection_event(
+        snapshot: RuntimeSnapshot, unit: dict[str, Any], raw_id: Any
+    ) -> GameEvent:
+        return GameEvent(
+            event_type="settler_site_selection_required",
+            turn=snapshot.turn,
+            entity_type="unit",
+            entity_id=raw_id,
+            level=EventLevel.L3,
+            risk=RiskLevel.HIGH,
+            blocking=True,
+            payload={
+                "reason": "Settler needs an approved city site before it can move.",
+                "unit": unit,
+            },
+            dedupe_key=f"settler_site_selection_required:{raw_id}",
+        )
+
+    @staticmethod
+    def _settler_review_event(
+        snapshot: RuntimeSnapshot,
+        unit: dict[str, Any],
+        event_type: str,
+        reason: str,
+        plan_revision: Any,
+    ) -> GameEvent:
+        raw_id = unit.get("unit_id", unit.get("id", "unknown"))
+        return GameEvent(
+            event_type=event_type,
+            turn=snapshot.turn,
+            entity_type="unit",
+            entity_id=raw_id,
+            level=EventLevel.L3,
+            risk=RiskLevel.HIGH,
+            blocking=True,
+            payload={
+                "reason": reason,
+                "unit": unit,
+                "plan_revision": plan_revision,
+            },
+            dedupe_key=f"{event_type}:{raw_id}:{plan_revision}",
+        )
+
+    @staticmethod
+    def _route_unit_without_blocker(unit: dict[str, Any]) -> bool:
+        unit_type = str(
+            unit.get("unit_type", unit.get("type", unit.get("name", "")))
+        ).upper()
+        return "SETTLER" in unit_type
+
+    @staticmethod
+    def _city_rows(value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, dict):
+            value = value.get("items", value.get("cities", []))
+        if not isinstance(value, list):
+            return []
+        return [row for row in value if isinstance(row, dict)]
+
+    def _compile_standard_unit_blocker(
+        self,
+        snapshot: RuntimeSnapshot,
+        context: dict[str, Any],
+        *,
+        unit_blocker_present: bool,
+    ) -> tuple[list[ProposedTask], list[GameEvent]]:
+        active_units = {
+            str(task.entity_id)
+            for task in self.store.list_tasks(snapshot.game_id)
+            if task.entity_type in {"unit", "builder"}
+            and task.status not in _TERMINAL_TASKS
+        }
+        builder_units = {
+            str(plan["assigned_unit_id"])
+            for plan in context.get("builders", {}).values()
+            if isinstance(plan, dict) and plan.get("assigned_unit_id") is not None
+        }
+        unit_plans = context.get("units", {})
+        tasks: list[ProposedTask] = []
+        events: list[GameEvent] = []
+
+        for unit in self._unit_rows(snapshot.units):
+            raw_id = unit.get("unit_id", unit.get("id"))
+            if raw_id is None:
+                continue
+            unit_id = str(raw_id)
+            if not unit_blocker_present and not self._route_unit_without_blocker(unit):
+                continue
+            if unit_id in active_units or unit_id in builder_units:
+                continue
+            moves = self._moves_remaining(unit)
+            if moves <= 0:
+                continue
+
+            unit_type = str(
+                unit.get("unit_type", unit.get("type", unit.get("name", "")))
+            ).upper()
+            if bool(unit.get("needs_promotion")):
+                events.append(
+                    self._unit_review_event(
+                        snapshot,
+                        unit,
+                        "unit_promotion_required",
+                        "Unit has an unselected promotion.",
+                    )
+                )
+                continue
+            if any(marker in unit_type for marker in _SPECIAL_CIVILIAN_MARKERS):
+                events.append(
+                    self._unit_review_event(
+                        snapshot,
+                        unit,
+                        "special_unit_orders_required",
+                        "Special civilian unit requires an explicit strategic decision.",
+                        risk=RiskLevel.HIGH,
+                    )
+                )
+                continue
+            if unit.get("targets"):
+                events.append(
+                    self._unit_review_event(
+                        snapshot,
+                        unit,
+                        "unit_combat_decision_required",
+                        "Unit has available combat targets; deterministic skip is unsafe.",
+                        risk=RiskLevel.HIGH,
+                    )
+                )
+                continue
+
+            plan = unit_plans.get(unit_id) if isinstance(unit_plans, dict) else None
+            if isinstance(plan, dict):
+                planned_task = self._compile_unit_plan(snapshot, unit, plan, events)
+                if planned_task is not None:
+                    tasks.append(planned_task)
+                continue
+
+            task_id = f"unit-skip:{unit_id}:{snapshot.turn}"
+            if self.store.task_status(snapshot.game_id, task_id) is not None:
+                continue
+            tasks.append(
+                ProposedTask(
+                    task_id=task_id,
+                    action_type="unit_skip",
+                    entity_type="unit",
+                    entity_id=raw_id,
+                    due_turn=snapshot.turn,
+                    expires_turn=snapshot.turn,
+                    arguments={"unit_id": raw_id},
+                    preconditions=[
+                        {
+                            "type": "entity_exists",
+                            "entity_type": "unit",
+                            "entity_id": raw_id,
+                        },
+                        {"type": "unit_has_moves", "unit_id": raw_id},
+                    ],
+                    postconditions=[{"type": "unit_no_moves", "unit_id": raw_id}],
+                    reason=(
+                        "No approved plan or high-risk decision applies; consume the "
+                        "ordinary unit's remaining orders deterministically."
+                    ),
+                )
+            )
+        return tasks, events
+
+    def _compile_unit_plan(
+        self,
+        snapshot: RuntimeSnapshot,
+        unit: dict[str, Any],
+        plan: dict[str, Any],
+        events: list[GameEvent],
+    ) -> ProposedTask | None:
+        raw_id = unit.get("unit_id", unit.get("id"))
+        unit_id = str(raw_id)
+        path = [
+            point
+            for point in (self._point(item) for item in plan.get("path", []))
+            if point
+        ]
+        current = (int(unit.get("x", -1)), int(unit.get("y", -1)))
+        current_index = self._last_index(path, current)
+        if not path or current_index is None or current_index + 1 >= len(path):
+            events.append(
+                self._unit_review_event(
+                    snapshot,
+                    unit,
+                    "unit_plan_requires_review",
+                    "Existing unit plan has no deterministic next path step.",
+                )
+            )
+            return None
+        target = path[current_index + 1]
+        plan_id = str(plan.get("_plan_id", "unknown"))
+        task_id = f"unit-move:{unit_id}:{plan_id}:{current_index + 1}"
+        if self.store.task_status(snapshot.game_id, task_id) is not None:
+            return None
+        return ProposedTask(
+            task_id=task_id,
+            action_type="unit_move",
+            entity_type="unit",
+            entity_id=raw_id,
+            due_turn=snapshot.turn,
+            expires_turn=snapshot.turn,
+            arguments={
+                "unit_id": raw_id,
+                "target_x": target[0],
+                "target_y": target[1],
+            },
+            preconditions=[
+                {"type": "entity_exists", "entity_type": "unit", "entity_id": raw_id},
+                {"type": "unit_has_moves", "unit_id": raw_id},
+                {
+                    "type": "unit_at",
+                    "unit_id": raw_id,
+                    "x": current[0],
+                    "y": current[1],
+                },
+            ],
+            postconditions=[
+                {"type": "unit_at", "unit_id": raw_id, "x": target[0], "y": target[1]}
+            ],
+            reason=f"Advance the approved unit path to {target}.",
+        )
+
+    @staticmethod
+    def _has_unit_blocker(observation: NormalizedRuntimeObservation) -> bool:
+        return any(
+            blocker.blocker_type == "ENDTURN_BLOCKING_UNITS"
+            for blocker in observation.canonical.blockers
+        )
+
+    @staticmethod
+    def _moves_remaining(unit: dict[str, Any]) -> float:
+        try:
+            return float(unit.get("moves_remaining", unit.get("moves", 0)) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _unit_review_event(
+        snapshot: RuntimeSnapshot,
+        unit: dict[str, Any],
+        event_type: str,
+        reason: str,
+        *,
+        risk: RiskLevel = RiskLevel.MEDIUM,
+    ) -> GameEvent:
+        raw_id = unit.get("unit_id", unit.get("id", "unknown"))
+        return GameEvent(
+            event_type=event_type,
+            turn=snapshot.turn,
+            entity_type="unit",
+            entity_id=raw_id,
+            level=EventLevel.L3,
+            risk=risk,
+            blocking=True,
+            payload={
+                "reason": reason,
+                "unit": {
+                    key: unit.get(key)
+                    for key in (
+                        "unit_id",
+                        "unit_type",
+                        "name",
+                        "x",
+                        "y",
+                        "moves_remaining",
+                        "health",
+                        "max_health",
+                        "needs_promotion",
+                        "targets",
+                    )
+                    if key in unit
+                },
+            },
+            dedupe_key=f"{event_type}:{raw_id}:{snapshot.turn}",
+        )
 
     def _compile_city_production(
         self,
@@ -83,16 +589,10 @@ class DeterministicRuleCompiler:
             queue = plan.get("followup_queue", [])
             if not isinstance(queue, list) or not queue:
                 continue
-            source_plan_id = str(plan.get("_plan_id", "unknown"))
-            selected: tuple[int, dict[str, Any]] | None = None
+
+            occurrences: dict[str, int] = {}
+            selected: tuple[str, dict[str, Any]] | None = None
             for index, raw_item in enumerate(queue):
-                task_id = f"city-production:{city_id}:{source_plan_id}:{index}"
-                status = self.store.task_status(snapshot.game_id, task_id)
-                if status is not None:
-                    if status.value in {"done", "cancelled", "expired"}:
-                        continue
-                    selected = None
-                    break
                 item = self._production_item(raw_item)
                 if item is None:
                     events.append(
@@ -105,19 +605,27 @@ class DeterministicRuleCompiler:
                             risk=RiskLevel.MEDIUM,
                             blocking=True,
                             payload={"queue_index": index, "item": raw_item},
-                            dedupe_key=(
-                                f"invalid_city_plan_item:{city_id}:"
-                                f"{source_plan_id}:{index}"
-                            ),
+                            dedupe_key=f"invalid_city_plan_item:{city_id}:{index}:{raw_item!r}",
                         )
                     )
                     break
-                selected = (index, item)
+
+                semantic_key = self._production_semantic_key(item)
+                occurrence = occurrences.get(semantic_key, 0)
+                occurrences[semantic_key] = occurrence + 1
+                task_id = f"city-production:{city_id}:{semantic_key}:{occurrence}"
+                status = self.store.task_status(snapshot.game_id, task_id)
+                if status is not None:
+                    if status.value in {"done", "cancelled", "expired"}:
+                        continue
+                    selected = None
+                    break
+                selected = (task_id, item)
                 break
+
             if selected is None:
                 continue
-            index, item = selected
-            task_id = f"city-production:{city_id}:{source_plan_id}:{index}"
+            task_id, item = selected
             arguments = {
                 "city_id": int(city_id) if str(city_id).isdigit() else city_id,
                 "item_type": item["item_type"],
@@ -151,12 +659,24 @@ class DeterministicRuleCompiler:
                         }
                     ],
                     invalidators=[],
-                    reason=(
-                        f"Continue approved production queue with {item['item_name']}."
-                    ),
+                    reason=f"Continue approved production queue with {item['item_name']}.",
                 )
             )
         return tasks
+
+    @staticmethod
+    def _production_semantic_key(item: dict[str, Any]) -> str:
+        canonical = json.dumps(
+            {
+                "item_type": item.get("item_type"),
+                "item_name": item.get("item_name"),
+                "target_x": item.get("target_x"),
+                "target_y": item.get("target_y"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
     def _compile_builders(
         self,
