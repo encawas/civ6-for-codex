@@ -304,6 +304,94 @@ def test_store_rejects_identity_changes_and_allows_lifecycle_updates(tmp_path):
     assert store.get_planner_request(request.planner_request_id) == in_progress
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("turn_number", 5),
+        ("observation_id", "obs-2"),
+        ("input_projection", {"projection": 2}),
+        ("request_payload", {"request": "changed"}),
+        ("policy_revision", "policy-2"),
+        ("approval_contract_hash", "approval-2"),
+        ("allowed_actions_hash", "actions-2"),
+        ("model_settings", {"provider": "changed"}),
+        ("context_bytes", 99),
+    ],
+)
+def test_store_rejects_creation_definition_changes_without_writing(
+    tmp_path, field, value
+):
+    path = tmp_path / f"immutable-{field}.sqlite3"
+    store = WorkflowStore(path)
+    request = _request()
+    store.save_planner_request(request)
+
+    with pytest.raises(ValueError, match="creation definition is immutable"):
+        store.save_planner_request(request.model_copy(update={field: value}))
+
+    assert store.get_planner_request(request.planner_request_id) == request
+    with sqlite3.connect(path) as conn:
+        row = conn.execute(
+            """
+            SELECT turn, request_json FROM logical_planner_requests
+            WHERE planner_request_id=?
+            """,
+            (request.planner_request_id,),
+        ).fetchone()
+    assert row[0] == 4
+    assert json.loads(row[1])["turn_number"] == 4
+
+
+def test_store_rejects_new_legacy_request_without_decision_group(tmp_path):
+    store = WorkflowStore(tmp_path / "new-legacy-no-group.sqlite3")
+    request = _request(target=_legacy_target(group_id=None))
+
+    with pytest.raises(ValueError, match="requires a DecisionGroup"):
+        store.save_planner_request(request)
+
+    assert store.get_planner_request(request.planner_request_id) is None
+
+
+def test_store_requires_payload_for_new_and_newly_completed_requests(tmp_path):
+    store = WorkflowStore(tmp_path / "completion-payload.sqlite3")
+    historical_shape = _request(
+        "new-completed",
+        status=PlannerRequestStatus.COMPLETED,
+        completed_at=NOW + timedelta(seconds=1),
+        response_hash="legacy-response",
+        validation_result={"result": "completed"},
+    )
+    with pytest.raises(ValueError, match="requires response_payload"):
+        store.save_planner_request(historical_shape)
+
+    pending = _request("pending-completion", input_hash="pending-input")
+    store.save_planner_request(pending)
+    missing_payload = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.COMPLETED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "response_hash": "legacy-response",
+            "validation_result": {"result": "completed"},
+        }
+    )
+    with pytest.raises(ValueError, match="requires response_payload"):
+        store.save_planner_request(missing_payload)
+    assert store.get_planner_request(pending.planner_request_id) == pending
+
+    payload = {"plan_id": "plan-1", "tasks": []}
+    completed = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.COMPLETED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "response_payload": payload,
+            "response_hash": canonical_json_hash(payload),
+            "validation_result": {"result": "completed"},
+        }
+    )
+    store.save_planner_request(completed)
+    assert store.get_planner_request(pending.planner_request_id) == completed
+
+
 def test_store_validates_relational_target_columns_on_read(tmp_path):
     path = tmp_path / "read-validation.sqlite3"
     store = WorkflowStore(path)
@@ -341,7 +429,7 @@ def test_store_uniqueness_uses_target_key_and_input_hash(tmp_path):
         store.save_planner_request(
             _request(
                 "request-duplicate",
-                target=_legacy_target(group_id=None),
+                target=_legacy_target(group_id="group-2"),
             )
         )
 
@@ -580,6 +668,7 @@ def test_v7_to_v8_migration_preserves_status_attempt_round_and_canonical_json(
         PlannerRequestStatus.AWAITING_INFORMATION,
     }
     assert store.get_planner_request("failed").decision_group_id is None
+    assert store.get_planner_request("completed").response_payload is None
     assert store.list_provider_attempts("backoff") == [attempt]
     assert store.list_information_rounds("awaiting") == [round_record]
     with sqlite3.connect(path) as conn:
@@ -605,6 +694,50 @@ def test_v7_to_v8_migration_preserves_status_attempt_round_and_canonical_json(
     assert reopened.get_planner_request("completed") == store.get_planner_request(
         "completed"
     )
+
+
+def test_migrated_legacy_request_without_group_allows_lifecycle_updates(tmp_path):
+    path = tmp_path / "historical-no-group.sqlite3"
+    historical = _request(
+        "historical-no-group",
+        target=_legacy_target(group_id=None, gap_ids=("historical-gap",)),
+    )
+    _create_v7_database(path, (historical,))
+    store = WorkflowStore(path)
+
+    in_progress = historical.model_copy(
+        update={"status": PlannerRequestStatus.IN_PROGRESS}
+    )
+    store.save_planner_request(in_progress)
+
+    assert store.get_planner_request(historical.planner_request_id) == in_progress
+
+
+def test_migrated_completed_request_without_payload_preserves_response_facts(tmp_path):
+    path = tmp_path / "historical-completed.sqlite3"
+    historical = _request(
+        "historical-completed",
+        status=PlannerRequestStatus.COMPLETED,
+        completed_at=NOW + timedelta(seconds=1),
+        response_hash="historical-response",
+        validation_result={"result": "completed"},
+    )
+    _create_v7_database(path, (historical,))
+    store = WorkflowStore(path)
+    restored = store.get_planner_request(historical.planner_request_id)
+
+    assert restored.response_payload is None
+    compatible_update = restored.model_copy(update={"provider_attempt_count": 1})
+    store.save_planner_request(compatible_update)
+    assert store.get_planner_request(historical.planner_request_id) == (
+        compatible_update
+    )
+
+    changed_response = compatible_update.model_copy(
+        update={"response_hash": "rewritten-history"}
+    )
+    with pytest.raises(ValueError, match="historical response facts are immutable"):
+        store.save_planner_request(changed_response)
 
 
 @pytest.mark.parametrize(
@@ -663,6 +796,85 @@ def test_v8_migration_fails_closed_on_relational_json_conflict(tmp_path):
         WorkflowStore(path)
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("planner_request_id", "row-request-id"),
+        ("turn", 5),
+        ("created_at", (NOW + timedelta(seconds=1)).isoformat()),
+        ("completed_at", (NOW + timedelta(seconds=2)).isoformat()),
+    ],
+)
+def test_v8_migration_rolls_back_core_relational_json_conflicts(
+    tmp_path, column, value
+):
+    path = tmp_path / f"conflict-{column}.sqlite3"
+    request = _request(
+        "json-request-id",
+        status=PlannerRequestStatus.COMPLETED,
+        completed_at=NOW + timedelta(seconds=1),
+        response_hash="historical-response",
+        validation_result={"result": "completed"},
+    )
+    _create_v7_database(path, (request,))
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            f"UPDATE logical_planner_requests SET {column}=?",
+            (value,),
+        )
+
+    with pytest.raises(ValueError, match=f"{column} conflicts"):
+        WorkflowStore(path)
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute(
+            "SELECT COUNT(*) FROM logical_planner_requests"
+        ).fetchone()[0] == 1
+
+
+def test_v8_migration_accepts_equivalent_timestamp_formats_and_normalizes(tmp_path):
+    path = tmp_path / "timestamp-formats.sqlite3"
+    request = _request(
+        "timestamp-formats",
+        status=PlannerRequestStatus.COMPLETED,
+        completed_at=NOW + timedelta(seconds=1),
+        response_hash="historical-response",
+        validation_result={"result": "completed"},
+    )
+    _create_v7_database(path, (request,))
+    with sqlite3.connect(path) as conn:
+        row = conn.execute(
+            "SELECT request_json FROM logical_planner_requests"
+        ).fetchone()
+        payload = json.loads(row[0])
+        payload["created_at"] = request.created_at.isoformat()
+        payload["completed_at"] = request.completed_at.isoformat()
+        conn.execute(
+            """
+            UPDATE logical_planner_requests
+            SET created_at=?, completed_at=?, request_json=?
+            """,
+            (
+                request.created_at.isoformat().replace("+00:00", "Z"),
+                request.completed_at.isoformat().replace("+00:00", "Z"),
+                canonical_json(payload),
+            ),
+        )
+
+    store = WorkflowStore(path)
+
+    assert store.get_planner_request(request.planner_request_id) == request
+    with sqlite3.connect(path) as conn:
+        row = conn.execute(
+            "SELECT created_at, completed_at FROM logical_planner_requests"
+        ).fetchone()
+    assert row == (
+        request.created_at.isoformat(),
+        request.completed_at.isoformat(),
+    )
 
 
 def test_future_database_version_fails_before_content_changes(tmp_path):
@@ -832,6 +1044,29 @@ def test_v7_replay_import_canonicalizes_request_and_preserves_children(tmp_path)
     assert row["request_target_key"] == request.target.target_key
     assert "target" in payload
     assert "decision_gap_ids" not in payload
+
+
+def test_v7_replay_turn_conflict_rolls_back_entire_import(tmp_path):
+    store = WorkflowStore(tmp_path / "replay-turn-conflict.sqlite3")
+    seed = _request(
+        "seed-turn-conflict",
+        target=_legacy_target(gap_ids=("seed-turn-gap",)),
+        input_hash="seed-turn-input",
+    )
+    store.save_planner_request(seed)
+    replay_request = _request(
+        "replay-turn-conflict",
+        target=_legacy_target(group_id=None, gap_ids=("replay-turn-gap",)),
+        input_hash="replay-turn-input",
+    )
+    state = _v7_replay_state(replay_request)
+    state["tables"]["logical_planner_requests"][0]["turn"] += 1
+
+    with pytest.raises(ValueError, match="turn conflicts"):
+        store.import_replay_state(state)
+
+    assert store.get_planner_request(seed.planner_request_id) == seed
+    assert store.get_planner_request(replay_request.planner_request_id) is None
 
 
 def test_replay_canonical_duplicate_rolls_back_entire_import(tmp_path):

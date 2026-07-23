@@ -873,14 +873,66 @@ class WorkflowStore:
         except Exception as exc:
             raise ValueError("invalid logical PlannerRequest JSON") from exc
 
+        required_columns = {
+            "planner_request_id",
+            "game_id",
+            "turn",
+            "status",
+            "input_projection_hash",
+            "input_projection_version",
+            "decision_group_id",
+            "decision_gap_ids_json",
+            "created_at",
+            "completed_at",
+        }
+        missing_columns = required_columns - normalized.keys()
+        if missing_columns:
+            raise ValueError(
+                "logical PlannerRequest row is missing columns: "
+                f"{sorted(missing_columns)}"
+            )
         relational_checks = {
+            "planner_request_id": request.planner_request_id,
             "game_id": request.game_session_id,
+            "turn": request.turn_number,
             "input_projection_hash": request.input_projection_hash,
             "input_projection_version": request.input_projection_version,
             "status": request.status.value,
         }
         for column, expected in relational_checks.items():
-            if column in normalized and str(normalized[column]) != expected:
+            actual = normalized[column]
+            if column == "turn":
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "logical PlannerRequest turn is not an integer"
+                    ) from exc
+            elif not isinstance(actual, str):
+                actual = str(actual)
+            if actual != expected:
+                raise ValueError(
+                    f"logical PlannerRequest {request.planner_request_id} "
+                    f"{column} conflicts with request_json"
+                )
+
+        for column, expected in (
+            ("created_at", request.created_at),
+            ("completed_at", request.completed_at),
+        ):
+            actual_value = normalized[column]
+            if actual_value is None:
+                actual = None
+            else:
+                try:
+                    actual = datetime.fromisoformat(
+                        str(actual_value).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"logical PlannerRequest {column} is not a datetime"
+                    ) from exc
+            if actual != expected:
                 raise ValueError(
                     f"logical PlannerRequest {request.planner_request_id} "
                     f"{column} conflicts with request_json"
@@ -936,6 +988,12 @@ class WorkflowStore:
 
         normalized.update(
             {
+                "planner_request_id": request.planner_request_id,
+                "game_id": request.game_session_id,
+                "turn": request.turn_number,
+                "status": request.status.value,
+                "input_projection_hash": request.input_projection_hash,
+                "input_projection_version": request.input_projection_version,
                 "request_target_kind": expected_kind,
                 "request_target_key": expected_key,
                 "decision_group_id": request.decision_group_id,
@@ -943,6 +1001,12 @@ class WorkflowStore:
                     list(request.decision_gap_ids)
                 ),
                 "request_json": canonical_json(request.model_dump(mode="json")),
+                "created_at": request.created_at.isoformat(),
+                "completed_at": (
+                    None
+                    if request.completed_at is None
+                    else request.completed_at.isoformat()
+                ),
             }
         )
         return normalized
@@ -3037,9 +3101,36 @@ class WorkflowStore:
         return [PlanLease.model_validate_json(row["lease_json"]) for row in rows]
 
     @staticmethod
+    def _planner_request_creation_definition(
+        request: PlannerRequest,
+    ) -> tuple[Any, ...]:
+        return (
+            request.planner_request_id,
+            request.game_session_id,
+            request.turn_number,
+            request.observation_id,
+            request.target,
+            request.input_projection_hash,
+            request.input_projection_version,
+            canonical_json(request.input_projection),
+            canonical_json(request.request_payload),
+            request.plan_revision_refs,
+            request.policy_revision,
+            request.approval_contract_hash,
+            request.allowed_actions_hash,
+            canonical_json(request.model_settings),
+            request.created_at,
+            request.context_bytes,
+        )
+
+    @staticmethod
     def _save_planner_request_in_connection(
         conn: sqlite3.Connection, request: PlannerRequest
     ) -> None:
+        completed_statuses = {
+            PlannerRequestStatus.COMPLETED,
+            PlannerRequestStatus.PARTIALLY_COMPLETED,
+        }
         existing_row = conn.execute(
             """
             SELECT * FROM logical_planner_requests
@@ -3047,26 +3138,59 @@ class WorkflowStore:
             """,
             (request.planner_request_id,),
         ).fetchone()
-        if existing_row is not None:
-            existing = WorkflowStore._planner_request_from_row(existing_row)
-            immutable_identity = (
-                existing.game_session_id,
-                existing.target,
-                existing.input_projection_hash,
-                existing.input_projection_version,
-                existing.created_at,
-            )
-            candidate_identity = (
-                request.game_session_id,
-                request.target,
-                request.input_projection_hash,
-                request.input_projection_version,
-                request.created_at,
-            )
-            if candidate_identity != immutable_identity:
+        if existing_row is None:
+            if (
+                request.target.kind
+                is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+                and request.decision_group_id is None
+            ):
                 raise ValueError(
-                    "PlannerRequest identity fields are immutable after creation"
+                    "new legacy PlannerRequest requires a DecisionGroup"
                 )
+            if (
+                request.status in completed_statuses
+                and request.response_payload is None
+            ):
+                raise ValueError(
+                    "new completed PlannerRequest requires response_payload"
+                )
+        else:
+            existing = WorkflowStore._planner_request_from_row(existing_row)
+            if (
+                WorkflowStore._planner_request_creation_definition(request)
+                != WorkflowStore._planner_request_creation_definition(existing)
+            ):
+                raise ValueError(
+                    "PlannerRequest creation definition is immutable"
+                )
+            if (
+                request.status in completed_statuses
+                and request.response_payload is None
+            ):
+                if (
+                    existing.status not in completed_statuses
+                    or existing.response_payload is not None
+                ):
+                    raise ValueError(
+                        "PlannerRequest completion requires response_payload"
+                    )
+                existing_response_facts = (
+                    existing.status,
+                    existing.response_payload,
+                    existing.response_hash,
+                    existing.validation_result,
+                )
+                candidate_response_facts = (
+                    request.status,
+                    request.response_payload,
+                    request.response_hash,
+                    request.validation_result,
+                )
+                if candidate_response_facts != existing_response_facts:
+                    raise ValueError(
+                        "historical response facts are immutable without "
+                        "response_payload"
+                    )
 
         conn.execute(
             """
