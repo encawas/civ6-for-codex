@@ -361,8 +361,9 @@ def test_store_requires_payload_for_new_and_newly_completed_requests(tmp_path):
         response_hash="legacy-response",
         validation_result={"result": "completed"},
     )
-    with pytest.raises(ValueError, match="requires response_payload"):
+    with pytest.raises(ValueError, match="requires.*response_payload"):
         store.save_planner_request(historical_shape)
+    assert store.get_planner_request(historical_shape.planner_request_id) is None
 
     pending = _request("pending-completion", input_hash="pending-input")
     store.save_planner_request(pending)
@@ -374,7 +375,7 @@ def test_store_requires_payload_for_new_and_newly_completed_requests(tmp_path):
             "validation_result": {"result": "completed"},
         }
     )
-    with pytest.raises(ValueError, match="requires response_payload"):
+    with pytest.raises(ValueError, match="requires.*response_payload"):
         store.save_planner_request(missing_payload)
     assert store.get_planner_request(pending.planner_request_id) == pending
 
@@ -390,6 +391,39 @@ def test_store_requires_payload_for_new_and_newly_completed_requests(tmp_path):
     )
     store.save_planner_request(completed)
     assert store.get_planner_request(pending.planner_request_id) == completed
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "response_payload": {"plan_id": "replacement", "tasks": []},
+            "response_hash": canonical_json_hash(
+                {"plan_id": "replacement", "tasks": []}
+            ),
+        },
+        {"status": PlannerRequestStatus.PARTIALLY_COMPLETED},
+        {"completed_at": NOW + timedelta(seconds=2)},
+        {"validation_result": {"result": "rewritten"}},
+        {"failure_category": "rewritten_failure"},
+    ],
+    ids=[
+        "payload-and-matching-hash",
+        "completed-to-partially-completed",
+        "completed-at",
+        "validation-result",
+        "failure-category",
+    ],
+)
+def test_completed_response_facts_are_permanently_immutable(tmp_path, updates):
+    store = WorkflowStore(tmp_path / "terminal-facts.sqlite3")
+    completed = _completed_request("terminal-facts")
+    store.save_planner_request(completed)
+
+    with pytest.raises(ValueError, match="terminal response facts are immutable"):
+        store.save_planner_request(completed.model_copy(update=updates))
+
+    assert store.get_planner_request(completed.planner_request_id) == completed
 
 
 def test_store_validates_relational_target_columns_on_read(tmp_path):
@@ -733,11 +767,28 @@ def test_migrated_completed_request_without_payload_preserves_response_facts(tmp
         compatible_update
     )
 
+    payload = {"plan_id": "invented-history", "tasks": []}
+    backfilled_response = compatible_update.model_copy(
+        update={
+            "response_payload": payload,
+            "response_hash": canonical_json_hash(payload),
+            "validation_result": {"result": "backfilled"},
+        }
+    )
+    with pytest.raises(ValueError, match="terminal response facts are immutable"):
+        store.save_planner_request(backfilled_response)
+    assert store.get_planner_request(historical.planner_request_id) == (
+        compatible_update
+    )
+
     changed_response = compatible_update.model_copy(
         update={"response_hash": "rewritten-history"}
     )
-    with pytest.raises(ValueError, match="historical response facts are immutable"):
+    with pytest.raises(ValueError, match="terminal response facts are immutable"):
         store.save_planner_request(changed_response)
+    assert store.get_planner_request(historical.planner_request_id) == (
+        compatible_update
+    )
 
 
 @pytest.mark.parametrize(

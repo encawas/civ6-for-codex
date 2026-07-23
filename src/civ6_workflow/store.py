@@ -3124,6 +3124,45 @@ class WorkflowStore:
         )
 
     @staticmethod
+    def _planner_request_terminal_response_facts(
+        request: PlannerRequest,
+    ) -> tuple[Any, ...]:
+        return (
+            request.status,
+            request.completed_at,
+            (
+                None
+                if request.response_payload is None
+                else canonical_json(request.response_payload)
+            ),
+            request.response_hash,
+            (
+                None
+                if request.validation_result is None
+                else canonical_json(request.validation_result)
+            ),
+            request.failure_category,
+        )
+
+    @staticmethod
+    def _validate_planner_request_completion(request: PlannerRequest) -> None:
+        required_evidence = {
+            "response_payload": request.response_payload,
+            "response_hash": request.response_hash,
+            "validation_result": request.validation_result,
+            "completed_at": request.completed_at,
+        }
+        missing = [
+            field for field, value in required_evidence.items() if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "PlannerRequest completion requires: "
+                f"{', '.join(sorted(missing))}"
+            )
+        PlannerRequest.model_validate_json(request.model_dump_json())
+
+    @staticmethod
     def _save_planner_request_in_connection(
         conn: sqlite3.Connection, request: PlannerRequest
     ) -> None:
@@ -3147,13 +3186,8 @@ class WorkflowStore:
                 raise ValueError(
                     "new legacy PlannerRequest requires a DecisionGroup"
                 )
-            if (
-                request.status in completed_statuses
-                and request.response_payload is None
-            ):
-                raise ValueError(
-                    "new completed PlannerRequest requires response_payload"
-                )
+            if request.status in completed_statuses:
+                WorkflowStore._validate_planner_request_completion(request)
         else:
             existing = WorkflowStore._planner_request_from_row(existing_row)
             if (
@@ -3163,34 +3197,18 @@ class WorkflowStore:
                 raise ValueError(
                     "PlannerRequest creation definition is immutable"
                 )
-            if (
-                request.status in completed_statuses
-                and request.response_payload is None
-            ):
+            if existing.status in completed_statuses:
                 if (
-                    existing.status not in completed_statuses
-                    or existing.response_payload is not None
+                    WorkflowStore._planner_request_terminal_response_facts(request)
+                    != WorkflowStore._planner_request_terminal_response_facts(
+                        existing
+                    )
                 ):
                     raise ValueError(
-                        "PlannerRequest completion requires response_payload"
+                        "PlannerRequest terminal response facts are immutable"
                     )
-                existing_response_facts = (
-                    existing.status,
-                    existing.response_payload,
-                    existing.response_hash,
-                    existing.validation_result,
-                )
-                candidate_response_facts = (
-                    request.status,
-                    request.response_payload,
-                    request.response_hash,
-                    request.validation_result,
-                )
-                if candidate_response_facts != existing_response_facts:
-                    raise ValueError(
-                        "historical response facts are immutable without "
-                        "response_payload"
-                    )
+            elif request.status in completed_statuses:
+                WorkflowStore._validate_planner_request_completion(request)
 
         conn.execute(
             """
