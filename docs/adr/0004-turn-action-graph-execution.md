@@ -44,6 +44,16 @@ graph in one Tick.
 11. StoredTask and TurnActionNode cannot both decide the same action.
 12. TurnActionGraph and BatchExecutor are not a generic DAG or workflow
     platform.
+13. Each TurnActionGraph binds exactly one game session, one turn, one source
+    Canonical NormalizedObservation, and one source Contract revision.
+14. A turn change, Contract revision change, or inapplicable source
+    Observation makes the graph stale. The graph cannot remain active across
+    turns; future-turn intent remains in MissionGraph.
+15. A Turn Barrier keeps a future-turn node out of the current claimable Wave.
+    Entering a new turn requires a new normalized Observation and a newly
+    compiled TurnActionGraph before the Barrier is reevaluated.
+16. Approval, verification, and ActionAttempt audit may recover durably, but a
+    node claim always comes from the current graph.
 
 WorkflowRuntime remains the sole orchestrator that selects when compilation
 or execution advances; it does not absorb BatchExecutor behavior.
@@ -64,11 +74,24 @@ compile current Contract and Observation
 -> send one mutation
 -> read and normalize a fresh Observation
 -> verify postconditions
--> update node and Mission evidence
+-> persist independent ActionAttempt verification audit
+-> when Mission state or persisted evidence changes, validate and atomically
+   commit one deterministic Contract transition as a new Contract revision
+-> make the old TurnActionGraph stale and recompile on the next Tick
 ```
 
 UNKNOWN delivery or verification does not cause blind resend. Approval and
 verification barriers are durable and survive restart.
+
+The deterministic Contract transition starts from the expected current
+revision and is idempotent: duplicate recovery of the same verification does
+not increment revision again. MissionGraph is never updated in place. Once the
+new revision commits, old READY nodes cannot be claimed. ActionAttempt evidence
+kept only as an external audit record cannot advance or complete a Mission.
+
+When turn N+1 begins, Runtime cannot retain claimable READY nodes from turn N.
+It first reads and normalizes the new Observation, compiles the turn N+1 graph,
+and only then evaluates Turn Barriers and selects a Wave.
 
 ## Consequences
 
@@ -79,6 +102,7 @@ verification barriers are durable and survive restart.
 - Existing delivery and verification safety semantics remain usable.
 - Waves expose available work without adding parallel writes.
 - The execution model can replace StoredTask incrementally.
+- Turn boundaries cannot leak stale READY work into a later game turn.
 
 ### Negative
 

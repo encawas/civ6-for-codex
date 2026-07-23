@@ -48,6 +48,22 @@ Migration also needs scope-by-scope ownership without production dual writes.
     on one WorkflowStateStorePort; no type-specific Repository family is
     created.
 
+`initial_baseline` and `rebaseline_required` are Workflow control results, not
+ordinary StateDelta values and not permission to accept the current
+Observation automatically. A Canonical NormalizedObservation replaces the
+accepted baseline only when its session is consistent, its normalization and
+source versions are acceptable, all collections and fields required for the
+comparison have sufficient completeness, and persistence plus explicit
+acceptance both succeed.
+
+An incomplete Observation does not overwrite the last accepted baseline,
+manufacture deletion, switch Scope authority, delete a Mission by itself, or
+by itself globally invalidate the Contract or rebuild the full MissionGraph.
+Independent fields that are known and comparable may still produce local
+Delta; unavailable portions remain unknown. The next complete Observation is
+compared against the unchanged accepted baseline, preventing reappearing data
+from being classified as newly created.
+
 ActionAttempt evidence remains workflow verification evidence. It may be
 referenced by StateDelta but is not disguised as an Observation. Events and
 caches likewise do not replace current Canonical NormalizedObservation.
@@ -84,6 +100,7 @@ Adapters implement Ports. Bootstrap selects implementations.
 - A single representation answers questions about current game facts.
 - Partial reads cannot manufacture deletion or invalidation.
 - StateDelta has explicit baseline and provenance rules.
+- An incomplete read cannot silently replace an accepted comparison baseline.
 - Planner and Executor remain independently testable and auditable.
 - SQLite remains replaceable behind the Store Port without fragmenting state.
 - Scope authority can switch atomically without production dual writes.

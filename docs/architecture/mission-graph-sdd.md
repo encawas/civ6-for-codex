@@ -95,6 +95,20 @@ settler  -> legacy authority
 city     -> legacy authority
 ```
 
+Before deterministic validation accepts a `StrategicContractProposal` or
+`MissionGraphPatch`, it derives the writable Scope set from the current
+Authority Scope Set. A proposal or patch may add, modify, or delete only
+Scopes for which MissionGraph currently holds write authority. A legacy-owned
+Scope may be supplied as a read-only game fact or controlled context input,
+but it cannot create, modify, or delete an active Mission or change strategic
+state for that Scope. An out-of-scope write is rejected deterministically.
+
+The only exception is an atomic Scope authority-switch transaction. That
+transaction must update the Authority Scope Set, initialize the newly owned
+Scope Missions, record migration audit, stop the legacy authority write path,
+and commit one new StrategicContract revision together. No intermediate state
+may expose two writers or a MissionGraph Mission for a legacy-owned Scope.
+
 For any scope, legacy authority or MissionGraph authority may write, never
 both. Storage may later be physically partitioned, but there remains one
 logical root revision, one atomic commit, and one strategic authority.
@@ -273,6 +287,26 @@ fabricated field Delta. Rebaselining applies to a new session, missing
 history, turn regression, incompatible normalization or source versions,
 partial critical data, or unverifiable history.
 
+`initial_baseline` and `rebaseline_required` are Workflow control results.
+They are not ordinary StateDelta values and do not automatically accept the
+current Observation as a replacement baseline. A Canonical
+NormalizedObservation becomes the accepted baseline only after all of these
+conditions hold:
+
+- its game session matches the Workflow session;
+- its normalization and source versions are accepted for comparison;
+- every collection and field required by the intended comparison has the
+  required completeness;
+- the Observation is successfully persisted and explicitly accepted.
+
+An incomplete Observation cannot overwrite the last accepted baseline,
+manufacture deletion, switch Scope authority, delete a Mission by itself, or
+by itself globally invalidate the Contract or trigger a full-graph rebuild.
+Independent known and comparable fields may still produce a local Delta;
+unavailable portions remain unknown. A later complete Observation is compared
+with the unchanged accepted baseline, so data that merely reappears is not
+misclassified as newly created.
+
 StateDelta can express explicit entity creation/deletion, known field changes,
 known-to-known slot changes, turn and strategic-event changes, and
 unknown-to-known transitions.
@@ -326,6 +360,23 @@ When the same response is processed after a crash:
 A stale-base patch is rejected or enters an explicit repair flow. It never
 overwrites current state.
 
+ActionAttempt verification is first an independent Workflow audit fact. If a
+verified result changes a Mission's status, completion or invalidation state,
+desired-outcome satisfaction, or MissionGraph-persisted evidence references,
+Runtime must execute a deterministic Contract state transition:
+
+```text
+expected current Contract revision
+-> validate deterministic Mission transition
+-> WorkflowStateStorePort atomic commit
+-> new StrategicContract revision
+```
+
+MissionGraph is never updated in place. The transition is idempotent: recovery
+of the same verified evidence commits at most one new revision. Evidence kept
+only as an external ActionAttempt audit record, without a committed Contract
+transition, cannot make the corresponding Mission completed or advanced.
+
 ## 11. TurnActionGraph
 
 TurnActionGraph is a deterministic execution projection of:
@@ -339,6 +390,13 @@ current StrategicContract revision
 + approval state
 ```
 
+Each TurnActionGraph is bound to exactly one game session, one turn, one source
+Canonical NormalizedObservation, and one source StrategicContract revision. A
+turn change, Contract revision change, or source Observation that no longer
+applies makes the graph stale. A TurnActionGraph never remains the active
+execution graph across turns; future-turn strategic intent remains in
+MissionGraph.
+
 It is not strategic state. It belongs to a turn and Observation, references
 its source Contract revision, and links nodes to source Missions. Nodes use
 stable idempotent identities and only Action Registry actions. Entity types,
@@ -346,7 +404,10 @@ arguments, and conditions pass existing contracts.
 
 Before claim, BatchExecutor checks `source_contract_revision`. READY nodes
 from a stale graph cannot be sent. The graph invalidates or recompiles after
-a Contract revision change.
+a Contract revision change. Committing a new Contract revision after a
+deterministic Mission transition therefore makes every graph referencing the
+old revision stale; its READY nodes cannot be claimed, and the next Tick must
+compile a new current execution projection.
 
 ### 11.1 Phased execution authority
 
@@ -361,6 +422,16 @@ StoredTask is deterministically projected from a current Mission revision and
 references its Mission and Contract revision. Planner cannot create an
 independently strategic StoredTask. A stale Contract makes old StoredTask
 unclaimable, and an action cannot have two execution authorities.
+
+Before a Scope authority switch, every legacy-authority READY StoredTask must
+either be cancelled or superseded, or be converted by creating a new
+Mission-derived StoredTask projected deterministically from the current
+Contract and Mission revision. Conversion occurs in the controlled authority
+switch transaction or an explicit migration step, preserves an audit link from
+the old task to the new task, makes the old task unclaimable, and never rewrites
+the old task's provenance in place. At most one equivalent action may remain
+claimable. VERIFYING StoredTask completes fresh verification before switching;
+an UNCERTAIN ActionAttempt blocks the switch and any equivalent mutation.
 
 Phase 3 makes `domain.Task` and TurnActionGraph the research execution
 authority. `workflow_tasks` and `models.StoredTask` stop deciding research
@@ -379,6 +450,13 @@ WorkflowRuntime claims at most one node each Tick. Barrier has four kinds:
 2. Verification Barrier
 3. Approval Barrier
 4. Turn Barrier
+
+A Turn Barrier excludes a node from the current claimable Wave until its
+target turn arrives. On entering a new turn, Runtime reads and normalizes a new
+Observation, compiles a new TurnActionGraph, and reevaluates the Turn Barrier
+against that graph. It cannot carry a READY node from the previous current-turn
+graph across the turn boundary. Approval, verification, and ActionAttempt audit
+can recover durably, but execution claim always uses the current graph.
 
 This is not a general workflow language, plugin platform, distributed queue,
 or generic DAG executor. BatchExecutor cannot call Planner.
@@ -539,7 +617,10 @@ select one node from current Wave
 -> ObservationNormalizer
 -> fresh Canonical NormalizedObservation
 -> verification
--> update execution node and Mission evidence
+-> persist independent ActionAttempt verification audit
+-> if Mission state or persisted evidence changes, commit one deterministic
+   Contract transition and new StrategicContract revision
+-> invalidate the old TurnActionGraph and recompile on the next Tick
 ```
 
 ### 16.6 Insufficient Planner information

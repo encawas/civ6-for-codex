@@ -30,6 +30,22 @@ scope changes authority only in the transaction that records the active
 StrategicContract revision and migration audit. Deployment alone never
 implies a scope switch.
 
+Deterministic validation rejects any `StrategicContractProposal` or
+`MissionGraphPatch` that adds, modifies, or deletes a Scope outside the current
+MissionGraph-owned Authority Scope Set. Legacy-owned Scopes may be read-only
+facts or controlled context only; they cannot contain active Mission writes or
+strategic-state changes. The sole exception is an atomic Scope
+authority-switch transaction that updates the Authority Scope Set, initializes
+new Scope Missions, records migration audit, stops the legacy write path, and
+commits one new StrategicContract revision.
+
+ActionAttempt verification is an independent Workflow audit fact. Any change
+to Mission status, completion or invalidation, desired-outcome satisfaction,
+or MissionGraph-persisted evidence must use an idempotent deterministic
+Contract transition from the expected current revision through an atomic
+WorkflowStateStorePort commit to one new revision. MissionGraph is never
+updated in place, and external-only evidence cannot advance a Mission.
+
 All durable Contract, MissionGraph, Patch, execution, request, attempt, and
 approval state is accessed through one WorkflowStateStorePort and one database
 authority.
@@ -205,7 +221,10 @@ The Contract root covers the game session. Other scopes remain legacy-owned.
 ### Data migration
 
 - Create the game-session Contract and Authority Scope Set.
-- Switch only research atomically to MissionGraph authority.
+- Switch only research through an atomic authority-switch transaction that
+  updates the Authority Scope Set, initializes research Missions, records
+  migration audit, stops the legacy research write path, and commits one new
+  StrategicContract revision.
 - Persist source Contract/Mission revision on projected execution work.
 - Stop new research DecisionGap and PlanLease writes in the same switch.
 
@@ -214,7 +233,13 @@ The Contract root covers the game session. Other scopes remain legacy-owned.
 - OPEN/REQUESTED research DecisionGap completes or supersedes.
 - Active PlannerRequest completes, supersedes, or explicitly migrates.
 - Research PlanLease completes, invalidates, or blocks switch.
-- READY StoredTask continues only with proven source and target, else cancels.
+- Every legacy-authority READY StoredTask is cancelled or superseded before
+  switch, or converted by creating a new deterministic StoredTask projection
+  from the current Contract and Mission revision in the switch transaction or
+  an explicit migration step.
+- Converted tasks retain old-to-new audit linkage; the old task is unclaimable,
+  its provenance is not rewritten in place, and at most one equivalent action
+  is claimable.
 - VERIFYING StoredTask completes fresh verification first.
 - UNCERTAIN ActionAttempt blocks equivalent replacement and authority switch
   until human or observed reconciliation.
@@ -224,9 +249,15 @@ The Contract root covers the game session. Other scopes remain legacy-owned.
 
 - New and existing games have one Contract root.
 - Only research enters MissionGraph authority.
+- With research MissionGraph-owned and civic legacy-owned, a research Patch is
+  accepted and a civic Patch is rejected deterministically.
 - Research creates no DecisionGap or PlanLease after switch.
 - StoredTask projection is deterministic and revision-bound.
 - Stale Mission revisions cannot produce claimable tasks.
+- A legacy READY research task is cancelled or superseded at switch, and at
+  most one Mission-derived replacement is claimable.
+- Verified action evidence that completes a Mission increments the Contract
+  revision exactly once; duplicate recovery does not increment it again.
 - Other scopes remain legacy and unchanged.
 - Replay and crash recovery cover the slice.
 
@@ -281,14 +312,22 @@ strategic authority.
 
 ### Data migration
 
-- Seed `initial_baseline` from first accepted canonical Observation.
+- Treat `initial_baseline` and `rebaseline_required` as Workflow control
+  results, not ordinary StateDelta and not automatic baseline acceptance.
+- Seed or replace the accepted baseline only with a persisted Canonical
+  NormalizedObservation whose session is consistent, normalization and source
+  versions are acceptable, and required collections and fields are complete.
 - Version history by session, normalization version, and source version.
 - Preserve Observation versus ActionAttempt evidence provenance.
 
 ### Active object handling
 
 - Incompatible history produces `rebaseline_required`.
-- Rebaseline does not automatically invalidate the full graph.
+- An incomplete Observation never overwrites the last accepted baseline,
+  manufactures deletion, switches Scope authority, deletes a Mission by
+  itself, or by itself invalidates the Contract or rebuilds the full graph.
+- Known independent comparable fields may produce local Delta while unknown
+  portions remain unknown.
 - Stale patch rejects or explicitly re-requests.
 - Already committed patch recovers idempotently after crash.
 
@@ -298,6 +337,9 @@ strategic authority.
 - Explicitly complete absence can mean deletion.
 - Session/version mismatch, turn regression, and partial critical data
   rebaseline rather than fabricate Delta.
+- A complete accepted baseline followed by an incomplete current Observation
+  leaves the baseline unchanged; a later complete Observation does not classify
+  reappearing data as newly created.
 - Unrelated changes do not call Planner.
 - Direct, downstream, conflict, and ancestor closures are selected.
 - Duplicate patch handling neither increments revision nor recalls Provider.
@@ -344,7 +386,8 @@ TurnActionGraph becomes sole research execution authority.
 
 ### Allowed scope
 
-- Add graph and node revision/provenance semantics needed for research.
+- Add graph and node provenance that binds exactly one game session, one turn,
+  one source Canonical NormalizedObservation, and one source Contract revision.
 - Add TurnCompiler from current Contract, Mission, canonical Observation,
   action contracts, and approvals.
 - Add stale-source checks before claim.
@@ -363,13 +406,21 @@ TurnActionGraph becomes sole research execution authority.
 - VERIFYING StoredTask finishes fresh verification first.
 - UNCERTAIN ActionAttempt blocks an equivalent node.
 - Pending approval rebinds to a current graph revision or invalidates.
-- Nodes from stale Contract revisions invalidate or recompile.
+- A turn change, Contract revision change, or inapplicable source Observation
+  makes the graph stale; old READY nodes become unclaimable and Runtime
+  recompiles before execution.
 
 ### Tests
 
-- Graphs reference Contract revision, Observation, and source Missions.
+- Graphs reference one session, one turn, one source Contract revision, one
+  source Observation, and source Missions.
 - Stable node identity survives restart and replay.
 - Stale READY nodes never send.
+- When verified action evidence changes Mission completion, Contract revision
+  increments exactly once, duplicate recovery does not increment again, and
+  the old TurnActionGraph cannot execute.
+- A turn N graph with a future-turn candidate becomes unclaimable when turn
+  N+1 begins; Runtime compiles a new graph before any execution.
 - Action contracts and approvals are enforced.
 - Equivalent StoredTask and TurnActionNode cannot both be claimable.
 - ActionAttempt history remains continuous.
@@ -419,6 +470,9 @@ Barrier kinds. WorkflowRuntime remains sole orchestrator.
 - Reuse BoundedGamePort, ActionAttempt, verification, approval, and process
   lock boundaries.
 - Implement Dependency, Verification, Approval, and Turn Barriers only.
+- Enforce Turn Barrier by excluding future-turn nodes from the current Wave and
+  compiling a new graph after reading and normalizing each new-turn
+  Observation before reevaluating the Barrier.
 
 ### Data migration
 
@@ -431,6 +485,8 @@ node claim, attempt, Barrier, and verification through the one Store.
   rules.
 - Never resend UNKNOWN automatically.
 - Recheck Contract revision before each claim.
+- Reject claims from graphs bound to a prior turn or an inapplicable source
+  Observation.
 - Keep active Barriers durable across restart.
 
 ### Tests
@@ -438,8 +494,12 @@ node claim, attempt, Barrier, and verification through the one Store.
 - At most one mutation occurs per Tick.
 - Wave selection is deterministic and never sends in parallel.
 - Every Barrier blocks and resumes correctly.
+- A future-turn candidate in the turn N graph cannot be claimed in turn N+1;
+  the turn N+1 Observation is normalized and a new graph is compiled first.
 - Attempt persistence precedes delivery.
 - Fresh canonical Observation drives verification.
+- Approval, verification, and ActionAttempt audit recover across restart while
+  execution claim still requires the current graph.
 - BatchExecutor has no Planner dependency.
 - Windows/Linux lock and replay behavior remain consistent.
 
@@ -503,7 +563,9 @@ migration audit, replay fixtures, and control-surface reads.
 
 ### Data migration
 
-- Add scope to MissionGraph authority atomically with Contract revision.
+- Add a Scope only through the atomic authority-switch transaction: update the
+  Authority Scope Set, initialize its Missions, record migration audit, stop
+  its legacy write path, and commit one new StrategicContract revision.
 - Migrate only provable durable intent and execution work.
 - Retain compatibility reads until history validation completes.
 - Stop legacy writes before deleting data or types.
@@ -515,7 +577,7 @@ migration audit, replay fixtures, and control-surface reads.
 | OPEN/REQUESTED DecisionGap | Complete or supersede before switch |
 | Active PlannerRequest | Complete, supersede, or explicitly migrate |
 | PlanLease | Invalidate, complete, or block switch |
-| READY StoredTask | Continue with proven source/target or cancel |
+| READY StoredTask | Cancel or supersede the old task, or create a deterministic Mission-derived replacement in the controlled switch transaction or explicit migration step |
 | VERIFYING StoredTask | Finish fresh verification before switch |
 | UNCERTAIN ActionAttempt | Reconcile manually or from facts; never generate equivalent replacement mutation |
 | Pending approval | Complete, invalidate, or resubmit on new revision |
@@ -524,11 +586,20 @@ migration audit, replay fixtures, and control-surface reads.
 An UNCERTAIN ActionAttempt blocks any switch that could generate the same
 semantic mutation.
 
+Any READY StoredTask conversion creates a new task referencing the current
+Contract and Mission revision, records old-to-new audit linkage, leaves the old
+task unclaimable, and does not rewrite old provenance in place. The migration
+must leave at most one equivalent action claimable.
+
 ### Tests
 
 - Scope-specific safety and behavior characterization.
 - Authority Scope Set has one writer per scope.
+- With research MissionGraph-owned and civic legacy-owned, a research Patch is
+  accepted and a civic Patch is rejected deterministically.
 - No equivalent legacy/new action is claimable.
+- A legacy READY research task is cancelled or superseded during authority
+  switch, with at most one Mission-derived replacement claimable.
 - Active-object migration and rollback fixtures.
 - Multi-game isolation, replay, approvals, crash injection, and rebaseline.
 - Unmigrated scopes remain unchanged.

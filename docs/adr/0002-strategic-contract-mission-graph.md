@@ -38,6 +38,23 @@ settler, and city planning to become unrelated strategic roots.
    inconsistency, not the ordinary response to state change.
 10. Planner output is a proposal until deterministic validation and atomic
     Contract commit succeed.
+11. A `StrategicContractProposal` or `MissionGraphPatch` may add, modify, or
+    delete only Scopes in the current Authority Scope Set for which
+    MissionGraph has write authority. Legacy-owned Scopes are read-only facts
+    or controlled context and any attempted strategic write is rejected
+    deterministically.
+12. The only way to initialize Missions for a legacy-owned Scope is an atomic
+    Scope authority-switch transaction that updates the Authority Scope Set,
+    initializes the new Scope Missions, records migration audit, stops the
+    legacy write path, and commits one new StrategicContract revision.
+13. ActionAttempt verification remains an independent Workflow audit fact. If
+    verification changes Mission status, completion or invalidation,
+    desired-outcome satisfaction, or MissionGraph-persisted evidence, it must
+    perform an idempotent deterministic Contract transition from the expected
+    current revision through WorkflowStateStorePort atomic commit to exactly
+    one new StrategicContract revision. MissionGraph is never updated in place.
+14. External ActionAttempt evidence that is not committed through such a
+    Contract transition cannot make a Mission completed or advanced.
 
 The physical representation may later be partitioned, but Contract revision,
 MissionGraph, patch audit, and Authority Scope Set changes share one logical
@@ -53,6 +70,8 @@ aggregate and transaction boundary.
   strategy.
 - Local repair limits model input and avoids unrelated replanning.
 - Legacy and MissionGraph ownership cannot silently overlap.
+- Mission progress and evidence have the same revision and recovery guarantees
+  as every other MissionGraph mutation.
 
 ### Negative
 
