@@ -675,7 +675,16 @@ _PLANNER_CONTRACT_KEYS = {
 }
 
 
-def _persist_legacy_in_progress_request(engine, game, gap, event, request_id):
+def _persist_legacy_in_progress_request(
+    engine,
+    game,
+    gap,
+    event,
+    request_id,
+    *,
+    policy_revision="planner-call-policy/v1",
+    planner_input_contract_revision=None,
+):
     group = batch_compatible_gaps(
         game.snapshot.game_id,
         gap.observation_id,
@@ -686,8 +695,9 @@ def _persist_legacy_in_progress_request(engine, game, gap, event, request_id):
         game.snapshot, [event]
     ).model_dump(mode="json")
     old_constraints = dict(old_payload["constraints"])
-    for key in _PLANNER_CONTRACT_KEYS:
-        old_constraints.pop(key)
+    if planner_input_contract_revision is None:
+        for key in _PLANNER_CONTRACT_KEYS:
+            old_constraints.pop(key)
     old_payload["constraints"] = old_constraints
     requested_gap = gap.model_copy(
         update={
@@ -696,6 +706,14 @@ def _persist_legacy_in_progress_request(engine, game, gap, event, request_id):
         }
     )
     now = datetime.now(UTC)
+    input_projection = {
+        "decision_group_id": group.decision_group_id,
+        "gaps": [gap.model_dump(mode="json")["input_projection"]],
+    }
+    if planner_input_contract_revision is not None:
+        input_projection["planner_input_contract_revision"] = (
+            planner_input_contract_revision
+        )
     request = PlannerRequest(
         planner_request_id=request_id,
         game_session_id=game.snapshot.game_id,
@@ -704,13 +722,10 @@ def _persist_legacy_in_progress_request(engine, game, gap, event, request_id):
         decision_gap_ids=(gap.decision_gap_id,),
         decision_group_id=group.decision_group_id,
         input_projection_hash=group.input_projection_hash,
-        input_projection={
-            "decision_group_id": group.decision_group_id,
-            "gaps": [gap.model_dump(mode="json")["input_projection"]],
-        },
+        input_projection=input_projection,
         request_payload=old_payload,
         plan_revision_refs=gap.relevant_plan_revisions,
-        policy_revision="planner-call-policy/v1",
+        policy_revision=policy_revision,
         approval_contract_hash=engine.planner_lifecycle._contract_hash(
             [gap.model_dump(mode="json")["input_projection"]["approval"]]
         ),
@@ -961,6 +976,54 @@ def test_contract_migration_recovers_started_attempt_across_three_ticks(tmp_path
         assert actual_payload.pop("request_id") != old_payload["request_id"]
         expected_payload.pop("request_id")
         assert actual_payload == expected_payload
+
+    asyncio.run(scenario())
+
+
+def test_call_policy_change_does_not_receive_contract_migration_budget_exemption(
+    tmp_path,
+):
+    async def scenario():
+        delegate = _ResolvingPlanner()
+        engine, game, planner = _engine(tmp_path, delegate)
+        await engine.tick()
+        gap = engine.store.list_decision_gaps("opening")[0]
+        request_id = "old-call-policy-current-input-contract"
+        _persist_legacy_in_progress_request(
+            engine,
+            game,
+            gap,
+            _settler_event(),
+            request_id,
+            policy_revision=(
+                f"planner-call-policy/v0+{PLANNER_INPUT_CONTRACT_REVISION}"
+            ),
+            planner_input_contract_revision=PLANNER_INPUT_CONTRACT_REVISION,
+        )
+
+        superseded = await engine.tick()
+
+        assert (
+            superseded.workflow_tick["outcome"]
+            == TickOutcomeKind.DECISION_GAP_UPDATED
+        )
+        stored_old = engine.store.get_planner_request(request_id)
+        assert stored_old.status is PlannerRequestStatus.SUPERSEDED
+        assert stored_old.failure_category == "stale_planning_input"
+        assert [
+            attempt.status
+            for attempt in engine.store.list_provider_attempts(request_id)
+        ] == [ProviderAttemptStatus.ABANDONED]
+        assert engine.store.provider_budget_request_count_for_turn("opening", 1) == 1
+
+        blocked = await engine.tick()
+
+        assert blocked.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert engine.store.logical_request_count_for_turn("opening", 1) == 1
+        assert engine.store.active_planner_request("opening") is None
+        assert delegate.calls == 0
+        assert planner.summary.logical_requests == 0
+        assert planner.summary.provider_attempts == 0
 
     asyncio.run(scenario())
 

@@ -749,6 +749,7 @@ class PlannerLifecycleCoordinator:
         engine = self.engine
         snapshot = observation.snapshot
         gaps = self._request_gaps(request)
+        projection = thaw_json(request.input_projection)
         reason = None
         contract_revision_migration = False
         refreshed = []
@@ -774,7 +775,10 @@ class PlannerLifecycleCoordinator:
             )
             if request.policy_revision != PLANNER_REQUEST_POLICY_REVISION:
                 reason = "planner request policy revision changed"
-                contract_revision_migration = True
+                contract_revision_migration = (
+                    projection.get("planner_input_contract_revision")
+                    != PLANNER_INPUT_CONTRACT_REVISION
+                )
             elif group.decision_group_id != request.decision_group_id:
                 reason = "stable decision identity was replaced"
             elif self._planner_input_hash(
