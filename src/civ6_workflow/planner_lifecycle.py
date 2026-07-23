@@ -71,6 +71,13 @@ from .workflow_protocol import (
 )
 
 
+PLANNER_CALL_POLICY_REVISION = "planner-call-policy/v1"
+PLANNER_INPUT_CONTRACT_REVISION = "planner-input-contract/v2"
+PLANNER_REQUEST_POLICY_REVISION = (
+    f"{PLANNER_CALL_POLICY_REVISION}+{PLANNER_INPUT_CONTRACT_REVISION}"
+)
+
+
 class PlannerLifecycleCoordinator:
     """Advance durable planning state without owning the workflow Tick loop."""
 
@@ -742,7 +749,9 @@ class PlannerLifecycleCoordinator:
         engine = self.engine
         snapshot = observation.snapshot
         gaps = self._request_gaps(request)
+        projection = thaw_json(request.input_projection)
         reason = None
+        contract_revision_migration = False
         refreshed = []
         if len(gaps) != len(request.decision_gap_ids):
             reason = "source decision gap no longer exists"
@@ -764,9 +773,17 @@ class PlannerLifecycleCoordinator:
                 refreshed,
                 now=engine._now(),
             )
-            if group.decision_group_id != request.decision_group_id:
+            if request.policy_revision != PLANNER_REQUEST_POLICY_REVISION:
+                reason = "planner request policy revision changed"
+                contract_revision_migration = (
+                    projection.get("planner_input_contract_revision")
+                    != PLANNER_INPUT_CONTRACT_REVISION
+                )
+            elif group.decision_group_id != request.decision_group_id:
                 reason = "stable decision identity was replaced"
-            elif group.input_projection_hash != request.input_projection_hash:
+            elif self._planner_input_hash(
+                group.input_projection_hash
+            ) != request.input_projection_hash:
                 reason = "relevant decision input changed"
             elif (
                 tuple(
@@ -777,8 +794,6 @@ class PlannerLifecycleCoordinator:
                 != request.plan_revision_refs
             ):
                 reason = "relevant plan revision changed"
-            elif request.policy_revision != "planner-call-policy/v1":
-                reason = "planner policy revision changed"
             elif request.approval_contract_hash != self._contract_hash(
                 [
                     thaw_json(gap.input_projection).get("approval", {})
@@ -798,7 +813,11 @@ class PlannerLifecycleCoordinator:
             update={
                 "status": PlannerRequestStatus.SUPERSEDED,
                 "completed_at": engine._now(),
-                "failure_category": "stale_planning_input",
+                "failure_category": (
+                    "planner_contract_revision_migration"
+                    if contract_revision_migration
+                    else "stale_planning_input"
+                ),
                 "pending_information_requests": (),
             }
         )
@@ -902,6 +921,19 @@ class PlannerLifecycleCoordinator:
             ).encode("utf-8")
         ).hexdigest()
 
+    @classmethod
+    def _planner_input_hash(
+        cls,
+        decision_input_hash: str,
+        planner_request_policy_revision: str = PLANNER_REQUEST_POLICY_REVISION,
+    ) -> str:
+        return cls._contract_hash(
+            {
+                "decision_input_hash": decision_input_hash,
+                "planner_request_policy_revision": planner_request_policy_revision,
+            }
+        )
+
     def _create_request_if_eligible(
         self,
         ctx,
@@ -958,10 +990,11 @@ class PlannerLifecycleCoordinator:
             list(eligibility.gaps),
             now=engine._now(),
         )
+        planner_input_hash = self._planner_input_hash(group.input_projection_hash)
         duplicate = engine.store.planner_request_for_input(
             snapshot.game_id,
             group.decision_group_id,
-            group.input_projection_hash,
+            planner_input_hash,
         )
         if duplicate is not None:
             for gap in eligibility.gaps:
@@ -996,6 +1029,9 @@ class PlannerLifecycleCoordinator:
         logical_id = f"logical_{uuid4().hex}"
         request_projection = {
             "projection_version": group.input_projection_version,
+            "planner_call_policy_revision": PLANNER_CALL_POLICY_REVISION,
+            "planner_input_contract_revision": PLANNER_INPUT_CONTRACT_REVISION,
+            "planner_request_policy_revision": PLANNER_REQUEST_POLICY_REVISION,
             "decision_group_id": group.decision_group_id,
             "gaps": [thaw_json(gap.input_projection) for gap in eligibility.gaps],
         }
@@ -1015,7 +1051,7 @@ class PlannerLifecycleCoordinator:
             observation_id=observation_id,
             decision_gap_ids=group.decision_gap_ids,
             decision_group_id=group.decision_group_id,
-            input_projection_hash=group.input_projection_hash,
+            input_projection_hash=planner_input_hash,
             input_projection=request_projection,
             request_payload=request_payload,
             plan_revision_refs=tuple(
@@ -1023,7 +1059,7 @@ class PlannerLifecycleCoordinator:
                 for gap in eligibility.gaps
                 for revision in gap.relevant_plan_revisions
             ),
-            policy_revision="planner-call-policy/v1",
+            policy_revision=PLANNER_REQUEST_POLICY_REVISION,
             approval_contract_hash=self._contract_hash(
                 [
                     thaw_json(gap.input_projection).get("approval", {})

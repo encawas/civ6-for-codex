@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from .actions import ACTION_REGISTRY
 from .models import PlanBundle, ProposedTask, RiskLevel
@@ -50,6 +52,135 @@ ACTION_ENTITY_TYPES = {
     "unit_skip": {"unit"},
     "unit_found_city": {"unit"},
 }
+
+ENTITY_ID_ARGUMENTS: Mapping[str, str] = MappingProxyType(
+    {
+        "builder": "unit_id",
+        "city": "city_id",
+        "civic": "tech_or_civic",
+        "research": "tech_or_civic",
+        "unit": "unit_id",
+    }
+)
+
+
+def _freeze_contract(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_contract(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_contract(item) for item in value)
+    return value
+
+
+ACTION_CONDITION_CONTRACTS: Mapping[
+    str, Mapping[str, tuple[Mapping[str, Any], ...]]
+] = _freeze_contract(
+    {
+        "set_civic": {
+            "required_preconditions": (
+                {"type": "civic_unselected"},
+                {
+                    "type": "civic_available",
+                    "civic_type": "$tech_or_civic",
+                },
+            ),
+            "required_postconditions": (
+                {
+                    "type": "civic_equals",
+                    "civic_type": "$tech_or_civic",
+                },
+            ),
+        },
+        "set_research": {
+            "required_preconditions": (
+                {"type": "research_unselected"},
+                {
+                    "type": "research_available",
+                    "tech_type": "$tech_or_civic",
+                },
+            ),
+            "required_postconditions": (
+                {
+                    "type": "research_equals",
+                    "tech_type": "$tech_or_civic",
+                },
+            ),
+        },
+    }
+)
+
+
+def action_entity_type_contracts(
+    action_types: set[str] | None = None,
+) -> dict[str, list[str]]:
+    selected = set(ACTION_REGISTRY) if action_types is None else set(action_types)
+    unknown = selected - set(ACTION_REGISTRY)
+    if unknown:
+        raise PlanValidationError(
+            f"unsupported action types in entity contract projection: {sorted(unknown)}"
+        )
+    missing = selected - set(ACTION_ENTITY_TYPES)
+    if missing:
+        raise PlanValidationError(
+            f"actions missing entity type contracts: {sorted(missing)}"
+        )
+    return {
+        action_type: sorted(ACTION_ENTITY_TYPES[action_type])
+        for action_type in sorted(selected)
+    }
+
+
+def entity_id_argument_contracts(
+    selected_action_entity_types: Mapping[str, list[str]],
+) -> dict[str, str]:
+    selected: dict[str, str] = {}
+    for action_type in sorted(selected_action_entity_types):
+        spec = ACTION_REGISTRY.get(action_type)
+        if spec is None:
+            raise PlanValidationError(
+                f"entity contract references unsupported action type: {action_type}"
+            )
+        for entity_type in selected_action_entity_types[action_type]:
+            argument_name = ENTITY_ID_ARGUMENTS.get(entity_type)
+            if argument_name is None:
+                raise PlanValidationError(
+                    f"entity type has no ID argument contract: {entity_type}"
+                )
+            if argument_name not in spec.required_arguments:
+                raise PlanValidationError(
+                    f"action {action_type} entity type {entity_type} requires "
+                    f"ID argument {argument_name} to be a required action argument"
+                )
+            selected[entity_type] = argument_name
+    return {name: selected[name] for name in sorted(selected)}
+
+
+def condition_contracts(
+    action_types: set[str] | None = None,
+) -> dict[str, dict[str, object]]:
+    selected = set(ACTION_REGISTRY) if action_types is None else set(action_types)
+    unknown = selected - set(ACTION_REGISTRY)
+    if unknown:
+        raise PlanValidationError(
+            f"unsupported action types in condition contract projection: {sorted(unknown)}"
+        )
+    return {
+        action_type: _stable_contract_copy(ACTION_CONDITION_CONTRACTS[action_type])
+        for action_type in sorted(selected & set(ACTION_CONDITION_CONTRACTS))
+    }
+
+
+def _stable_contract_copy(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _stable_contract_copy(value[key])
+            for key in sorted(value)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_contract_copy(item) for item in value]
+    return deepcopy(value)
 
 
 @dataclass(slots=True)
@@ -172,13 +303,7 @@ def validate_plan_bundle(bundle: PlanBundle, context: PlanValidationContext) -> 
             )
         entity_turn_claims.add(claim)
 
-        expected_argument = {
-            "city": "city_id",
-            "research": "tech_or_civic",
-            "civic": "tech_or_civic",
-            "unit": "unit_id",
-            "builder": "unit_id",
-        }.get(task.entity_type)
+        expected_argument = ENTITY_ID_ARGUMENTS.get(task.entity_type)
         if expected_argument and expected_argument in task.arguments:
             if str(task.arguments[expected_argument]) != entity_id:
                 errors.append(
@@ -190,28 +315,82 @@ def validate_plan_bundle(bundle: PlanBundle, context: PlanValidationContext) -> 
 
 
 def _validate_action_contract(task: ProposedTask, errors: list[str]) -> None:
-    if task.action_type == "set_research":
-        target = str(task.arguments.get("tech_or_civic", ""))
-        _require_conditions(
-            task,
-            [
-                {"type": "research_unselected"},
-                {"type": "research_available", "tech_type": target},
-            ],
-            [{"type": "research_equals", "tech_type": target}],
-            errors,
+    placeholders = sorted(
+        {
+            placeholder
+            for conditions in (
+                task.preconditions,
+                task.postconditions,
+                task.invalidators,
+            )
+            for condition in conditions
+            for placeholder in _contract_placeholders(condition)
+        }
+    )
+    if placeholders:
+        errors.append(
+            f"task {task.task_id} contains unresolved contract placeholder(s): "
+            f"{placeholders}"
         )
-    elif task.action_type == "set_civic":
-        target = str(task.arguments.get("tech_or_civic", ""))
-        _require_conditions(
-            task,
-            [
-                {"type": "civic_unselected"},
-                {"type": "civic_available", "civic_type": target},
-            ],
-            [{"type": "civic_equals", "civic_type": target}],
-            errors,
+
+    contract = ACTION_CONDITION_CONTRACTS.get(task.action_type)
+    if contract is None:
+        return
+    try:
+        required_preconditions = [
+            _render_contract_value(condition, task.arguments)
+            for condition in contract["required_preconditions"]
+        ]
+        required_postconditions = [
+            _render_contract_value(condition, task.arguments)
+            for condition in contract["required_postconditions"]
+        ]
+    except KeyError as exc:
+        errors.append(
+            f"task {task.task_id} condition contract references missing task "
+            f"argument: {exc.args[0]}"
         )
+        return
+    _require_conditions(
+        task,
+        required_preconditions,
+        required_postconditions,
+        errors,
+    )
+
+
+def _render_contract_value(value: Any, arguments: Mapping[str, Any]) -> Any:
+    if isinstance(value, str) and value.startswith("$"):
+        argument_name = value[1:]
+        if argument_name not in arguments:
+            raise KeyError(argument_name)
+        return deepcopy(arguments[argument_name])
+    if isinstance(value, Mapping):
+        return {
+            key: _render_contract_value(item, arguments)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_render_contract_value(item, arguments) for item in value]
+    return deepcopy(value)
+
+
+def _contract_placeholders(value: Any) -> set[str]:
+    if isinstance(value, str) and value.startswith("$"):
+        return {value}
+    if isinstance(value, Mapping):
+        return {
+            placeholder
+            for item in value.values()
+            for placeholder in _contract_placeholders(item)
+        }
+    if isinstance(value, (list, tuple)):
+        return {
+            placeholder
+            for item in value
+            for placeholder in _contract_placeholders(item)
+        }
+    return set()
 
 
 def _require_conditions(

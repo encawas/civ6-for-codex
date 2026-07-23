@@ -2916,26 +2916,47 @@ class WorkflowStore:
 
         A superseded request with no persisted ProviderAttempt never reached the
         provider boundary, so a successor may reuse the same turn's one-call
-        budget while the original request remains available for audit.
+        budget while the original request remains available for audit. Contract
+        migrations also release the budget after every attempt is durably
+        abandoned; all other provider-attempt history remains budget-consuming.
         """
 
         with self._connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT COUNT(*) AS value
+                SELECT request.request_json,
+                       COUNT(attempt.provider_attempt_id) AS attempt_count,
+                       SUM(
+                           CASE
+                               WHEN attempt.provider_attempt_id IS NOT NULL
+                                AND attempt.status != ?
+                               THEN 1 ELSE 0
+                           END
+                       ) AS non_abandoned_attempt_count
                 FROM logical_planner_requests AS request
+                LEFT JOIN provider_attempts AS attempt
+                  ON attempt.planner_request_id=request.planner_request_id
                 WHERE request.game_id=? AND request.turn=?
-                  AND (
-                    request.status != ?
-                    OR EXISTS(
-                        SELECT 1 FROM provider_attempts AS attempt
-                        WHERE attempt.planner_request_id=request.planner_request_id
-                    )
-                  )
+                GROUP BY request.planner_request_id
                 """,
-                (game_id, turn, PlannerRequestStatus.SUPERSEDED.value),
-            ).fetchone()
-        return int(row["value"])
+                (ProviderAttemptStatus.ABANDONED.value, game_id, turn),
+            ).fetchall()
+
+        consumed = 0
+        for row in rows:
+            request = PlannerRequest.model_validate_json(row["request_json"])
+            attempt_count = int(row["attempt_count"])
+            if request.status is PlannerRequestStatus.SUPERSEDED:
+                if attempt_count == 0:
+                    continue
+                if (
+                    request.failure_category
+                    == "planner_contract_revision_migration"
+                    and int(row["non_abandoned_attempt_count"]) == 0
+                ):
+                    continue
+            consumed += 1
+        return consumed
 
     @staticmethod
     def _save_provider_attempt_in_connection(

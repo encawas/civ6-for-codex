@@ -42,6 +42,11 @@ from civ6_workflow.engine import (
     InjectedCrashBoundary,
     WorkflowEngine,
 )
+from civ6_workflow.planner_lifecycle import (
+    PLANNER_CALL_POLICY_REVISION,
+    PLANNER_INPUT_CONTRACT_REVISION,
+    PLANNER_REQUEST_POLICY_REVISION,
+)
 from civ6_workflow.models import (
     ActionResult,
     EventLevel,
@@ -59,6 +64,7 @@ from civ6_workflow.store import WorkflowStore
 from civ6_workflow.workflow_protocol import (
     EventResolution,
     LeaseContract,
+    READ_ONLY_QUERY_SPECS,
     ResolutionDisposition,
     WorkflowPlanBundle,
 )
@@ -658,6 +664,628 @@ def _engine(tmp_path, planner):
         ),
     )
     return engine, game, recording
+
+
+_PLANNER_CONTRACT_KEYS = {
+    "action_argument_contracts",
+    "action_entity_types",
+    "entity_id_arguments",
+    "condition_contracts",
+    "information_tool_arguments",
+}
+
+
+def _persist_legacy_in_progress_request(
+    engine,
+    game,
+    gap,
+    event,
+    request_id,
+    *,
+    policy_revision="planner-call-policy/v1",
+    planner_input_contract_revision=None,
+):
+    group = batch_compatible_gaps(
+        game.snapshot.game_id,
+        gap.observation_id,
+        [gap],
+        now=datetime.now(UTC),
+    )
+    old_payload = engine._build_agent_request(
+        game.snapshot, [event]
+    ).model_dump(mode="json")
+    old_constraints = dict(old_payload["constraints"])
+    if planner_input_contract_revision is None:
+        for key in _PLANNER_CONTRACT_KEYS:
+            old_constraints.pop(key)
+    old_payload["constraints"] = old_constraints
+    requested_gap = gap.model_copy(
+        update={
+            "status": DecisionGapStatus.REQUESTED,
+            "logical_request_id": request_id,
+        }
+    )
+    now = datetime.now(UTC)
+    input_projection = {
+        "decision_group_id": group.decision_group_id,
+        "gaps": [gap.model_dump(mode="json")["input_projection"]],
+    }
+    if planner_input_contract_revision is not None:
+        input_projection["planner_input_contract_revision"] = (
+            planner_input_contract_revision
+        )
+    request = PlannerRequest(
+        planner_request_id=request_id,
+        game_session_id=game.snapshot.game_id,
+        turn_number=game.snapshot.turn,
+        observation_id=gap.observation_id,
+        decision_gap_ids=(gap.decision_gap_id,),
+        decision_group_id=group.decision_group_id,
+        input_projection_hash=group.input_projection_hash,
+        input_projection=input_projection,
+        request_payload=old_payload,
+        plan_revision_refs=gap.relevant_plan_revisions,
+        policy_revision=policy_revision,
+        approval_contract_hash=engine.planner_lifecycle._contract_hash(
+            [gap.model_dump(mode="json")["input_projection"]["approval"]]
+        ),
+        allowed_actions_hash=engine.planner_lifecycle._contract_hash(
+            sorted(engine.config.allowed_action_types)
+        ),
+        model_settings={"provider": "legacy"},
+        status=PlannerRequestStatus.PENDING,
+        created_at=now,
+    )
+    engine.store.save_decision_gap(requested_gap, turn=game.snapshot.turn)
+    engine.store.save_planner_request(request)
+    started = ProviderAttempt(
+        provider_attempt_id=f"attempt-{request_id}",
+        planner_request_id=request_id,
+        attempt_number=1,
+        provider_request_id=old_payload["request_id"],
+        status=ProviderAttemptStatus.STARTED,
+        started_at=now,
+    )
+    in_progress = engine.store.start_provider_attempt(
+        game.snapshot.game_id, request, started
+    )
+    assert in_progress.status is PlannerRequestStatus.IN_PROGRESS
+    return old_payload
+
+
+def test_planner_receives_filtered_canonical_input_contracts(tmp_path):
+    async def scenario():
+        engine, _, planner = _engine(tmp_path, _ResolvingPlanner())
+        engine.config.allowed_action_types = {"set_research"}
+
+        await engine.tick()
+        await engine.tick()
+        await engine.tick()
+
+        assert len(planner.requests) == 1
+        constraints = planner.requests[0].constraints
+        assert set(constraints["action_argument_contracts"]) == {"set_research"}
+        assert set(constraints["action_entity_types"]) == {"set_research"}
+        assert set(constraints["condition_contracts"]) == {"set_research"}
+        assert constraints["entity_id_arguments"] == {
+            "research": "tech_or_civic"
+        }
+        assert set(constraints["allowed_action_types"]) == {"set_research"}
+        assert set(constraints["allowed_information_tools"]) == set(
+            constraints["information_tool_arguments"]
+        ) == set(READ_ONLY_QUERY_SPECS)
+        assert "unit_move" not in constraints["action_argument_contracts"]
+        assert "builder_improve" not in constraints["action_entity_types"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "legacy_status",
+    [
+        PlannerRequestStatus.PENDING,
+        PlannerRequestStatus.READY_TO_CONTINUE,
+        PlannerRequestStatus.AWAITING_INFORMATION,
+        PlannerRequestStatus.BACKOFF,
+    ],
+)
+def test_legacy_active_request_is_superseded_and_rebuilt_with_contracts(
+    tmp_path, legacy_status
+):
+    async def scenario():
+        engine, game, planner = _engine(tmp_path, _ResolvingPlanner())
+        await engine.tick()
+        gap = engine.store.list_decision_gaps("opening")[0]
+        group = batch_compatible_gaps(
+            "opening", gap.observation_id, [gap], now=datetime.now(UTC)
+        )
+        request_id = f"legacy-{legacy_status.value.lower()}"
+        gap_status = (
+            DecisionGapStatus.AWAITING_INFORMATION
+            if legacy_status is PlannerRequestStatus.AWAITING_INFORMATION
+            else DecisionGapStatus.REQUESTED
+        )
+        requested_gap = gap.model_copy(
+            update={"status": gap_status, "logical_request_id": request_id}
+        )
+        old_payload = engine._build_agent_request(
+            game.snapshot, [_settler_event()]
+        ).model_dump(mode="json")
+        old_constraints = dict(old_payload["constraints"])
+        for key in (
+            "action_argument_contracts",
+            "action_entity_types",
+            "entity_id_arguments",
+            "condition_contracts",
+            "information_tool_arguments",
+        ):
+            old_constraints.pop(key)
+        old_payload["constraints"] = old_constraints
+        pending_information_requests = (
+            (
+                {
+                    "request_id": "legacy-info",
+                    "event_dedupe_key": gap.cooldown_key,
+                    "query_type": "settler_select_site",
+                    "tool_name": "get_settle_advisor",
+                    "arguments": {"unit_id": 7},
+                    "purpose": "legacy request",
+                },
+            )
+            if legacy_status is PlannerRequestStatus.AWAITING_INFORMATION
+            else ()
+        )
+        request = PlannerRequest(
+            planner_request_id=request_id,
+            game_session_id="opening",
+            turn_number=1,
+            observation_id=gap.observation_id,
+            decision_gap_ids=(gap.decision_gap_id,),
+            decision_group_id=group.decision_group_id,
+            input_projection_hash=group.input_projection_hash,
+            input_projection={
+                "decision_group_id": group.decision_group_id,
+                "gaps": [gap.model_dump(mode="json")["input_projection"]],
+            },
+            request_payload=old_payload,
+            plan_revision_refs=gap.relevant_plan_revisions,
+            policy_revision="planner-call-policy/v1",
+            approval_contract_hash=engine.planner_lifecycle._contract_hash(
+                [gap.model_dump(mode="json")["input_projection"]["approval"]]
+            ),
+            allowed_actions_hash=engine.planner_lifecycle._contract_hash(
+                sorted(engine.config.allowed_action_types)
+            ),
+            model_settings={"provider": "legacy"},
+            status=legacy_status,
+            created_at=datetime.now(UTC),
+            pending_information_requests=pending_information_requests,
+        )
+        engine.store.save_decision_gap(requested_gap, turn=1)
+        engine.store.save_planner_request(request)
+
+        superseded = await engine.tick()
+
+        assert (
+            superseded.workflow_tick["outcome"]
+            == TickOutcomeKind.DECISION_GAP_UPDATED
+        )
+        stored_old = engine.store.get_planner_request(request_id)
+        assert stored_old.status is PlannerRequestStatus.SUPERSEDED
+        assert (
+            stored_old.failure_category
+            == "planner_contract_revision_migration"
+        )
+        assert engine.store.list_provider_attempts(request_id) == []
+        assert planner.summary.logical_requests == 0
+        assert planner.summary.provider_attempts == 0
+        reopened = engine.store.get_decision_gap("opening", gap.decision_gap_id)
+        assert reopened.status is DecisionGapStatus.OPEN
+        assert reopened.logical_request_id is None
+        assert reopened.reopen_reason == "planner request policy revision changed"
+
+        created = await engine.tick()
+
+        assert (
+            created.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        new_request = engine.store.get_planner_request(
+            created.workflow_tick["planner_request_id"]
+        )
+        assert new_request.policy_revision == PLANNER_REQUEST_POLICY_REVISION
+        assert new_request.planner_request_id != request_id
+        assert {
+            "action_argument_contracts",
+            "action_entity_types",
+            "entity_id_arguments",
+            "condition_contracts",
+            "information_tool_arguments",
+        } <= set(new_request.request_payload["constraints"])
+        assert planner.summary.logical_requests == 0
+        assert planner.summary.provider_attempts == 0
+
+    asyncio.run(scenario())
+
+
+def test_contract_migration_recovers_started_attempt_across_three_ticks(tmp_path):
+    async def scenario():
+        delegate = _ResolvingPlanner()
+        engine, game, planner = _engine(tmp_path, delegate)
+        await engine.tick()
+        gap = engine.store.list_decision_gaps("opening")[0]
+        request_id = "legacy-in-progress"
+        old_payload = _persist_legacy_in_progress_request(
+            engine, game, gap, _settler_event(), request_id
+        )
+
+        migrated = await engine.tick()
+
+        assert (
+            migrated.workflow_tick["outcome"]
+            == TickOutcomeKind.DECISION_GAP_UPDATED
+        )
+        stored_old = engine.store.get_planner_request(request_id)
+        assert stored_old.status is PlannerRequestStatus.SUPERSEDED
+        assert (
+            stored_old.failure_category
+            == "planner_contract_revision_migration"
+        )
+        attempts = engine.store.list_provider_attempts(request_id)
+        assert [attempt.status for attempt in attempts] == [
+            ProviderAttemptStatus.ABANDONED
+        ]
+        assert attempts[0].attempt_number == 1
+        assert (
+            engine.store.get_decision_gap("opening", gap.decision_gap_id).status
+            is DecisionGapStatus.OPEN
+        )
+        assert engine.store.provider_budget_request_count_for_turn("opening", 1) == 0
+        assert delegate.calls == 0
+        assert planner.summary.provider_attempts == 0
+
+        created = await engine.tick()
+
+        assert (
+            created.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        replacement = engine.store.get_planner_request(
+            created.workflow_tick["planner_request_id"]
+        )
+        assert replacement.status is PlannerRequestStatus.PENDING
+        assert replacement.policy_revision == PLANNER_REQUEST_POLICY_REVISION
+        assert _PLANNER_CONTRACT_KEYS <= set(
+            replacement.request_payload["constraints"]
+        )
+        assert replacement.request_payload != old_payload
+        assert delegate.calls == 0
+        assert planner.summary.provider_attempts == 0
+
+        completed = await engine.tick()
+
+        assert (
+            completed.workflow_tick["outcome"]
+            == TickOutcomeKind.PLANNER_ATTEMPT_COMPLETED
+        )
+        assert delegate.calls == 1
+        assert planner.summary.provider_attempts == 1
+        assert len(planner.requests) == 1
+        actual_payload = planner.requests[0].model_dump(mode="json")
+        expected_payload = replacement.model_dump(mode="json")["request_payload"]
+        assert actual_payload.pop("request_id") != old_payload["request_id"]
+        expected_payload.pop("request_id")
+        assert actual_payload == expected_payload
+
+    asyncio.run(scenario())
+
+
+def test_call_policy_change_does_not_receive_contract_migration_budget_exemption(
+    tmp_path,
+):
+    async def scenario():
+        delegate = _ResolvingPlanner()
+        engine, game, planner = _engine(tmp_path, delegate)
+        await engine.tick()
+        gap = engine.store.list_decision_gaps("opening")[0]
+        request_id = "old-call-policy-current-input-contract"
+        _persist_legacy_in_progress_request(
+            engine,
+            game,
+            gap,
+            _settler_event(),
+            request_id,
+            policy_revision=(
+                f"planner-call-policy/v0+{PLANNER_INPUT_CONTRACT_REVISION}"
+            ),
+            planner_input_contract_revision=PLANNER_INPUT_CONTRACT_REVISION,
+        )
+
+        superseded = await engine.tick()
+
+        assert (
+            superseded.workflow_tick["outcome"]
+            == TickOutcomeKind.DECISION_GAP_UPDATED
+        )
+        stored_old = engine.store.get_planner_request(request_id)
+        assert stored_old.status is PlannerRequestStatus.SUPERSEDED
+        assert stored_old.failure_category == "stale_planning_input"
+        assert [
+            attempt.status
+            for attempt in engine.store.list_provider_attempts(request_id)
+        ] == [ProviderAttemptStatus.ABANDONED]
+        assert engine.store.provider_budget_request_count_for_turn("opening", 1) == 1
+
+        blocked = await engine.tick()
+
+        assert blocked.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert engine.store.logical_request_count_for_turn("opening", 1) == 1
+        assert engine.store.active_planner_request("opening") is None
+        assert delegate.calls == 0
+        assert planner.summary.logical_requests == 0
+        assert planner.summary.provider_attempts == 0
+
+    asyncio.run(scenario())
+
+
+def test_contract_migration_resolves_externally_filled_research_gap(tmp_path):
+    async def scenario():
+        snapshot = RuntimeSnapshot(
+            turn=1,
+            game_id="research-migration",
+            overview={"turn": 1, "num_cities": 1, "num_units": 0},
+            cities=[{"city_id": 1, "currently_building": "UNIT_SCOUT"}],
+            units=[],
+            blockers=[],
+            tech_civics={
+                "current_research": None,
+                "available_techs": [{"tech_type": "TECH_MINING"}],
+            },
+        )
+        game = _Game(snapshot)
+        delegate = _ResolvingPlanner()
+        planner = RecordingPlanner(delegate)
+        engine = WorkflowEngine(
+            store=WorkflowStore(tmp_path / "research-migration.sqlite3"),
+            game=game,
+            planner=planner,
+            config=EngineConfig(
+                execution_mode=ExecutionMode.AUTO,
+                auto_end_turn=False,
+                max_agent_calls_per_turn=1,
+            ),
+        )
+        await engine.tick()
+        gap = engine.store.list_decision_gaps("research-migration")[0]
+        assert gap.gap_type == "research_direction_required"
+        request_id = "legacy-research-in-progress"
+        event = GameEvent(
+            event_type="research_direction_required",
+            turn=1,
+            entity_type="research",
+            blocking=True,
+            dedupe_key="research_direction_required:empire",
+        )
+        _persist_legacy_in_progress_request(
+            engine, game, gap, event, request_id
+        )
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "tech_civics": {
+                    **game.snapshot.tech_civics,
+                    "current_research": "TECH_MINING",
+                }
+            }
+        )
+
+        resolved = await engine.tick()
+
+        assert (
+            resolved.workflow_tick["outcome"]
+            == TickOutcomeKind.DECISION_GAP_UPDATED
+        )
+        stored_old = engine.store.get_planner_request(request_id)
+        assert stored_old.status is PlannerRequestStatus.SUPERSEDED
+        assert stored_old.failure_category == "stale_planning_input"
+        assert [
+            attempt.status
+            for attempt in engine.store.list_provider_attempts(request_id)
+        ] == [ProviderAttemptStatus.ABANDONED]
+        stored_gap = engine.store.get_decision_gap(
+            "research-migration", gap.decision_gap_id
+        )
+        assert stored_gap.status is DecisionGapStatus.RESOLVED
+        assert stored_gap.resolution_reason == "research slot was filled outside the workflow"
+        assert engine.store.active_planner_request("research-migration") is None
+        assert engine.store.logical_request_count_for_turn("research-migration", 1) == 1
+        assert delegate.calls == 0
+        assert planner.summary.provider_attempts == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    (
+        "case_name",
+        "request_status",
+        "failure_category",
+        "attempt_statuses",
+        "expected_count",
+    ),
+    [
+        ("failed", PlannerRequestStatus.FAILED, "provider_failure", (), 1),
+        ("backoff", PlannerRequestStatus.BACKOFF, "provider_backoff", (), 1),
+        (
+            "in-progress",
+            PlannerRequestStatus.IN_PROGRESS,
+            None,
+            (ProviderAttemptStatus.STARTED,),
+            1,
+        ),
+        (
+            "ordinary-superseded",
+            PlannerRequestStatus.SUPERSEDED,
+            "stale_planning_input",
+            (ProviderAttemptStatus.ABANDONED,),
+            1,
+        ),
+        (
+            "migration-succeeded",
+            PlannerRequestStatus.SUPERSEDED,
+            "planner_contract_revision_migration",
+            (ProviderAttemptStatus.SUCCEEDED,),
+            1,
+        ),
+        (
+            "migration-failed",
+            PlannerRequestStatus.SUPERSEDED,
+            "planner_contract_revision_migration",
+            (ProviderAttemptStatus.FAILED,),
+            1,
+        ),
+        (
+            "migration-started",
+            PlannerRequestStatus.SUPERSEDED,
+            "planner_contract_revision_migration",
+            (ProviderAttemptStatus.STARTED,),
+            1,
+        ),
+        (
+            "migration-mixed",
+            PlannerRequestStatus.SUPERSEDED,
+            "planner_contract_revision_migration",
+            (
+                ProviderAttemptStatus.ABANDONED,
+                ProviderAttemptStatus.SUCCEEDED,
+            ),
+            1,
+        ),
+        (
+            "migration-all-abandoned",
+            PlannerRequestStatus.SUPERSEDED,
+            "planner_contract_revision_migration",
+            (
+                ProviderAttemptStatus.ABANDONED,
+                ProviderAttemptStatus.ABANDONED,
+            ),
+            0,
+        ),
+        (
+            "superseded-without-attempt",
+            PlannerRequestStatus.SUPERSEDED,
+            "stale_planning_input",
+            (),
+            0,
+        ),
+    ],
+)
+def test_provider_budget_contract_migration_exemption_is_narrow(
+    tmp_path,
+    case_name,
+    request_status,
+    failure_category,
+    attempt_statuses,
+    expected_count,
+):
+    store = WorkflowStore(tmp_path / f"budget-{case_name}.sqlite3")
+    now = datetime.now(UTC)
+    terminal = request_status in {
+        PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.SUPERSEDED,
+    }
+    request = PlannerRequest(
+        planner_request_id=f"request-{case_name}",
+        game_session_id="budget",
+        turn_number=1,
+        observation_id="obs-budget",
+        decision_gap_ids=("gap-budget",),
+        decision_group_id=f"group-{case_name}",
+        input_projection_hash=f"hash-{case_name}",
+        policy_revision=(
+            "planner-call-policy/v1"
+            if failure_category == "planner_contract_revision_migration"
+            else PLANNER_REQUEST_POLICY_REVISION
+        ),
+        model_settings={"provider": "test"},
+        status=request_status,
+        created_at=now,
+        completed_at=now if terminal else None,
+        failure_category=failure_category,
+    )
+    store.save_planner_request(request)
+    for attempt_number, attempt_status in enumerate(attempt_statuses, start=1):
+        attempt_terminal = attempt_status is not ProviderAttemptStatus.STARTED
+        store.save_provider_attempt(
+            "budget",
+            ProviderAttempt(
+                provider_attempt_id=f"attempt-{case_name}-{attempt_number}",
+                planner_request_id=request.planner_request_id,
+                attempt_number=attempt_number,
+                provider_request_id=f"wire-{attempt_number}",
+                status=attempt_status,
+                started_at=now,
+                completed_at=now if attempt_terminal else None,
+                latency_seconds=0.0 if attempt_terminal else None,
+                failure_category=(
+                    "provider_failure"
+                    if attempt_status is ProviderAttemptStatus.FAILED
+                    else None
+                ),
+            ),
+        )
+
+    assert store.provider_budget_request_count_for_turn("budget", 1) == expected_count
+    assert len(store.list_provider_attempts(request.planner_request_id)) == len(
+        attempt_statuses
+    )
+
+
+def test_planner_input_hash_versions_call_policy_and_contract(tmp_path):
+    engine, _, _ = _engine(tmp_path, _ResolvingPlanner())
+    decision_hash = "same-decision-input"
+    call_policy_changed = (
+        f"planner-call-policy/v2+{PLANNER_INPUT_CONTRACT_REVISION}"
+    )
+    input_contract_changed = (
+        f"{PLANNER_CALL_POLICY_REVISION}+planner-input-contract/v3"
+    )
+    revisions = (
+        PLANNER_REQUEST_POLICY_REVISION,
+        call_policy_changed,
+        input_contract_changed,
+    )
+    hashes = tuple(
+        engine.planner_lifecycle._planner_input_hash(decision_hash, revision)
+        for revision in revisions
+    )
+
+    assert len(set(hashes)) == 3
+
+    now = datetime.now(UTC)
+    for index, (revision, input_hash) in enumerate(
+        zip(revisions, hashes, strict=True), start=1
+    ):
+        engine.store.save_planner_request(
+            PlannerRequest(
+                planner_request_id=f"versioned-request-{index}",
+                game_session_id="opening",
+                turn_number=1,
+                observation_id="obs-versioned",
+                decision_gap_ids=("gap-versioned",),
+                decision_group_id="group-versioned",
+                input_projection_hash=input_hash,
+                policy_revision=revision,
+                model_settings={"provider": "test"},
+                status=PlannerRequestStatus.PENDING,
+                created_at=now,
+            )
+        )
+
+    for index, input_hash in enumerate(hashes, start=1):
+        stored = engine.store.planner_request_for_input(
+            "opening", "group-versioned", input_hash
+        )
+        assert stored.planner_request_id == f"versioned-request-{index}"
 
 
 def test_ai_001_003_phase4_vertical_chain_and_zero_mutation(tmp_path):
@@ -1836,7 +2464,9 @@ def test_issue7_independent_gap_items_commit_partial_success(tmp_path):
             observation_id="obs-partial",
             decision_gap_ids=group.decision_gap_ids,
             decision_group_id=group.decision_group_id,
-            input_projection_hash=group.input_projection_hash,
+            input_projection_hash=engine.planner_lifecycle._planner_input_hash(
+                group.input_projection_hash
+            ),
             input_projection={
                 "decision_group_id": group.decision_group_id,
                 "gaps": [
@@ -1850,7 +2480,7 @@ def test_issue7_independent_gap_items_commit_partial_success(tmp_path):
                 for gap in requested_gaps
                 for revision in gap.relevant_plan_revisions
             ),
-            policy_revision="planner-call-policy/v1",
+            policy_revision=PLANNER_REQUEST_POLICY_REVISION,
             approval_contract_hash=engine.planner_lifecycle._contract_hash(
                 approval_contract
             ),
@@ -2479,7 +3109,9 @@ def test_issue7_atomic_multi_gap_failure_persists_no_partial_outputs(tmp_path):
             observation_id="obs-atomic",
             decision_gap_ids=group.decision_gap_ids,
             decision_group_id=group.decision_group_id,
-            input_projection_hash=group.input_projection_hash,
+            input_projection_hash=engine.planner_lifecycle._planner_input_hash(
+                group.input_projection_hash
+            ),
             input_projection={
                 "decision_group_id": group.decision_group_id,
                 "gaps": [
@@ -2489,7 +3121,7 @@ def test_issue7_atomic_multi_gap_failure_persists_no_partial_outputs(tmp_path):
             },
             request_payload=provider_request.model_dump(mode="json"),
             plan_revision_refs=(),
-            policy_revision="planner-call-policy/v1",
+            policy_revision=PLANNER_REQUEST_POLICY_REVISION,
             approval_contract_hash=engine.planner_lifecycle._contract_hash(
                 [
                     gap.model_dump(mode="json")["input_projection"]["approval"]
@@ -2569,11 +3201,13 @@ def test_issue7_turn_specific_active_request_expires_before_provider_call(tmp_pa
             observation_id="obs-tactical-request",
             decision_gap_ids=(gap.decision_gap_id,),
             decision_group_id=group.decision_group_id,
-            input_projection_hash=group.input_projection_hash,
+            input_projection_hash=engine.planner_lifecycle._planner_input_hash(
+                group.input_projection_hash
+            ),
             input_projection=gap.model_dump(mode="json")["input_projection"],
             request_payload=provider_request.model_dump(mode="json"),
             plan_revision_refs=gap.relevant_plan_revisions,
-            policy_revision="planner-call-policy/v1",
+            policy_revision=PLANNER_REQUEST_POLICY_REVISION,
             approval_contract_hash=engine.planner_lifecycle._contract_hash(
                 [gap.model_dump(mode="json")["input_projection"]["approval"]]
             ),

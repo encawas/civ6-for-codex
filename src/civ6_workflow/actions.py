@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import InitVar, dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -130,6 +131,39 @@ END_TURN_ACTION_SPEC = ActionSpec(
     required_arguments=frozenset(),
     retry_classification=RetryClassification.NEVER_BLIND_RETRY,
 )
+
+
+def action_argument_contracts(
+    action_types: set[str] | None = None,
+) -> dict[str, dict[str, object]]:
+    selected = set(ACTION_REGISTRY) if action_types is None else set(action_types)
+    unknown = selected - set(ACTION_REGISTRY)
+    if unknown:
+        raise ActionValidationError(
+            f"unsupported action types in contract projection: {sorted(unknown)}"
+        )
+
+    contracts: dict[str, dict[str, object]] = {}
+    for action_type in sorted(selected):
+        spec = ACTION_REGISTRY[action_type]
+        fixed_names = set(spec.fixed_arguments)
+        overlap = fixed_names & (
+            set(spec.required_arguments) | set(spec.optional_arguments)
+        )
+        if overlap:
+            raise ActionValidationError(
+                f"fixed arguments overlap planner arguments for {action_type}: "
+                f"{sorted(overlap)}"
+            )
+        contracts[action_type] = {
+            "required": sorted(spec.required_arguments),
+            "optional": sorted(spec.optional_arguments),
+            "injected_by_runtime": {
+                name: deepcopy(spec.fixed_arguments[name])
+                for name in sorted(spec.fixed_arguments)
+            },
+        }
+    return contracts
 
 
 def resolve_action_spec(action_type: str) -> ActionSpec:

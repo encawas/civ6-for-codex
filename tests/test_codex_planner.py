@@ -10,6 +10,25 @@ from civ6_workflow.codex_planner import (
     PlannerError,
 )
 from civ6_workflow.models import AgentRequest, ExecutionMode, PlanBundle
+from civ6_workflow.workflow_prompt import EXTENDED_SYSTEM_INSTRUCTIONS
+
+
+def test_planner_prompt_names_versioned_input_contracts():
+    for contract_key in (
+        "constraints.action_argument_contracts",
+        "constraints.action_entity_types",
+        "constraints.entity_id_arguments",
+        "constraints.condition_contracts",
+    ):
+        assert contract_key in EXTENDED_SYSTEM_INSTRUCTIONS
+    assert "constraints.information_tool_arguments" in EXTENDED_SYSTEM_INSTRUCTIONS
+    assert "never emit arguments listed in injected_by_runtime" in (
+        EXTENDED_SYSTEM_INSTRUCTIONS
+    )
+    assert "$..." in EXTENDED_SYSTEM_INSTRUCTIONS
+    assert "never emit an unresolved `$...` placeholder" in (
+        EXTENDED_SYSTEM_INSTRUCTIONS
+    )
 
 
 def test_codex_command_is_noninteractive_and_read_only(tmp_path: Path):
