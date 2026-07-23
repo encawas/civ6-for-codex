@@ -16,6 +16,7 @@ Rules:
 2. Prefer durable plan updates over repeatedly asking the model for ordinary continuation work.
 3. Each entity may have at most one task due on the same turn.
 4. Use only action types listed in constraints.allowed_action_types and never invent entity IDs.
+When creating tasks, strictly follow constraints.action_argument_contracts, constraints.action_entity_types, constraints.entity_id_arguments, and constraints.condition_contracts. Never invent arguments or entity types, and never emit arguments listed in injected_by_runtime. Information request arguments must follow constraints.information_tool_arguments.
 Condition template strings beginning with `$` reference the same-named task.arguments field. Replace every such template value with the actual argument value in emitted tasks; never emit an unresolved `$...` placeholder.
 5. High-impact or irreversible actions must use risk=high or critical and requires_confirmation=true.
 6. Every task needs concise reason, preconditions, postconditions, invalidators, due_turn, and risk.

@@ -71,7 +71,11 @@ from .workflow_protocol import (
 )
 
 
+PLANNER_CALL_POLICY_REVISION = "planner-call-policy/v1"
 PLANNER_INPUT_CONTRACT_REVISION = "planner-input-contract/v2"
+PLANNER_REQUEST_POLICY_REVISION = (
+    f"{PLANNER_CALL_POLICY_REVISION}+{PLANNER_INPUT_CONTRACT_REVISION}"
+)
 
 
 class PlannerLifecycleCoordinator:
@@ -746,6 +750,7 @@ class PlannerLifecycleCoordinator:
         snapshot = observation.snapshot
         gaps = self._request_gaps(request)
         reason = None
+        contract_revision_migration = False
         refreshed = []
         if len(gaps) != len(request.decision_gap_ids):
             reason = "source decision gap no longer exists"
@@ -767,8 +772,9 @@ class PlannerLifecycleCoordinator:
                 refreshed,
                 now=engine._now(),
             )
-            if request.policy_revision != PLANNER_INPUT_CONTRACT_REVISION:
-                reason = "planner input contract revision changed"
+            if request.policy_revision != PLANNER_REQUEST_POLICY_REVISION:
+                reason = "planner request policy revision changed"
+                contract_revision_migration = True
             elif group.decision_group_id != request.decision_group_id:
                 reason = "stable decision identity was replaced"
             elif self._planner_input_hash(
@@ -803,7 +809,11 @@ class PlannerLifecycleCoordinator:
             update={
                 "status": PlannerRequestStatus.SUPERSEDED,
                 "completed_at": engine._now(),
-                "failure_category": "stale_planning_input",
+                "failure_category": (
+                    "planner_contract_revision_migration"
+                    if contract_revision_migration
+                    else "stale_planning_input"
+                ),
                 "pending_information_requests": (),
             }
         )
@@ -908,11 +918,15 @@ class PlannerLifecycleCoordinator:
         ).hexdigest()
 
     @classmethod
-    def _planner_input_hash(cls, decision_input_hash: str) -> str:
+    def _planner_input_hash(
+        cls,
+        decision_input_hash: str,
+        planner_request_policy_revision: str = PLANNER_REQUEST_POLICY_REVISION,
+    ) -> str:
         return cls._contract_hash(
             {
                 "decision_input_hash": decision_input_hash,
-                "planner_input_contract_revision": PLANNER_INPUT_CONTRACT_REVISION,
+                "planner_request_policy_revision": planner_request_policy_revision,
             }
         )
 
@@ -1011,7 +1025,9 @@ class PlannerLifecycleCoordinator:
         logical_id = f"logical_{uuid4().hex}"
         request_projection = {
             "projection_version": group.input_projection_version,
+            "planner_call_policy_revision": PLANNER_CALL_POLICY_REVISION,
             "planner_input_contract_revision": PLANNER_INPUT_CONTRACT_REVISION,
+            "planner_request_policy_revision": PLANNER_REQUEST_POLICY_REVISION,
             "decision_group_id": group.decision_group_id,
             "gaps": [thaw_json(gap.input_projection) for gap in eligibility.gaps],
         }
@@ -1039,7 +1055,7 @@ class PlannerLifecycleCoordinator:
                 for gap in eligibility.gaps
                 for revision in gap.relevant_plan_revisions
             ),
-            policy_revision=PLANNER_INPUT_CONTRACT_REVISION,
+            policy_revision=PLANNER_REQUEST_POLICY_REVISION,
             approval_contract_hash=self._contract_hash(
                 [
                     thaw_json(gap.input_projection).get("approval", {})

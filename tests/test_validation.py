@@ -231,6 +231,44 @@ def test_condition_contract_projection_is_stable_filtered_and_defensive():
     ][0] == {"type": "research_unselected"}
 
 
+def test_action_condition_contracts_are_recursively_immutable():
+    with pytest.raises(TypeError):
+        ACTION_CONDITION_CONTRACTS["set_research"][
+            "required_preconditions"
+        ][0]["type"] = "anything"
+
+    validate_plan_bundle(
+        PlanBundle(
+            summary="unchanged research contract",
+            tasks=[
+                ProposedTask(
+                    task_id="immutable-safe-research",
+                    action_type="set_research",
+                    entity_type="research",
+                    entity_id="TECH_MINING",
+                    due_turn=10,
+                    arguments={"tech_or_civic": "TECH_MINING"},
+                    preconditions=[
+                        {"type": "research_unselected"},
+                        {
+                            "type": "research_available",
+                            "tech_type": "TECH_MINING",
+                        },
+                    ],
+                    postconditions=[
+                        {
+                            "type": "research_equals",
+                            "tech_type": "TECH_MINING",
+                        }
+                    ],
+                    reason="verify immutable canonical contract",
+                )
+            ],
+        ),
+        _context(),
+    )
+
+
 def test_accepts_complete_civic_contract_rendered_from_shared_template():
     bundle = PlanBundle(
         summary="safe civic selection",

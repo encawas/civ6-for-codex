@@ -63,44 +63,51 @@ ENTITY_ID_ARGUMENTS: Mapping[str, str] = MappingProxyType(
     }
 )
 
+
+def _freeze_contract(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_contract(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_contract(item) for item in value)
+    return value
+
+
 ACTION_CONDITION_CONTRACTS: Mapping[
-    str, Mapping[str, tuple[dict[str, Any], ...]]
-] = MappingProxyType(
+    str, Mapping[str, tuple[Mapping[str, Any], ...]]
+] = _freeze_contract(
     {
-        "set_civic": MappingProxyType(
-            {
-                "required_preconditions": (
-                    {"type": "civic_unselected"},
-                    {
-                        "type": "civic_available",
-                        "civic_type": "$tech_or_civic",
-                    },
-                ),
-                "required_postconditions": (
-                    {
-                        "type": "civic_equals",
-                        "civic_type": "$tech_or_civic",
-                    },
-                ),
-            }
-        ),
-        "set_research": MappingProxyType(
-            {
-                "required_preconditions": (
-                    {"type": "research_unselected"},
-                    {
-                        "type": "research_available",
-                        "tech_type": "$tech_or_civic",
-                    },
-                ),
-                "required_postconditions": (
-                    {
-                        "type": "research_equals",
-                        "tech_type": "$tech_or_civic",
-                    },
-                ),
-            }
-        ),
+        "set_civic": {
+            "required_preconditions": (
+                {"type": "civic_unselected"},
+                {
+                    "type": "civic_available",
+                    "civic_type": "$tech_or_civic",
+                },
+            ),
+            "required_postconditions": (
+                {
+                    "type": "civic_equals",
+                    "civic_type": "$tech_or_civic",
+                },
+            ),
+        },
+        "set_research": {
+            "required_preconditions": (
+                {"type": "research_unselected"},
+                {
+                    "type": "research_available",
+                    "tech_type": "$tech_or_civic",
+                },
+            ),
+            "required_postconditions": (
+                {
+                    "type": "research_equals",
+                    "tech_type": "$tech_or_civic",
+                },
+            ),
+        },
     }
 )
 
