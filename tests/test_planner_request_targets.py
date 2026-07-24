@@ -520,7 +520,47 @@ def test_store_schema_failure_requires_an_existing_request(tmp_path):
     assert store.get_planner_request(request.planner_request_id) is None
 
 
-def test_store_lifecycle_can_commit_and_reopen_schema_failure(tmp_path):
+@pytest.mark.parametrize(
+    "attempt_status",
+    [
+        None,
+        ProviderAttemptStatus.STARTED,
+        ProviderAttemptStatus.FAILED,
+        ProviderAttemptStatus.ABANDONED,
+    ],
+    ids=["missing", "started", "failed", "abandoned"],
+)
+def test_store_lifecycle_schema_failure_rejects_unproven_attempt(
+    tmp_path, attempt_status
+):
+    store = WorkflowStore(tmp_path / f"lifecycle-{attempt_status}.sqlite3")
+    pending = _request(f"lifecycle-{attempt_status}")
+    store.save_planner_request(pending)
+    in_progress = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.IN_PROGRESS,
+            "provider_attempt_count": 1,
+        }
+    )
+    store.save_planner_request(in_progress)
+    if attempt_status is not None:
+        store.save_provider_attempt(
+            "game-1", _attempt(in_progress, 1, attempt_status)
+        )
+    rejected = in_progress.model_copy(
+        update={
+            "status": PlannerRequestStatus.REJECTED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "failure_category": "planner_contract_failure",
+        }
+    )
+
+    with pytest.raises(ValueError, match="final ProviderAttempt"):
+        store.save_planner_request(rejected)
+    assert store.get_planner_request(pending.planner_request_id) == in_progress
+
+
+def test_store_lifecycle_can_commit_reopen_and_replay_schema_failure(tmp_path):
     path = tmp_path / "lifecycle-schema-failure.sqlite3"
     store = WorkflowStore(path)
     pending = _request("lifecycle-schema-failure")
@@ -532,6 +572,8 @@ def test_store_lifecycle_can_commit_and_reopen_schema_failure(tmp_path):
         }
     )
     store.save_planner_request(in_progress)
+    attempt = _attempt(in_progress, 1, ProviderAttemptStatus.SUCCEEDED)
+    store.save_provider_attempt("game-1", attempt)
     rejected = in_progress.model_copy(
         update={
             "status": PlannerRequestStatus.REJECTED,
@@ -547,11 +589,79 @@ def test_store_lifecycle_can_commit_and_reopen_schema_failure(tmp_path):
     assert WorkflowStore(path).get_planner_request(
         rejected.planner_request_id
     ) == rejected
+    exported = store.export_replay_state("game-1")
+    restored = WorkflowStore(tmp_path / "restored-schema-failure.sqlite3")
+    restored.import_replay_state(exported)
+    assert restored.get_planner_request(rejected.planner_request_id) == rejected
+    assert restored.list_provider_attempts(rejected.planner_request_id) == [attempt]
+    assert restored.export_replay_state("game-1") == exported
     with pytest.raises(ValueError, match="terminal PlannerRequest row is immutable"):
         store.save_planner_request(
             rejected.model_copy(update={"failure_category": "rewritten"})
         )
     assert store.get_planner_request(rejected.planner_request_id) == rejected
+
+
+def test_store_lifecycle_schema_failure_requires_declared_attempt_number(tmp_path):
+    store = WorkflowStore(tmp_path / "lifecycle-attempt-number.sqlite3")
+    pending = _request("lifecycle-attempt-number")
+    store.save_planner_request(pending)
+    in_progress = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.IN_PROGRESS,
+            "provider_attempt_count": 2,
+        }
+    )
+    store.save_planner_request(in_progress)
+    store.save_provider_attempt(
+        "game-1", _attempt(in_progress, 1, ProviderAttemptStatus.SUCCEEDED)
+    )
+    rejected = in_progress.model_copy(
+        update={
+            "status": PlannerRequestStatus.REJECTED,
+            "completed_at": NOW + timedelta(seconds=2),
+            "failure_category": "planner_contract_failure",
+        }
+    )
+
+    with pytest.raises(ValueError, match="matching final ProviderAttempt"):
+        store.save_planner_request(rejected)
+    assert store.get_planner_request(pending.planner_request_id) == in_progress
+
+
+def test_store_save_and_startup_reject_schema_failure_after_attempt_loss(tmp_path):
+    path = tmp_path / "schema-failure-attempt-loss.sqlite3"
+    store = WorkflowStore(path)
+    pending = _request("schema-failure-attempt-loss")
+    store.save_planner_request(pending)
+    in_progress = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.IN_PROGRESS,
+            "provider_attempt_count": 1,
+        }
+    )
+    store.save_planner_request(in_progress)
+    store.save_provider_attempt(
+        "game-1", _attempt(in_progress, 1, ProviderAttemptStatus.SUCCEEDED)
+    )
+    rejected = in_progress.model_copy(
+        update={
+            "status": PlannerRequestStatus.REJECTED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "failure_category": "planner_contract_failure",
+        }
+    )
+    store.save_planner_request(rejected)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "DELETE FROM provider_attempts WHERE planner_request_id=?",
+            (rejected.planner_request_id,),
+        )
+
+    with pytest.raises(ValueError, match="matching final ProviderAttempt"):
+        store.save_planner_request(rejected)
+    with pytest.raises(ValueError, match="matching final ProviderAttempt"):
+        WorkflowStore(path)
 
 
 def test_v8_read_and_startup_reject_the_same_missing_response_shape(tmp_path):

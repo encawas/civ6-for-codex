@@ -1188,7 +1188,18 @@ class WorkflowStore:
         for row in conn.execute(
             "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
         ).fetchall():
-            cls._planner_request_from_row(row)
+            request = cls._planner_request_from_row(row)
+            cls._validate_contract_schema_failure_attempt(
+                request,
+                conn.execute(
+                    """
+                    SELECT * FROM provider_attempts
+                    WHERE planner_request_id=?
+                    ORDER BY attempt_number
+                    """,
+                    (request.planner_request_id,),
+                ).fetchall(),
+            )
 
         indexes = {
             str(row["name"]): int(row["unique"])
@@ -3241,6 +3252,51 @@ class WorkflowStore:
             )
         return _PlannerResponseFacts.CANONICAL_RESPONSE
 
+    @classmethod
+    def _validate_contract_schema_failure_attempt(
+        cls,
+        request: PlannerRequest,
+        attempt_rows: Iterable[Mapping[str, Any]],
+    ) -> None:
+        if (
+            cls._classify_planner_request_response(request)
+            is not _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
+        ):
+            return
+        if request.provider_attempt_count < 1:
+            raise ValueError(
+                "planner contract schema failure requires "
+                "provider_attempt_count >= 1"
+            )
+
+        final_attempt: ProviderAttempt | None = None
+        for row in attempt_rows:
+            normalized = cls._normalize_provider_attempt_row(row)
+            if (
+                normalized["game_id"] == request.game_session_id
+                and normalized["planner_request_id"]
+                == request.planner_request_id
+                and normalized["attempt_number"]
+                == request.provider_attempt_count
+            ):
+                final_attempt = ProviderAttempt.model_validate_json(
+                    str(normalized["attempt_json"])
+                )
+                break
+        if final_attempt is None:
+            raise ValueError(
+                "planner contract schema failure requires a matching final "
+                "ProviderAttempt"
+            )
+        if (
+            final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+            or final_attempt.completed_at is None
+        ):
+            raise ValueError(
+                "planner contract schema failure requires a SUCCEEDED final "
+                "ProviderAttempt"
+            )
+
     @staticmethod
     def _save_planner_request_in_connection(
         conn: sqlite3.Connection, request: PlannerRequest
@@ -3297,6 +3353,18 @@ class WorkflowStore:
                         "legacy response compatibility can only be introduced by "
                         "migration or replay normalization"
                     )
+
+            WorkflowStore._validate_contract_schema_failure_attempt(
+                request,
+                conn.execute(
+                    """
+                    SELECT * FROM provider_attempts
+                    WHERE planner_request_id=?
+                    ORDER BY attempt_number
+                    """,
+                    (request.planner_request_id,),
+                ).fetchall(),
+            )
 
         conn.execute(
             """
@@ -4424,51 +4492,11 @@ class WorkflowStore:
                 prepared_rows.append(row)
             prepared[table] = prepared_rows
 
-        requests = {
-            str(row["planner_request_id"]): PlannerRequest.model_validate_json(
-                str(row["request_json"])
+        for row in prepared["logical_planner_requests"]:
+            cls._validate_contract_schema_failure_attempt(
+                PlannerRequest.model_validate_json(str(row["request_json"])),
+                prepared["provider_attempts"],
             )
-            for row in prepared["logical_planner_requests"]
-        }
-        attempts = {
-            (
-                str(row["game_id"]),
-                str(row["planner_request_id"]),
-                int(row["attempt_number"]),
-            ): ProviderAttempt.model_validate_json(str(row["attempt_json"]))
-            for row in prepared["provider_attempts"]
-        }
-        for request in requests.values():
-            if (
-                cls._classify_planner_request_response(request)
-                is not _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
-            ):
-                continue
-            if request.provider_attempt_count < 1:
-                raise ValueError(
-                    "planner contract schema failure requires "
-                    "provider_attempt_count >= 1"
-                )
-            attempt = attempts.get(
-                (
-                    request.game_session_id,
-                    request.planner_request_id,
-                    request.provider_attempt_count,
-                )
-            )
-            if attempt is None:
-                raise ValueError(
-                    "planner contract schema failure requires a matching final "
-                    "ProviderAttempt"
-                )
-            if (
-                attempt.status is not ProviderAttemptStatus.SUCCEEDED
-                or attempt.completed_at is None
-            ):
-                raise ValueError(
-                    "planner contract schema failure requires a SUCCEEDED final "
-                    "ProviderAttempt"
-                )
 
         for table in REPLAY_STATE_TABLES:
             for foreign_key in conn.execute(
