@@ -3734,10 +3734,26 @@ def test_issue7_invalid_lease_parameters_are_contract_rejection(tmp_path):
         assert request.response_payload is None
         assert request.response_hash is None
         assert request.validation_result is None
+        assert request.response_evidence_compatibility is None
+        assert request.provider_attempt_count == 1
         attempts = engine.store.list_provider_attempts(request.planner_request_id)
         assert len(attempts) == 1
         assert attempts[0].status is ProviderAttemptStatus.SUCCEEDED
         assert planner.summary.provider_attempts == 1
         assert engine.store.list_plan_leases("opening") == []
+
+        source_ticks = engine.store.list_workflow_ticks("opening")
+        source_gaps = engine.store.list_decision_gaps("opening")
+        exported = engine.store.export_replay_state("opening")
+        restored = WorkflowStore(tmp_path / "restored-schema-failure.sqlite3")
+
+        restored.import_replay_state(exported)
+
+        assert restored.get_planner_request(request.planner_request_id) == request
+        assert restored.list_provider_attempts(request.planner_request_id) == attempts
+        assert restored.list_workflow_ticks("opening") == source_ticks
+        assert restored.list_decision_gaps("opening") == source_gaps
+        assert restored.load_runtime_state("opening") is RuntimeState.AWAITING_HUMAN
+        assert restored.export_replay_state("opening") == exported
 
     asyncio.run(scenario())

@@ -119,6 +119,23 @@ def _completed_request(
     )
 
 
+def _schema_failure_request(
+    request_id: str,
+    *,
+    provider_attempt_count: int = 1,
+) -> PlannerRequest:
+    return _request(
+        request_id,
+        status=PlannerRequestStatus.REJECTED,
+        completed_at=NOW + timedelta(seconds=1),
+    ).model_copy(
+        update={
+            "failure_category": "planner_contract_failure",
+            "provider_attempt_count": provider_attempt_count,
+        }
+    )
+
+
 def test_legacy_target_key_uses_only_sorted_gap_ids():
     historical = _legacy_target(group_id=None, gap_ids=(" gap-b ", "gap-a"))
     current = _legacy_target(group_id="group-new", gap_ids=("gap-a", "gap-b"))
@@ -488,6 +505,86 @@ def test_store_requires_payload_for_new_and_newly_completed_requests(tmp_path):
     )
     store.save_planner_request(completed)
     assert store.get_planner_request(pending.planner_request_id) == completed
+
+
+def test_store_schema_failure_requires_an_existing_request(tmp_path):
+    store = WorkflowStore(tmp_path / "new-schema-failure.sqlite3")
+    request = _schema_failure_request("new-schema-failure")
+
+    with pytest.raises(
+        ValueError,
+        match="schema failure can only be committed by a lifecycle transition",
+    ):
+        store.save_planner_request(request)
+
+    assert store.get_planner_request(request.planner_request_id) is None
+
+
+def test_store_lifecycle_can_commit_and_reopen_schema_failure(tmp_path):
+    path = tmp_path / "lifecycle-schema-failure.sqlite3"
+    store = WorkflowStore(path)
+    pending = _request("lifecycle-schema-failure")
+    store.save_planner_request(pending)
+    in_progress = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.IN_PROGRESS,
+            "provider_attempt_count": 1,
+        }
+    )
+    store.save_planner_request(in_progress)
+    rejected = in_progress.model_copy(
+        update={
+            "status": PlannerRequestStatus.REJECTED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "failure_category": "planner_contract_failure",
+        }
+    )
+
+    store.save_planner_request(rejected)
+    store.save_planner_request(rejected)
+
+    assert store.get_planner_request(rejected.planner_request_id) == rejected
+    assert WorkflowStore(path).get_planner_request(
+        rejected.planner_request_id
+    ) == rejected
+    with pytest.raises(ValueError, match="terminal PlannerRequest row is immutable"):
+        store.save_planner_request(
+            rejected.model_copy(update={"failure_category": "rewritten"})
+        )
+    assert store.get_planner_request(rejected.planner_request_id) == rejected
+
+
+def test_v8_read_and_startup_reject_the_same_missing_response_shape(tmp_path):
+    path = tmp_path / "invalid-v8-response-shape.sqlite3"
+    store = WorkflowStore(path)
+    pending = _request("invalid-v8-response-shape")
+    store.save_planner_request(pending)
+    invalid = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.REJECTED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "failure_category": "ordinary_rejection",
+        }
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE logical_planner_requests
+            SET status=?, request_json=?, completed_at=?
+            WHERE planner_request_id=?
+            """,
+            (
+                invalid.status.value,
+                invalid.model_dump_json(),
+                invalid.completed_at.isoformat(),
+                invalid.planner_request_id,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="requires.*response_payload"):
+        store.get_planner_request(invalid.planner_request_id)
+    with pytest.raises(ValueError, match="requires.*response_payload"):
+        WorkflowStore(path)
 
 
 @pytest.mark.parametrize(
@@ -1126,23 +1223,7 @@ def test_response_payload_survives_store_restart(tmp_path):
 def _v7_replay_state(request, *, attempt=None, round_record=None):
     tables = {"logical_planner_requests": [_v7_request_row(request)]}
     if attempt is not None:
-        tables["provider_attempts"] = [
-            {
-                "provider_attempt_id": attempt.provider_attempt_id,
-                "game_id": "game-1",
-                "planner_request_id": attempt.planner_request_id,
-                "attempt_number": attempt.attempt_number,
-                "provider_request_id": attempt.provider_request_id,
-                "status": attempt.status.value,
-                "attempt_json": attempt.model_dump_json(),
-                "started_at": attempt.started_at.isoformat(),
-                "completed_at": (
-                    None
-                    if attempt.completed_at is None
-                    else attempt.completed_at.isoformat()
-                ),
-            }
-        ]
+        tables["provider_attempts"] = [_provider_attempt_row(attempt)]
     if round_record is not None:
         tables["information_rounds"] = [
             {
@@ -1161,6 +1242,28 @@ def _v7_replay_state(request, *, attempt=None, round_record=None):
             }
         ]
     return {"game_id": "game-1", "tables": tables}
+
+
+def _provider_attempt_row(
+    attempt: ProviderAttempt,
+    *,
+    game_id: str = "game-1",
+) -> dict:
+    return {
+        "provider_attempt_id": attempt.provider_attempt_id,
+        "game_id": game_id,
+        "planner_request_id": attempt.planner_request_id,
+        "attempt_number": attempt.attempt_number,
+        "provider_request_id": attempt.provider_request_id,
+        "status": attempt.status.value,
+        "attempt_json": attempt.model_dump_json(),
+        "started_at": attempt.started_at.isoformat(),
+        "completed_at": (
+            None
+            if attempt.completed_at is None
+            else attempt.completed_at.isoformat()
+        ),
+    }
 
 
 def test_v7_replay_import_canonicalizes_request_and_preserves_children(tmp_path):
@@ -1578,6 +1681,182 @@ def _v8_request_row(request: PlannerRequest) -> dict:
         }
     )
     return row
+
+
+def _schema_failure_replay_state(
+    request: PlannerRequest,
+    *,
+    attempts: tuple[ProviderAttempt, ...] = (),
+) -> dict:
+    tables = {"logical_planner_requests": [_v8_request_row(request)]}
+    if attempts:
+        tables["provider_attempts"] = [
+            _provider_attempt_row(attempt) for attempt in attempts
+        ]
+    return {"game_id": request.game_session_id, "tables": tables}
+
+
+def _attempt(
+    request: PlannerRequest,
+    number: int,
+    status: ProviderAttemptStatus,
+) -> ProviderAttempt:
+    terminal = status is not ProviderAttemptStatus.STARTED
+    return ProviderAttempt(
+        provider_attempt_id=f"{request.planner_request_id}-attempt-{number}",
+        planner_request_id=request.planner_request_id,
+        attempt_number=number,
+        provider_request_id=f"provider-{request.planner_request_id}-{number}",
+        status=status,
+        started_at=NOW,
+        completed_at=(NOW + timedelta(seconds=number) if terminal else None),
+        latency_seconds=(number if terminal else None),
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_attempt_count", "message"),
+    [
+        (0, "provider_attempt_count >= 1"),
+        (1, "matching final ProviderAttempt"),
+    ],
+)
+def test_replay_schema_failure_requires_provider_attempt_before_delete(
+    tmp_path,
+    provider_attempt_count,
+    message,
+):
+    store = WorkflowStore(tmp_path / f"missing-attempt-{provider_attempt_count}.sqlite3")
+    seed = _request("schema-failure-seed")
+    store.save_planner_request(seed)
+    request = _schema_failure_request(
+        f"schema-failure-missing-{provider_attempt_count}",
+        provider_attempt_count=provider_attempt_count,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        store.import_replay_state(_schema_failure_replay_state(request))
+
+    assert store.get_planner_request(seed.planner_request_id) == seed
+    assert store.get_planner_request(request.planner_request_id) is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ProviderAttemptStatus.STARTED,
+        ProviderAttemptStatus.FAILED,
+        ProviderAttemptStatus.ABANDONED,
+    ],
+)
+def test_replay_schema_failure_requires_succeeded_final_attempt(tmp_path, status):
+    store = WorkflowStore(tmp_path / f"wrong-final-attempt-{status.value}.sqlite3")
+    seed = _request("wrong-final-attempt-seed")
+    store.save_planner_request(seed)
+    request = _schema_failure_request(f"wrong-final-attempt-{status.value}")
+    attempt = _attempt(request, 1, status)
+
+    with pytest.raises(ValueError, match="SUCCEEDED final ProviderAttempt"):
+        store.import_replay_state(
+            _schema_failure_replay_state(request, attempts=(attempt,))
+        )
+
+    assert store.get_planner_request(seed.planner_request_id) == seed
+
+
+def test_replay_schema_failure_requires_declared_attempt_number(tmp_path):
+    store = WorkflowStore(tmp_path / "schema-failure-attempt-number.sqlite3")
+    seed = _request("attempt-number-seed")
+    store.save_planner_request(seed)
+    request = _schema_failure_request(
+        "schema-failure-attempt-number",
+        provider_attempt_count=2,
+    )
+    attempt = _attempt(request, 1, ProviderAttemptStatus.SUCCEEDED)
+
+    with pytest.raises(ValueError, match="matching final ProviderAttempt"):
+        store.import_replay_state(
+            _schema_failure_replay_state(request, attempts=(attempt,))
+        )
+
+    assert store.get_planner_request(seed.planner_request_id) == seed
+
+
+def test_replay_schema_failure_attempt_cannot_belong_to_another_request(tmp_path):
+    store = WorkflowStore(tmp_path / "schema-failure-other-request.sqlite3")
+    seed = _request("other-request-seed")
+    store.save_planner_request(seed)
+    request = _schema_failure_request("schema-failure-parent")
+    other = _request(
+        "other-attempt-parent",
+        target=_legacy_target(
+            group_id="other-attempt-group",
+            gap_ids=("other-attempt-gap",),
+        ),
+        input_hash="other-attempt-input",
+    )
+    attempt = _attempt(other, 1, ProviderAttemptStatus.SUCCEEDED)
+    state = _schema_failure_replay_state(request, attempts=(attempt,))
+    state["tables"]["logical_planner_requests"].append(_v8_request_row(other))
+
+    with pytest.raises(ValueError, match="matching final ProviderAttempt"):
+        store.import_replay_state(state)
+
+    assert store.get_planner_request(seed.planner_request_id) == seed
+
+
+def test_replay_schema_failure_attempt_cannot_belong_to_another_game(tmp_path):
+    store = WorkflowStore(tmp_path / "schema-failure-other-game.sqlite3")
+    seed = _request("other-game-seed")
+    store.save_planner_request(seed)
+    request = _schema_failure_request("schema-failure-game")
+    attempt = _attempt(request, 1, ProviderAttemptStatus.SUCCEEDED)
+    state = _schema_failure_replay_state(request, attempts=(attempt,))
+    state["tables"]["provider_attempts"][0]["game_id"] = "game-2"
+
+    with pytest.raises(ValueError, match="belongs to another game"):
+        store.import_replay_state(state)
+
+    assert store.get_planner_request(seed.planner_request_id) == seed
+
+
+def test_replay_schema_failure_allows_earlier_failed_attempts(tmp_path):
+    request = _schema_failure_request(
+        "schema-failure-recovered",
+        provider_attempt_count=2,
+    )
+    attempts = (
+        _attempt(request, 1, ProviderAttemptStatus.FAILED),
+        _attempt(request, 2, ProviderAttemptStatus.SUCCEEDED),
+    )
+    store = WorkflowStore(tmp_path / "schema-failure-recovered.sqlite3")
+
+    store.import_replay_state(
+        _schema_failure_replay_state(request, attempts=attempts)
+    )
+
+    assert store.get_planner_request(request.planner_request_id) == request
+    assert store.list_provider_attempts(request.planner_request_id) == list(attempts)
+
+
+def test_planner_contract_failure_cannot_carry_response_evidence(tmp_path):
+    payload = canonical_workflow_plan_bundle_payload(
+        WorkflowPlanBundle(summary="not a schema failure")
+    )
+    request = _request(
+        "schema-failure-with-payload",
+        status=PlannerRequestStatus.REJECTED,
+        completed_at=NOW,
+        response_payload=payload,
+        response_hash=canonical_json_hash(payload),
+        validation_result={"result": "rejected"},
+    ).model_copy(update={"failure_category": "planner_contract_failure"})
+    store = WorkflowStore(tmp_path / "schema-failure-with-payload.sqlite3")
+
+    with pytest.raises(ValueError, match="invalid response facts"):
+        store.save_planner_request(request)
+
+    assert store.get_planner_request(request.planner_request_id) is None
 
 
 @pytest.mark.parametrize(

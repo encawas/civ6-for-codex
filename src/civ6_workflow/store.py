@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from uuid import uuid4
@@ -64,6 +65,13 @@ _STICKY_EVENT_TYPES = {
 
 class TaskIdentityConflictError(ValueError):
     """Raised when an existing task ID is reused for different semantics."""
+
+
+class _PlannerResponseFacts(StrEnum):
+    CANONICAL_RESPONSE = "CANONICAL_RESPONSE"
+    CONTRACT_SCHEMA_FAILURE = "CONTRACT_SCHEMA_FAILURE"
+    LEGACY_V7_MISSING_PAYLOAD = "LEGACY_V7_MISSING_PAYLOAD"
+    NO_RESPONSE = "NO_RESPONSE"
 
 
 SCHEMA = """
@@ -845,7 +853,10 @@ class WorkflowStore:
         cls, row: Mapping[str, Any]
     ) -> PlannerRequest:
         stored = dict(row)
-        normalized = cls._normalize_planner_request_row(stored)
+        normalized = cls._normalize_planner_request_row(
+            stored,
+            validate_response_contract=True,
+        )
         for column in (
             "request_target_kind",
             "request_target_key",
@@ -1023,7 +1034,7 @@ class WorkflowStore:
                 )
 
         if validate_response_contract:
-            cls._validate_planner_request_response(request)
+            cls._classify_planner_request_response(request)
 
         normalized.update(
             {
@@ -3164,36 +3175,40 @@ class WorkflowStore:
         )
 
     @staticmethod
-    def _validate_planner_request_response(
+    def _classify_planner_request_response(
         request: PlannerRequest,
-        *,
-        allow_contract_schema_failure: bool = False,
-    ) -> None:
+    ) -> _PlannerResponseFacts:
         response_statuses = {
             PlannerRequestStatus.COMPLETED,
             PlannerRequestStatus.PARTIALLY_COMPLETED,
             PlannerRequestStatus.REJECTED,
         }
-        if request.status not in response_statuses:
-            return
-        if request.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
-            raise ValueError(
-                "non-legacy planner response contract is not enabled before Phase 1B"
-            )
         if (
             request.response_evidence_compatibility
             is PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
         ):
-            return
-        if (
-            allow_contract_schema_failure
-            and request.status is PlannerRequestStatus.REJECTED
-            and request.response_payload is None
-            and request.response_hash is None
-            and request.validation_result is None
-            and request.failure_category == "planner_contract_failure"
-        ):
-            return
+            return _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD
+        if request.failure_category == "planner_contract_failure":
+            if (
+                request.target.kind
+                is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+                and request.status is PlannerRequestStatus.REJECTED
+                and request.completed_at is not None
+                and request.response_payload is None
+                and request.response_hash is None
+                and request.validation_result is None
+                and request.response_evidence_compatibility is None
+            ):
+                return _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
+            raise ValueError(
+                "planner contract schema failure has invalid response facts"
+            )
+        if request.status not in response_statuses:
+            return _PlannerResponseFacts.NO_RESPONSE
+        if request.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+            raise ValueError(
+                "non-legacy planner response contract is not enabled before Phase 1B"
+            )
         required_evidence = {
             "response_payload": request.response_payload,
             "response_hash": request.response_hash,
@@ -3224,6 +3239,7 @@ class WorkflowStore:
                 "legacy planner response_hash must use the canonical "
                 "WorkflowPlanBundle payload"
             )
+        return _PlannerResponseFacts.CANONICAL_RESPONSE
 
     @staticmethod
     def _save_planner_request_in_connection(
@@ -3237,7 +3253,13 @@ class WorkflowStore:
             (request.planner_request_id,),
         ).fetchone()
         if existing_row is None:
-            if request.response_evidence_compatibility is not None:
+            response_facts = WorkflowStore._classify_planner_request_response(request)
+            if response_facts is _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE:
+                raise ValueError(
+                    "planner contract schema failure can only be committed by "
+                    "a lifecycle transition or replay recovery"
+                )
+            if response_facts is _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD:
                 raise ValueError(
                     "legacy response compatibility can only be introduced by "
                     "migration or replay normalization"
@@ -3250,17 +3272,8 @@ class WorkflowStore:
                 raise ValueError(
                     "new legacy PlannerRequest requires a DecisionGroup"
                 )
-            WorkflowStore._validate_planner_request_response(request)
         else:
             existing = WorkflowStore._planner_request_from_row(existing_row)
-            if (
-                request.response_evidence_compatibility is not None
-                and existing.response_evidence_compatibility is None
-            ):
-                raise ValueError(
-                    "legacy response compatibility can only be introduced by "
-                    "migration or replay normalization"
-                )
             if existing.status in TERMINAL_PLANNER_STATUSES:
                 if request != existing:
                     raise ValueError("terminal PlannerRequest row is immutable")
@@ -3272,10 +3285,18 @@ class WorkflowStore:
                     "PlannerRequest creation definition is immutable"
                 )
             else:
-                WorkflowStore._validate_planner_request_response(
-                    request,
-                    allow_contract_schema_failure=True,
+                response_facts = (
+                    WorkflowStore._classify_planner_request_response(request)
                 )
+                if (
+                    response_facts
+                    is _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD
+                    and existing.response_evidence_compatibility is None
+                ):
+                    raise ValueError(
+                        "legacy response compatibility can only be introduced by "
+                        "migration or replay normalization"
+                    )
 
         conn.execute(
             """
@@ -4402,6 +4423,52 @@ class WorkflowStore:
                     seen.add(identity)
                 prepared_rows.append(row)
             prepared[table] = prepared_rows
+
+        requests = {
+            str(row["planner_request_id"]): PlannerRequest.model_validate_json(
+                str(row["request_json"])
+            )
+            for row in prepared["logical_planner_requests"]
+        }
+        attempts = {
+            (
+                str(row["game_id"]),
+                str(row["planner_request_id"]),
+                int(row["attempt_number"]),
+            ): ProviderAttempt.model_validate_json(str(row["attempt_json"]))
+            for row in prepared["provider_attempts"]
+        }
+        for request in requests.values():
+            if (
+                cls._classify_planner_request_response(request)
+                is not _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
+            ):
+                continue
+            if request.provider_attempt_count < 1:
+                raise ValueError(
+                    "planner contract schema failure requires "
+                    "provider_attempt_count >= 1"
+                )
+            attempt = attempts.get(
+                (
+                    request.game_session_id,
+                    request.planner_request_id,
+                    request.provider_attempt_count,
+                )
+            )
+            if attempt is None:
+                raise ValueError(
+                    "planner contract schema failure requires a matching final "
+                    "ProviderAttempt"
+                )
+            if (
+                attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or attempt.completed_at is None
+            ):
+                raise ValueError(
+                    "planner contract schema failure requires a SUCCEEDED final "
+                    "ProviderAttempt"
+                )
 
         for table in REPLAY_STATE_TABLES:
             for foreign_key in conn.execute(
