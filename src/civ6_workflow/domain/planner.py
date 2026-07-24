@@ -183,6 +183,10 @@ class PlannerRequestStatus(StrEnum):
     SUPERSEDED = "SUPERSEDED"
 
 
+class PlannerResponseEvidenceCompatibility(StrEnum):
+    LEGACY_V7_MISSING_PAYLOAD = "LEGACY_V7_MISSING_PAYLOAD"
+
+
 TERMINAL_PLANNER_STATUSES = frozenset(
     {
         PlannerRequestStatus.COMPLETED,
@@ -229,6 +233,9 @@ class PlannerRequest(DomainModel):
     response_payload: ImmutableJsonObject | None = None
     response_hash: str | None = None
     validation_result: ImmutableJsonObject | None = None
+    response_evidence_compatibility: (
+        PlannerResponseEvidenceCompatibility | None
+    ) = None
     pending_information_requests: tuple[ImmutableJsonObject, ...] = ()
     information_results: ImmutableJsonObject = {}
     information_round_count: int = Field(default=0, ge=0)
@@ -299,6 +306,23 @@ class PlannerRequest(DomainModel):
             PlannerRequestStatus.PARTIALLY_COMPLETED,
             PlannerRequestStatus.REJECTED,
         }
+        if self.response_evidence_compatibility is not None:
+            if (
+                self.target.kind
+                is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+            ):
+                raise ValueError(
+                    "legacy response compatibility requires a legacy target"
+                )
+            if self.status not in response_statuses:
+                raise ValueError(
+                    "legacy response compatibility requires a response-terminal "
+                    "status"
+                )
+            if self.response_payload is not None:
+                raise ValueError(
+                    "legacy response compatibility cannot include response_payload"
+                )
         if self.status in {
             PlannerRequestStatus.COMPLETED,
             PlannerRequestStatus.PARTIALLY_COMPLETED,

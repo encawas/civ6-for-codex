@@ -27,6 +27,7 @@ from .domain import (
     PlanLease,
     PlanLeaseStatus,
     PlannerRequest,
+    PlannerResponseEvidenceCompatibility,
     PlannerRequestStatus,
     PlannerRequestTarget,
     PlannerRequestTargetKind,
@@ -875,9 +876,6 @@ class WorkflowStore:
             raw_request = json.loads(str(normalized["request_json"]))
             if not isinstance(raw_request, dict):
                 raise ValueError("PlannerRequest JSON must be an object")
-            request = PlannerRequest.model_validate_json(
-                str(normalized["request_json"])
-            )
         except Exception as exc:
             raise ValueError("invalid logical PlannerRequest JSON") from exc
         has_v8_relational_target = all(
@@ -892,6 +890,24 @@ class WorkflowStore:
                 or "decision_group_id" in raw_request
             )
         )
+        if (
+            legacy_v7_shape
+            and raw_request.get("status")
+            in {
+                PlannerRequestStatus.COMPLETED.value,
+                PlannerRequestStatus.PARTIALLY_COMPLETED.value,
+                PlannerRequestStatus.REJECTED.value,
+            }
+            and raw_request.get("response_payload") is None
+            and "response_evidence_compatibility" not in raw_request
+        ):
+            raw_request["response_evidence_compatibility"] = (
+                PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD.value
+            )
+        try:
+            request = PlannerRequest.model_validate_json(canonical_json(raw_request))
+        except Exception as exc:
+            raise ValueError("invalid logical PlannerRequest JSON") from exc
 
         required_columns = {
             "planner_request_id",
@@ -1007,10 +1023,7 @@ class WorkflowStore:
                 )
 
         if validate_response_contract:
-            cls._validate_planner_request_response(
-                request,
-                allow_historical_missing_response=legacy_v7_shape,
-            )
+            cls._validate_planner_request_response(request)
 
         normalized.update(
             {
@@ -3154,7 +3167,6 @@ class WorkflowStore:
     def _validate_planner_request_response(
         request: PlannerRequest,
         *,
-        allow_historical_missing_response: bool = False,
         allow_contract_schema_failure: bool = False,
     ) -> None:
         response_statuses = {
@@ -3168,7 +3180,10 @@ class WorkflowStore:
             raise ValueError(
                 "non-legacy planner response contract is not enabled before Phase 1B"
             )
-        if allow_historical_missing_response and request.response_payload is None:
+        if (
+            request.response_evidence_compatibility
+            is PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
+        ):
             return
         if (
             allow_contract_schema_failure
@@ -3222,6 +3237,11 @@ class WorkflowStore:
             (request.planner_request_id,),
         ).fetchone()
         if existing_row is None:
+            if request.response_evidence_compatibility is not None:
+                raise ValueError(
+                    "legacy response compatibility can only be introduced by "
+                    "migration or replay normalization"
+                )
             if (
                 request.target.kind
                 is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
@@ -3233,6 +3253,14 @@ class WorkflowStore:
             WorkflowStore._validate_planner_request_response(request)
         else:
             existing = WorkflowStore._planner_request_from_row(existing_row)
+            if (
+                request.response_evidence_compatibility is not None
+                and existing.response_evidence_compatibility is None
+            ):
+                raise ValueError(
+                    "legacy response compatibility can only be introduced by "
+                    "migration or replay normalization"
+                )
             if existing.status in TERMINAL_PLANNER_STATUSES:
                 if request != existing:
                     raise ValueError("terminal PlannerRequest row is immutable")
