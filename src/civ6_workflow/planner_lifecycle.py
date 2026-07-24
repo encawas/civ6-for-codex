@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from contextlib import nullcontext
@@ -47,11 +46,15 @@ from .domain import (
     PlannerBackoffTick,
     PlannerRequest,
     PlannerRequestStatus,
+    PlannerRequestTarget,
+    PlannerRequestTargetKind,
     ProviderAttempt,
     ProviderAttemptStatus,
     RuntimeState,
     SubjectRef,
     validate_workflow_tick,
+    canonical_json,
+    canonical_json_hash,
 )
 from .models import (
     EventLevel,
@@ -66,6 +69,7 @@ from .workflow_protocol import (
     WorkflowAgentRequest as AgentRequest,
     ResolutionDisposition,
     WorkflowPlanBundle,
+    canonical_workflow_plan_bundle_payload,
     validate_event_resolution_contract,
     validate_global_resolution_structure,
 )
@@ -125,6 +129,24 @@ class PlannerLifecycleCoordinator:
 
         active = engine.store.active_planner_request(game_id)
         if active is not None:
+            if (
+                active.target.kind
+                is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+            ):
+                reason = (
+                    "non-legacy planner request routing is not enabled "
+                    "before Phase 1B"
+                )
+                compatibility.paused = True
+                compatibility.pause_reason = reason
+                compatibility.planner_request_id = active.planner_request_id
+                return [], self._finish(
+                    ctx,
+                    snapshot,
+                    AwaitingHumanTick,
+                    compatibility=compatibility,
+                    blocking_reason=reason,
+                )
             stale_tick = self._supersede_stale_request(
                 ctx,
                 observation,
@@ -911,15 +933,7 @@ class PlannerLifecycleCoordinator:
 
     @staticmethod
     def _contract_hash(value):
-        return hashlib.sha256(
-            json.dumps(
-                value,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
+        return canonical_json_hash(value)
 
     @classmethod
     def _planner_input_hash(
@@ -990,10 +1004,15 @@ class PlannerLifecycleCoordinator:
             list(eligibility.gaps),
             now=engine._now(),
         )
+        target = PlannerRequestTarget(
+            kind=PlannerRequestTargetKind.LEGACY_DECISION_GROUP,
+            decision_group_id=group.decision_group_id,
+            decision_gap_ids=group.decision_gap_ids,
+        )
         planner_input_hash = self._planner_input_hash(group.input_projection_hash)
         duplicate = engine.store.planner_request_for_input(
             snapshot.game_id,
-            group.decision_group_id,
+            target.target_key,
             planner_input_hash,
         )
         if duplicate is not None:
@@ -1036,21 +1055,13 @@ class PlannerLifecycleCoordinator:
             "gaps": [thaw_json(gap.input_projection) for gap in eligibility.gaps],
         }
         request_payload = provider_request.model_dump(mode="json")
-        context_bytes = len(
-            json.dumps(
-                request_payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-            ).encode("utf-8")
-        )
+        context_bytes = len(canonical_json(request_payload).encode("utf-8"))
         logical_request = PlannerRequest(
             planner_request_id=logical_id,
             game_session_id=snapshot.game_id,
             turn_number=snapshot.turn,
             observation_id=observation_id,
-            decision_gap_ids=group.decision_gap_ids,
-            decision_group_id=group.decision_group_id,
+            target=target,
             input_projection_hash=planner_input_hash,
             input_projection=request_projection,
             request_payload=request_payload,
@@ -1095,6 +1106,7 @@ class PlannerLifecycleCoordinator:
             decision_group=group,
             planner_request=logical_request,
             planner_request_id=logical_id,
+            request_target_kind=target.kind,
             decision_gap_ids=group.decision_gap_ids,
         )
 
@@ -1269,9 +1281,10 @@ class PlannerLifecycleCoordinator:
             error = exc
         else:
             try:
-                bundle = WorkflowPlanBundle.model_validate(
-                    raw_bundle.model_dump(mode="python")
+                canonical_bundle_payload = (
+                    canonical_workflow_plan_bundle_payload(raw_bundle)
                 )
+                bundle = WorkflowPlanBundle.model_validate(canonical_bundle_payload)
             except Exception as exc:
                 contract_error = exc
         finally:
@@ -1345,6 +1358,7 @@ class PlannerLifecycleCoordinator:
                     provider_attempts,
                     provider_count,
                     "information round limit exceeded",
+                    response_payload=canonical_bundle_payload,
                 )
             try:
                 engine._validate_planner_bundle(
@@ -1363,6 +1377,7 @@ class PlannerLifecycleCoordinator:
                     provider_attempts,
                     provider_count,
                     str(exc),
+                    response_payload=canonical_bundle_payload,
                 )
             round_id = f"info_round_{uuid4().hex}"
             pending = tuple(
@@ -1461,19 +1476,17 @@ class PlannerLifecycleCoordinator:
                 "result": "completed",
                 "successful_gap_ids": sorted(successful_gap_ids),
             }
+        response_payload = canonical_bundle_payload
         updated_request = logical_request.model_copy(
             update={
                 "status": request_status,
                 "completed_at": completed,
-                "response_hash": hashlib.sha256(
-                    json.dumps(
-                        bundle.model_dump(mode="json"),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        ensure_ascii=True,
-                        default=str,
-                    ).encode("utf-8")
-                ).hexdigest(),
+                "response_payload": response_payload,
+                "response_hash": (
+                    None
+                    if response_payload is None
+                    else canonical_json_hash(response_payload)
+                ),
                 "validation_result": validation,
                 "provider_attempt_count": logical_request.provider_attempt_count,
                 "failure_category": (
@@ -1623,9 +1636,24 @@ class PlannerLifecycleCoordinator:
         provider_attempts,
         provider_count,
         reason,
+        *,
+        response_payload=None,
     ):
+        response_evidence = (
+            {}
+            if response_payload is None
+            else {
+                'response_payload': response_payload,
+                'response_hash': canonical_json_hash(response_payload),
+                'validation_result': {
+                    'result': 'rejected',
+                    'reason': reason[:300],
+                },
+            }
+        )
         updated_request = logical_request.model_copy(
             update={
+                **response_evidence,
                 "status": PlannerRequestStatus.REJECTED,
                 "completed_at": self.engine._now(),
                 "failure_category": "planner_contract_failure",

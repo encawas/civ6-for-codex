@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import hashlib
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from uuid import uuid4
@@ -23,17 +24,24 @@ from .domain import (
     DecisionGapStatus,
     DecisionGroup,
     InformationRound,
+    InformationRoundStatus,
     PlanLease,
     PlanLeaseStatus,
     PlannerRequest,
+    PlannerResponseEvidenceCompatibility,
     PlannerRequestStatus,
+    PlannerRequestTarget,
+    PlannerRequestTargetKind,
     ProviderAttempt,
     RuntimeState,
     TurnTransitionConfirmedTick,
     WorkflowTick,
     validate_workflow_tick,
     ProviderAttemptStatus,
+    canonical_json,
+    canonical_json_hash,
 )
+from .domain.planner import TERMINAL_PLANNER_STATUSES
 from .models import (
     AgentRequest,
     EventLevel,
@@ -44,6 +52,7 @@ from .models import (
     TaskStatus,
     TickMetrics,
 )
+from .workflow_protocol import canonical_workflow_plan_bundle_payload
 
 
 _STICKY_EVENT_TYPES = {
@@ -56,6 +65,13 @@ _STICKY_EVENT_TYPES = {
 
 class TaskIdentityConflictError(ValueError):
     """Raised when an existing task ID is reused for different semantics."""
+
+
+class _PlannerResponseFacts(StrEnum):
+    CANONICAL_RESPONSE = "CANONICAL_RESPONSE"
+    CONTRACT_SCHEMA_FAILURE = "CONTRACT_SCHEMA_FAILURE"
+    LEGACY_V7_MISSING_PAYLOAD = "LEGACY_V7_MISSING_PAYLOAD"
+    NO_RESPONSE = "NO_RESPONSE"
 
 
 SCHEMA = """
@@ -187,6 +203,8 @@ CREATE TABLE IF NOT EXISTS decision_groups (
 CREATE TABLE IF NOT EXISTS logical_planner_requests (
     planner_request_id TEXT PRIMARY KEY,
     game_id TEXT NOT NULL,
+    request_target_kind TEXT NOT NULL,
+    request_target_key TEXT NOT NULL,
     decision_group_id TEXT,
     turn INTEGER NOT NULL,
     status TEXT NOT NULL,
@@ -195,8 +213,7 @@ CREATE TABLE IF NOT EXISTS logical_planner_requests (
     decision_gap_ids_json TEXT NOT NULL,
     request_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    completed_at TEXT,
-    UNIQUE (game_id, decision_group_id, input_projection_hash)
+    completed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_logical_requests_game_status
@@ -412,6 +429,12 @@ class WorkflowStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version > 8:
+                raise ValueError(
+                    f"unsupported workflow database version {version}; "
+                    "maximum supported version is 8"
+                )
             conn.executescript(SCHEMA)
             self._migrate(conn)
 
@@ -610,9 +633,34 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version < 7:
+        if version > 8:
+            raise ValueError(
+                f"unsupported workflow database version {version}; "
+                "maximum supported version is 8"
+            )
+        upgraded_from_pre_v7 = version < 7
+        if upgraded_from_pre_v7:
             WorkflowStore._migrate_phase4_v7(conn)
-        conn.execute("PRAGMA user_version=7")
+            conn.execute("PRAGMA user_version=7")
+            version = 7
+        if version < 8:
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                WorkflowStore._migrate_phase1a_v8(
+                    conn,
+                    validate_existing_target_columns=not upgraded_from_pre_v7,
+                )
+                conn.execute("PRAGMA user_version=8")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
+        else:
+            WorkflowStore._validate_phase1a_v8(conn)
 
     @staticmethod
     def _migrate_phase4_v7(conn: sqlite3.Connection) -> None:
@@ -799,6 +847,379 @@ class WorkflowStore:
                     "UPDATE workflow_ticks SET tick_json=? WHERE tick_id=?",
                     (WorkflowStore._dump(payload), row["tick_id"]),
                 )
+
+    @classmethod
+    def _planner_request_from_row(
+        cls, row: Mapping[str, Any]
+    ) -> PlannerRequest:
+        stored = dict(row)
+        normalized = cls._normalize_planner_request_row(
+            stored,
+            validate_response_contract=True,
+        )
+        for column in (
+            "request_target_kind",
+            "request_target_key",
+            "decision_group_id",
+            "decision_gap_ids_json",
+            "request_json",
+        ):
+            if stored.get(column) != normalized.get(column):
+                request_id = stored.get("planner_request_id", "<unknown>")
+                raise ValueError(
+                    f"logical PlannerRequest {request_id} {column} "
+                    "is not canonical"
+                )
+        return PlannerRequest.model_validate_json(str(stored["request_json"]))
+
+    @classmethod
+    def _normalize_planner_request_row(
+        cls,
+        row: Mapping[str, Any],
+        *,
+        validate_existing_target_columns: bool = True,
+        validate_response_contract: bool = False,
+    ) -> dict[str, Any]:
+        """Canonicalize one v7/v8 request row for migration and replay import."""
+
+        normalized = dict(row)
+        try:
+            raw_request = json.loads(str(normalized["request_json"]))
+            if not isinstance(raw_request, dict):
+                raise ValueError("PlannerRequest JSON must be an object")
+        except Exception as exc:
+            raise ValueError("invalid logical PlannerRequest JSON") from exc
+        has_v8_relational_target = all(
+            column in normalized
+            for column in ("request_target_kind", "request_target_key")
+        )
+        legacy_v7_shape = (
+            not has_v8_relational_target
+            and "target" not in raw_request
+            and (
+                "decision_gap_ids" in raw_request
+                or "decision_group_id" in raw_request
+            )
+        )
+        if (
+            legacy_v7_shape
+            and raw_request.get("status")
+            in {
+                PlannerRequestStatus.COMPLETED.value,
+                PlannerRequestStatus.PARTIALLY_COMPLETED.value,
+                PlannerRequestStatus.REJECTED.value,
+            }
+            and raw_request.get("response_payload") is None
+            and "response_evidence_compatibility" not in raw_request
+        ):
+            raw_request["response_evidence_compatibility"] = (
+                PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD.value
+            )
+        try:
+            request = PlannerRequest.model_validate_json(canonical_json(raw_request))
+        except Exception as exc:
+            raise ValueError("invalid logical PlannerRequest JSON") from exc
+
+        required_columns = {
+            "planner_request_id",
+            "game_id",
+            "turn",
+            "status",
+            "input_projection_hash",
+            "input_projection_version",
+            "decision_group_id",
+            "decision_gap_ids_json",
+            "created_at",
+            "completed_at",
+        }
+        missing_columns = required_columns - normalized.keys()
+        if missing_columns:
+            raise ValueError(
+                "logical PlannerRequest row is missing columns: "
+                f"{sorted(missing_columns)}"
+            )
+        relational_checks = {
+            "planner_request_id": request.planner_request_id,
+            "game_id": request.game_session_id,
+            "turn": request.turn_number,
+            "input_projection_hash": request.input_projection_hash,
+            "input_projection_version": request.input_projection_version,
+            "status": request.status.value,
+        }
+        for column, expected in relational_checks.items():
+            actual = normalized[column]
+            if column == "turn":
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "logical PlannerRequest turn is not an integer"
+                    ) from exc
+            elif not isinstance(actual, str):
+                actual = str(actual)
+            if actual != expected:
+                raise ValueError(
+                    f"logical PlannerRequest {request.planner_request_id} "
+                    f"{column} conflicts with request_json"
+                )
+
+        for column, expected in (
+            ("created_at", request.created_at),
+            ("completed_at", request.completed_at),
+        ):
+            actual_value = normalized[column]
+            if actual_value is None:
+                actual = None
+            else:
+                try:
+                    actual = datetime.fromisoformat(
+                        str(actual_value).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"logical PlannerRequest {column} is not a datetime"
+                    ) from exc
+            if actual != expected:
+                raise ValueError(
+                    f"logical PlannerRequest {request.planner_request_id} "
+                    f"{column} conflicts with request_json"
+                )
+
+        try:
+            relation_gap_ids = json.loads(
+                str(normalized.get("decision_gap_ids_json", "[]"))
+            )
+        except Exception as exc:
+            raise ValueError("invalid decision_gap_ids_json") from exc
+        if not isinstance(relation_gap_ids, list):
+            raise ValueError("decision_gap_ids_json must contain a JSON array")
+        relation_group_id = normalized.get("decision_group_id")
+        if request.target.kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+            relation_target = PlannerRequestTarget(
+                kind=PlannerRequestTargetKind.LEGACY_DECISION_GROUP,
+                decision_group_id=(
+                    None if relation_group_id is None else str(relation_group_id)
+                ),
+                decision_gap_ids=tuple(relation_gap_ids),
+            )
+            if (
+                relation_target.decision_group_id != request.decision_group_id
+                or relation_target.decision_gap_ids != request.decision_gap_ids
+            ):
+                raise ValueError(
+                    f"logical PlannerRequest {request.planner_request_id} "
+                    "legacy target columns conflict with request_json"
+                )
+        elif relation_group_id is not None or relation_gap_ids:
+            raise ValueError(
+                f"logical PlannerRequest {request.planner_request_id} "
+                "non-legacy target has legacy relational identity"
+            )
+
+        expected_kind = request.target.kind.value
+        expected_key = request.target.target_key
+        for column, expected in (
+            ("request_target_kind", expected_kind),
+            ("request_target_key", expected_key),
+        ):
+            existing = normalized.get(column)
+            if (
+                validate_existing_target_columns
+                and existing is not None
+                and str(existing) != expected
+            ):
+                raise ValueError(
+                    f"logical PlannerRequest {request.planner_request_id} "
+                    f"{column} conflicts with canonical target"
+                )
+
+        if validate_response_contract:
+            cls._classify_planner_request_response(request)
+
+        normalized.update(
+            {
+                "planner_request_id": request.planner_request_id,
+                "game_id": request.game_session_id,
+                "turn": request.turn_number,
+                "status": request.status.value,
+                "input_projection_hash": request.input_projection_hash,
+                "input_projection_version": request.input_projection_version,
+                "request_target_kind": expected_kind,
+                "request_target_key": expected_key,
+                "decision_group_id": request.decision_group_id,
+                "decision_gap_ids_json": canonical_json(
+                    list(request.decision_gap_ids)
+                ),
+                "request_json": canonical_json(request.model_dump(mode="json")),
+                "created_at": request.created_at.isoformat(),
+                "completed_at": (
+                    None
+                    if request.completed_at is None
+                    else request.completed_at.isoformat()
+                ),
+            }
+        )
+        return normalized
+
+    @classmethod
+    def _migrate_phase1a_v8(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        validate_existing_target_columns: bool = True,
+    ) -> None:
+        normalized_rows = [
+            cls._normalize_planner_request_row(
+                row,
+                validate_existing_target_columns=validate_existing_target_columns,
+                validate_response_contract=True,
+            )
+            for row in conn.execute(
+                "SELECT * FROM logical_planner_requests "
+                "ORDER BY planner_request_id"
+            ).fetchall()
+        ]
+        identities: set[tuple[str, str, str]] = set()
+        for row in normalized_rows:
+            identity = (
+                str(row["game_id"]),
+                str(row["request_target_key"]),
+                str(row["input_projection_hash"]),
+            )
+            if identity in identities:
+                raise ValueError(
+                    "v8 migration found duplicate canonical PlannerRequest identity"
+                )
+            identities.add(identity)
+
+        conn.execute("DROP TABLE IF EXISTS logical_planner_requests_v8")
+        conn.execute(
+            """
+            CREATE TABLE logical_planner_requests_v8 (
+                planner_request_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                request_target_kind TEXT NOT NULL,
+                request_target_key TEXT NOT NULL,
+                decision_group_id TEXT,
+                turn INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                input_projection_hash TEXT NOT NULL,
+                input_projection_version TEXT NOT NULL,
+                decision_gap_ids_json TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+        for row in normalized_rows:
+            conn.execute(
+                """
+                INSERT INTO logical_planner_requests_v8(
+                    planner_request_id, game_id, request_target_kind,
+                    request_target_key, decision_group_id, turn, status,
+                    input_projection_hash, input_projection_version,
+                    decision_gap_ids_json, request_json, created_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["planner_request_id"],
+                    row["game_id"],
+                    row["request_target_kind"],
+                    row["request_target_key"],
+                    row["decision_group_id"],
+                    row["turn"],
+                    row["status"],
+                    row["input_projection_hash"],
+                    row["input_projection_version"],
+                    row["decision_gap_ids_json"],
+                    row["request_json"],
+                    row["created_at"],
+                    row["completed_at"],
+                ),
+            )
+
+        conn.execute("DROP TABLE logical_planner_requests")
+        conn.execute(
+            "ALTER TABLE logical_planner_requests_v8 "
+            "RENAME TO logical_planner_requests"
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_logical_requests_game_status
+            ON logical_planner_requests (game_id, status, turn)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_logical_requests_target_input
+            ON logical_planner_requests(
+                game_id, request_target_key, input_projection_hash
+            )
+            """
+        )
+        if conn.execute("PRAGMA foreign_key_check").fetchall():
+            raise ValueError("v8 migration would violate PlannerRequest foreign keys")
+        cls._validate_phase1a_v8(conn)
+
+    @classmethod
+    def _validate_phase1a_v8(cls, conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(logical_planner_requests)"
+            ).fetchall()
+        }
+        required = {"request_target_kind", "request_target_key"}
+        if not required.issubset(columns):
+            raise ValueError("workflow database v8 is missing PlannerRequest columns")
+        null_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS value FROM logical_planner_requests
+                WHERE request_target_kind IS NULL OR request_target_key IS NULL
+                   OR request_target_kind='' OR request_target_key=''
+                """
+            ).fetchone()["value"]
+        )
+        if null_count:
+            raise ValueError("workflow database v8 has incomplete PlannerRequest keys")
+        for row in conn.execute(
+            "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
+        ).fetchall():
+            request = cls._planner_request_from_row(row)
+            cls._validate_contract_schema_failure_attempt(
+                request,
+                conn.execute(
+                    """
+                    SELECT * FROM provider_attempts
+                    WHERE planner_request_id=?
+                    ORDER BY attempt_number
+                    """,
+                    (request.planner_request_id,),
+                ).fetchall(),
+            )
+
+        indexes = {
+            str(row["name"]): int(row["unique"])
+            for row in conn.execute(
+                "PRAGMA index_list(logical_planner_requests)"
+            ).fetchall()
+        }
+        index_name = "idx_logical_requests_target_input"
+        if indexes.get(index_name) != 1:
+            raise ValueError("workflow database v8 is missing target identity index")
+        index_columns = [
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+        ]
+        if index_columns != [
+            "game_id",
+            "request_target_key",
+            "input_projection_hash",
+        ]:
+            raise ValueError("workflow database v8 target identity index is invalid")
 
     @staticmethod
     def _repair_failed_attempt_tasks(conn: sqlite3.Connection) -> None:
@@ -2742,16 +3163,217 @@ class WorkflowStore:
         return [PlanLease.model_validate_json(row["lease_json"]) for row in rows]
 
     @staticmethod
+    def _planner_request_creation_definition(
+        request: PlannerRequest,
+    ) -> tuple[Any, ...]:
+        return (
+            request.planner_request_id,
+            request.game_session_id,
+            request.turn_number,
+            request.observation_id,
+            request.target,
+            request.input_projection_hash,
+            request.input_projection_version,
+            canonical_json(request.input_projection),
+            canonical_json(request.request_payload),
+            request.plan_revision_refs,
+            request.policy_revision,
+            request.approval_contract_hash,
+            request.allowed_actions_hash,
+            canonical_json(request.model_settings),
+            request.created_at,
+            request.context_bytes,
+        )
+
+    @staticmethod
+    def _classify_planner_request_response(
+        request: PlannerRequest,
+    ) -> _PlannerResponseFacts:
+        response_statuses = {
+            PlannerRequestStatus.COMPLETED,
+            PlannerRequestStatus.PARTIALLY_COMPLETED,
+            PlannerRequestStatus.REJECTED,
+        }
+        if (
+            request.response_evidence_compatibility
+            is PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
+        ):
+            return _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD
+        if request.failure_category == "planner_contract_failure":
+            if (
+                request.target.kind
+                is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+                and request.status is PlannerRequestStatus.REJECTED
+                and request.completed_at is not None
+                and request.response_payload is None
+                and request.response_hash is None
+                and request.validation_result is None
+                and request.response_evidence_compatibility is None
+            ):
+                return _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
+            raise ValueError(
+                "planner contract schema failure has invalid response facts"
+            )
+        if request.status not in response_statuses:
+            return _PlannerResponseFacts.NO_RESPONSE
+        if request.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+            raise ValueError(
+                "non-legacy planner response contract is not enabled before Phase 1B"
+            )
+        required_evidence = {
+            "response_payload": request.response_payload,
+            "response_hash": request.response_hash,
+            "validation_result": request.validation_result,
+            "completed_at": request.completed_at,
+        }
+        missing = [
+            field for field, value in required_evidence.items() if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "PlannerRequest completion requires: "
+                f"{', '.join(sorted(missing))}"
+            )
+        PlannerRequest.model_validate_json(request.model_dump_json())
+        canonical_payload = canonical_workflow_plan_bundle_payload(
+            request.response_payload
+        )
+        if canonical_json(request.response_payload) != canonical_json(
+            canonical_payload
+        ):
+            raise ValueError(
+                "legacy planner response_payload must be a canonical "
+                "WorkflowPlanBundle"
+            )
+        if request.response_hash != canonical_json_hash(canonical_payload):
+            raise ValueError(
+                "legacy planner response_hash must use the canonical "
+                "WorkflowPlanBundle payload"
+            )
+        return _PlannerResponseFacts.CANONICAL_RESPONSE
+
+    @classmethod
+    def _validate_contract_schema_failure_attempt(
+        cls,
+        request: PlannerRequest,
+        attempt_rows: Iterable[Mapping[str, Any]],
+    ) -> None:
+        if (
+            cls._classify_planner_request_response(request)
+            is not _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
+        ):
+            return
+        if request.provider_attempt_count < 1:
+            raise ValueError(
+                "planner contract schema failure requires "
+                "provider_attempt_count >= 1"
+            )
+
+        final_attempt: ProviderAttempt | None = None
+        for row in attempt_rows:
+            normalized = cls._normalize_provider_attempt_row(row)
+            if (
+                normalized["game_id"] == request.game_session_id
+                and normalized["planner_request_id"]
+                == request.planner_request_id
+                and normalized["attempt_number"]
+                == request.provider_attempt_count
+            ):
+                final_attempt = ProviderAttempt.model_validate_json(
+                    str(normalized["attempt_json"])
+                )
+                break
+        if final_attempt is None:
+            raise ValueError(
+                "planner contract schema failure requires a matching final "
+                "ProviderAttempt"
+            )
+        if (
+            final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+            or final_attempt.completed_at is None
+        ):
+            raise ValueError(
+                "planner contract schema failure requires a SUCCEEDED final "
+                "ProviderAttempt"
+            )
+
+    @staticmethod
     def _save_planner_request_in_connection(
         conn: sqlite3.Connection, request: PlannerRequest
     ) -> None:
+        existing_row = conn.execute(
+            """
+            SELECT * FROM logical_planner_requests
+            WHERE planner_request_id=?
+            """,
+            (request.planner_request_id,),
+        ).fetchone()
+        if existing_row is None:
+            response_facts = WorkflowStore._classify_planner_request_response(request)
+            if response_facts is _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE:
+                raise ValueError(
+                    "planner contract schema failure can only be committed by "
+                    "a lifecycle transition or replay recovery"
+                )
+            if response_facts is _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD:
+                raise ValueError(
+                    "legacy response compatibility can only be introduced by "
+                    "migration or replay normalization"
+                )
+            if (
+                request.target.kind
+                is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+                and request.decision_group_id is None
+            ):
+                raise ValueError(
+                    "new legacy PlannerRequest requires a DecisionGroup"
+                )
+        else:
+            existing = WorkflowStore._planner_request_from_row(existing_row)
+            if existing.status in TERMINAL_PLANNER_STATUSES:
+                if request != existing:
+                    raise ValueError("terminal PlannerRequest row is immutable")
+            elif (
+                WorkflowStore._planner_request_creation_definition(request)
+                != WorkflowStore._planner_request_creation_definition(existing)
+            ):
+                raise ValueError(
+                    "PlannerRequest creation definition is immutable"
+                )
+            else:
+                response_facts = (
+                    WorkflowStore._classify_planner_request_response(request)
+                )
+                if (
+                    response_facts
+                    is _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD
+                    and existing.response_evidence_compatibility is None
+                ):
+                    raise ValueError(
+                        "legacy response compatibility can only be introduced by "
+                        "migration or replay normalization"
+                    )
+
+            WorkflowStore._validate_contract_schema_failure_attempt(
+                request,
+                conn.execute(
+                    """
+                    SELECT * FROM provider_attempts
+                    WHERE planner_request_id=?
+                    ORDER BY attempt_number
+                    """,
+                    (request.planner_request_id,),
+                ).fetchall(),
+            )
+
         conn.execute(
             """
             INSERT INTO logical_planner_requests(
-                planner_request_id, game_id, decision_group_id, turn, status,
+                planner_request_id, game_id, request_target_kind,
+                request_target_key, decision_group_id, turn, status,
                 input_projection_hash, input_projection_version,
                 decision_gap_ids_json, request_json, created_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(planner_request_id) DO UPDATE SET
                 status=excluded.status,
                 request_json=excluded.request_json,
@@ -2760,13 +3382,15 @@ class WorkflowStore:
             (
                 request.planner_request_id,
                 request.game_session_id,
+                request.target.kind.value,
+                request.target.target_key,
                 request.decision_group_id,
                 request.turn_number,
                 request.status.value,
                 request.input_projection_hash,
                 request.input_projection_version,
-                WorkflowStore._dump(list(request.decision_gap_ids)),
-                request.model_dump_json(),
+                canonical_json(list(request.decision_gap_ids)),
+                canonical_json(request.model_dump(mode="json")),
                 request.created_at.isoformat(),
                 (
                     None
@@ -2795,7 +3419,7 @@ class WorkflowStore:
         completed_at = request.completed_at or datetime.now(UTC)
         rows = conn.execute(
             """
-            SELECT attempt_json FROM provider_attempts
+            SELECT * FROM provider_attempts
             WHERE planner_request_id=? AND status=?
             ORDER BY attempt_number
             """,
@@ -2805,7 +3429,7 @@ class WorkflowStore:
             ),
         ).fetchall()
         for row in rows:
-            started = ProviderAttempt.model_validate_json(row["attempt_json"])
+            started = WorkflowStore._provider_attempt_from_row(conn, row)
             diagnostics = dict(started.diagnostics)
             diagnostics.update(
                 {
@@ -2840,16 +3464,12 @@ class WorkflowStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT request_json FROM logical_planner_requests
+                SELECT * FROM logical_planner_requests
                 WHERE planner_request_id=?
                 """,
                 (planner_request_id,),
             ).fetchone()
-        return (
-            None
-            if row is None
-            else PlannerRequest.model_validate_json(row["request_json"])
-        )
+        return None if row is None else self._planner_request_from_row(row)
 
     def active_planner_request(self, game_id: str) -> PlannerRequest | None:
         terminal = tuple(
@@ -2867,38 +3487,30 @@ class WorkflowStore:
         with self._connect() as conn:
             row = conn.execute(
                 f"""
-                SELECT request_json FROM logical_planner_requests
+                SELECT * FROM logical_planner_requests
                 WHERE game_id=? AND status NOT IN ({placeholders})
                 ORDER BY created_at LIMIT 1
                 """,
                 (game_id, *terminal),
             ).fetchone()
-        return (
-            None
-            if row is None
-            else PlannerRequest.model_validate_json(row["request_json"])
-        )
+        return None if row is None else self._planner_request_from_row(row)
 
     def planner_request_for_input(
         self,
         game_id: str,
-        decision_group_id: str,
+        request_target_key: str,
         input_projection_hash: str,
     ) -> PlannerRequest | None:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT request_json FROM logical_planner_requests
-                WHERE game_id=? AND decision_group_id=?
+                SELECT * FROM logical_planner_requests
+                WHERE game_id=? AND request_target_key=?
                   AND input_projection_hash=?
                 """,
-                (game_id, decision_group_id, input_projection_hash),
+                (game_id, request_target_key, input_projection_hash),
             ).fetchone()
-        return (
-            None
-            if row is None
-            else PlannerRequest.model_validate_json(row["request_json"])
-        )
+        return None if row is None else self._planner_request_from_row(row)
 
     def logical_request_count_for_turn(self, game_id: str, turn: int) -> int:
         with self._connect() as conn:
@@ -2924,7 +3536,7 @@ class WorkflowStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT request.request_json,
+                SELECT request.*,
                        COUNT(attempt.provider_attempt_id) AS attempt_count,
                        SUM(
                            CASE
@@ -2944,7 +3556,7 @@ class WorkflowStore:
 
         consumed = 0
         for row in rows:
-            request = PlannerRequest.model_validate_json(row["request_json"])
+            request = self._planner_request_from_row(row)
             attempt_count = int(row["attempt_count"])
             if request.status is PlannerRequestStatus.SUPERSEDED:
                 if attempt_count == 0:
@@ -2959,11 +3571,195 @@ class WorkflowStore:
         return consumed
 
     @staticmethod
+    def _parse_audit_datetime(value: Any, field_name: str) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} is not a datetime") from exc
+
+    @classmethod
+    def _normalize_provider_attempt_row(
+        cls,
+        row: Mapping[str, Any],
+        *,
+        expected_game_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "provider_attempt_id",
+            "game_id",
+            "planner_request_id",
+            "attempt_number",
+            "provider_request_id",
+            "status",
+            "attempt_json",
+            "started_at",
+            "completed_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"ProviderAttempt row is missing columns: {sorted(missing)}"
+            )
+        try:
+            attempt = ProviderAttempt.model_validate_json(
+                str(normalized["attempt_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid ProviderAttempt JSON") from exc
+        checks = {
+            "provider_attempt_id": attempt.provider_attempt_id,
+            "planner_request_id": attempt.planner_request_id,
+            "attempt_number": attempt.attempt_number,
+            "provider_request_id": attempt.provider_request_id,
+            "status": attempt.status.value,
+        }
+        for column, expected in checks.items():
+            actual = normalized[column]
+            if column == "attempt_number":
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "ProviderAttempt attempt_number is not an integer"
+                    ) from exc
+            elif not isinstance(actual, str):
+                actual = str(actual)
+            if actual != expected:
+                raise ValueError(
+                    f"ProviderAttempt {attempt.provider_attempt_id} {column} "
+                    "conflicts with attempt_json"
+                )
+        for column, expected in (
+            ("started_at", attempt.started_at),
+            ("completed_at", attempt.completed_at),
+        ):
+            if cls._parse_audit_datetime(normalized[column], column) != expected:
+                raise ValueError(
+                    f"ProviderAttempt {attempt.provider_attempt_id} {column} "
+                    "conflicts with attempt_json"
+                )
+        game_id = str(normalized["game_id"])
+        if expected_game_id is not None and game_id != expected_game_id:
+            raise ValueError("ProviderAttempt belongs to another game")
+        normalized.update(
+            {
+                "provider_attempt_id": attempt.provider_attempt_id,
+                "game_id": game_id,
+                "planner_request_id": attempt.planner_request_id,
+                "attempt_number": attempt.attempt_number,
+                "provider_request_id": attempt.provider_request_id,
+                "status": attempt.status.value,
+                "attempt_json": canonical_json(attempt.model_dump(mode="json")),
+                "started_at": attempt.started_at.isoformat(),
+                "completed_at": (
+                    None
+                    if attempt.completed_at is None
+                    else attempt.completed_at.isoformat()
+                ),
+            }
+        )
+        return normalized
+
+    @classmethod
+    def _provider_attempt_from_row(
+        cls, conn: sqlite3.Connection, row: Mapping[str, Any]
+    ) -> ProviderAttempt:
+        normalized = cls._normalize_provider_attempt_row(row)
+        parent = conn.execute(
+            """
+            SELECT game_id FROM logical_planner_requests
+            WHERE planner_request_id=?
+            """,
+            (normalized["planner_request_id"],),
+        ).fetchone()
+        if parent is None:
+            raise ValueError("ProviderAttempt parent PlannerRequest does not exist")
+        if str(parent["game_id"]) != normalized["game_id"]:
+            raise ValueError(
+                "ProviderAttempt game_id conflicts with parent PlannerRequest"
+            )
+        return ProviderAttempt.model_validate_json(normalized["attempt_json"])
+
+    @staticmethod
+    def _provider_attempt_creation_definition(
+        game_id: str, attempt: ProviderAttempt
+    ) -> tuple[Any, ...]:
+        return (
+            attempt.provider_attempt_id,
+            game_id,
+            attempt.planner_request_id,
+            attempt.attempt_number,
+            attempt.provider_request_id,
+            attempt.started_at,
+        )
+
+    @classmethod
     def _save_provider_attempt_in_connection(
+        cls,
         conn: sqlite3.Connection,
         game_id: str,
         attempt: ProviderAttempt,
     ) -> None:
+        parent = conn.execute(
+            """
+            SELECT game_id FROM logical_planner_requests
+            WHERE planner_request_id=?
+            """,
+            (attempt.planner_request_id,),
+        ).fetchone()
+        if parent is None:
+            raise ValueError("ProviderAttempt parent PlannerRequest does not exist")
+        if str(parent["game_id"]) != game_id:
+            raise ValueError(
+                "ProviderAttempt game_id conflicts with parent PlannerRequest"
+            )
+        existing_row = conn.execute(
+            """
+            SELECT * FROM provider_attempts WHERE provider_attempt_id=?
+            """,
+            (attempt.provider_attempt_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = cls._provider_attempt_from_row(conn, existing_row)
+            existing_game_id = str(existing_row["game_id"])
+            if (
+                cls._provider_attempt_creation_definition(game_id, attempt)
+                != cls._provider_attempt_creation_definition(
+                    existing_game_id, existing
+                )
+            ):
+                raise ValueError("ProviderAttempt creation identity is immutable")
+            if existing.status is not ProviderAttemptStatus.STARTED:
+                if attempt != existing:
+                    raise ValueError("terminal ProviderAttempt is immutable")
+            elif (
+                attempt.status is ProviderAttemptStatus.STARTED
+                and attempt != existing
+            ):
+                raise ValueError(
+                    "STARTED ProviderAttempt only allows a terminal transition"
+                )
+        row = cls._normalize_provider_attempt_row(
+            {
+                "provider_attempt_id": attempt.provider_attempt_id,
+                "game_id": game_id,
+                "planner_request_id": attempt.planner_request_id,
+                "attempt_number": attempt.attempt_number,
+                "provider_request_id": attempt.provider_request_id,
+                "status": attempt.status.value,
+                "attempt_json": attempt.model_dump_json(),
+                "started_at": attempt.started_at.isoformat(),
+                "completed_at": (
+                    None
+                    if attempt.completed_at is None
+                    else attempt.completed_at.isoformat()
+                ),
+            },
+            expected_game_id=game_id,
+        )
         conn.execute(
             """
             INSERT INTO provider_attempts(
@@ -2977,19 +3773,15 @@ class WorkflowStore:
                 completed_at=excluded.completed_at
             """,
             (
-                attempt.provider_attempt_id,
-                game_id,
-                attempt.planner_request_id,
-                attempt.attempt_number,
-                attempt.provider_request_id,
-                attempt.status.value,
-                attempt.model_dump_json(),
-                attempt.started_at.isoformat(),
-                (
-                    None
-                    if attempt.completed_at is None
-                    else attempt.completed_at.isoformat()
-                ),
+                row["provider_attempt_id"],
+                row["game_id"],
+                row["planner_request_id"],
+                row["attempt_number"],
+                row["provider_request_id"],
+                row["status"],
+                row["attempt_json"],
+                row["started_at"],
+                row["completed_at"],
             ),
         )
 
@@ -3012,7 +3804,7 @@ class WorkflowStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT attempt_json FROM provider_attempts
+                SELECT * FROM provider_attempts
                 WHERE game_id=? AND planner_request_id=? AND status=?
                 ORDER BY attempt_number
                 """,
@@ -3023,8 +3815,8 @@ class WorkflowStore:
                 ),
             ).fetchall()
             for row in rows:
-                interrupted = ProviderAttempt.model_validate_json(
-                    row["attempt_json"]
+                interrupted = self._provider_attempt_from_row(
+                    conn, row
                 ).model_copy(
                     update={
                         "status": ProviderAttemptStatus.ABANDONED,
@@ -3067,21 +3859,192 @@ class WorkflowStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT attempt_json FROM provider_attempts
+                SELECT * FROM provider_attempts
                 WHERE planner_request_id=? ORDER BY attempt_number
                 """,
                 (planner_request_id,),
             ).fetchall()
-        return [
-            ProviderAttempt.model_validate_json(row["attempt_json"]) for row in rows
-        ]
+            return [self._provider_attempt_from_row(conn, row) for row in rows]
+
+    @classmethod
+    def _normalize_information_round_row(
+        cls,
+        row: Mapping[str, Any],
+        *,
+        expected_game_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "information_round_id",
+            "game_id",
+            "planner_request_id",
+            "round_number",
+            "status",
+            "round_json",
+            "requested_at",
+            "completed_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"InformationRound row is missing columns: {sorted(missing)}"
+            )
+        try:
+            round_record = InformationRound.model_validate_json(
+                str(normalized["round_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid InformationRound JSON") from exc
+        checks = {
+            "information_round_id": round_record.information_round_id,
+            "planner_request_id": round_record.planner_request_id,
+            "round_number": round_record.round_number,
+            "status": round_record.status.value,
+        }
+        for column, expected in checks.items():
+            actual = normalized[column]
+            if column == "round_number":
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "InformationRound round_number is not an integer"
+                    ) from exc
+            elif not isinstance(actual, str):
+                actual = str(actual)
+            if actual != expected:
+                raise ValueError(
+                    f"InformationRound {round_record.information_round_id} "
+                    f"{column} conflicts with round_json"
+                )
+        for column, expected in (
+            ("requested_at", round_record.requested_at),
+            ("completed_at", round_record.completed_at),
+        ):
+            if cls._parse_audit_datetime(normalized[column], column) != expected:
+                raise ValueError(
+                    f"InformationRound {round_record.information_round_id} "
+                    f"{column} conflicts with round_json"
+                )
+        game_id = str(normalized["game_id"])
+        if expected_game_id is not None and game_id != expected_game_id:
+            raise ValueError("InformationRound belongs to another game")
+        normalized.update(
+            {
+                "information_round_id": round_record.information_round_id,
+                "game_id": game_id,
+                "planner_request_id": round_record.planner_request_id,
+                "round_number": round_record.round_number,
+                "status": round_record.status.value,
+                "round_json": canonical_json(
+                    round_record.model_dump(mode="json")
+                ),
+                "requested_at": round_record.requested_at.isoformat(),
+                "completed_at": (
+                    None
+                    if round_record.completed_at is None
+                    else round_record.completed_at.isoformat()
+                ),
+            }
+        )
+        return normalized
+
+    @classmethod
+    def _information_round_from_row(
+        cls, conn: sqlite3.Connection, row: Mapping[str, Any]
+    ) -> InformationRound:
+        normalized = cls._normalize_information_round_row(row)
+        parent = conn.execute(
+            """
+            SELECT game_id FROM logical_planner_requests
+            WHERE planner_request_id=?
+            """,
+            (normalized["planner_request_id"],),
+        ).fetchone()
+        if parent is None:
+            raise ValueError("InformationRound parent PlannerRequest does not exist")
+        if str(parent["game_id"]) != normalized["game_id"]:
+            raise ValueError(
+                "InformationRound game_id conflicts with parent PlannerRequest"
+            )
+        return InformationRound.model_validate_json(normalized["round_json"])
 
     @staticmethod
+    def _information_round_creation_definition(
+        game_id: str, round_record: InformationRound
+    ) -> tuple[Any, ...]:
+        return (
+            round_record.information_round_id,
+            game_id,
+            round_record.planner_request_id,
+            round_record.round_number,
+            canonical_json(round_record.requests),
+            round_record.requested_at,
+        )
+
+    @classmethod
     def _save_information_round_in_connection(
+        cls,
         conn: sqlite3.Connection,
         game_id: str,
         round_record: InformationRound,
     ) -> None:
+        parent = conn.execute(
+            """
+            SELECT game_id FROM logical_planner_requests
+            WHERE planner_request_id=?
+            """,
+            (round_record.planner_request_id,),
+        ).fetchone()
+        if parent is None:
+            raise ValueError("InformationRound parent PlannerRequest does not exist")
+        if str(parent["game_id"]) != game_id:
+            raise ValueError(
+                "InformationRound game_id conflicts with parent PlannerRequest"
+            )
+        existing_row = conn.execute(
+            """
+            SELECT * FROM information_rounds WHERE information_round_id=?
+            """,
+            (round_record.information_round_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = cls._information_round_from_row(conn, existing_row)
+            existing_game_id = str(existing_row["game_id"])
+            if (
+                cls._information_round_creation_definition(game_id, round_record)
+                != cls._information_round_creation_definition(
+                    existing_game_id, existing
+                )
+            ):
+                raise ValueError("InformationRound creation identity is immutable")
+            if existing.status is not InformationRoundStatus.REQUESTED:
+                if round_record != existing:
+                    raise ValueError("terminal InformationRound is immutable")
+            elif (
+                round_record.status is InformationRoundStatus.REQUESTED
+                and round_record != existing
+            ):
+                raise ValueError(
+                    "REQUESTED InformationRound only allows a terminal transition"
+                )
+        row = cls._normalize_information_round_row(
+            {
+                "information_round_id": round_record.information_round_id,
+                "game_id": game_id,
+                "planner_request_id": round_record.planner_request_id,
+                "round_number": round_record.round_number,
+                "status": round_record.status.value,
+                "round_json": round_record.model_dump_json(),
+                "requested_at": round_record.requested_at.isoformat(),
+                "completed_at": (
+                    None
+                    if round_record.completed_at is None
+                    else round_record.completed_at.isoformat()
+                ),
+            },
+            expected_game_id=game_id,
+        )
         conn.execute(
             """
             INSERT INTO information_rounds(
@@ -3094,18 +4057,14 @@ class WorkflowStore:
                 completed_at=excluded.completed_at
             """,
             (
-                round_record.information_round_id,
-                game_id,
-                round_record.planner_request_id,
-                round_record.round_number,
-                round_record.status.value,
-                round_record.model_dump_json(),
-                round_record.requested_at.isoformat(),
-                (
-                    None
-                    if round_record.completed_at is None
-                    else round_record.completed_at.isoformat()
-                ),
+                row["information_round_id"],
+                row["game_id"],
+                row["planner_request_id"],
+                row["round_number"],
+                row["status"],
+                row["round_json"],
+                row["requested_at"],
+                row["completed_at"],
             ),
         )
 
@@ -3121,12 +4080,12 @@ class WorkflowStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT round_json FROM information_rounds
+                SELECT * FROM information_rounds
                 WHERE planner_request_id=? ORDER BY round_number
                 """,
                 (planner_request_id,),
             ).fetchall()
-        return [InformationRound.model_validate_json(row["round_json"]) for row in rows]
+            return [self._information_round_from_row(conn, row) for row in rows]
 
     def record_planner_suppression(
         self,
@@ -3209,14 +4168,14 @@ class WorkflowStore:
                         decision_group.created_at.isoformat(),
                     ),
                 )
-            if planner_request is not None:
-                if planner_request.game_session_id != tick.game_session_id:
-                    raise ValueError("planner request and Tick must belong to one game")
-                self._save_planner_request_in_connection(conn, planner_request)
             for provider_attempt in provider_attempts:
                 self._save_provider_attempt_in_connection(
                     conn, tick.game_session_id, provider_attempt
                 )
+            if planner_request is not None:
+                if planner_request.game_session_id != tick.game_session_id:
+                    raise ValueError("planner request and Tick must belong to one game")
+                self._save_planner_request_in_connection(conn, planner_request)
             if information_round is not None:
                 self._save_information_round_in_connection(
                     conn, tick.game_session_id, information_round
@@ -3413,6 +4372,153 @@ class WorkflowStore:
             ]
         return {"game_id": game_id, "tables": tables}
 
+    @classmethod
+    def _prepare_replay_state(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+        tables: Mapping[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        prepared: dict[str, list[dict[str, Any]]] = {}
+        meta_keys = {
+            "last_game_id",
+            "last_observed_turn",
+            f"unit_observations_initialized:{game_id}",
+        }
+        for table in (*REPLAY_STATE_TABLES, "workflow_meta"):
+            rows = tables.get(table, [])
+            if not isinstance(rows, list):
+                raise ValueError(f"invalid replay state table: {table!r}")
+            column_rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            known_columns = {str(row["name"]) for row in column_rows}
+            primary_columns = [
+                str(row["name"])
+                for row in sorted(column_rows, key=lambda item: int(item["pk"]))
+                if int(row["pk"]) > 0
+            ]
+            unique_specs: list[tuple[str, ...]] = []
+            for index in conn.execute(f"PRAGMA index_list({table})").fetchall():
+                if not int(index["unique"]):
+                    continue
+                columns = tuple(
+                    str(row["name"])
+                    for row in conn.execute(
+                        f"PRAGMA index_info({index['name']})"
+                    ).fetchall()
+                )
+                if columns:
+                    unique_specs.append(columns)
+            seen_primary: set[tuple[Any, ...]] = set()
+            seen_unique: dict[tuple[str, ...], set[tuple[Any, ...]]] = {
+                spec: set() for spec in unique_specs
+            }
+            prepared_rows: list[dict[str, Any]] = []
+            for source_row in rows:
+                if not isinstance(source_row, dict) or not source_row:
+                    raise ValueError(f"invalid replay row for {table}")
+                unknown = set(source_row) - known_columns
+                if unknown:
+                    raise ValueError(
+                        f"unknown replay columns for {table}: {sorted(unknown)}"
+                    )
+                row = dict(source_row)
+                if table == "workflow_meta":
+                    if row.get("key") not in meta_keys:
+                        raise ValueError("replay workflow_meta key is outside game scope")
+                elif row.get("game_id") != game_id:
+                    raise ValueError(
+                        f"replay row for {table} belongs to another game"
+                    )
+                for column, value in row.items():
+                    if column.endswith("_json") and value is not None:
+                        try:
+                            json.loads(str(value))
+                        except Exception as exc:
+                            raise ValueError(
+                                f"invalid replay JSON in {table}.{column}"
+                            ) from exc
+                if table == "logical_planner_requests":
+                    row = cls._normalize_planner_request_row(
+                        row,
+                        validate_response_contract=True,
+                    )
+                elif table == "provider_attempts":
+                    row = cls._normalize_provider_attempt_row(
+                        row, expected_game_id=game_id
+                    )
+                elif table == "information_rounds":
+                    row = cls._normalize_information_round_row(
+                        row, expected_game_id=game_id
+                    )
+
+                if primary_columns:
+                    if any(column not in row for column in primary_columns):
+                        raise ValueError(
+                            f"replay row for {table} is missing its primary key"
+                        )
+                    primary = tuple(row[column] for column in primary_columns)
+                    if primary in seen_primary:
+                        raise ValueError(
+                            f"duplicate replay primary key for {table}: {primary}"
+                        )
+                    seen_primary.add(primary)
+                    where = " AND ".join(
+                        f"{column}=?" for column in primary_columns
+                    )
+                    existing = conn.execute(
+                        f"SELECT * FROM {table} WHERE {where}",
+                        primary,
+                    ).fetchone()
+                    if (
+                        existing is not None
+                        and table != "workflow_meta"
+                        and str(existing["game_id"]) != game_id
+                    ):
+                        raise ValueError(
+                            f"replay primary key for {table} belongs to "
+                            "another game"
+                        )
+                for spec, seen in seen_unique.items():
+                    if any(column not in row for column in spec):
+                        continue
+                    identity = tuple(row[column] for column in spec)
+                    if any(value is None for value in identity):
+                        continue
+                    if identity in seen:
+                        raise sqlite3.IntegrityError(
+                            f"duplicate replay identity for {table}: {spec}"
+                        )
+                    seen.add(identity)
+                prepared_rows.append(row)
+            prepared[table] = prepared_rows
+
+        for row in prepared["logical_planner_requests"]:
+            cls._validate_contract_schema_failure_attempt(
+                PlannerRequest.model_validate_json(str(row["request_json"])),
+                prepared["provider_attempts"],
+            )
+
+        for table in REPLAY_STATE_TABLES:
+            for foreign_key in conn.execute(
+                f"PRAGMA foreign_key_list({table})"
+            ).fetchall():
+                parent_table = str(foreign_key["table"])
+                child_column = str(foreign_key["from"])
+                parent_column = str(foreign_key["to"])
+                parent_values = {
+                    row[parent_column]
+                    for row in prepared.get(parent_table, [])
+                    if parent_column in row
+                }
+                for row in prepared[table]:
+                    child_value = row.get(child_column)
+                    if child_value is not None and child_value not in parent_values:
+                        raise ValueError(
+                            f"replay {table}.{child_column} references a missing "
+                            f"{parent_table}.{parent_column}"
+                        )
+        return prepared
+
     def import_replay_state(self, state: dict[str, Any]) -> None:
         tables = state.get("tables")
         if not isinstance(tables, dict):
@@ -3425,6 +4531,7 @@ class WorkflowStore:
         if unknown_tables:
             raise ValueError(f"invalid replay state tables: {sorted(unknown_tables)}")
         with self._connect() as conn:
+            prepared = self._prepare_replay_state(conn, game_id, tables)
             for table in reversed(REPLAY_STATE_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE game_id=?", (game_id,))
             conn.execute(
@@ -3439,26 +4546,12 @@ class WorkflowStore:
                 ),
             )
             for table in (*REPLAY_STATE_TABLES, "workflow_meta"):
-                rows = tables.get(table, [])
-                if not isinstance(rows, list):
-                    raise ValueError(f"invalid replay state table: {table!r}")
-                known_columns = {
-                    str(row["name"])
-                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-                }
-                for row in rows:
-                    if not isinstance(row, dict) or not row:
-                        raise ValueError(f"invalid replay row for {table}")
-                    unknown = set(row) - known_columns
-                    if unknown:
-                        raise ValueError(
-                            f"unknown replay columns for {table}: {sorted(unknown)}"
-                        )
+                for row in prepared[table]:
                     columns = sorted(row)
                     placeholders = ",".join("?" for _ in columns)
                     column_sql = ",".join(columns)
                     conn.execute(
-                        f"INSERT OR REPLACE INTO {table} ({column_sql}) "
+                        f"INSERT INTO {table} ({column_sql}) "
                         f"VALUES ({placeholders})",
                         tuple(row[column] for column in columns),
                     )
