@@ -69,6 +69,7 @@ from .workflow_protocol import (
     WorkflowAgentRequest as AgentRequest,
     ResolutionDisposition,
     WorkflowPlanBundle,
+    canonical_workflow_plan_bundle_payload,
     validate_event_resolution_contract,
     validate_global_resolution_structure,
 )
@@ -1280,9 +1281,10 @@ class PlannerLifecycleCoordinator:
             error = exc
         else:
             try:
-                bundle = WorkflowPlanBundle.model_validate(
-                    raw_bundle.model_dump(mode="python")
+                canonical_bundle_payload = (
+                    canonical_workflow_plan_bundle_payload(raw_bundle)
                 )
+                bundle = WorkflowPlanBundle.model_validate(canonical_bundle_payload)
             except Exception as exc:
                 contract_error = exc
         finally:
@@ -1356,6 +1358,7 @@ class PlannerLifecycleCoordinator:
                     provider_attempts,
                     provider_count,
                     "information round limit exceeded",
+                    response_payload=canonical_bundle_payload,
                 )
             try:
                 engine._validate_planner_bundle(
@@ -1374,6 +1377,7 @@ class PlannerLifecycleCoordinator:
                     provider_attempts,
                     provider_count,
                     str(exc),
+                    response_payload=canonical_bundle_payload,
                 )
             round_id = f"info_round_{uuid4().hex}"
             pending = tuple(
@@ -1472,15 +1476,7 @@ class PlannerLifecycleCoordinator:
                 "result": "completed",
                 "successful_gap_ids": sorted(successful_gap_ids),
             }
-        response_payload = (
-            bundle.model_dump(mode="json")
-            if request_status
-            in {
-                PlannerRequestStatus.COMPLETED,
-                PlannerRequestStatus.PARTIALLY_COMPLETED,
-            }
-            else None
-        )
+        response_payload = canonical_bundle_payload
         updated_request = logical_request.model_copy(
             update={
                 "status": request_status,
@@ -1640,9 +1636,24 @@ class PlannerLifecycleCoordinator:
         provider_attempts,
         provider_count,
         reason,
+        *,
+        response_payload=None,
     ):
+        response_evidence = (
+            {}
+            if response_payload is None
+            else {
+                'response_payload': response_payload,
+                'response_hash': canonical_json_hash(response_payload),
+                'validation_result': {
+                    'result': 'rejected',
+                    'reason': reason[:300],
+                },
+            }
+        )
         updated_request = logical_request.model_copy(
             update={
+                **response_evidence,
                 "status": PlannerRequestStatus.REJECTED,
                 "completed_at": self.engine._now(),
                 "failure_category": "planner_contract_failure",

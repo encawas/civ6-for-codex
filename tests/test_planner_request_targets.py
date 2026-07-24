@@ -6,9 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from civ6_workflow.domain import (
+    ApprovalStatus,
+    ContinuationPolicy,
     InformationRound,
     InformationRoundStatus,
+    LeaseValidationResult,
     LogicalPlannerRequestCreatedTick,
+    PlanLease,
+    PlanLeaseStatus,
     PlannerRequest,
     PlannerRequestStatus,
     PlannerRequestTarget,
@@ -20,6 +25,10 @@ from civ6_workflow.domain import (
     canonical_json_hash,
 )
 from civ6_workflow.store import WorkflowStore
+from civ6_workflow.workflow_protocol import (
+    WorkflowPlanBundle,
+    canonical_workflow_plan_bundle_payload,
+)
 
 
 NOW = datetime(2026, 7, 23, tzinfo=UTC)
@@ -93,6 +102,7 @@ def _completed_request(
     payload: dict | None = None,
 ) -> PlannerRequest:
     payload = payload or {"summary": request_id, "tasks": []}
+    payload = canonical_workflow_plan_bundle_payload(payload)
     return _request(
         request_id,
         target=target,
@@ -379,7 +389,9 @@ def test_store_requires_payload_for_new_and_newly_completed_requests(tmp_path):
         store.save_planner_request(missing_payload)
     assert store.get_planner_request(pending.planner_request_id) == pending
 
-    payload = {"plan_id": "plan-1", "tasks": []}
+    payload = canonical_workflow_plan_bundle_payload(
+        {"plan_id": "plan-1", "summary": "accepted", "tasks": []}
+    )
     completed = pending.model_copy(
         update={
             "status": PlannerRequestStatus.COMPLETED,
@@ -420,7 +432,7 @@ def test_completed_response_facts_are_permanently_immutable(tmp_path, updates):
     completed = _completed_request("terminal-facts")
     store.save_planner_request(completed)
 
-    with pytest.raises(ValueError, match="terminal response facts are immutable"):
+    with pytest.raises(ValueError, match="terminal PlannerRequest row is immutable"):
         store.save_planner_request(completed.model_copy(update=updates))
 
     assert store.get_planner_request(completed.planner_request_id) == completed
@@ -761,34 +773,38 @@ def test_migrated_completed_request_without_payload_preserves_response_facts(tmp
     restored = store.get_planner_request(historical.planner_request_id)
 
     assert restored.response_payload is None
-    compatible_update = restored.model_copy(update={"provider_attempt_count": 1})
-    store.save_planner_request(compatible_update)
-    assert store.get_planner_request(historical.planner_request_id) == (
-        compatible_update
-    )
+    store.save_planner_request(restored)
+    assert store.get_planner_request(historical.planner_request_id) == restored
 
-    payload = {"plan_id": "invented-history", "tasks": []}
-    backfilled_response = compatible_update.model_copy(
+    changed_count = restored.model_copy(update={"provider_attempt_count": 1})
+    with pytest.raises(ValueError, match="terminal PlannerRequest row is immutable"):
+        store.save_planner_request(changed_count)
+    assert store.get_planner_request(historical.planner_request_id) == restored
+
+    payload = canonical_workflow_plan_bundle_payload(
+        {
+            "plan_id": "invented-history",
+            "summary": "must not be backfilled",
+            "tasks": [],
+        }
+    )
+    backfilled_response = restored.model_copy(
         update={
             "response_payload": payload,
             "response_hash": canonical_json_hash(payload),
             "validation_result": {"result": "backfilled"},
         }
     )
-    with pytest.raises(ValueError, match="terminal response facts are immutable"):
+    with pytest.raises(ValueError, match="terminal PlannerRequest row is immutable"):
         store.save_planner_request(backfilled_response)
-    assert store.get_planner_request(historical.planner_request_id) == (
-        compatible_update
-    )
+    assert store.get_planner_request(historical.planner_request_id) == restored
 
-    changed_response = compatible_update.model_copy(
+    changed_response = restored.model_copy(
         update={"response_hash": "rewritten-history"}
     )
-    with pytest.raises(ValueError, match="terminal response facts are immutable"):
+    with pytest.raises(ValueError, match="terminal PlannerRequest row is immutable"):
         store.save_planner_request(changed_response)
-    assert store.get_planner_request(historical.planner_request_id) == (
-        compatible_update
-    )
+    assert store.get_planner_request(historical.planner_request_id) == restored
 
 
 @pytest.mark.parametrize(
@@ -1001,7 +1017,7 @@ def test_all_target_kinds_reuse_provider_attempts_and_information_rounds(tmp_pat
 
 def test_response_payload_survives_store_restart(tmp_path):
     path = tmp_path / "response.sqlite3"
-    request = _completed_request("request-response", target=_repair_target())
+    request = _completed_request("request-response")
     WorkflowStore(path).save_planner_request(request)
 
     assert WorkflowStore(path).get_planner_request(request.planner_request_id) == request
@@ -1148,3 +1164,744 @@ def test_replay_canonical_duplicate_rolls_back_entire_import(tmp_path):
 
     assert store.get_planner_request(seed.planner_request_id) == seed
     assert store.get_planner_request(first.planner_request_id) is None
+
+
+def test_store_rejects_noncanonical_and_arbitrary_legacy_responses(tmp_path):
+    store = WorkflowStore(tmp_path / "canonical-response.sqlite3")
+    arbitrary = {"answer": 42}
+    arbitrary_request = _request(
+        "arbitrary-response",
+        status=PlannerRequestStatus.COMPLETED,
+        completed_at=NOW,
+        response_payload=arbitrary,
+        response_hash=canonical_json_hash(arbitrary),
+        validation_result={"result": "completed"},
+    )
+    with pytest.raises(ValueError):
+        store.save_planner_request(arbitrary_request)
+
+    noncanonical = {"summary": "defaults omitted"}
+    noncanonical_request = _request(
+        "noncanonical-response",
+        input_hash="noncanonical-input",
+        status=PlannerRequestStatus.COMPLETED,
+        completed_at=NOW,
+        response_payload=noncanonical,
+        response_hash=canonical_json_hash(noncanonical),
+        validation_result={"result": "completed"},
+    )
+    with pytest.raises(ValueError, match="canonical WorkflowPlanBundle"):
+        store.save_planner_request(noncanonical_request)
+
+    canonical = canonical_workflow_plan_bundle_payload(
+        WorkflowPlanBundle(summary="canonical response")
+    )
+    accepted = _request(
+        "canonical-response",
+        input_hash="canonical-input",
+        status=PlannerRequestStatus.COMPLETED,
+        completed_at=NOW,
+        response_payload=canonical,
+        response_hash=canonical_json_hash(canonical),
+        validation_result={"result": "completed"},
+    )
+    store.save_planner_request(accepted)
+    assert store.get_planner_request(accepted.planner_request_id) == accepted
+
+
+def test_store_rejects_nonlegacy_response_before_phase1b(tmp_path):
+    store = WorkflowStore(tmp_path / "nonlegacy-response.sqlite3")
+    request = _completed_request(
+        "nonlegacy-response",
+        target=_repair_target(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="non-legacy planner response contract is not enabled before Phase 1B",
+    ):
+        store.save_planner_request(request)
+    assert store.get_planner_request(request.planner_request_id) is None
+
+
+def _terminal_request(
+    request_id: str,
+    status: PlannerRequestStatus,
+) -> PlannerRequest:
+    if status in {
+        PlannerRequestStatus.COMPLETED,
+        PlannerRequestStatus.PARTIALLY_COMPLETED,
+    }:
+        completed = _completed_request(request_id)
+        return completed.model_copy(update={"status": status})
+    if status is PlannerRequestStatus.REJECTED:
+        payload = canonical_workflow_plan_bundle_payload(
+            WorkflowPlanBundle(summary="rejected response")
+        )
+        return _request(
+            request_id,
+            status=status,
+            completed_at=NOW,
+            response_payload=payload,
+            response_hash=canonical_json_hash(payload),
+            validation_result={"result": "rejected"},
+        ).model_copy(
+            update={"failure_category": "invalid_planner_output_item"}
+        )
+    return _request(
+        request_id,
+        status=status,
+        completed_at=NOW,
+        validation_result=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "replacement"),
+    [
+        (PlannerRequestStatus.FAILED, PlannerRequestStatus.PENDING),
+        (PlannerRequestStatus.REJECTED, PlannerRequestStatus.IN_PROGRESS),
+        (PlannerRequestStatus.SUPERSEDED, PlannerRequestStatus.COMPLETED),
+        (PlannerRequestStatus.CANCELLED, PlannerRequestStatus.BACKOFF),
+        (
+            PlannerRequestStatus.PARTIALLY_COMPLETED,
+            PlannerRequestStatus.COMPLETED,
+        ),
+        (PlannerRequestStatus.COMPLETED, PlannerRequestStatus.COMPLETED),
+    ],
+)
+def test_every_planner_terminal_state_freezes_the_entire_row(
+    tmp_path,
+    status,
+    replacement,
+):
+    store = WorkflowStore(tmp_path / f"terminal-{status.value}.sqlite3")
+    terminal = _terminal_request(f"terminal-{status.value}", status)
+    store.save_planner_request(terminal)
+    store.save_planner_request(terminal)
+
+    if status is PlannerRequestStatus.COMPLETED:
+        changed = terminal.model_copy(
+            update={
+                "provider_attempt_count": terminal.provider_attempt_count + 1
+            }
+        )
+    elif replacement is PlannerRequestStatus.COMPLETED:
+        payload = canonical_workflow_plan_bundle_payload(
+            WorkflowPlanBundle(summary="reactivation attempt")
+        )
+        changed = terminal.model_copy(
+            update={
+                "status": replacement,
+                "response_payload": payload,
+                "response_hash": canonical_json_hash(payload),
+                "validation_result": {"result": "completed"},
+            }
+        )
+    else:
+        changed = terminal.model_copy(
+            update={
+                "status": replacement,
+                "completed_at": None,
+                "response_payload": None,
+                "response_hash": None,
+                "validation_result": None,
+            }
+        )
+    with pytest.raises(ValueError, match="terminal PlannerRequest row is immutable"):
+        store.save_planner_request(changed)
+
+    assert store.get_planner_request(terminal.planner_request_id) == terminal
+
+
+def test_provider_attempt_identity_transition_and_read_consistency(tmp_path):
+    path = tmp_path / "provider-attempt-safety.sqlite3"
+    store = WorkflowStore(path)
+    request_a = _request("provider-parent-a")
+    request_b = _request(
+        "provider-parent-b",
+        target=_legacy_target(group_id="group-b", gap_ids=("gap-b",)),
+        input_hash="provider-input-b",
+    )
+    store.save_planner_request(request_a)
+    store.save_planner_request(request_b)
+    started = ProviderAttempt(
+        provider_attempt_id="provider-attempt",
+        planner_request_id=request_a.planner_request_id,
+        attempt_number=1,
+        provider_request_id="provider-call",
+        status=ProviderAttemptStatus.STARTED,
+        started_at=NOW,
+    )
+    store.save_provider_attempt("game-1", started)
+
+    for changed in (
+        started.model_copy(update={"attempt_number": 2}),
+        started.model_copy(update={"provider_request_id": "other-call"}),
+        started.model_copy(
+            update={"planner_request_id": request_b.planner_request_id}
+        ),
+    ):
+        with pytest.raises(ValueError, match="creation identity is immutable"):
+            store.save_provider_attempt("game-1", changed)
+
+    succeeded = started.model_copy(
+        update={
+            "status": ProviderAttemptStatus.SUCCEEDED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "latency_seconds": 1,
+        }
+    )
+    store.save_provider_attempt("game-1", succeeded)
+    store.save_provider_attempt("game-1", succeeded)
+    with pytest.raises(ValueError, match="terminal ProviderAttempt is immutable"):
+        store.save_provider_attempt("game-1", started)
+    assert store.list_provider_attempts(request_a.planner_request_id) == [succeeded]
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE provider_attempts SET planner_request_id=? "
+            "WHERE provider_attempt_id=?",
+            (request_b.planner_request_id, started.provider_attempt_id),
+        )
+    with pytest.raises(ValueError, match="conflicts with attempt_json"):
+        store.list_provider_attempts(request_b.planner_request_id)
+
+
+def test_child_save_requires_an_existing_parent_in_the_same_game(tmp_path):
+    store = WorkflowStore(tmp_path / "child-parent-safety.sqlite3")
+    parent = _request("child-parent").model_copy(
+        update={"game_session_id": "game-B"}
+    )
+    store.save_planner_request(parent)
+    attempt = ProviderAttempt(
+        provider_attempt_id="child-parent-attempt",
+        planner_request_id=parent.planner_request_id,
+        attempt_number=1,
+        provider_request_id="child-parent-provider",
+        status=ProviderAttemptStatus.STARTED,
+        started_at=NOW,
+    )
+    round_record = InformationRound(
+        information_round_id="child-parent-round",
+        planner_request_id=parent.planner_request_id,
+        round_number=1,
+        status=InformationRoundStatus.REQUESTED,
+        requests=({"query": "research"},),
+        requested_at=NOW,
+    )
+
+    with pytest.raises(ValueError, match="game_id conflicts"):
+        store.save_provider_attempt("game-1", attempt)
+    with pytest.raises(ValueError, match="game_id conflicts"):
+        store.save_information_round("game-1", round_record)
+
+    missing_attempt = attempt.model_copy(
+        update={
+            "provider_attempt_id": "missing-parent-attempt",
+            "planner_request_id": "missing-parent",
+        }
+    )
+    missing_round = round_record.model_copy(
+        update={
+            "information_round_id": "missing-parent-round",
+            "planner_request_id": "missing-parent",
+        }
+    )
+    with pytest.raises(ValueError, match="does not exist"):
+        store.save_provider_attempt("game-1", missing_attempt)
+    with pytest.raises(ValueError, match="does not exist"):
+        store.save_information_round("game-1", missing_round)
+
+
+def test_information_round_identity_transition_and_read_consistency(tmp_path):
+    path = tmp_path / "information-round-safety.sqlite3"
+    store = WorkflowStore(path)
+    request_a = _request("round-parent-a")
+    request_b = _request(
+        "round-parent-b",
+        target=_legacy_target(group_id="round-group-b", gap_ids=("round-gap-b",)),
+        input_hash="round-input-b",
+    )
+    store.save_planner_request(request_a)
+    store.save_planner_request(request_b)
+    requested = InformationRound(
+        information_round_id="information-round",
+        planner_request_id=request_a.planner_request_id,
+        round_number=1,
+        status=InformationRoundStatus.REQUESTED,
+        requests=({"query": "research"},),
+        requested_at=NOW,
+    )
+    store.save_information_round("game-1", requested)
+
+    for changed in (
+        requested.model_copy(update={"round_number": 2}),
+        requested.model_copy(update={"requests": ({"query": "civic"},)}),
+        requested.model_copy(
+            update={"planner_request_id": request_b.planner_request_id}
+        ),
+    ):
+        with pytest.raises(ValueError, match="creation identity is immutable"):
+            store.save_information_round("game-1", changed)
+
+    collected = requested.model_copy(
+        update={
+            "status": InformationRoundStatus.COLLECTED,
+            "results": {"research": "POTTERY"},
+            "completed_at": NOW + timedelta(seconds=1),
+        }
+    )
+    store.save_information_round("game-1", collected)
+    store.save_information_round("game-1", collected)
+    with pytest.raises(ValueError, match="terminal InformationRound is immutable"):
+        store.save_information_round("game-1", requested)
+    assert store.list_information_rounds(request_a.planner_request_id) == [collected]
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE information_rounds SET planner_request_id=? "
+            "WHERE information_round_id=?",
+            (request_b.planner_request_id, requested.information_round_id),
+        )
+    with pytest.raises(ValueError, match="conflicts with round_json"):
+        store.list_information_rounds(request_b.planner_request_id)
+
+
+def _v8_request_row(request: PlannerRequest) -> dict:
+    row = _v7_request_row(request)
+    row.update(
+        {
+            "request_target_kind": request.target.kind.value,
+            "request_target_key": request.target.target_key,
+            "request_json": canonical_json(request.model_dump(mode="json")),
+        }
+    )
+    return row
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        PlannerRequestStatus.COMPLETED,
+        PlannerRequestStatus.PARTIALLY_COMPLETED,
+        PlannerRequestStatus.REJECTED,
+    ],
+)
+def test_v8_replay_terminal_legacy_request_requires_response_evidence(
+    tmp_path,
+    status,
+):
+    store = WorkflowStore(tmp_path / f"v8-missing-response-{status.value}.sqlite3")
+    seed = _request("v8-replay-seed")
+    store.save_planner_request(seed)
+    missing = _request(
+        f"v8-missing-{status.value}",
+        target=_legacy_target(
+            group_id=f"group-{status.value}",
+            gap_ids=(f"gap-{status.value}",),
+        ),
+        input_hash=f"input-{status.value}",
+        status=status,
+        completed_at=NOW,
+        response_hash=(
+            "historical-hash"
+            if status is not PlannerRequestStatus.REJECTED
+            else None
+        ),
+        validation_result=(
+            {"result": status.value.lower()}
+            if status is not PlannerRequestStatus.REJECTED
+            else None
+        ),
+    )
+    state = {
+        "game_id": "game-1",
+        "tables": {"logical_planner_requests": [_v8_request_row(missing)]},
+    }
+
+    with pytest.raises(ValueError, match="requires.*response_payload"):
+        store.import_replay_state(state)
+    assert store.get_planner_request(seed.planner_request_id) == seed
+
+
+def test_v7_replay_terminal_legacy_request_without_payload_is_accepted(tmp_path):
+    store = WorkflowStore(tmp_path / "v7-terminal-replay.sqlite3")
+    historical = _request(
+        "v7-terminal-replay",
+        target=_legacy_target(group_id=None, gap_ids=("v7-terminal-gap",)),
+        status=PlannerRequestStatus.COMPLETED,
+        completed_at=NOW,
+        response_hash="historical-response",
+        validation_result={"result": "completed"},
+    )
+
+    store.import_replay_state(
+        {
+            "game_id": "game-1",
+            "tables": {"logical_planner_requests": [_v7_request_row(historical)]},
+        }
+    )
+    assert store.get_planner_request(historical.planner_request_id) == historical
+
+
+def test_v8_target_columns_cannot_borrow_old_json_response_exemption(tmp_path):
+    store = WorkflowStore(tmp_path / "v8-old-json-no-exemption.sqlite3")
+    seed = _request("v8-old-json-seed")
+    store.save_planner_request(seed)
+    missing = _request(
+        "v8-old-json-missing",
+        target=_legacy_target(
+            group_id="v8-old-json-group",
+            gap_ids=("v8-old-json-gap",),
+        ),
+        input_hash="v8-old-json-input",
+        status=PlannerRequestStatus.REJECTED,
+        completed_at=NOW,
+    )
+    row = _v8_request_row(missing)
+    row["request_json"] = _legacy_request_json(missing)
+
+    with pytest.raises(ValueError, match="requires.*response_payload"):
+        store.import_replay_state(
+            {
+                "game_id": "game-1",
+                "tables": {"logical_planner_requests": [row]},
+            }
+        )
+    assert store.get_planner_request(seed.planner_request_id) == seed
+
+
+@pytest.mark.parametrize("child_kind", ["provider", "information"])
+def test_replay_rejects_child_relational_json_parent_split_before_delete(
+    tmp_path,
+    child_kind,
+):
+    store = WorkflowStore(tmp_path / f"replay-parent-split-{child_kind}.sqlite3")
+    seed = _request("split-seed")
+    parent_a = _request(
+        "split-parent-a",
+        target=_legacy_target(group_id="split-a", gap_ids=("split-gap-a",)),
+        input_hash="split-input-a",
+    )
+    parent_b = _request(
+        "split-parent-b",
+        target=_legacy_target(group_id="split-b", gap_ids=("split-gap-b",)),
+        input_hash="split-input-b",
+    )
+    store.save_planner_request(seed)
+    tables = {
+        "logical_planner_requests": [
+            _v7_request_row(parent_a),
+            _v7_request_row(parent_b),
+        ]
+    }
+    if child_kind == "provider":
+        attempt = ProviderAttempt(
+            provider_attempt_id="split-attempt",
+            planner_request_id=parent_a.planner_request_id,
+            attempt_number=1,
+            provider_request_id="split-provider-call",
+            status=ProviderAttemptStatus.SUCCEEDED,
+            started_at=NOW,
+            completed_at=NOW,
+            latency_seconds=0,
+        )
+        child_row = _v7_replay_state(parent_a, attempt=attempt)["tables"][
+            "provider_attempts"
+        ][0]
+        child_row["planner_request_id"] = parent_b.planner_request_id
+        tables["provider_attempts"] = [child_row]
+        expected = "conflicts with attempt_json"
+    else:
+        round_record = InformationRound(
+            information_round_id="split-round",
+            planner_request_id=parent_a.planner_request_id,
+            round_number=1,
+            status=InformationRoundStatus.REQUESTED,
+            requests=({"query": "research"},),
+            requested_at=NOW,
+        )
+        child_row = _v7_replay_state(
+            parent_a,
+            round_record=round_record,
+        )["tables"]["information_rounds"][0]
+        child_row["planner_request_id"] = parent_b.planner_request_id
+        tables["information_rounds"] = [child_row]
+        expected = "conflicts with round_json"
+
+    with pytest.raises(ValueError, match=expected):
+        store.import_replay_state({"game_id": "game-1", "tables": tables})
+    assert store.get_planner_request(seed.planner_request_id) == seed
+
+
+def test_replay_missing_planner_parent_fails_before_delete(tmp_path):
+    store = WorkflowStore(tmp_path / "replay-missing-parent.sqlite3")
+    seed = _request("missing-parent-seed")
+    store.save_planner_request(seed)
+    orphan = ProviderAttempt(
+        provider_attempt_id="orphan-attempt",
+        planner_request_id="missing-request",
+        attempt_number=1,
+        provider_request_id="orphan-provider-call",
+        status=ProviderAttemptStatus.SUCCEEDED,
+        started_at=NOW,
+        completed_at=NOW,
+        latency_seconds=0,
+    )
+    orphan_row = _v7_replay_state(seed, attempt=orphan)["tables"][
+        "provider_attempts"
+    ][0]
+
+    with pytest.raises(ValueError, match="references a missing"):
+        store.import_replay_state(
+            {
+                "game_id": "game-1",
+                "tables": {"provider_attempts": [orphan_row]},
+            }
+        )
+    assert store.get_planner_request(seed.planner_request_id) == seed
+
+
+def test_replay_provider_primary_key_collision_preserves_both_games(tmp_path):
+    store = WorkflowStore(tmp_path / "provider-cross-game.sqlite3")
+    seed_a = _request("provider-seed-a")
+    parent_b = _request("provider-parent-b").model_copy(
+        update={"game_session_id": "game-B"}
+    )
+    store.save_planner_request(seed_a)
+    store.save_planner_request(parent_b)
+    existing = ProviderAttempt(
+        provider_attempt_id="shared-provider-attempt",
+        planner_request_id=parent_b.planner_request_id,
+        attempt_number=1,
+        provider_request_id="provider-b",
+        status=ProviderAttemptStatus.SUCCEEDED,
+        started_at=NOW,
+        completed_at=NOW,
+        latency_seconds=0,
+    )
+    store.save_provider_attempt("game-B", existing)
+
+    incoming_parent = _request(
+        "provider-incoming-a",
+        target=_legacy_target(group_id="incoming-a", gap_ids=("incoming-gap-a",)),
+        input_hash="incoming-input-a",
+    )
+    incoming = existing.model_copy(
+        update={
+            "planner_request_id": incoming_parent.planner_request_id,
+            "provider_request_id": "provider-a",
+        }
+    )
+    state = _v7_replay_state(incoming_parent, attempt=incoming)
+
+    with pytest.raises(ValueError, match="belongs to another game"):
+        store.import_replay_state(state)
+    assert store.get_planner_request(seed_a.planner_request_id) == seed_a
+    assert store.get_planner_request(parent_b.planner_request_id) == parent_b
+    assert store.list_provider_attempts(parent_b.planner_request_id) == [existing]
+
+
+def test_replay_information_primary_key_collision_preserves_both_games(tmp_path):
+    store = WorkflowStore(tmp_path / "information-cross-game.sqlite3")
+    seed_a = _request("information-seed-a")
+    parent_b = _request("information-parent-b").model_copy(
+        update={"game_session_id": "game-B"}
+    )
+    store.save_planner_request(seed_a)
+    store.save_planner_request(parent_b)
+    existing = InformationRound(
+        information_round_id="shared-information-round",
+        planner_request_id=parent_b.planner_request_id,
+        round_number=1,
+        status=InformationRoundStatus.REQUESTED,
+        requests=({"query": "research"},),
+        requested_at=NOW,
+    )
+    store.save_information_round("game-B", existing)
+
+    incoming_parent = _request(
+        "information-incoming-a",
+        target=_legacy_target(
+            group_id="information-incoming-a",
+            gap_ids=("information-incoming-gap-a",),
+        ),
+        input_hash="information-incoming-input-a",
+    )
+    incoming = existing.model_copy(
+        update={"planner_request_id": incoming_parent.planner_request_id}
+    )
+    state = _v7_replay_state(incoming_parent, round_record=incoming)
+
+    with pytest.raises(ValueError, match="belongs to another game"):
+        store.import_replay_state(state)
+    assert store.get_planner_request(seed_a.planner_request_id) == seed_a
+    assert store.get_planner_request(parent_b.planner_request_id) == parent_b
+    assert store.list_information_rounds(parent_b.planner_request_id) == [existing]
+
+
+def test_v7_migration_preserves_real_foreign_key_children(tmp_path):
+    path = tmp_path / "v7-real-foreign-keys.sqlite3"
+    request = _request("v7-fk-request")
+    attempt = ProviderAttempt(
+        provider_attempt_id="v7-fk-attempt",
+        planner_request_id=request.planner_request_id,
+        attempt_number=1,
+        provider_request_id="v7-fk-provider",
+        status=ProviderAttemptStatus.SUCCEEDED,
+        started_at=NOW,
+        completed_at=NOW,
+        latency_seconds=0,
+    )
+    round_record = InformationRound(
+        information_round_id="v7-fk-round",
+        planner_request_id=request.planner_request_id,
+        round_number=1,
+        status=InformationRoundStatus.REQUESTED,
+        requests=({"query": "research"},),
+        requested_at=NOW,
+    )
+    lease = PlanLease(
+        plan_lease_id="v7-fk-lease",
+        plan_id="v7-fk-plan",
+        game_session_id="game-1",
+        decision_gap_ids=("v7-fk-gap",),
+        scope="research",
+        plan_revision=1,
+        source_planner_request_id=request.planner_request_id,
+        status=PlanLeaseStatus.EXPIRED,
+        approval_status=ApprovalStatus.NOT_REQUIRED,
+        valid_from_turn=0,
+        valid_until_turn=1,
+        continuation_policy=ContinuationPolicy.REQUIRE_REVIEW,
+        relevant_input_hash="v7-fk-input",
+        last_validated_observation_id="v7-fk-observation",
+        last_validation_result=LeaseValidationResult.EXPIRED,
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(
+            """
+            CREATE TABLE logical_planner_requests (
+                planner_request_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                decision_group_id TEXT,
+                turn INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                input_projection_hash TEXT NOT NULL,
+                input_projection_version TEXT NOT NULL,
+                decision_gap_ids_json TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE (game_id, decision_group_id, input_projection_hash)
+            );
+            CREATE TABLE provider_attempts (
+                provider_attempt_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                planner_request_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                provider_request_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt_json TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE (planner_request_id, attempt_number),
+                FOREIGN KEY (planner_request_id)
+                    REFERENCES logical_planner_requests(planner_request_id)
+            );
+            CREATE TABLE information_rounds (
+                information_round_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                planner_request_id TEXT NOT NULL,
+                round_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                round_json TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE (planner_request_id, round_number),
+                FOREIGN KEY (planner_request_id)
+                    REFERENCES logical_planner_requests(planner_request_id)
+            );
+            CREATE TABLE plan_leases (
+                plan_lease_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                status TEXT NOT NULL,
+                plan_revision INTEGER NOT NULL,
+                relevant_input_hash TEXT NOT NULL,
+                source_planner_request_id TEXT,
+                lease_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (source_planner_request_id)
+                    REFERENCES logical_planner_requests(planner_request_id)
+            );
+            """
+        )
+        request_row = _v7_request_row(request)
+        columns = tuple(request_row)
+        conn.execute(
+            f"INSERT INTO logical_planner_requests "
+            f"({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+            tuple(request_row[column] for column in columns),
+        )
+        conn.execute(
+            "INSERT INTO provider_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attempt.provider_attempt_id,
+                "game-1",
+                attempt.planner_request_id,
+                attempt.attempt_number,
+                attempt.provider_request_id,
+                attempt.status.value,
+                attempt.model_dump_json(),
+                attempt.started_at.isoformat(),
+                attempt.completed_at.isoformat(),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO information_rounds VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                round_record.information_round_id,
+                "game-1",
+                round_record.planner_request_id,
+                round_record.round_number,
+                round_record.status.value,
+                round_record.model_dump_json(),
+                round_record.requested_at.isoformat(),
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO plan_leases(
+                plan_lease_id, game_id, scope, status, plan_revision,
+                relevant_input_hash, source_planner_request_id, lease_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                lease.plan_lease_id,
+                lease.game_session_id,
+                lease.scope,
+                lease.status.value,
+                lease.plan_revision,
+                lease.relevant_input_hash,
+                lease.source_planner_request_id,
+                lease.model_dump_json(),
+            ),
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.execute("PRAGMA user_version=7")
+
+    store = WorkflowStore(path)
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert store.get_planner_request(request.planner_request_id) == request
+    assert store.list_provider_attempts(request.planner_request_id) == [attempt]
+    assert store.list_information_rounds(request.planner_request_id) == [
+        round_record
+    ]
+    assert store.list_plan_leases("game-1") == [lease]

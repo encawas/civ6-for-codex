@@ -294,6 +294,11 @@ class PlannerRequest(DomainModel):
                 "non-terminal planner requests cannot contain result evidence"
             )
 
+        response_statuses = {
+            PlannerRequestStatus.COMPLETED,
+            PlannerRequestStatus.PARTIALLY_COMPLETED,
+            PlannerRequestStatus.REJECTED,
+        }
         if self.status in {
             PlannerRequestStatus.COMPLETED,
             PlannerRequestStatus.PARTIALLY_COMPLETED,
@@ -310,14 +315,16 @@ class PlannerRequest(DomainModel):
                 raise ValueError(
                     "completed non-legacy planner requests require response_payload"
                 )
-        elif self.response_payload is not None:
+        elif self.status not in response_statuses and self.response_payload is not None:
             raise ValueError(
-                "response_payload is only valid for completed planner requests"
+                "response_payload is only valid for planner response statuses"
             )
 
         if self.response_payload is not None:
             if self.response_hash is None:
                 raise ValueError("response_payload requires response_hash")
+            if self.validation_result is None:
+                raise ValueError("response_payload requires validation_result")
             if canonical_json_hash(self.response_payload) != self.response_hash:
                 raise ValueError("response_hash does not match response_payload")
         if (

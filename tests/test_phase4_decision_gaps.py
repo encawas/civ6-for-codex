@@ -3246,6 +3246,18 @@ def test_issue7_atomic_multi_gap_failure_persists_no_partial_outputs(tmp_path):
         assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
         stored_request = engine.store.get_planner_request(logical_id)
         assert stored_request.status is PlannerRequestStatus.REJECTED
+        assert stored_request.response_payload is not None
+        assert stored_request.response_hash == canonical_json_hash(
+            stored_request.response_payload
+        )
+        assert stored_request.validation_result is not None
+        assert {
+            task["task_id"] for task in stored_request.response_payload["tasks"]
+        } == {"atomic-produce-A", "atomic-produce-B"}
+        assert [
+            attempt.status
+            for attempt in engine.store.list_provider_attempts(logical_id)
+        ] == [ProviderAttemptStatus.SUCCEEDED]
         assert all(
             gap.status is DecisionGapStatus.AWAITING_HUMAN
             for gap in engine.store.list_decision_gaps("opening")
@@ -3719,6 +3731,9 @@ def test_issue7_invalid_lease_parameters_are_contract_rejection(tmp_path):
         request = engine.store.get_planner_request(gap.logical_request_id)
         assert request.status is PlannerRequestStatus.REJECTED
         assert request.failure_category == "planner_contract_failure"
+        assert request.response_payload is None
+        assert request.response_hash is None
+        assert request.validation_result is None
         attempts = engine.store.list_provider_attempts(request.planner_request_id)
         assert len(attempts) == 1
         assert attempts[0].status is ProviderAttemptStatus.SUCCEEDED
