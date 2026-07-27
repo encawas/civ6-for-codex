@@ -2323,7 +2323,7 @@ def test_issue7_v6_phase4_identity_migration_is_idempotent(tmp_path):
     again = WorkflowStore(path)
     assert again.get_planner_request(request.planner_request_id) == migrated_request
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
 
 
 def _settler_domain_lease_for_completion():

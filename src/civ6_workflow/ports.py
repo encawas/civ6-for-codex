@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .domain import StrategicContract, StrategicContractCommit
 from .models import ActionResult, RuntimeSnapshot, StoredTask
 
 
@@ -11,6 +12,26 @@ class WorkflowStorePort(Protocol):
     """Application-facing persistence boundary implemented by WorkflowStore."""
 
     path: Path
+
+    def commit_strategic_contract_revision(
+        self, commit: StrategicContractCommit
+    ) -> StrategicContract: ...
+
+    def get_active_strategic_contract(
+        self, game_session_id: str
+    ) -> StrategicContract | None: ...
+
+    def get_strategic_contract_revision(
+        self, game_session_id: str, revision: int
+    ) -> StrategicContract | None: ...
+
+    def list_strategic_contract_revisions(
+        self, game_session_id: str
+    ) -> list[StrategicContract]: ...
+
+    def list_strategic_contract_commits(
+        self, game_session_id: str
+    ) -> list[StrategicContractCommit]: ...
 
     def __getattr__(self, name: str) -> Any: ...
 

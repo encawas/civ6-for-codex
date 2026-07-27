@@ -24,6 +24,7 @@ from .domain import (
     DecisionGapStatus,
     DecisionGroup,
     InformationRound,
+    Mission,
     InformationRoundStatus,
     PlanLease,
     PlanLeaseStatus,
@@ -33,6 +34,9 @@ from .domain import (
     PlannerRequestTarget,
     PlannerRequestTargetKind,
     ProviderAttempt,
+    StrategicContract,
+    StrategicContractCommit,
+    SubjectRef,
     RuntimeState,
     TurnTransitionConfirmedTick,
     WorkflowTick,
@@ -83,6 +87,47 @@ CREATE TABLE IF NOT EXISTS workflow_meta (
     value_json TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS strategic_contract_roots (
+    game_id TEXT PRIMARY KEY,
+    contract_id TEXT NOT NULL UNIQUE,
+    active_revision INTEGER NOT NULL CHECK (active_revision >= 1),
+    created_at TEXT NOT NULL,
+    UNIQUE (game_id, contract_id)
+);
+
+CREATE TABLE IF NOT EXISTS strategic_contract_revisions (
+    game_id TEXT NOT NULL,
+    contract_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    contract_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    PRIMARY KEY (game_id, revision),
+    UNIQUE (contract_id, revision),
+    FOREIGN KEY (game_id, contract_id)
+        REFERENCES strategic_contract_roots(game_id, contract_id)
+);
+
+CREATE TABLE IF NOT EXISTS strategic_contract_commits (
+    commit_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    contract_id TEXT NOT NULL,
+    expected_base_revision INTEGER NOT NULL CHECK (expected_base_revision >= 0),
+    committed_revision INTEGER NOT NULL CHECK (committed_revision >= 1),
+    commit_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    UNIQUE (game_id, committed_revision),
+    FOREIGN KEY (game_id, contract_id)
+        REFERENCES strategic_contract_roots(game_id, contract_id),
+    FOREIGN KEY (game_id, committed_revision)
+        REFERENCES strategic_contract_revisions(game_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_contract_revisions_identity
+ON strategic_contract_revisions (contract_id, revision);
+
+CREATE INDEX IF NOT EXISTS idx_contract_commits_game_revision
+ON strategic_contract_commits (game_id, committed_revision);
 
 CREATE TABLE IF NOT EXISTS strategy_state (
     game_id TEXT PRIMARY KEY,
@@ -400,6 +445,9 @@ ON workflow_ticks (game_id, turn);
 """
 
 REPLAY_STATE_TABLES = (
+    "strategic_contract_roots",
+    "strategic_contract_revisions",
+    "strategic_contract_commits",
     "strategy_state",
     "city_plans",
     "unit_plans",
@@ -430,10 +478,10 @@ class WorkflowStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > 8:
+            if version > 9:
                 raise ValueError(
                     f"unsupported workflow database version {version}; "
-                    "maximum supported version is 8"
+                    "maximum supported version is 9"
                 )
             conn.executescript(SCHEMA)
             self._migrate(conn)
@@ -633,10 +681,10 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > 8:
+        if version > 9:
             raise ValueError(
                 f"unsupported workflow database version {version}; "
-                "maximum supported version is 8"
+                "maximum supported version is 9"
             )
         upgraded_from_pre_v7 = version < 7
         if upgraded_from_pre_v7:
@@ -661,6 +709,319 @@ class WorkflowStore:
                 conn.execute("PRAGMA foreign_keys=ON")
         else:
             WorkflowStore._validate_phase1a_v8(conn)
+
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < 9:
+            WorkflowStore._migrate_phase1b_v9(conn)
+            conn.execute("PRAGMA user_version=9")
+        else:
+            WorkflowStore._validate_phase1b_v9(conn)
+
+    @classmethod
+    def _migrate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
+        """Add the empty Contract aggregate tables without changing legacy authority."""
+
+        cls._validate_phase1b_v9(conn)
+
+    @classmethod
+    def _validate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
+        roots = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_contract_roots ORDER BY game_id"
+            ).fetchall()
+        ]
+        revisions = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_contract_revisions "
+                "ORDER BY game_id, revision"
+            ).fetchall()
+        ]
+        commits = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_contract_commits "
+                "ORDER BY game_id, committed_revision"
+            ).fetchall()
+        ]
+        cls._validate_strategic_contract_state(
+            roots,
+            revisions,
+            commits,
+            require_canonical=True,
+        )
+
+    @classmethod
+    def _normalize_contract_root_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {"game_id", "contract_id", "active_revision", "created_at"}
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"StrategicContract root row is missing columns: {sorted(missing)}"
+            )
+        if not str(normalized["game_id"]) or not str(normalized["contract_id"]):
+            raise ValueError("StrategicContract root identities must be non-empty")
+        active_revision = int(normalized["active_revision"])
+        if active_revision < 1:
+            raise ValueError("StrategicContract active revision must be positive")
+        created_at = cls._parse_audit_datetime(
+            normalized["created_at"], "StrategicContract root created_at"
+        )
+        if created_at is None or created_at.tzinfo is None:
+            raise ValueError("StrategicContract root created_at must include a timezone")
+        normalized["active_revision"] = active_revision
+        normalized["created_at"] = created_at.isoformat()
+        return normalized
+
+    @classmethod
+    def _normalize_contract_revision_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "game_id",
+            "contract_id",
+            "revision",
+            "contract_json",
+            "committed_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"StrategicContract revision row is missing columns: {sorted(missing)}"
+            )
+        try:
+            contract = StrategicContract.model_validate_json(
+                str(normalized["contract_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid StrategicContract revision JSON") from exc
+        revision = int(normalized["revision"])
+        if (
+            contract.game_session_id != str(normalized["game_id"])
+            or contract.contract_id != str(normalized["contract_id"])
+            or contract.revision != revision
+        ):
+            raise ValueError(
+                "StrategicContract revision relational columns disagree with JSON"
+            )
+        committed_at = cls._parse_audit_datetime(
+            normalized["committed_at"], "StrategicContract revision committed_at"
+        )
+        if committed_at is None or committed_at.tzinfo is None:
+            raise ValueError(
+                "StrategicContract revision committed_at must include a timezone"
+            )
+        normalized["revision"] = revision
+        normalized["contract_json"] = cls._dump(contract.model_dump(mode="json"))
+        normalized["committed_at"] = committed_at.isoformat()
+        return normalized
+
+    @classmethod
+    def _normalize_contract_commit_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "commit_id",
+            "game_id",
+            "contract_id",
+            "expected_base_revision",
+            "committed_revision",
+            "commit_json",
+            "committed_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"StrategicContract commit row is missing columns: {sorted(missing)}"
+            )
+        try:
+            commit = StrategicContractCommit.model_validate_json(
+                str(normalized["commit_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid StrategicContract commit JSON") from exc
+        expected_base = int(normalized["expected_base_revision"])
+        committed_revision = int(normalized["committed_revision"])
+        committed_at = cls._parse_audit_datetime(
+            normalized["committed_at"], "StrategicContract commit committed_at"
+        )
+        if committed_at is None or committed_at.tzinfo is None:
+            raise ValueError(
+                "StrategicContract commit committed_at must include a timezone"
+            )
+        if (
+            commit.commit_id != str(normalized["commit_id"])
+            or commit.game_session_id != str(normalized["game_id"])
+            or commit.contract_id != str(normalized["contract_id"])
+            or commit.expected_base_revision != expected_base
+            or commit.contract.revision != committed_revision
+            or commit.committed_at != committed_at
+        ):
+            raise ValueError(
+                "StrategicContract commit relational columns disagree with JSON"
+            )
+        normalized["expected_base_revision"] = expected_base
+        normalized["committed_revision"] = committed_revision
+        normalized["commit_json"] = cls._dump(commit.model_dump(mode="json"))
+        normalized["committed_at"] = committed_at.isoformat()
+        return normalized
+
+    @classmethod
+    def _validate_strategic_contract_state(
+        cls,
+        roots: Sequence[Mapping[str, Any]],
+        revisions: Sequence[Mapping[str, Any]],
+        commits: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        normalized_roots = [cls._normalize_contract_root_row(row) for row in roots]
+        normalized_revisions = [
+            cls._normalize_contract_revision_row(row) for row in revisions
+        ]
+        normalized_commits = [
+            cls._normalize_contract_commit_row(row) for row in commits
+        ]
+        if require_canonical:
+            for source, normalized, record_type in (
+                *((dict(row), normalized_roots[index], "root") for index, row in enumerate(roots)),
+                *((dict(row), normalized_revisions[index], "revision") for index, row in enumerate(revisions)),
+                *((dict(row), normalized_commits[index], "commit") for index, row in enumerate(commits)),
+            ):
+                if source != normalized:
+                    raise ValueError(
+                        f"StrategicContract {record_type} row is not canonical"
+                    )
+
+        roots_by_game: dict[str, dict[str, Any]] = {}
+        contract_games: dict[str, str] = {}
+        for root in normalized_roots:
+            game_id = str(root["game_id"])
+            contract_id = str(root["contract_id"])
+            if game_id in roots_by_game:
+                raise ValueError("a game session cannot have two Contract roots")
+            prior_game = contract_games.setdefault(contract_id, game_id)
+            if prior_game != game_id:
+                raise ValueError("StrategicContract identity belongs to another game")
+            roots_by_game[game_id] = root
+
+        revisions_by_game: dict[str, dict[int, StrategicContract]] = {
+            game_id: {} for game_id in roots_by_game
+        }
+        revision_rows: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in normalized_revisions:
+            game_id = str(row["game_id"])
+            revision = int(row["revision"])
+            root = roots_by_game.get(game_id)
+            if root is None:
+                raise ValueError("StrategicContract revision has no Contract root")
+            if str(row["contract_id"]) != str(root["contract_id"]):
+                raise ValueError("StrategicContract revision uses another root identity")
+            key = (game_id, revision)
+            if key in revision_rows:
+                raise ValueError("duplicate StrategicContract revision")
+            revision_rows[key] = row
+            revisions_by_game[game_id][revision] = StrategicContract.model_validate_json(
+                str(row["contract_json"])
+            )
+
+        commits_by_revision: dict[tuple[str, int], StrategicContractCommit] = {}
+        commit_ids: dict[str, str] = {}
+        for row in normalized_commits:
+            game_id = str(row["game_id"])
+            revision = int(row["committed_revision"])
+            root = roots_by_game.get(game_id)
+            if root is None:
+                raise ValueError("StrategicContract commit has no Contract root")
+            if str(row["contract_id"]) != str(root["contract_id"]):
+                raise ValueError("StrategicContract commit uses another root identity")
+            commit_id = str(row["commit_id"])
+            prior_game = commit_ids.setdefault(commit_id, game_id)
+            if prior_game != game_id:
+                raise ValueError("StrategicContract commit identity belongs to another game")
+            key = (game_id, revision)
+            if key in commits_by_revision:
+                raise ValueError("duplicate StrategicContract commit revision")
+            commits_by_revision[key] = StrategicContractCommit.model_validate_json(
+                str(row["commit_json"])
+            )
+
+        mission_identities: dict[str, tuple[str, str, str, SubjectRef, str]] = {}
+        latest_missions: dict[str, Mission] = {}
+        for game_id, root in roots_by_game.items():
+            active_revision = int(root["active_revision"])
+            history = revisions_by_game[game_id]
+            expected_revisions = list(range(1, active_revision + 1))
+            if sorted(history) != expected_revisions:
+                raise ValueError(
+                    "StrategicContract revisions must be contiguous through active revision"
+                )
+            first_commit = commits_by_revision.get((game_id, 1))
+            if first_commit is None:
+                raise ValueError("StrategicContract revision has no commit audit")
+            root_created_at = cls._parse_audit_datetime(
+                root["created_at"], "StrategicContract root created_at"
+            )
+            if root_created_at != first_commit.committed_at:
+                raise ValueError(
+                    "StrategicContract root creation time disagrees with revision 1"
+                )
+
+            for revision in expected_revisions:
+                contract = history[revision]
+                commit = commits_by_revision.get((game_id, revision))
+                if commit is None:
+                    raise ValueError("StrategicContract revision has no commit audit")
+                if commit.expected_base_revision != revision - 1:
+                    raise ValueError(
+                        "StrategicContract commit base revision is not contiguous"
+                    )
+                if commit.contract != contract:
+                    raise ValueError(
+                        "StrategicContract commit audit disagrees with revision snapshot"
+                    )
+                committed_at = cls._parse_audit_datetime(
+                    revision_rows[(game_id, revision)]["committed_at"],
+                    "StrategicContract revision committed_at",
+                )
+                if committed_at != commit.committed_at:
+                    raise ValueError(
+                        "StrategicContract revision and commit timestamps disagree"
+                    )
+
+                for mission in contract.mission_graph.missions:
+                    semantic_identity = (
+                        mission.game_session_id,
+                        mission.contract_id,
+                        mission.scope,
+                        mission.subject,
+                        mission.slot,
+                    )
+                    prior_identity = mission_identities.setdefault(
+                        mission.mission_id, semantic_identity
+                    )
+                    if prior_identity != semantic_identity:
+                        raise ValueError(
+                            "Mission identity conflicts across game, Contract, or scope"
+                        )
+                    prior_mission = latest_missions.get(mission.mission_id)
+                    if prior_mission is not None:
+                        if mission == prior_mission:
+                            continue
+                        if mission.mission_revision != prior_mission.mission_revision + 1:
+                            raise ValueError(
+                                "changed Mission content requires the next Mission revision"
+                            )
+                    latest_missions[mission.mission_id] = mission
+
+        if len(commits_by_revision) != len(revision_rows):
+            raise ValueError("StrategicContract commit audit has no matching revision")
 
     @staticmethod
     def _migrate_phase4_v7(conn: sqlite3.Connection) -> None:
@@ -1427,6 +1788,213 @@ class WorkflowStore:
     @staticmethod
     def _load(value: str) -> Any:
         return json.loads(value)
+
+    @classmethod
+    def _contract_from_revision_row(
+        cls, row: Mapping[str, Any]
+    ) -> StrategicContract:
+        normalized = cls._normalize_contract_revision_row(row)
+        if dict(row) != normalized:
+            raise ValueError("StrategicContract revision row is not canonical")
+        return StrategicContract.model_validate_json(str(row["contract_json"]))
+
+    @classmethod
+    def _contract_commit_from_row(
+        cls, row: Mapping[str, Any]
+    ) -> StrategicContractCommit:
+        normalized = cls._normalize_contract_commit_row(row)
+        if dict(row) != normalized:
+            raise ValueError("StrategicContract commit row is not canonical")
+        return StrategicContractCommit.model_validate_json(str(row["commit_json"]))
+
+    def get_active_strategic_contract(
+        self, game_session_id: str
+    ) -> StrategicContract | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT revision.*
+                FROM strategic_contract_roots AS root
+                JOIN strategic_contract_revisions AS revision
+                  ON revision.game_id=root.game_id
+                 AND revision.revision=root.active_revision
+                WHERE root.game_id=?
+                """,
+                (game_session_id,),
+            ).fetchone()
+        return None if row is None else self._contract_from_revision_row(row)
+
+    def get_strategic_contract_revision(
+        self, game_session_id: str, revision: int
+    ) -> StrategicContract | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM strategic_contract_revisions
+                WHERE game_id=? AND revision=?
+                """,
+                (game_session_id, revision),
+            ).fetchone()
+        return None if row is None else self._contract_from_revision_row(row)
+
+    def list_strategic_contract_revisions(
+        self, game_session_id: str
+    ) -> list[StrategicContract]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM strategic_contract_revisions
+                WHERE game_id=? ORDER BY revision
+                """,
+                (game_session_id,),
+            ).fetchall()
+        return [self._contract_from_revision_row(row) for row in rows]
+
+    def list_strategic_contract_commits(
+        self, game_session_id: str
+    ) -> list[StrategicContractCommit]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM strategic_contract_commits
+                WHERE game_id=? ORDER BY committed_revision
+                """,
+                (game_session_id,),
+            ).fetchall()
+        return [self._contract_commit_from_row(row) for row in rows]
+
+    def commit_strategic_contract_revision(
+        self, commit: StrategicContractCommit
+    ) -> StrategicContract:
+        with self._connect() as conn:
+            existing_row = conn.execute(
+                "SELECT * FROM strategic_contract_commits WHERE commit_id=?",
+                (commit.commit_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._contract_commit_from_row(existing_row)
+                if existing != commit:
+                    raise ValueError(
+                        "StrategicContract commit identity was reused with new content"
+                    )
+                revision_row = conn.execute(
+                    """
+                    SELECT * FROM strategic_contract_revisions
+                    WHERE game_id=? AND revision=?
+                    """,
+                    (existing.game_session_id, existing.contract.revision),
+                ).fetchone()
+                if revision_row is None:
+                    raise ValueError(
+                        "StrategicContract idempotency audit has no revision"
+                    )
+                return self._contract_from_revision_row(revision_row)
+
+            root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (commit.game_session_id,),
+            ).fetchone()
+            if root is None:
+                identity_owner = conn.execute(
+                    """
+                    SELECT game_id FROM strategic_contract_roots
+                    WHERE contract_id=?
+                    """,
+                    (commit.contract_id,),
+                ).fetchone()
+                if identity_owner is not None:
+                    raise ValueError(
+                        "StrategicContract identity belongs to another game"
+                    )
+                if commit.expected_base_revision != 0:
+                    raise ValueError(
+                        "stale StrategicContract base revision: no root exists"
+                    )
+                if (
+                    commit.contract.authority_scope_set.mission_graph_scopes
+                    or commit.contract.mission_graph.missions
+                ):
+                    raise ValueError(
+                        "initial StrategicContract must not claim scope authority"
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO strategic_contract_roots(
+                        game_id, contract_id, active_revision, created_at
+                    ) VALUES (?, ?, 1, ?)
+                    """,
+                    (
+                        commit.game_session_id,
+                        commit.contract_id,
+                        commit.committed_at.isoformat(),
+                    ),
+                )
+            else:
+                if str(root["contract_id"]) != commit.contract_id:
+                    raise ValueError(
+                        "game session already has another StrategicContract root"
+                    )
+                active_revision = int(root["active_revision"])
+                if active_revision != commit.expected_base_revision:
+                    raise ValueError(
+                        "stale StrategicContract base revision: "
+                        f"expected {commit.expected_base_revision}, "
+                        f"active {active_revision}"
+                    )
+
+            contract_json = self._dump(commit.contract.model_dump(mode="json"))
+            commit_json = self._dump(commit.model_dump(mode="json"))
+            conn.execute(
+                """
+                INSERT INTO strategic_contract_revisions(
+                    game_id, contract_id, revision, contract_json, committed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    commit.game_session_id,
+                    commit.contract_id,
+                    commit.contract.revision,
+                    contract_json,
+                    commit.committed_at.isoformat(),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO strategic_contract_commits(
+                    commit_id, game_id, contract_id, expected_base_revision,
+                    committed_revision, commit_json, committed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    commit.commit_id,
+                    commit.game_session_id,
+                    commit.contract_id,
+                    commit.expected_base_revision,
+                    commit.contract.revision,
+                    commit_json,
+                    commit.committed_at.isoformat(),
+                ),
+            )
+            if commit.expected_base_revision > 0:
+                updated = conn.execute(
+                    """
+                    UPDATE strategic_contract_roots
+                    SET active_revision=?
+                    WHERE game_id=? AND contract_id=? AND active_revision=?
+                    """,
+                    (
+                        commit.contract.revision,
+                        commit.game_session_id,
+                        commit.contract_id,
+                        commit.expected_base_revision,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError("stale StrategicContract base revision")
+
+            self._validate_phase1b_v9(conn)
+            return commit.contract
+
 
     @classmethod
     def _set_meta_in_connection(
@@ -4463,7 +5031,13 @@ class WorkflowStore:
                             raise ValueError(
                                 f"invalid replay JSON in {table}.{column}"
                             ) from exc
-                if table == "logical_planner_requests":
+                if table == "strategic_contract_roots":
+                    row = cls._normalize_contract_root_row(row)
+                elif table == "strategic_contract_revisions":
+                    row = cls._normalize_contract_revision_row(row)
+                elif table == "strategic_contract_commits":
+                    row = cls._normalize_contract_commit_row(row)
+                elif table == "logical_planner_requests":
                     row = cls._normalize_planner_request_row(
                         row,
                         validate_response_contract=True,
@@ -4523,6 +5097,34 @@ class WorkflowStore:
                 PlannerRequest.model_validate_json(str(row["request_json"])),
                 prepared["provider_attempts"],
             )
+        external_roots = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_revisions = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_contract_revisions WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_commits = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_contract_commits WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        cls._validate_strategic_contract_state(
+            [*external_roots, *prepared["strategic_contract_roots"]],
+            [*external_revisions, *prepared["strategic_contract_revisions"]],
+            [*external_commits, *prepared["strategic_contract_commits"]],
+            require_canonical=True,
+        )
+
 
         for table in REPLAY_STATE_TABLES:
             for foreign_key in conn.execute(

@@ -23,6 +23,16 @@ from .base import (
     freeze_json,
     thaw_json,
 )
+from .contracts import (
+    AuthorityScopeSet,
+    Mission,
+    MissionGraph,
+    MissionStatus,
+    StrategicContract,
+    StrategicContractCommit,
+    build_mission_id,
+    build_strategic_contract_id,
+)
 from .decisions import (
     DECISION_INPUT_PROJECTION_VERSION,
     DecisionGap,
@@ -113,6 +123,14 @@ from .ticks import (
 )
 
 __all__ = [
+    "AuthorityScopeSet",
+    "Mission",
+    "MissionGraph",
+    "MissionStatus",
+    "StrategicContract",
+    "StrategicContractCommit",
+    "build_mission_id",
+    "build_strategic_contract_id",
     "ACTIVE_TASK_STATUSES",
     "ProviderAttemptStatus",
     "ProviderAttempt",
