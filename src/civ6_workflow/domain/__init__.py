@@ -79,6 +79,14 @@ from .plans import (
     PlanSource,
     PlanStatus,
 )
+from .proposals import (
+    STRATEGIC_PROPOSAL_TARGET_KINDS,
+    STRATEGIC_RESEARCH_PROPOSAL_SCHEMA_VERSION,
+    StrategicResearchProposal,
+    build_strategic_research_proposal,
+    build_strategic_research_proposal_id,
+    strategic_research_proposal_hash,
+)
 from .tasks import (
     ACTIVE_TASK_STATUSES,
     Task,
@@ -104,6 +112,7 @@ from .ticks import (
     MutationUncertainTick,
     PlanLeaseUpdatedTick,
     PlannerAttemptCompletedTick,
+    StrategicProposalReadyTick,
     NoSafeActionTick,
     ObservedOnlyTick,
     PausedTick,
@@ -124,6 +133,12 @@ from .ticks import (
 
 __all__ = [
     "AuthorityScopeSet",
+    "STRATEGIC_PROPOSAL_TARGET_KINDS",
+    "STRATEGIC_RESEARCH_PROPOSAL_SCHEMA_VERSION",
+    "StrategicResearchProposal",
+    "build_strategic_research_proposal",
+    "build_strategic_research_proposal_id",
+    "strategic_research_proposal_hash",
     "Mission",
     "MissionGraph",
     "MissionStatus",
@@ -136,6 +151,7 @@ __all__ = [
     "ProviderAttempt",
     "PlannerAttemptCompletedTick",
     "PlanLeaseUpdatedTick",
+    "StrategicProposalReadyTick",
     "PlanLeaseStatus",
     "PlanLease",
     "LogicalPlannerRequestCreatedTick",

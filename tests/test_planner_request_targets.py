@@ -237,15 +237,18 @@ def test_nonlegacy_target_keys_cover_contract_revision_scope_and_missions():
     scope_wide = _repair_target()
     newer = _repair_target(revision=2, mission_ids=("mission-1",))
 
-    assert len(
-        {
-            creation.target_key,
-            existing_creation.target_key,
-            repair.target_key,
-            scope_wide.target_key,
-            newer.target_key,
-        }
-    ) == 5
+    assert (
+        len(
+            {
+                creation.target_key,
+                existing_creation.target_key,
+                repair.target_key,
+                scope_wide.target_key,
+                newer.target_key,
+            }
+        )
+        == 5
+    )
 
 
 def test_created_tick_defaults_old_json_to_legacy_and_validates_gap_summary():
@@ -334,9 +337,7 @@ def test_legacy_response_compatibility_requires_response_terminal_status(status)
 
 
 def test_legacy_response_compatibility_rejects_nonlegacy_target_and_payload():
-    compatibility = (
-        PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
-    )
+    compatibility = PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
     with pytest.raises(ValidationError, match="requires a legacy target"):
         _request(
             target=_repair_target(),
@@ -347,9 +348,7 @@ def test_legacy_response_compatibility_rejects_nonlegacy_target_and_payload():
 
     completed = _completed_request("marked-with-payload")
     with pytest.raises(ValidationError, match="cannot include response_payload"):
-        completed.model_copy(
-            update={"response_evidence_compatibility": compatibility}
-        )
+        completed.model_copy(update={"response_evidence_compatibility": compatibility})
 
 
 def test_legacy_response_compatibility_rejects_unknown_value():
@@ -365,9 +364,7 @@ def test_legacy_response_compatibility_rejects_unknown_value():
 
 def test_store_rejects_new_or_lifecycle_introduced_response_compatibility(tmp_path):
     store = WorkflowStore(tmp_path / "ordinary-save-compatibility.sqlite3")
-    compatibility = (
-        PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
-    )
+    compatibility = PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
     marked = _request(
         "marked-new-request",
         status=PlannerRequestStatus.REJECTED,
@@ -575,9 +572,7 @@ def test_store_lifecycle_schema_failure_rejects_unproven_attempt(
     )
     store.save_planner_request(in_progress)
     if attempt_status is not None:
-        store.save_provider_attempt(
-            "game-1", _attempt(in_progress, 1, attempt_status)
-        )
+        store.save_provider_attempt("game-1", _attempt(in_progress, 1, attempt_status))
     rejected = in_progress.model_copy(
         update={
             "status": PlannerRequestStatus.REJECTED,
@@ -617,9 +612,9 @@ def test_store_lifecycle_can_commit_reopen_and_replay_schema_failure(tmp_path):
     store.save_planner_request(rejected)
 
     assert store.get_planner_request(rejected.planner_request_id) == rejected
-    assert WorkflowStore(path).get_planner_request(
-        rejected.planner_request_id
-    ) == rejected
+    assert (
+        WorkflowStore(path).get_planner_request(rejected.planner_request_id) == rejected
+    )
     exported = store.export_replay_state("game-1")
     restored = WorkflowStore(tmp_path / "restored-schema-failure.sqlite3")
     restored.import_replay_state(exported)
@@ -713,9 +708,9 @@ def test_schema_failure_rolls_back_later_provider_attempt(tmp_path, status):
         store.save_provider_attempt("game-1", later)
 
     assert store.list_provider_attempts(rejected.planner_request_id) == list(attempts)
-    assert WorkflowStore(path).get_planner_request(
-        rejected.planner_request_id
-    ) == rejected
+    assert (
+        WorkflowStore(path).get_planner_request(rejected.planner_request_id) == rejected
+    )
 
 
 @pytest.mark.parametrize(
@@ -741,17 +736,20 @@ def test_startup_and_replay_reject_later_schema_failure_attempt(tmp_path, status
                 started_at, completed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            tuple(row[column] for column in (
-                "provider_attempt_id",
-                "game_id",
-                "planner_request_id",
-                "attempt_number",
-                "provider_request_id",
-                "status",
-                "attempt_json",
-                "started_at",
-                "completed_at",
-            )),
+            tuple(
+                row[column]
+                for column in (
+                    "provider_attempt_id",
+                    "game_id",
+                    "planner_request_id",
+                    "attempt_number",
+                    "provider_request_id",
+                    "status",
+                    "attempt_json",
+                    "started_at",
+                    "completed_at",
+                )
+            ),
         )
 
     with pytest.raises(ValueError, match="maximum ProviderAttempt"):
@@ -778,9 +776,9 @@ def test_schema_failure_allows_failed_attempt_before_succeeded_maximum(tmp_path)
     )
 
     assert store.list_provider_attempts(rejected.planner_request_id) == list(attempts)
-    assert WorkflowStore(path).get_planner_request(
-        rejected.planner_request_id
-    ) == rejected
+    assert (
+        WorkflowStore(path).get_planner_request(rejected.planner_request_id) == rejected
+    )
 
 
 def test_v8_read_and_startup_reject_the_same_missing_response_shape(tmp_path):
@@ -894,9 +892,12 @@ def test_store_uniqueness_uses_target_key_and_input_hash(tmp_path):
     store.save_planner_request(
         _request("request-new-target", target=_legacy_target(gap_ids=("gap-2",)))
     )
-    assert store.planner_request_for_input(
-        "game-1", first.target.target_key, first.input_projection_hash
-    ) == first
+    assert (
+        store.planner_request_for_input(
+            "game-1", first.target.target_key, first.input_projection_hash
+        )
+        == first
+    )
 
 
 def _legacy_request_json(request: PlannerRequest) -> str:
@@ -1136,7 +1137,7 @@ def test_v7_to_v8_migration_preserves_status_attempt_round_and_canonical_json(
     assert store.list_information_rounds("awaiting") == [round_record]
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
         rows = conn.execute(
             "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
         ).fetchall()
@@ -1147,9 +1148,8 @@ def test_v7_to_v8_migration_preserves_status_attempt_round_and_canonical_json(
             "decision_gap_ids" not in json.loads(row["request_json"]) for row in rows
         )
         indexes = {
-            row[1] for row in conn.execute(
-                "PRAGMA index_list(logical_planner_requests)"
-            )
+            row[1]
+            for row in conn.execute("PRAGMA index_list(logical_planner_requests)")
         }
         assert "idx_logical_requests_target_input" in indexes
 
@@ -1236,15 +1236,16 @@ def test_v8_migration_recovers_one_column_interruption(tmp_path, partial_column)
 
     store = WorkflowStore(path)
 
-    assert store.get_planner_request(request.planner_request_id).target == request.target
+    assert (
+        store.get_planner_request(request.planner_request_id).target == request.target
+    )
     with sqlite3.connect(path) as conn:
         columns = {
-            row[1] for row in conn.execute(
-                "PRAGMA table_info(logical_planner_requests)"
-            )
+            row[1]
+            for row in conn.execute("PRAGMA table_info(logical_planner_requests)")
         }
         assert {"request_target_kind", "request_target_key"} <= columns
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 def test_v8_migration_rolls_back_canonical_duplicates(tmp_path):
@@ -1261,9 +1262,10 @@ def test_v8_migration_rolls_back_canonical_duplicates(tmp_path):
 
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
-        assert conn.execute(
-            "SELECT COUNT(*) FROM logical_planner_requests"
-        ).fetchone()[0] == 2
+        assert (
+            conn.execute("SELECT COUNT(*) FROM logical_planner_requests").fetchone()[0]
+            == 2
+        )
 
 
 def test_v8_migration_fails_closed_on_relational_json_conflict(tmp_path):
@@ -1315,9 +1317,10 @@ def test_v8_migration_rolls_back_core_relational_json_conflicts(
 
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
-        assert conn.execute(
-            "SELECT COUNT(*) FROM logical_planner_requests"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM logical_planner_requests").fetchone()[0]
+            == 1
+        )
 
 
 def test_v8_migration_accepts_equivalent_timestamp_formats_and_normalizes(tmp_path):
@@ -1351,9 +1354,7 @@ def test_v8_migration_accepts_equivalent_timestamp_formats_and_normalizes(tmp_pa
 
     store = WorkflowStore(path)
 
-    assert store.get_planner_request(
-        request.planner_request_id
-    ) == request.model_copy(
+    assert store.get_planner_request(request.planner_request_id) == request.model_copy(
         update={
             "response_evidence_compatibility": (
                 PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
@@ -1375,18 +1376,21 @@ def test_future_database_version_fails_before_content_changes(tmp_path):
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE sentinel(value TEXT NOT NULL)")
         conn.execute("INSERT INTO sentinel VALUES ('unchanged')")
-        conn.execute("PRAGMA user_version=10")
+        conn.execute("PRAGMA user_version=11")
 
-    with pytest.raises(ValueError, match="unsupported workflow database version 10"):
+    with pytest.raises(ValueError, match="unsupported workflow database version 11"):
         WorkflowStore(path)
 
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
         assert conn.execute("SELECT value FROM sentinel").fetchone()[0] == "unchanged"
-        assert conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master "
-            "WHERE type='table' AND name='logical_planner_requests'"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='logical_planner_requests'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_all_target_kinds_reuse_provider_attempts_and_information_rounds(tmp_path):
@@ -1446,7 +1450,9 @@ def test_response_payload_survives_store_restart(tmp_path):
     request = _completed_request("request-response")
     WorkflowStore(path).save_planner_request(request)
 
-    assert WorkflowStore(path).get_planner_request(request.planner_request_id) == request
+    assert (
+        WorkflowStore(path).get_planner_request(request.planner_request_id) == request
+    )
 
 
 def _v7_replay_state(request, *, attempt=None, round_record=None):
@@ -1488,9 +1494,7 @@ def _provider_attempt_row(
         "attempt_json": attempt.model_dump_json(),
         "started_at": attempt.started_at.isoformat(),
         "completed_at": (
-            None
-            if attempt.completed_at is None
-            else attempt.completed_at.isoformat()
+            None if attempt.completed_at is None else attempt.completed_at.isoformat()
         ),
     }
 
@@ -1533,9 +1537,7 @@ def test_v7_replay_import_canonicalizes_request_and_preserves_children(tmp_path)
     restored = store.get_planner_request(request.planner_request_id)
     assert restored.target == request.target
     assert store.list_provider_attempts(request.planner_request_id) == [attempt]
-    assert store.list_information_rounds(request.planner_request_id) == [
-        round_record
-    ]
+    assert store.list_information_rounds(request.planner_request_id) == [round_record]
     exported = store.export_replay_state("game-1")
     row = exported["tables"]["logical_planner_requests"][0]
     payload = json.loads(row["request_json"])
@@ -1641,17 +1643,14 @@ def test_store_rejects_noncanonical_and_arbitrary_legacy_responses(tmp_path):
     assert store.get_planner_request(accepted.planner_request_id) == accepted
 
 
-def test_store_rejects_nonlegacy_response_before_phase1b(tmp_path):
+def test_store_rejects_legacy_bundle_for_strategic_target(tmp_path):
     store = WorkflowStore(tmp_path / "nonlegacy-response.sqlite3")
     request = _completed_request(
         "nonlegacy-response",
         target=_repair_target(),
     )
 
-    with pytest.raises(
-        ValueError,
-        match="non-legacy planner response contract is not enabled before Phase 1B",
-    ):
+    with pytest.raises(ValueError, match="StrategicResearchProposalResponse"):
         store.save_planner_request(request)
     assert store.get_planner_request(request.planner_request_id) is None
 
@@ -1677,9 +1676,7 @@ def _terminal_request(
             response_payload=payload,
             response_hash=canonical_json_hash(payload),
             validation_result={"result": "rejected"},
-        ).model_copy(
-            update={"failure_category": "invalid_planner_output_item"}
-        )
+        ).model_copy(update={"failure_category": "invalid_planner_output_item"})
     return _request(
         request_id,
         status=status,
@@ -1714,9 +1711,7 @@ def test_every_planner_terminal_state_freezes_the_entire_row(
 
     if status is PlannerRequestStatus.COMPLETED:
         changed = terminal.model_copy(
-            update={
-                "provider_attempt_count": terminal.provider_attempt_count + 1
-            }
+            update={"provider_attempt_count": terminal.provider_attempt_count + 1}
         )
     elif replacement is PlannerRequestStatus.COMPLETED:
         payload = canonical_workflow_plan_bundle_payload(
@@ -1770,9 +1765,7 @@ def test_provider_attempt_identity_transition_and_read_consistency(tmp_path):
     for changed in (
         started.model_copy(update={"attempt_number": 2}),
         started.model_copy(update={"provider_request_id": "other-call"}),
-        started.model_copy(
-            update={"planner_request_id": request_b.planner_request_id}
-        ),
+        started.model_copy(update={"planner_request_id": request_b.planner_request_id}),
     ):
         with pytest.raises(ValueError, match="creation identity is immutable"):
             store.save_provider_attempt("game-1", changed)
@@ -1802,9 +1795,7 @@ def test_provider_attempt_identity_transition_and_read_consistency(tmp_path):
 
 def test_child_save_requires_an_existing_parent_in_the_same_game(tmp_path):
     store = WorkflowStore(tmp_path / "child-parent-safety.sqlite3")
-    parent = _request("child-parent").model_copy(
-        update={"game_session_id": "game-B"}
-    )
+    parent = _request("child-parent").model_copy(update={"game_session_id": "game-B"})
     store.save_planner_request(parent)
     attempt = ProviderAttempt(
         provider_attempt_id="child-parent-attempt",
@@ -1955,7 +1946,9 @@ def test_replay_schema_failure_requires_provider_attempt_before_delete(
     provider_attempt_count,
     message,
 ):
-    store = WorkflowStore(tmp_path / f"missing-attempt-{provider_attempt_count}.sqlite3")
+    store = WorkflowStore(
+        tmp_path / f"missing-attempt-{provider_attempt_count}.sqlite3"
+    )
     seed = _request("schema-failure-seed")
     store.save_planner_request(seed)
     request = _schema_failure_request(
@@ -2060,9 +2053,7 @@ def test_replay_schema_failure_allows_earlier_failed_attempts(tmp_path):
     )
     store = WorkflowStore(tmp_path / "schema-failure-recovered.sqlite3")
 
-    store.import_replay_state(
-        _schema_failure_replay_state(request, attempts=attempts)
-    )
+    store.import_replay_state(_schema_failure_replay_state(request, attempts=attempts))
 
     assert store.get_planner_request(request.planner_request_id) == request
     assert store.list_provider_attempts(request.planner_request_id) == list(attempts)
@@ -2076,9 +2067,7 @@ def test_replay_schema_failure_allows_earlier_failed_attempts(tmp_path):
         PlannerRequestStatus.PARTIALLY_COMPLETED,
     ],
 )
-def test_planner_contract_failure_with_complete_response_is_canonical(
-    tmp_path, status
-):
+def test_planner_contract_failure_with_complete_response_is_canonical(tmp_path, status):
     payload = canonical_workflow_plan_bundle_payload(
         WorkflowPlanBundle(summary="auditable contract rejection")
     )
@@ -2108,9 +2097,7 @@ def test_planner_contract_failure_with_complete_response_is_canonical(
     ],
     ids=["payload-only", "hash-only", "validation-only"],
 )
-def test_planner_contract_failure_rejects_partial_response_evidence(
-    tmp_path, evidence
-):
+def test_planner_contract_failure_rejects_partial_response_evidence(tmp_path, evidence):
     if "response_payload" in evidence:
         with pytest.raises(ValidationError, match="response_payload requires"):
             _schema_failure_request("partial-contract-response").model_copy(
@@ -2153,9 +2140,7 @@ def test_v8_replay_terminal_legacy_request_requires_response_evidence(
         status=status,
         completed_at=NOW,
         response_hash=(
-            "historical-hash"
-            if status is not PlannerRequestStatus.REJECTED
-            else None
+            "historical-hash" if status is not PlannerRequestStatus.REJECTED else None
         ),
         validation_result=(
             {"result": status.value.lower()}
@@ -2224,9 +2209,10 @@ def test_v7_terminal_missing_payload_replay_round_trip_is_stable(tmp_path, statu
 
     first_export = store.export_replay_state("game-1")
     exported_request = first_export["tables"]["logical_planner_requests"][0]
-    assert json.loads(exported_request["request_json"])[
-        "response_evidence_compatibility"
-    ] == PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD.value
+    assert (
+        json.loads(exported_request["request_json"])["response_evidence_compatibility"]
+        == PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD.value
+    )
 
     restored_store = WorkflowStore(
         tmp_path / f"v8-terminal-replay-{status.value}.sqlite3"
@@ -2340,9 +2326,9 @@ def test_replay_missing_planner_parent_fails_before_delete(tmp_path):
         completed_at=NOW,
         latency_seconds=0,
     )
-    orphan_row = _v7_replay_state(seed, attempt=orphan)["tables"][
-        "provider_attempts"
-    ][0]
+    orphan_row = _v7_replay_state(seed, attempt=orphan)["tables"]["provider_attempts"][
+        0
+    ]
 
     with pytest.raises(ValueError, match="references a missing"):
         store.import_replay_state(
@@ -2601,13 +2587,11 @@ def test_v7_migration_preserves_real_foreign_key_children(tmp_path):
     )
 
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert store.get_planner_request(request.planner_request_id) == migrated_request
     assert store.list_provider_attempts(request.planner_request_id) == [attempt]
-    assert store.list_information_rounds(request.planner_request_id) == [
-        round_record
-    ]
+    assert store.list_information_rounds(request.planner_request_id) == [round_record]
     assert store.list_plan_leases("game-1") == [lease]
 
     exported = store.export_replay_state("game-1")

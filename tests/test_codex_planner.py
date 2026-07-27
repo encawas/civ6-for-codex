@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -433,3 +434,51 @@ def test_cli_started_hook_precedes_subprocess_creation(tmp_path: Path, monkeypat
 
     assert phases == [("started", 1)]
     assert spawned is False
+
+
+def test_codex_cli_uses_target_specific_strategic_schema(tmp_path, monkeypatch):
+    state_directory = tmp_path / "strategic-schema"
+    planner = CodexPlanner(
+        CodexPlannerConfig(
+            backend="codex_cli",
+            command=str(Path(__file__).resolve()),
+            state_directory=state_directory,
+            use_output_schema=True,
+        )
+    )
+    request = AgentRequest(
+        request_id="req_strategic_schema",
+        turn=1,
+        execution_mode=ExecutionMode.READONLY,
+        trigger_events=[],
+        constraints={"planner_request_target_kind": "MISSION_GRAPH_REPAIR"},
+    )
+
+    class StrategicOutputProcess:
+        returncode = 0
+
+        async def communicate(self, payload: bytes):
+            request_directory = state_directory / "requests" / request.request_id
+            (request_directory / "plan.json").write_text(
+                "not-json-yet", encoding="utf-8"
+            )
+            return b"", b""
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return StrategicOutputProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    raw = asyncio.run(planner.plan(request))
+
+    assert raw == "not-json-yet"
+    schema_path = state_directory / "requests" / request.request_id / "plan.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert "proposal_candidates" in schema["properties"]
+    assert "tasks" not in schema["properties"]

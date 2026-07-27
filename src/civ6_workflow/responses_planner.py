@@ -13,6 +13,7 @@ from .credentials import CredentialError, resolve_api_credential
 from .workflow_protocol import (
     WorkflowAgentRequest as AgentRequest,
     WorkflowPlanBundle as PlanBundle,
+    planner_response_model_for_request,
 )
 
 log = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ class ResponsesPlanner:
         if self.provider_attempt_hook is not None:
             await self.provider_attempt_hook(phase, details)
 
-    async def plan(self, request: AgentRequest) -> PlanBundle:
+    async def plan(self, request: AgentRequest) -> Any:
         try:
             credential = resolve_api_credential(
                 self.config.api_key_env, self.config.api_key_file
@@ -72,6 +73,12 @@ class ResponsesPlanner:
             )
 
         request_text = request.model_dump_json(exclude_none=True)
+        response_model = planner_response_model_for_request(request)
+        response_name = (
+            "civ6_plan_bundle"
+            if response_model is PlanBundle
+            else "strategic_research_proposal"
+        )
         payload: dict[str, Any] = {
             "model": self.config.model,
             "instructions": self.system_instructions,
@@ -79,8 +86,8 @@ class ResponsesPlanner:
             "text": {
                 "format": {
                     "type": "json_schema",
-                    "name": "civ6_plan_bundle",
-                    "schema": PlanBundle.model_json_schema(),
+                    "name": response_name,
+                    "schema": response_model.model_json_schema(),
                     # Pydantic defaults intentionally remain optional in the remote
                     # schema. The returned object is validated strictly and with
                     # extra="forbid" locally before any task is persisted.
@@ -238,6 +245,10 @@ class ResponsesPlanner:
                 "Responses API completed without output_text; "
                 f"request_id={diagnostics.request_id}"
             )
+
+        if response_model is not PlanBundle:
+            self._record(diagnostics)
+            return output_text
 
         try:
             bundle = PlanBundle.model_validate_json(output_text)

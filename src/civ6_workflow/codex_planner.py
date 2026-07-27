@@ -13,6 +13,7 @@ from .workflow_prompt import EXTENDED_SYSTEM_INSTRUCTIONS
 from .workflow_protocol import (
     WorkflowAgentRequest as AgentRequest,
     WorkflowPlanBundle as PlanBundle,
+    planner_response_model_for_request,
 )
 
 
@@ -124,7 +125,7 @@ class CodexPlanner:
         command.extend(["--output-last-message", str(output_path), "-"])
         return command
 
-    async def plan(self, request: AgentRequest) -> PlanBundle:
+    async def plan(self, request: AgentRequest) -> Any:
         backend = self.config.backend.strip().lower()
         if backend == "responses":
             from .responses_planner import ResponsesPlanner
@@ -142,7 +143,7 @@ class CodexPlanner:
             )
         return await self._plan_with_cli(request)
 
-    async def _plan_with_cli(self, request: AgentRequest) -> PlanBundle:
+    async def _plan_with_cli(self, request: AgentRequest) -> Any:
         self.last_diagnostics = None
         started = asyncio.get_running_loop().time()
         prompt = self._build_prompt(request)
@@ -153,8 +154,11 @@ class CodexPlanner:
         schema_path = request_dir / "plan.schema.json"
         output_path = request_dir / "plan.json"
         prompt_path = request_dir / "request.txt"
+        response_model = planner_response_model_for_request(request)
         schema_path.write_text(
-            json.dumps(PlanBundle.model_json_schema(), ensure_ascii=False, indent=2),
+            json.dumps(
+                response_model.model_json_schema(), ensure_ascii=False, indent=2
+            ),
             encoding="utf-8",
         )
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -259,6 +263,9 @@ class CodexPlanner:
             record_diagnostics(response_bytes=0, error_body=error)
             raise PlannerError(error)
         response_bytes = len(raw.encode("utf-8"))
+        if response_model is not PlanBundle:
+            record_diagnostics(response_bytes=response_bytes)
+            return raw
         try:
             bundle = PlanBundle.model_validate_json(raw)
         except Exception as exc:

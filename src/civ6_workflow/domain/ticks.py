@@ -40,6 +40,7 @@ class TickOutcomeKind(StrEnum):
     PLAN_LEASE_UPDATED = "PLAN_LEASE_UPDATED"
     LOGICAL_PLANNER_REQUEST_CREATED = "LOGICAL_PLANNER_REQUEST_CREATED"
     PLANNER_ATTEMPT_COMPLETED = "PLANNER_ATTEMPT_COMPLETED"
+    STRATEGIC_PROPOSAL_READY = "STRATEGIC_PROPOSAL_READY"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
     INFORMATION_COLLECTED = "INFORMATION_COLLECTED"
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
@@ -132,14 +133,9 @@ class LogicalPlannerRequestCreatedTick(TickRecord):
 
     @model_validator(mode="after")
     def validate_target_summary(self) -> Self:
-        if (
-            self.request_target_kind
-            is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
-        ):
+        if self.request_target_kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
             if not self.decision_gap_ids:
-                raise ValueError(
-                    "legacy PlannerRequest Tick requires DecisionGap IDs"
-                )
+                raise ValueError("legacy PlannerRequest Tick requires DecisionGap IDs")
         elif self.decision_gap_ids:
             raise ValueError(
                 "non-legacy PlannerRequest Tick cannot contain DecisionGap IDs"
@@ -156,6 +152,24 @@ class PlannerAttemptCompletedTick(TickRecord):
     planner_request_id: str
     provider_attempt_id: str
     provider_attempt_count: int = Field(ge=0)
+
+
+class StrategicProposalReadyTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_READY] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_READY
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    proposal_id: str
+    target_kind: Literal[
+        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+    ]
+    expected_base_revision: int = Field(ge=0)
+    blocking_reason: str = Field(min_length=1)
 
 
 class InformationRequestedTick(TickRecord):
@@ -180,6 +194,7 @@ class InformationCollectedTick(TickRecord):
     mutation_budget_used: Literal[0] = 0
     planner_request_id: str
     information_round_id: str
+
 
 class ContextGatheredTick(TickRecord):
     outcome: Literal[TickOutcomeKind.CONTEXT_GATHERED] = (
@@ -378,6 +393,7 @@ WorkflowTick: TypeAlias = Annotated[
     | PlanLeaseUpdatedTick
     | LogicalPlannerRequestCreatedTick
     | PlannerAttemptCompletedTick
+    | StrategicProposalReadyTick
     | InformationRequestedTick
     | InformationCollectedTick
     | ContextGatheredTick

@@ -1721,6 +1721,10 @@ class WorkflowEngine:
             # Legacy records predate a durable comparison baseline. Reconcile once
             # from the fresh observation and immediately write a v1 baseline.
             return "legacy human wait has no durable comparison baseline"
+        if context.get("wait_kind") == "strategic_contract_proposal_ready":
+            if context.get("resume_requested") is True:
+                return "explicit user resume was requested"
+            return None
         if context.get("resume_requested") is True:
             return "explicit user resume was requested"
         if (

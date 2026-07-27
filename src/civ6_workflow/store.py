@@ -34,6 +34,9 @@ from .domain import (
     PlannerRequestTargetKind,
     ProviderAttempt,
     StrategicContract,
+    STRATEGIC_PROPOSAL_TARGET_KINDS,
+    StrategicResearchProposal,
+    build_strategic_contract_id,
     StrategicContractCommit,
     RuntimeState,
     TurnTransitionConfirmedTick,
@@ -54,7 +57,10 @@ from .models import (
     TaskStatus,
     TickMetrics,
 )
-from .workflow_protocol import canonical_workflow_plan_bundle_payload
+from .workflow_protocol import (
+    canonical_strategic_research_proposal_response_payload,
+    canonical_workflow_plan_bundle_payload,
+)
 
 
 _STICKY_EVENT_TYPES = {
@@ -67,6 +73,10 @@ _STICKY_EVENT_TYPES = {
 
 class TaskIdentityConflictError(ValueError):
     """Raised when an existing task ID is reused for different semantics."""
+
+
+class StaleStrategicContractBaseError(ValueError):
+    """Raised when Proposal persistence loses its frozen Contract base."""
 
 
 class _PlannerResponseFacts(StrEnum):
@@ -291,8 +301,31 @@ CREATE TABLE IF NOT EXISTS information_rounds (
         REFERENCES logical_planner_requests(planner_request_id)
 );
 
+CREATE TABLE IF NOT EXISTS strategic_research_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    source_planner_request_id TEXT NOT NULL UNIQUE,
+    source_provider_attempt_id TEXT NOT NULL UNIQUE,
+    source_provider_attempt_number INTEGER NOT NULL
+        CHECK (source_provider_attempt_number >= 1),
+    target_kind TEXT NOT NULL,
+    target_contract_id TEXT NOT NULL,
+    expected_base_revision INTEGER NOT NULL CHECK (expected_base_revision >= 0),
+    proposal_hash TEXT NOT NULL,
+    proposal_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (source_planner_request_id)
+        REFERENCES logical_planner_requests(planner_request_id),
+    FOREIGN KEY (source_provider_attempt_id)
+        REFERENCES provider_attempts(provider_attempt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategic_research_proposals_game
+ON strategic_research_proposals (game_id, target_kind, target_contract_id);
+
 CREATE TABLE IF NOT EXISTS plan_leases (
     plan_lease_id TEXT PRIMARY KEY,
+
     game_id TEXT NOT NULL,
     scope TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -457,6 +490,7 @@ REPLAY_STATE_TABLES = (
     "approval_records",
     "logical_planner_requests",
     "provider_attempts",
+    "strategic_research_proposals",
     "information_rounds",
     "plan_leases",
     "planner_suppressions",
@@ -476,10 +510,10 @@ class WorkflowStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > 9:
+            if version > 10:
                 raise ValueError(
                     f"unsupported workflow database version {version}; "
-                    "maximum supported version is 9"
+                    "maximum supported version is 10"
                 )
             conn.executescript(SCHEMA)
             self._migrate(conn)
@@ -679,10 +713,10 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > 9:
+        if version > 10:
             raise ValueError(
                 f"unsupported workflow database version {version}; "
-                "maximum supported version is 9"
+                "maximum supported version is 10"
             )
         upgraded_from_pre_v7 = version < 7
         if upgraded_from_pre_v7:
@@ -714,6 +748,13 @@ class WorkflowStore:
             conn.execute("PRAGMA user_version=9")
         else:
             WorkflowStore._validate_phase1b_v9(conn)
+
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < 10:
+            WorkflowStore._migrate_phase1b_v10(conn)
+            conn.execute("PRAGMA user_version=10")
+        else:
+            WorkflowStore._validate_phase1b_proposals_v10(conn)
 
     @classmethod
     def _migrate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
@@ -748,6 +789,12 @@ class WorkflowStore:
             commits,
             require_canonical=True,
         )
+
+    @classmethod
+    def _migrate_phase1b_v10(cls, conn: sqlite3.Connection) -> None:
+        """Add candidate Proposal persistence without changing Contract authority."""
+
+        cls._validate_phase1b_proposals_v10(conn)
 
     @classmethod
     def _normalize_contract_root_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1012,6 +1059,246 @@ class WorkflowStore:
                 "v9 StrategicContract foundation requires empty authority scope and "
                 "MissionGraph"
             )
+
+    @classmethod
+    def _normalize_strategic_research_proposal_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "proposal_id",
+            "game_id",
+            "source_planner_request_id",
+            "source_provider_attempt_id",
+            "source_provider_attempt_number",
+            "target_kind",
+            "target_contract_id",
+            "expected_base_revision",
+            "proposal_hash",
+            "proposal_json",
+            "created_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"StrategicResearchProposal row is missing columns: {sorted(missing)}"
+            )
+        try:
+            proposal = StrategicResearchProposal.model_validate_json(
+                str(normalized["proposal_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid StrategicResearchProposal JSON") from exc
+        created_at = cls._parse_audit_datetime(
+            normalized["created_at"], "StrategicResearchProposal created_at"
+        )
+        if created_at is None or created_at.tzinfo is None:
+            raise ValueError("StrategicResearchProposal created_at requires timezone")
+        relational = {
+            "proposal_id": proposal.proposal_id,
+            "game_id": proposal.game_session_id,
+            "source_planner_request_id": proposal.source_planner_request_id,
+            "source_provider_attempt_id": proposal.source_provider_attempt_id,
+            "source_provider_attempt_number": proposal.source_provider_attempt_number,
+            "target_kind": proposal.target_kind.value,
+            "target_contract_id": proposal.target_contract_id,
+            "expected_base_revision": proposal.expected_base_revision,
+            "proposal_hash": proposal.proposal_hash,
+            "created_at": proposal.created_at,
+        }
+        for column, expected in relational.items():
+            actual = created_at if column == "created_at" else normalized[column]
+            if column in {
+                "source_provider_attempt_number",
+                "expected_base_revision",
+            }:
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"StrategicResearchProposal {column} must be an integer"
+                    ) from exc
+            if actual != expected:
+                raise ValueError(
+                    "StrategicResearchProposal relational columns disagree with JSON"
+                )
+        normalized.update(
+            {
+                "source_provider_attempt_number": proposal.source_provider_attempt_number,
+                "expected_base_revision": proposal.expected_base_revision,
+                "proposal_json": cls._dump(proposal.model_dump(mode="json")),
+                "created_at": proposal.created_at.isoformat(),
+            }
+        )
+        return normalized
+
+    @classmethod
+    def _validate_strategic_proposal_attempt(
+        cls,
+        proposal: StrategicResearchProposal,
+        request: PlannerRequest,
+        attempt_rows: Sequence[Mapping[str, Any]],
+    ) -> None:
+        normalized_attempts = [
+            cls._normalize_provider_attempt_row(row) for row in attempt_rows
+        ]
+        matching = [
+            row
+            for row in normalized_attempts
+            if str(row["planner_request_id"]) == request.planner_request_id
+        ]
+        if not matching:
+            raise ValueError("Proposal requires a matching final ProviderAttempt")
+        maximum = max(int(row["attempt_number"]) for row in matching)
+        if request.provider_attempt_count != maximum:
+            raise ValueError(
+                "Proposal requires provider_attempt_count to match the maximum Attempt"
+            )
+        if proposal.source_provider_attempt_number != maximum:
+            raise ValueError("Proposal must bind the maximum ProviderAttempt number")
+        final_row = next(
+            row for row in matching if int(row["attempt_number"]) == maximum
+        )
+        if final_row["game_id"] != proposal.game_session_id:
+            raise ValueError("Proposal final ProviderAttempt belongs to another game")
+        final_attempt = ProviderAttempt.model_validate_json(
+            str(final_row["attempt_json"])
+        )
+        if final_attempt.provider_attempt_id != proposal.source_provider_attempt_id:
+            raise ValueError("Proposal must bind the final ProviderAttempt identity")
+        if (
+            final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+            or final_attempt.completed_at is None
+        ):
+            raise ValueError("Proposal requires a completed SUCCEEDED final Attempt")
+
+    @staticmethod
+    def _validate_strategic_proposal_target(
+        proposal: StrategicResearchProposal, request: PlannerRequest
+    ) -> None:
+        target = request.target
+        if target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+            raise ValueError("Proposal parent Request target is not supported")
+        if proposal.target_kind is not target.kind:
+            raise ValueError("Proposal target kind disagrees with PlannerRequest")
+        if target.strategic_scope != "research":
+            raise ValueError("Strategic research Proposal requires research scope")
+        if target.kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            contract_id = target.strategic_contract_id or build_strategic_contract_id(
+                request.game_session_id
+            )
+            base_revision = 0
+        else:
+            assert target.strategic_contract_id is not None
+            assert target.base_contract_revision is not None
+            contract_id = target.strategic_contract_id
+            base_revision = target.base_contract_revision
+        if proposal.target_contract_id != contract_id:
+            raise ValueError("Proposal Contract ID disagrees with PlannerRequest")
+        if proposal.expected_base_revision != base_revision:
+            raise ValueError("Proposal base revision disagrees with PlannerRequest")
+
+    @classmethod
+    def _validate_strategic_proposal_state(
+        cls,
+        proposal_rows: Sequence[Mapping[str, Any]],
+        request_rows: Sequence[Mapping[str, Any]],
+        attempt_rows: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        normalized_proposals = [
+            cls._normalize_strategic_research_proposal_row(row) for row in proposal_rows
+        ]
+        normalized_requests = [
+            cls._normalize_planner_request_row(row, validate_response_contract=True)
+            for row in request_rows
+        ]
+        normalized_attempts = [
+            cls._normalize_provider_attempt_row(row) for row in attempt_rows
+        ]
+        if require_canonical:
+            for index, row in enumerate(proposal_rows):
+                source = dict(row)
+                normalized = normalized_proposals[index]
+                if source != normalized:
+                    raise ValueError("StrategicResearchProposal row is not canonical")
+
+        requests: dict[str, PlannerRequest] = {}
+        for row in normalized_requests:
+            request = PlannerRequest.model_validate_json(str(row["request_json"]))
+            if request.planner_request_id in requests:
+                raise ValueError("duplicate PlannerRequest identity")
+            requests[request.planner_request_id] = request
+
+        proposals_by_request: dict[str, StrategicResearchProposal] = {}
+        proposal_ids: set[str] = set()
+        attempt_ids: set[str] = set()
+        for row in normalized_proposals:
+            proposal = StrategicResearchProposal.model_validate_json(
+                str(row["proposal_json"])
+            )
+            if proposal.proposal_id in proposal_ids:
+                raise ValueError("duplicate StrategicResearchProposal identity")
+            proposal_ids.add(proposal.proposal_id)
+            if proposal.source_planner_request_id in proposals_by_request:
+                raise ValueError("a PlannerRequest cannot have two Proposals")
+            if proposal.source_provider_attempt_id in attempt_ids:
+                raise ValueError("a ProviderAttempt cannot support two Proposals")
+            attempt_ids.add(proposal.source_provider_attempt_id)
+            proposals_by_request[proposal.source_planner_request_id] = proposal
+
+            request = requests.get(proposal.source_planner_request_id)
+            if request is None:
+                raise ValueError("Proposal parent PlannerRequest does not exist")
+            if request.game_session_id != proposal.game_session_id:
+                raise ValueError(
+                    "Proposal and PlannerRequest belong to different games"
+                )
+            if request.status is not PlannerRequestStatus.COMPLETED:
+                raise ValueError("Proposal parent PlannerRequest must be COMPLETED")
+            cls._validate_strategic_proposal_target(proposal, request)
+            cls._validate_strategic_proposal_attempt(
+                proposal, request, normalized_attempts
+            )
+
+        for request in requests.values():
+            if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                continue
+            proposal = proposals_by_request.get(request.planner_request_id)
+            if request.status is PlannerRequestStatus.COMPLETED and proposal is None:
+                raise ValueError(
+                    "COMPLETED non-legacy PlannerRequest requires Proposal"
+                )
+            if (
+                request.status is not PlannerRequestStatus.COMPLETED
+                and proposal is not None
+            ):
+                raise ValueError("non-COMPLETED PlannerRequest cannot own Proposal")
+
+    @classmethod
+    def _validate_phase1b_proposals_v10(cls, conn: sqlite3.Connection) -> None:
+        cls._validate_strategic_proposal_state(
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_research_proposals ORDER BY proposal_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM provider_attempts ORDER BY planner_request_id, attempt_number"
+                ).fetchall()
+            ],
+            require_canonical=True,
+        )
 
     @staticmethod
     def _migrate_phase4_v7(conn: sqlite3.Connection) -> None:
@@ -1968,6 +2255,150 @@ class WorkflowStore:
 
             self._validate_phase1b_v9(conn)
             return commit.contract
+
+    @classmethod
+    def _strategic_research_proposal_from_row(
+        cls, row: Mapping[str, Any]
+    ) -> StrategicResearchProposal:
+        normalized = cls._normalize_strategic_research_proposal_row(row)
+        if dict(row) != normalized:
+            raise ValueError("StrategicResearchProposal row is not canonical")
+        return StrategicResearchProposal.model_validate_json(
+            str(normalized["proposal_json"])
+        )
+
+    @staticmethod
+    def _validate_proposal_contract_base_in_connection(
+        conn: sqlite3.Connection, proposal: StrategicResearchProposal
+    ) -> None:
+        root = conn.execute(
+            "SELECT contract_id, active_revision FROM strategic_contract_roots "
+            "WHERE game_id=?",
+            (proposal.game_session_id,),
+        ).fetchone()
+        if proposal.target_kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            if root is not None:
+                raise StaleStrategicContractBaseError(
+                    "Contract creation Proposal became stale"
+                )
+            return
+        if (
+            root is None
+            or str(root["contract_id"]) != proposal.target_contract_id
+            or int(root["active_revision"]) != proposal.expected_base_revision
+        ):
+            raise StaleStrategicContractBaseError(
+                "Mission repair Proposal Contract base became stale"
+            )
+
+    @classmethod
+    def _save_strategic_research_proposal_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+    ) -> StrategicResearchProposal:
+        existing_row = conn.execute(
+            "SELECT * FROM strategic_research_proposals WHERE proposal_id=?",
+            (proposal.proposal_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = cls._strategic_research_proposal_from_row(existing_row)
+            if existing != proposal:
+                raise ValueError("Proposal identity was reused with new content")
+            return existing
+        request_row = conn.execute(
+            "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+            (proposal.source_planner_request_id,),
+        ).fetchone()
+        if request_row is None:
+            raise ValueError("Proposal parent PlannerRequest does not exist")
+        request = cls._planner_request_from_row(request_row)
+        if request.status is not PlannerRequestStatus.COMPLETED:
+            raise ValueError("Proposal parent PlannerRequest must be COMPLETED")
+        cls._validate_strategic_proposal_target(proposal, request)
+        attempt_rows = conn.execute(
+            "SELECT * FROM provider_attempts WHERE planner_request_id=? "
+            "ORDER BY attempt_number",
+            (request.planner_request_id,),
+        ).fetchall()
+        cls._validate_strategic_proposal_attempt(proposal, request, attempt_rows)
+        cls._validate_proposal_contract_base_in_connection(conn, proposal)
+        conflicting = conn.execute(
+            "SELECT proposal_id FROM strategic_research_proposals "
+            "WHERE source_planner_request_id=? OR source_provider_attempt_id=?",
+            (
+                proposal.source_planner_request_id,
+                proposal.source_provider_attempt_id,
+            ),
+        ).fetchone()
+        if conflicting is not None:
+            raise ValueError(
+                "PlannerRequest or ProviderAttempt already owns a Proposal"
+            )
+        conn.execute(
+            """
+            INSERT INTO strategic_research_proposals(
+                proposal_id, game_id, source_planner_request_id,
+                source_provider_attempt_id, source_provider_attempt_number,
+                target_kind, target_contract_id, expected_base_revision,
+                proposal_hash, proposal_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                proposal.proposal_id,
+                proposal.game_session_id,
+                proposal.source_planner_request_id,
+                proposal.source_provider_attempt_id,
+                proposal.source_provider_attempt_number,
+                proposal.target_kind.value,
+                proposal.target_contract_id,
+                proposal.expected_base_revision,
+                proposal.proposal_hash,
+                cls._dump(proposal.model_dump(mode="json")),
+                proposal.created_at.isoformat(),
+            ),
+        )
+        return proposal
+
+    def save_strategic_research_proposal(
+        self, proposal: StrategicResearchProposal
+    ) -> StrategicResearchProposal:
+        with self._connect() as conn:
+            saved = self._save_strategic_research_proposal_in_connection(conn, proposal)
+            self._validate_phase1b_proposals_v10(conn)
+            return saved
+
+    def get_strategic_research_proposal(
+        self, proposal_id: str
+    ) -> StrategicResearchProposal | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+        return None if row is None else self._strategic_research_proposal_from_row(row)
+
+    def strategic_research_proposal_for_request(
+        self, planner_request_id: str
+    ) -> StrategicResearchProposal | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategic_research_proposals "
+                "WHERE source_planner_request_id=?",
+                (planner_request_id,),
+            ).fetchone()
+        return None if row is None else self._strategic_research_proposal_from_row(row)
+
+    def list_strategic_research_proposals(
+        self, game_session_id: str
+    ) -> list[StrategicResearchProposal]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategic_research_proposals "
+                "WHERE game_id=? ORDER BY proposal_id",
+                (game_session_id,),
+            ).fetchall()
+        return [self._strategic_research_proposal_from_row(row) for row in rows]
 
     @classmethod
     def _set_meta_in_connection(
@@ -3742,10 +4173,6 @@ class WorkflowStore:
             return _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD
         if request.status not in response_statuses:
             return _PlannerResponseFacts.NO_RESPONSE
-        if request.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
-            raise ValueError(
-                "non-legacy planner response contract is not enabled before Phase 1B"
-            )
         response_evidence = {
             "response_payload": request.response_payload,
             "response_hash": request.response_hash,
@@ -3767,19 +4194,33 @@ class WorkflowStore:
                 f"PlannerRequest completion requires: {', '.join(sorted(missing))}"
             )
         PlannerRequest.model_validate_json(request.model_dump_json())
-        canonical_payload = canonical_workflow_plan_bundle_payload(
-            request.response_payload
-        )
+        match request.target.kind:
+            case PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+                canonical_payload = canonical_workflow_plan_bundle_payload(
+                    request.response_payload
+                )
+                contract_name = "WorkflowPlanBundle"
+            case (
+                PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION
+                | PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+            ):
+                canonical_payload = (
+                    canonical_strategic_research_proposal_response_payload(
+                        request.response_payload
+                    )
+                )
+                contract_name = "StrategicResearchProposalResponse"
+            case _:
+                raise ValueError("unsupported PlannerRequest response target")
         if canonical_json(request.response_payload) != canonical_json(
             canonical_payload
         ):
             raise ValueError(
-                "legacy planner response_payload must be a canonical WorkflowPlanBundle"
+                f"planner response_payload must be a canonical {contract_name}"
             )
         if request.response_hash != canonical_json_hash(canonical_payload):
             raise ValueError(
-                "legacy planner response_hash must use the canonical "
-                "WorkflowPlanBundle payload"
+                f"planner response_hash must use the canonical {contract_name} payload"
             )
         return _PlannerResponseFacts.CANONICAL_RESPONSE
 
@@ -3994,6 +4435,7 @@ class WorkflowStore:
     def save_planner_request(self, request: PlannerRequest) -> None:
         with self._connect() as conn:
             self._save_planner_request_in_connection(conn, request)
+            self._validate_phase1b_proposals_v10(conn)
 
     def get_planner_request(self, planner_request_id: str) -> PlannerRequest | None:
         with self._connect() as conn:
@@ -4334,6 +4776,7 @@ class WorkflowStore:
                 (attempt.planner_request_id,),
             ).fetchall(),
         )
+        cls._validate_phase1b_proposals_v10(conn)
 
     def save_provider_attempt(self, game_id: str, attempt: ProviderAttempt) -> None:
         with self._connect() as conn:
@@ -4663,6 +5106,7 @@ class WorkflowStore:
         decision_group: DecisionGroup | None = None,
         plan_leases: Sequence[PlanLease] = (),
         planner_request: PlannerRequest | None = None,
+        strategic_research_proposal: StrategicResearchProposal | None = None,
         provider_attempts: Sequence[ProviderAttempt] = (),
         information_round: InformationRound | None = None,
         plan_bundle: PlanBundle | None = None,
@@ -4719,6 +5163,13 @@ class WorkflowStore:
                 if planner_request.game_session_id != tick.game_session_id:
                     raise ValueError("planner request and Tick must belong to one game")
                 self._save_planner_request_in_connection(conn, planner_request)
+            if strategic_research_proposal is not None:
+                if strategic_research_proposal.game_session_id != tick.game_session_id:
+                    raise ValueError("proposal and Tick must belong to one game")
+                self._save_strategic_research_proposal_in_connection(
+                    conn, strategic_research_proposal
+                )
+                self._validate_phase1b_proposals_v10(conn)
             if information_round is not None:
                 self._save_information_round_in_connection(
                     conn, tick.game_session_id, information_round
@@ -4904,6 +5355,7 @@ class WorkflowStore:
                 "last_game_id",
                 "last_observed_turn",
                 f"unit_observations_initialized:{game_id}",
+                self._human_wait_meta_key(game_id),
             )
             placeholders = ",".join("?" for _ in meta_keys)
             tables["workflow_meta"] = [
@@ -4927,6 +5379,7 @@ class WorkflowStore:
             "last_game_id",
             "last_observed_turn",
             f"unit_observations_initialized:{game_id}",
+            cls._human_wait_meta_key(game_id),
         }
         for table in (*REPLAY_STATE_TABLES, "workflow_meta"):
             rows = tables.get(table, [])
@@ -4986,6 +5439,8 @@ class WorkflowStore:
                     row = cls._normalize_contract_revision_row(row)
                 elif table == "strategic_contract_commits":
                     row = cls._normalize_contract_commit_row(row)
+                elif table == "strategic_research_proposals":
+                    row = cls._normalize_strategic_research_proposal_row(row)
                 elif table == "logical_planner_requests":
                     row = cls._normalize_planner_request_row(
                         row,
@@ -5043,6 +5498,42 @@ class WorkflowStore:
                 PlannerRequest.model_validate_json(str(row["request_json"])),
                 prepared["provider_attempts"],
             )
+        external_proposals = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_requests = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_attempts = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM provider_attempts WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        cls._validate_strategic_proposal_state(
+            [
+                *external_proposals,
+                *prepared["strategic_research_proposals"],
+            ],
+            [
+                *external_requests,
+                *prepared["logical_planner_requests"],
+            ],
+            [
+                *external_attempts,
+                *prepared["provider_attempts"],
+            ],
+            require_canonical=True,
+        )
         external_roots = [
             dict(row)
             for row in conn.execute(
@@ -5110,12 +5601,13 @@ class WorkflowStore:
             conn.execute(
                 """
                 DELETE FROM workflow_meta
-                WHERE key IN (?, ?, ?)
+                WHERE key IN (?, ?, ?, ?)
                 """,
                 (
                     "last_game_id",
                     "last_observed_turn",
                     f"unit_observations_initialized:{game_id}",
+                    self._human_wait_meta_key(game_id),
                 ),
             )
             for table in (*REPLAY_STATE_TABLES, "workflow_meta"):

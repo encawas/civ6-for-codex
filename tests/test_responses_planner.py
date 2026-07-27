@@ -185,3 +185,59 @@ def test_responses_planner_retries_transient_gateway_errors(monkeypatch):
     assert planner.last_diagnostics["attempt_count"] == 3
     assert recording.summary.logical_requests == 1
     assert recording.summary.provider_attempts == 3
+
+
+class _StrategicResponseClient(_Client):
+    payload = None
+
+    def stream(self, method, url, *, headers, content):
+        payload = json.loads(content)
+        type(self).payload = payload
+        body = {
+            "id": "resp_strategic",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "not-json-yet"}],
+                }
+            ],
+        }
+        return _Stream(
+            httpx.Response(
+                200,
+                headers={
+                    "x-request-id": "req_strategic",
+                    "content-type": "application/json",
+                },
+                content=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+
+def test_responses_planner_uses_target_specific_strategic_schema(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _StrategicResponseClient.payload = None
+    monkeypatch.setattr(
+        "civ6_workflow.responses_planner.httpx.AsyncClient",
+        _StrategicResponseClient,
+    )
+    planner = ResponsesPlanner(
+        CodexPlannerConfig(backend="responses", model="test-model"),
+        SYSTEM_INSTRUCTIONS,
+        PlannerError,
+    )
+    request = AgentRequest(
+        turn=1,
+        execution_mode=ExecutionMode.READONLY,
+        trigger_events=[],
+        constraints={"planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"},
+    )
+
+    raw = asyncio.run(planner.plan(request))
+
+    assert raw == "not-json-yet"
+    payload = _StrategicResponseClient.payload
+    assert payload["text"]["format"]["name"] == "strategic_research_proposal"
+    properties = payload["text"]["format"]["schema"]["properties"]
+    assert "proposal_candidates" in properties
+    assert "tasks" not in properties

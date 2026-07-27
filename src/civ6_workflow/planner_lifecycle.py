@@ -51,7 +51,11 @@ from .domain import (
     ProviderAttempt,
     ProviderAttemptStatus,
     RuntimeState,
+    StrategicProposalReadyTick,
     SubjectRef,
+    build_strategic_contract_id,
+    build_strategic_research_proposal,
+    build_strategic_research_proposal_id,
     validate_workflow_tick,
     canonical_json,
     canonical_json_hash,
@@ -68,11 +72,15 @@ from .workflow_protocol import (
     InformationRequest,
     WorkflowAgentRequest as AgentRequest,
     ResolutionDisposition,
+    StrategicResearchProposalResponse,
     WorkflowPlanBundle,
+    canonical_strategic_research_proposal_response_payload,
     canonical_workflow_plan_bundle_payload,
     validate_event_resolution_contract,
     validate_global_resolution_structure,
+    validate_information_request,
 )
+from .store import StaleStrategicContractBaseError
 
 
 PLANNER_CALL_POLICY_REVISION = "planner-call-policy/v1"
@@ -129,24 +137,49 @@ class PlannerLifecycleCoordinator:
 
         active = engine.store.active_planner_request(game_id)
         if active is not None:
-            if (
-                active.target.kind
-                is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP
-            ):
-                reason = (
-                    "non-legacy planner request routing is not enabled "
-                    "before Phase 1B"
-                )
-                compatibility.paused = True
-                compatibility.pause_reason = reason
-                compatibility.planner_request_id = active.planner_request_id
-                return [], self._finish(
+            if active.target.kind in {
+                PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+                PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+            }:
+                try:
+                    proposal_context = self._strategic_proposal_context(active)
+                except ValueError as exc:
+                    return [], self._supersede_strategic_request(
+                        ctx, snapshot, active, compatibility, str(exc)
+                    )
+                if active.status is PlannerRequestStatus.AWAITING_INFORMATION:
+                    return [], await self._collect_information(
+                        ctx, observation, active, compatibility
+                    )
+                backoff = engine._active_backoff()
+                if active.status is PlannerRequestStatus.BACKOFF and backoff:
+                    engine.store.record_planner_suppression(
+                        game_id,
+                        snapshot.turn,
+                        reason="provider_backoff",
+                        relevant_input_hash=active.input_projection_hash,
+                    )
+                    return [], self._finish(
+                        ctx,
+                        snapshot,
+                        PlannerBackoffTick,
+                        compatibility=compatibility,
+                        planner_request=active,
+                        planner_request_id=active.planner_request_id,
+                        blocking_reason=(
+                            "planner provider backoff remains active for "
+                            f"{backoff['remaining_seconds']:.1f}s"
+                        ),
+                    )
+                return [], await self._continue_strategic_proposal_request(
                     ctx,
-                    snapshot,
-                    AwaitingHumanTick,
-                    compatibility=compatibility,
-                    blocking_reason=reason,
+                    observation,
+                    active,
+                    compatibility,
+                    proposal_context,
                 )
+            if active.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+                raise RuntimeError("unsupported PlannerRequest target kind")
             stale_tick = self._supersede_stale_request(
                 ctx,
                 observation,
@@ -803,9 +836,10 @@ class PlannerLifecycleCoordinator:
                 )
             elif group.decision_group_id != request.decision_group_id:
                 reason = "stable decision identity was replaced"
-            elif self._planner_input_hash(
-                group.input_projection_hash
-            ) != request.input_projection_hash:
+            elif (
+                self._planner_input_hash(group.input_projection_hash)
+                != request.input_projection_hash
+            ):
                 reason = "relevant decision input changed"
             elif (
                 tuple(
@@ -1174,6 +1208,528 @@ class PlannerLifecycleCoordinator:
             information_round_id=collected.information_round_id,
         )
 
+    def _strategic_proposal_context(
+        self, logical_request: PlannerRequest
+    ) -> tuple[str, int]:
+        target = logical_request.target
+        if target.strategic_scope != "research":
+            raise ValueError("strategic Proposal request scope must be research")
+        active = self.engine.store.get_active_strategic_contract(
+            logical_request.game_session_id
+        )
+        if target.kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            if active is not None:
+                raise ValueError("StrategicContract creation base is stale")
+            contract_id = target.strategic_contract_id or build_strategic_contract_id(
+                logical_request.game_session_id
+            )
+            expected_base_revision = 0
+        elif target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR:
+            if active is None:
+                raise ValueError("MissionGraph repair requires an active Contract")
+            if target.strategic_contract_id != active.contract_id:
+                raise ValueError("MissionGraph repair Contract identity is stale")
+            if target.base_contract_revision != active.revision:
+                raise ValueError("MissionGraph repair Contract revision is stale")
+            contract_id = active.contract_id
+            expected_base_revision = active.revision
+        else:
+            raise ValueError("PlannerRequest target is not a strategic Proposal target")
+
+        projection = thaw_json(logical_request.input_projection)
+        projection_context = projection.get("strategic_proposal_context", projection)
+        if not isinstance(projection_context, dict):
+            raise ValueError("strategic Proposal input projection context is missing")
+        expected_projection = {
+            "target_contract_id": contract_id,
+            "expected_base_revision": expected_base_revision,
+            "strategic_scope": "research",
+        }
+        if any(
+            projection_context.get(key) != value
+            for key, value in expected_projection.items()
+        ):
+            raise ValueError("strategic Proposal input projection is stale")
+        return contract_id, expected_base_revision
+
+    def _supersede_strategic_request(
+        self,
+        ctx,
+        snapshot,
+        logical_request: PlannerRequest,
+        compatibility: TickResult,
+        reason: str,
+    ) -> TickResult:
+        updated_request = logical_request.model_copy(
+            update={
+                "status": PlannerRequestStatus.SUPERSEDED,
+                "completed_at": self.engine._now(),
+                "failure_category": "stale_strategic_contract_base",
+            }
+        )
+        compatibility.paused = True
+        compatibility.pause_reason = reason
+        compatibility.planner_request_id = logical_request.planner_request_id
+        return self._finish(
+            ctx,
+            snapshot,
+            AwaitingHumanTick,
+            compatibility=compatibility,
+            planner_request=updated_request,
+            blocking_reason=reason,
+        )
+
+    async def _continue_strategic_proposal_request(
+        self,
+        ctx,
+        observation,
+        logical_request: PlannerRequest,
+        compatibility: TickResult,
+        proposal_context: tuple[str, int],
+    ) -> TickResult:
+        engine = self.engine
+        snapshot = observation.snapshot
+        target_contract_id, expected_base_revision = proposal_context
+        payload = thaw_json(logical_request.request_payload)
+        payload["request_id"] = f"req_{uuid4().hex}"
+        constraints = thaw_json(payload.get("constraints", {}))
+        constraints.update(
+            {
+                "planner_request_target_kind": logical_request.target.kind.value,
+                "target_contract_id": target_contract_id,
+                "expected_base_revision": expected_base_revision,
+                "strategic_scope": "research",
+                "response_schema_version": ("strategic-research-proposal-response/v1"),
+            }
+        )
+        if logical_request.information_results:
+            payload["information_results"] = thaw_json(
+                logical_request.information_results
+            )
+            constraints.update(
+                {
+                    "planning_phase": "final",
+                    "allow_information_requests": False,
+                }
+            )
+        payload["constraints"] = constraints
+        provider_request = AgentRequest.model_validate(payload)
+        provider_attempts: list[ProviderAttempt] = []
+        active_provider_attempt: ProviderAttempt | None = None
+        provider_count = 0
+
+        async def provider_attempt_hook(phase, details):
+            nonlocal logical_request, active_provider_attempt, provider_count
+            now = engine._now()
+            if phase == "started":
+                provider_request_id = str(
+                    details.get("provider_request_id", provider_request.request_id)
+                )
+                attempt_number = (
+                    len(
+                        engine.store.list_provider_attempts(
+                            logical_request.planner_request_id
+                        )
+                    )
+                    + 1
+                )
+                started_record = ProviderAttempt(
+                    provider_attempt_id=f"provider_{uuid4().hex}",
+                    planner_request_id=logical_request.planner_request_id,
+                    attempt_number=attempt_number,
+                    provider_request_id=provider_request_id,
+                    status=ProviderAttemptStatus.STARTED,
+                    started_at=now,
+                    diagnostics=details.get("diagnostics", {}),
+                )
+                logical_request = engine.store.start_provider_attempt(
+                    snapshot.game_id, logical_request, started_record
+                )
+                active_provider_attempt = started_record
+                provider_count += 1
+                engine._checkpoint("after_provider_attempt_started")
+                return
+            if phase == "failed" and active_provider_attempt is not None:
+                failed = active_provider_attempt.model_copy(
+                    update={
+                        "status": ProviderAttemptStatus.FAILED,
+                        "completed_at": now,
+                        "latency_seconds": max(
+                            0.0,
+                            (now - active_provider_attempt.started_at).total_seconds(),
+                        ),
+                        "diagnostics": details.get("diagnostics", details),
+                        "failure_category": str(
+                            details.get("failure_category", "provider_retry_failed")
+                        ),
+                    }
+                )
+                engine.store.save_provider_attempt(snapshot.game_id, failed)
+                active_provider_attempt = None
+
+        setter = getattr(engine.planner, "set_provider_attempt_hook", None)
+        hook_supported = (
+            bool(setter(provider_attempt_hook)) if callable(setter) else False
+        )
+        if not hook_supported:
+            await provider_attempt_hook(
+                "started", {"provider_request_id": provider_request.request_id}
+            )
+
+        started_monotonic = time.perf_counter()
+        response: StrategicResearchProposalResponse | None = None
+        canonical_response_payload: dict[str, Any] | None = None
+        error: Exception | None = None
+        contract_error: Exception | None = None
+        planner_scope = getattr(engine.planner, "logical_request_scope", None)
+        scope = (
+            planner_scope(logical_request.planner_request_id)
+            if callable(planner_scope)
+            else nullcontext()
+        )
+        try:
+            with scope:
+                raw_response = await engine._plan_once(provider_request, ctx.metrics)
+        except Exception as exc:
+            from .engine import InjectedCrashBoundary
+
+            if isinstance(exc, InjectedCrashBoundary):
+                raise
+            error = exc
+        else:
+            try:
+                canonical_response_payload = (
+                    canonical_strategic_research_proposal_response_payload(raw_response)
+                )
+                response = StrategicResearchProposalResponse.model_validate_json(
+                    json.dumps(canonical_response_payload)
+                )
+            except Exception as exc:
+                contract_error = exc
+        finally:
+            if hook_supported:
+                setter(None)
+        completed = engine._now()
+        duration = max(0.0, time.perf_counter() - started_monotonic)
+        diagnostics = self._json_diagnostics(
+            getattr(engine.planner, "last_diagnostics", None)
+        )
+        if active_provider_attempt is not None:
+            completed_attempt = active_provider_attempt.model_copy(
+                update={
+                    "status": (
+                        ProviderAttemptStatus.SUCCEEDED
+                        if error is None
+                        else ProviderAttemptStatus.FAILED
+                    ),
+                    "completed_at": completed,
+                    "latency_seconds": max(
+                        0.0,
+                        (
+                            completed - active_provider_attempt.started_at
+                        ).total_seconds(),
+                    ),
+                    "diagnostics": diagnostics,
+                    "failure_category": (
+                        None if error is None else type(error).__name__
+                    ),
+                }
+            )
+            provider_attempts = [completed_attempt]
+        ctx.metrics.provider_attempt_count += provider_count
+        compatibility.agent_invoked = True
+        compatibility.planner_request_id = logical_request.planner_request_id
+        engine._checkpoint("after_provider_call")
+
+        if error is not None:
+            return self._strategic_provider_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                provider_count,
+                error,
+            )
+        if contract_error is not None:
+            return self._strategic_contract_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                provider_count,
+                str(contract_error),
+            )
+
+        assert response is not None
+        assert canonical_response_payload is not None
+        if response.information_requests:
+            if logical_request.information_round_count >= 1:
+                return self._strategic_contract_failure(
+                    ctx,
+                    snapshot,
+                    logical_request,
+                    compatibility,
+                    provider_attempts,
+                    provider_count,
+                    "information round limit exceeded",
+                    response_payload=canonical_response_payload,
+                    failure_category="information_round_limit_exceeded",
+                )
+            try:
+                for information_request in response.information_requests:
+                    validate_information_request(information_request)
+            except Exception as exc:
+                return self._strategic_contract_failure(
+                    ctx,
+                    snapshot,
+                    logical_request,
+                    compatibility,
+                    provider_attempts,
+                    provider_count,
+                    str(exc),
+                    response_payload=canonical_response_payload,
+                    failure_category="invalid_information_request",
+                )
+            round_id = f"info_round_{uuid4().hex}"
+            pending = tuple(
+                request.model_dump(mode="json")
+                for request in response.information_requests
+            )
+            round_record = InformationRound(
+                information_round_id=round_id,
+                planner_request_id=logical_request.planner_request_id,
+                round_number=logical_request.information_round_count + 1,
+                status=InformationRoundStatus.REQUESTED,
+                requests=pending,
+                requested_at=completed,
+            )
+            updated_request = logical_request.model_copy(
+                update={
+                    "status": PlannerRequestStatus.AWAITING_INFORMATION,
+                    "pending_information_requests": pending,
+                }
+            )
+            ctx.metrics.information_round_count += 1
+            return self._finish(
+                ctx,
+                snapshot,
+                InformationRequestedTick,
+                compatibility=compatibility,
+                planner_request=updated_request,
+                provider_attempts=provider_attempts,
+                information_round=round_record,
+                planner_request_id=logical_request.planner_request_id,
+                information_round_id=round_id,
+            )
+
+        if len(response.proposal_candidates) != 1:
+            return self._strategic_contract_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                provider_count,
+                "final response requires exactly one Proposal candidate",
+                response_payload=canonical_response_payload,
+                failure_category="invalid_proposal_candidate_count",
+            )
+        if not provider_attempts:
+            raise RuntimeError("strategic Proposal has no final ProviderAttempt")
+
+        candidate = response.proposal_candidates[0]
+        try:
+            if candidate.created_from_observation_id != logical_request.observation_id:
+                raise ValueError("Proposal observation identity does not match Request")
+            for field_name, values in (
+                ("strategic_objectives", candidate.strategic_objectives),
+                ("global_constraints", candidate.global_constraints),
+            ):
+                if any(not value.strip() for value in values):
+                    raise ValueError(f"{field_name} contain a blank value")
+            proposal = build_strategic_research_proposal(
+                proposal_id=build_strategic_research_proposal_id(
+                    logical_request.planner_request_id
+                ),
+                game_session_id=snapshot.game_id,
+                source_planner_request_id=logical_request.planner_request_id,
+                source_provider_attempt_id=provider_attempts[-1].provider_attempt_id,
+                source_provider_attempt_number=provider_attempts[-1].attempt_number,
+                target_kind=logical_request.target.kind,
+                target_contract_id=target_contract_id,
+                expected_base_revision=expected_base_revision,
+                strategic_objectives=tuple(sorted(set(candidate.strategic_objectives))),
+                global_constraints=tuple(sorted(set(candidate.global_constraints))),
+                proposed_research_mission=candidate.proposed_research_mission,
+                created_from_observation_id=candidate.created_from_observation_id,
+                created_at=completed,
+            )
+        except Exception as exc:
+            return self._strategic_contract_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                provider_count,
+                str(exc),
+                response_payload=canonical_response_payload,
+                failure_category="invalid_strategic_proposal",
+            )
+
+        updated_request = logical_request.model_copy(
+            update={
+                "status": PlannerRequestStatus.COMPLETED,
+                "completed_at": completed,
+                "response_payload": canonical_response_payload,
+                "response_hash": canonical_json_hash(canonical_response_payload),
+                "validation_result": {
+                    "result": "completed",
+                    "proposal_id": proposal.proposal_id,
+                    "proposal_hash": proposal.proposal_hash,
+                },
+                "failure_category": None,
+            }
+        )
+        engine._clear_backoff()
+        compatibility.paused = True
+        compatibility.pause_reason = "strategic_contract_proposal_ready"
+        engine.store.record_agent_run(
+            snapshot.game_id,
+            provider_request,
+            response=response,
+            success=True,
+            error=None,
+            duration_seconds=duration,
+        )
+        try:
+            result = self._finish(
+                ctx,
+                snapshot,
+                StrategicProposalReadyTick,
+                compatibility=compatibility,
+                planner_request=updated_request,
+                provider_attempts=provider_attempts,
+                strategic_research_proposal=proposal,
+                planner_request_id=logical_request.planner_request_id,
+                proposal_id=proposal.proposal_id,
+                target_kind=logical_request.target.kind,
+                expected_base_revision=expected_base_revision,
+                blocking_reason="strategic_contract_proposal_ready",
+            )
+        except StaleStrategicContractBaseError as exc:
+            return self._strategic_contract_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                provider_count,
+                str(exc),
+                response_payload=canonical_response_payload,
+                failure_category="stale_strategic_contract_base",
+            )
+        engine._checkpoint("after_provider_attempt_finalized")
+        return result
+
+    def _strategic_provider_failure(
+        self,
+        ctx,
+        snapshot,
+        logical_request,
+        compatibility,
+        provider_attempts,
+        provider_count,
+        error,
+    ):
+        engine = self.engine
+        failure = engine._classify_planner_failure(error)
+        transient = bool(failure["transient"])
+        updated_request = logical_request.model_copy(
+            update={
+                "status": (
+                    PlannerRequestStatus.BACKOFF
+                    if transient
+                    else PlannerRequestStatus.FAILED
+                ),
+                "failure_category": str(failure["category"]),
+                "completed_at": None if transient else engine._now(),
+            }
+        )
+        if transient:
+            engine._set_backoff(failure)
+            return self._finish(
+                ctx,
+                snapshot,
+                PlannerAttemptCompletedTick,
+                compatibility=compatibility,
+                planner_request=updated_request,
+                provider_attempts=provider_attempts,
+                planner_request_id=logical_request.planner_request_id,
+                provider_attempt_id=self._provider_tick_id(
+                    logical_request, provider_attempts
+                ),
+                provider_attempt_count=provider_count,
+            )
+        compatibility.paused = True
+        compatibility.pause_reason = f"planner failed: {failure['category']}"
+        return self._finish(
+            ctx,
+            snapshot,
+            AwaitingHumanTick,
+            compatibility=compatibility,
+            planner_request=updated_request,
+            provider_attempts=provider_attempts,
+            blocking_reason=compatibility.pause_reason,
+        )
+
+    def _strategic_contract_failure(
+        self,
+        ctx,
+        snapshot,
+        logical_request,
+        compatibility,
+        provider_attempts,
+        provider_count,
+        reason,
+        *,
+        response_payload=None,
+        failure_category="planner_contract_failure",
+    ):
+        response_evidence = (
+            {}
+            if response_payload is None
+            else {
+                "response_payload": response_payload,
+                "response_hash": canonical_json_hash(response_payload),
+                "validation_result": {
+                    "result": "rejected",
+                    "reason": reason[:300],
+                },
+            }
+        )
+        updated_request = logical_request.model_copy(
+            update={
+                **response_evidence,
+                "status": PlannerRequestStatus.REJECTED,
+                "completed_at": self.engine._now(),
+                "failure_category": failure_category,
+            }
+        )
+        compatibility.paused = True
+        compatibility.pause_reason = f"strategic Proposal rejected: {reason[:300]}"
+        return self._finish(
+            ctx,
+            snapshot,
+            AwaitingHumanTick,
+            compatibility=compatibility,
+            planner_request=updated_request,
+            provider_attempts=provider_attempts,
+            blocking_reason=compatibility.pause_reason,
+        )
+
     async def _continue_request(
         self,
         ctx,
@@ -1281,8 +1837,8 @@ class PlannerLifecycleCoordinator:
             error = exc
         else:
             try:
-                canonical_bundle_payload = (
-                    canonical_workflow_plan_bundle_payload(raw_bundle)
+                canonical_bundle_payload = canonical_workflow_plan_bundle_payload(
+                    raw_bundle
                 )
                 bundle = WorkflowPlanBundle.model_validate(canonical_bundle_payload)
             except Exception as exc:
@@ -1643,11 +2199,11 @@ class PlannerLifecycleCoordinator:
             {}
             if response_payload is None
             else {
-                'response_payload': response_payload,
-                'response_hash': canonical_json_hash(response_payload),
-                'validation_result': {
-                    'result': 'rejected',
-                    'reason': reason[:300],
+                "response_payload": response_payload,
+                "response_hash": canonical_json_hash(response_payload),
+                "validation_result": {
+                    "result": "rejected",
+                    "reason": reason[:300],
                 },
             }
         )
@@ -2770,6 +3326,7 @@ class PlannerLifecycleCoordinator:
         provider_attempts=(),
         information_round=None,
         plan_bundle=None,
+        strategic_research_proposal=None,
         cancel_task_ids=(),
         **fields,
     ):
@@ -2790,7 +3347,21 @@ class PlannerLifecycleCoordinator:
         }
         tick = validate_workflow_tick(tick_type(**common, **fields))
         human_wait_context = None
-        if isinstance(tick, AwaitingHumanTick):
+        if isinstance(tick, StrategicProposalReadyTick):
+            human_wait_context = engine._human_wait_context(snapshot)
+            human_wait_context.update(
+                {
+                    "wait_kind": "strategic_contract_proposal_ready",
+                    "resume_policy": "explicit_only",
+                    "reason": "strategic_contract_proposal_ready",
+                    "blocking_reason": tick.blocking_reason,
+                    "planner_request_id": tick.planner_request_id,
+                    "proposal_id": tick.proposal_id,
+                    "target_kind": tick.target_kind.value,
+                    "expected_base_revision": tick.expected_base_revision,
+                }
+            )
+        elif isinstance(tick, AwaitingHumanTick):
             human_wait_context = engine._human_wait_context(snapshot)
             human_wait_context["blocking_reason"] = tick.blocking_reason
         engine.store.persist_phase4_tick(
@@ -2799,6 +3370,7 @@ class PlannerLifecycleCoordinator:
             decision_group=decision_group,
             plan_leases=plan_leases,
             planner_request=planner_request,
+            strategic_research_proposal=strategic_research_proposal,
             provider_attempts=provider_attempts,
             information_round=information_round,
             plan_bundle=plan_bundle,
