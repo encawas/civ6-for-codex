@@ -5,13 +5,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal, Self, TypeAlias
 
-from pydantic import Field, TypeAdapter
+from pydantic import Field, TypeAdapter, model_validator
 from pydantic_core import to_json
 
 from .attempts import AttemptStatus
 from .base import DomainModel, ImmutableJsonObject
+from .planner import PlannerRequestTargetKind
 
 
 class RuntimeState(StrEnum):
@@ -124,7 +125,26 @@ class LogicalPlannerRequestCreatedTick(TickRecord):
     )
     mutation_budget_used: Literal[0] = 0
     planner_request_id: str
-    decision_gap_ids: tuple[str, ...] = Field(min_length=1)
+    request_target_kind: PlannerRequestTargetKind = (
+        PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+    )
+    decision_gap_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_target_summary(self) -> Self:
+        if (
+            self.request_target_kind
+            is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+        ):
+            if not self.decision_gap_ids:
+                raise ValueError(
+                    "legacy PlannerRequest Tick requires DecisionGap IDs"
+                )
+        elif self.decision_gap_ids:
+            raise ValueError(
+                "non-legacy PlannerRequest Tick cannot contain DecisionGap IDs"
+            )
+        return self
 
 
 class PlannerAttemptCompletedTick(TickRecord):

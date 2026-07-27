@@ -10,7 +10,7 @@ from uuid import uuid4
 from pydantic import Field, field_validator, model_validator
 
 from .decisioning import SETTLER_GAP_TYPES, STRATEGIC_GAP_TYPES
-from .domain import ContinuationPolicy
+from .domain import ContinuationPolicy, thaw_json
 
 from .models import (
     ExecutionMode,
@@ -234,6 +234,15 @@ class WorkflowPlanBundle(BasePlanBundle):
     event_resolutions: list[EventResolution] = Field(
         default_factory=list, max_length=100
     )
+
+
+def canonical_workflow_plan_bundle_payload(value: Any) -> dict[str, Any]:
+    source = (
+        value.model_dump(mode="python")
+        if hasattr(value, "model_dump")
+        else thaw_json(value)
+    )
+    return WorkflowPlanBundle.model_validate(source).model_dump(mode="json")
 
 
 class WorkflowAgentRequest(BaseAgentRequest):
