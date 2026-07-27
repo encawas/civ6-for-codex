@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,8 @@ def _contract(
     contract_id: str | None = None,
     mission: Mission | None = None,
     objectives: tuple[str, ...] = (),
+    constraints: tuple[str, ...] = (),
+    policy_snapshot: dict[str, object] | None = None,
 ) -> StrategicContract:
     return StrategicContract(
         contract_id=contract_id or build_strategic_contract_id(game_id),
@@ -37,7 +40,9 @@ def _contract(
         ),
         mission_graph=MissionGraph(missions=() if mission is None else (mission,)),
         strategic_objectives=objectives,
+        global_constraints=constraints,
         created_from_observation_id=f"obs-{game_id}-{revision}",
+        policy_snapshot=policy_snapshot or {},
     )
 
 
@@ -91,24 +96,21 @@ def _create_root(store: WorkflowStore, game_id: str) -> StrategicContractCommit:
     return commit
 
 
-def _append_research_mission(
-    store: WorkflowStore,
-    game_id: str,
-    *,
-    mission_id: str = "mission-research",
+def _append_foundation_revision(
+    store: WorkflowStore, game_id: str
 ) -> StrategicContractCommit:
     active = store.get_active_strategic_contract(game_id)
     assert active is not None
-    mission = _mission(game_id, active.contract_id, mission_id=mission_id)
     commit = _commit(
         _contract(
             game_id,
             active.revision + 1,
             contract_id=active.contract_id,
-            mission=mission,
-            objectives=("Establish an opening research direction",),
+            objectives=("Preserve the legacy execution authority",),
+            constraints=("Do not claim MissionGraph scope authority",),
+            policy_snapshot={"authority_mode": "legacy"},
         ),
-        commit_id=f"research-{game_id}",
+        commit_id=f"foundation-{game_id}",
         base_revision=active.revision,
     )
     assert store.commit_strategic_contract_revision(commit) == commit.contract
@@ -163,7 +165,7 @@ def test_duplicate_creation_cannot_create_a_second_root(tmp_path: Path):
 def test_revisions_are_contiguous_and_history_is_immutable(tmp_path: Path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     initial = _create_root(store, "game-1")
-    second = _append_research_mission(store, "game-1")
+    second = _append_foundation_revision(store, "game-1")
 
     assert store.get_active_strategic_contract("game-1") == second.contract
     assert store.list_strategic_contract_revisions("game-1") == [
@@ -177,7 +179,7 @@ def test_revisions_are_contiguous_and_history_is_immutable(tmp_path: Path):
 def test_stale_base_revision_is_rejected_without_partial_history(tmp_path: Path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     initial = _create_root(store, "game-1")
-    _append_research_mission(store, "game-1")
+    _append_foundation_revision(store, "game-1")
     stale = _commit(
         _contract(
             "game-1",
@@ -204,7 +206,7 @@ def test_stale_base_revision_is_rejected_without_partial_history(tmp_path: Path)
 def test_commit_identity_is_idempotent_but_cannot_change_content(tmp_path: Path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     initial = _create_root(store, "game-1")
-    second = _append_research_mission(store, "game-1")
+    second = _append_foundation_revision(store, "game-1")
 
     assert store.commit_strategic_contract_revision(initial) == initial.contract
     assert len(store.list_strategic_contract_revisions("game-1")) == 2
@@ -217,16 +219,17 @@ def test_commit_identity_is_idempotent_but_cannot_change_content(tmp_path: Path)
     assert len(store.list_strategic_contract_commits("game-1")) == 2
 
 
-def test_contract_graph_scope_and_audit_commit_atomically(tmp_path: Path):
+def test_contract_revision_and_audit_commit_atomically(tmp_path: Path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     initial = _create_root(store, "game-1")
-    mission = _mission("game-1", initial.contract_id)
     second = _commit(
         _contract(
             "game-1",
             2,
             contract_id=initial.contract_id,
-            mission=mission,
+            objectives=("Keep contract history immutable",),
+            constraints=("Keep authority scopes empty",),
+            policy_snapshot={"foundation_revision": 2},
         ),
         commit_id="failing-revision",
         base_revision=1,
@@ -251,7 +254,7 @@ def test_contract_graph_scope_and_audit_commit_atomically(tmp_path: Path):
     assert store.list_strategic_contract_commits("game-1") == [initial]
 
 
-def test_contract_and_mission_identities_cannot_cross_games(tmp_path: Path):
+def test_contract_identity_cannot_cross_games(tmp_path: Path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     game_one = _create_root(store, "game-1")
     conflicting_root = _commit(
@@ -262,29 +265,7 @@ def test_contract_and_mission_identities_cannot_cross_games(tmp_path: Path):
     with pytest.raises(ValueError, match="identity belongs to another game"):
         store.commit_strategic_contract_revision(conflicting_root)
 
-    _create_root(store, "game-2")
-    _append_research_mission(store, "game-1", mission_id="mission-shared")
-    game_two = store.get_active_strategic_contract("game-2")
-    assert game_two is not None
-    conflicting_mission = _mission(
-        "game-2", game_two.contract_id, mission_id="mission-shared"
-    )
-    conflicting_revision = _commit(
-        _contract(
-            "game-2",
-            2,
-            contract_id=game_two.contract_id,
-            mission=conflicting_mission,
-        ),
-        commit_id="research-game-2-conflict",
-        base_revision=1,
-    )
-
-    with pytest.raises(ValueError, match="Mission identity conflicts"):
-        store.commit_strategic_contract_revision(conflicting_revision)
-
-    assert store.get_active_strategic_contract("game-2") == game_two
-    assert len(store.list_strategic_contract_revisions("game-2")) == 1
+    assert store.get_active_strategic_contract("game-2") is None
 
 
 def test_startup_rejects_inconsistent_active_revision(tmp_path: Path):
@@ -303,7 +284,7 @@ def test_startup_rejects_inconsistent_active_revision(tmp_path: Path):
 def test_contract_history_and_audit_replay_round_trip_stably(tmp_path: Path):
     source = WorkflowStore(tmp_path / "source.sqlite3")
     initial = _create_root(source, "game-1")
-    second = _append_research_mission(source, "game-1")
+    second = _append_foundation_revision(source, "game-1")
 
     first_export = source.export_replay_state("game-1")
     restored = WorkflowStore(tmp_path / "restored.sqlite3")
@@ -323,6 +304,112 @@ def test_contract_history_and_audit_replay_round_trip_stably(tmp_path: Path):
     assert second_restore.export_replay_state("game-1") == first_export
 
 
+def test_domain_models_retain_future_research_mission_shape():
+    contract_id = build_strategic_contract_id("game-1")
+    mission = _mission("game-1", contract_id)
+    contract = _contract("game-1", 1, contract_id=contract_id, mission=mission)
+
+    assert contract.authority_scope_set.mission_graph_scopes == ("research",)
+    assert contract.mission_graph.missions == (mission,)
+
+
+@pytest.mark.parametrize("include_mission", [False, True])
+def test_revision_cannot_enable_scope_authority_or_persist_mission(
+    tmp_path: Path, include_mission: bool
+):
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    initial = _create_root(store, "game-1")
+    mission = _mission("game-1", initial.contract_id)
+    candidate = StrategicContract(
+        contract_id=initial.contract_id,
+        game_session_id="game-1",
+        revision=2,
+        authority_scope_set=AuthorityScopeSet(mission_graph_scopes=("research",)),
+        mission_graph=MissionGraph(missions=(mission,) if include_mission else ()),
+        strategic_objectives=("Attempt to enable research authority",),
+        created_from_observation_id="obs-game-1-2",
+    )
+    commit = _commit(candidate, commit_id="forbidden-revision", base_revision=1)
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="foundation requires empty authority scope"):
+        store.commit_strategic_contract_revision(commit)
+
+    assert store.export_replay_state("game-1") == before
+    assert store.get_active_strategic_contract("game-1") == initial.contract
+    assert store.list_strategic_contract_revisions("game-1") == [initial.contract]
+    assert store.list_strategic_contract_commits("game-1") == [initial]
+
+
+def test_startup_rejects_manually_persisted_scope_and_mission(tmp_path: Path):
+    path = tmp_path / "workflow.sqlite3"
+    store = WorkflowStore(path)
+    initial = _create_root(store, "game-1")
+    valid_second = _append_foundation_revision(store, "game-1")
+    mission = _mission("game-1", initial.contract_id)
+    invalid_contract = _contract(
+        "game-1", 2, contract_id=initial.contract_id, mission=mission
+    )
+    invalid_commit = _commit(
+        invalid_contract,
+        commit_id=valid_second.commit_id,
+        base_revision=1,
+        committed_at=valid_second.committed_at,
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE strategic_contract_revisions SET contract_json=? "
+            "WHERE game_id=? AND revision=2",
+            (_dump_model(invalid_contract), "game-1"),
+        )
+        conn.execute(
+            "UPDATE strategic_contract_commits SET commit_json=? WHERE commit_id=?",
+            (_dump_model(invalid_commit), valid_second.commit_id),
+        )
+
+    with pytest.raises(ValueError, match="foundation requires empty authority scope"):
+        WorkflowStore(path)
+
+
+def test_replay_rejects_scope_and_mission_before_deleting_target(tmp_path: Path):
+    source = WorkflowStore(tmp_path / "source.sqlite3")
+    initial = _create_root(source, "game-1")
+    valid_second = _append_foundation_revision(source, "game-1")
+    state = source.export_replay_state("game-1")
+    mission = _mission("game-1", initial.contract_id)
+    invalid_contract = _contract(
+        "game-1", 2, contract_id=initial.contract_id, mission=mission
+    )
+    invalid_commit = _commit(
+        invalid_contract,
+        commit_id=valid_second.commit_id,
+        base_revision=1,
+        committed_at=valid_second.committed_at,
+    )
+    revision_row = next(
+        row
+        for row in state["tables"]["strategic_contract_revisions"]
+        if row["revision"] == 2
+    )
+    revision_row["contract_json"] = _dump_model(invalid_contract)
+    commit_row = next(
+        row
+        for row in state["tables"]["strategic_contract_commits"]
+        if row["committed_revision"] == 2
+    )
+    commit_row["commit_json"] = _dump_model(invalid_commit)
+
+    target = WorkflowStore(tmp_path / "target.sqlite3")
+    target_initial = _create_root(target, "game-1")
+    before = target.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="foundation requires empty authority scope"):
+        target.import_replay_state(state)
+
+    assert target.export_replay_state("game-1") == before
+    assert target.get_active_strategic_contract("game-1") == target_initial.contract
+
+
 def test_initial_contract_cannot_claim_research_authority(tmp_path: Path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     contract_id = build_strategic_contract_id("game-1")
@@ -333,7 +420,16 @@ def test_initial_contract_cannot_claim_research_authority(tmp_path: Path):
         base_revision=0,
     )
 
-    with pytest.raises(ValueError, match="must not claim scope authority"):
+    with pytest.raises(ValueError, match="foundation requires empty authority scope"):
         store.commit_strategic_contract_revision(nonempty_initial)
 
     assert store.get_active_strategic_contract("game-1") is None
+
+
+def _dump_model(value: StrategicContract | StrategicContractCommit) -> str:
+    return json.dumps(
+        value.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
