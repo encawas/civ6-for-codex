@@ -246,6 +246,19 @@ def _engine(store, game, planner):
     )
 
 
+def _assert_proposal_wait(store, request, proposal):
+    wait = store.human_wait_context(request.game_session_id)
+    assert wait is not None
+    assert wait["wait_kind"] == "strategic_contract_proposal_ready"
+    assert wait["resume_policy"] == "explicit_only"
+    assert wait["reason"] == "strategic_contract_proposal_ready"
+    assert wait["planner_request_id"] == request.planner_request_id
+    assert wait["proposal_id"] == proposal.proposal_id
+    assert wait["target_kind"] == request.target.kind.value
+    assert wait["expected_base_revision"] == proposal.expected_base_revision
+    assert wait["resume_requested"] is False
+
+
 def test_creation_uses_isolated_lifecycle_and_persists_proposal(tmp_path, monkeypatch):
     async def scenario():
         store = WorkflowStore(tmp_path / "creation.sqlite3")
@@ -501,9 +514,9 @@ def test_information_round_then_proposal_and_second_round_limit(tmp_path):
     asyncio.run(limited_round())
 
 
-def test_proposal_wait_is_explicit_only_and_resume_does_not_apply(tmp_path):
+def test_proposal_wait_survives_repeated_observation_changes(tmp_path):
     async def scenario():
-        store = WorkflowStore(tmp_path / "explicit-only.sqlite3")
+        store = WorkflowStore(tmp_path / "observation-changes.sqlite3")
         contract_id = build_strategic_contract_id("game-1")
         planner = _Planner(_response("game-1", contract_id))
         game = _Game()
@@ -512,45 +525,148 @@ def test_proposal_wait_is_explicit_only_and_resume_does_not_apply(tmp_path):
         engine = _engine(store, game, planner)
 
         await engine.tick()
+        proposal = store.list_strategic_research_proposals("game-1")[0]
+        _assert_proposal_wait(store, request, proposal)
+
         game.snapshot = game.snapshot.model_copy(
             update={"turn": 2, "notifications": [{"changed": True}]}
         )
         await engine.tick()
+        _assert_proposal_wait(store, request, proposal)
+
+        game.snapshot = game.snapshot.model_copy(
+            update={"turn": 3, "notifications": [{"changed": "again"}]}
+        )
+        await engine.tick()
+        _assert_proposal_wait(store, request, proposal)
+
         assert planner.calls == 1
         assert store.load_runtime_state("game-1") is RuntimeState.AWAITING_HUMAN
-
-        assert store.request_human_resume("game-1") is True
-        await engine.tick()
-
-        assert store.get_active_strategic_contract("game-1") is None
-        assert len(store.list_strategic_research_proposals("game-1")) == 1
-        assert store.list_tasks("game-1") == []
-        assert planner.calls == 1
 
     asyncio.run(scenario())
 
 
-def test_restart_and_replay_do_not_repeat_provider(tmp_path):
+def test_proposal_wait_survives_auto_mode_after_intermediate_wait(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "auto-after-wait.sqlite3")
+        contract_id = build_strategic_contract_id("game-1")
+        planner = _Planner(_response("game-1", contract_id))
+        game = _Game()
+        request = _request("game-1")
+        store.save_planner_request(request)
+        engine = _engine(store, game, planner)
+        engine.config.execution_mode = ExecutionMode.CONFIRM
+
+        await engine.tick()
+        proposal = store.list_strategic_research_proposals("game-1")[0]
+        await engine.tick()
+        _assert_proposal_wait(store, request, proposal)
+
+        engine.config.execution_mode = ExecutionMode.AUTO
+        result = await engine.tick()
+
+        assert result.runtime_state == RuntimeState.AWAITING_HUMAN
+        _assert_proposal_wait(store, request, proposal)
+        assert planner.calls == 1
+        assert store.get_active_strategic_contract("game-1") is None
+        assert store.list_tasks("game-1") == []
+
+    asyncio.run(scenario())
+
+
+def test_proposal_wait_survives_restart_after_intermediate_wait(tmp_path):
     async def scenario():
         path = tmp_path / "restart.sqlite3"
         store = WorkflowStore(path)
         contract_id = build_strategic_contract_id("game-1")
         planner = _Planner(_response("game-1", contract_id))
+        game = _Game()
         request = _request("game-1")
         store.save_planner_request(request)
-        await _engine(store, _Game(), planner).tick()
-        exported = store.export_replay_state("game-1")
+        engine = _engine(store, game, planner)
 
-        restarted = WorkflowStore(path)
-        await _engine(restarted, _Game(), planner).tick()
+        await engine.tick()
+        proposal = store.list_strategic_research_proposals("game-1")[0]
+        await engine.tick()
+        _assert_proposal_wait(store, request, proposal)
+
+        restarted_store = WorkflowStore(path)
+        restarted_game = _Game()
+        restarted_game.snapshot = restarted_game.snapshot.model_copy(
+            update={"turn": 2, "notifications": [{"after_restart": True}]}
+        )
+        result = await _engine(restarted_store, restarted_game, planner).tick()
+
+        assert result.runtime_state == RuntimeState.AWAITING_HUMAN
+        _assert_proposal_wait(restarted_store, request, proposal)
         assert planner.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_proposal_wait_survives_replay_after_intermediate_wait(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "source.sqlite3")
+        contract_id = build_strategic_contract_id("game-1")
+        planner = _Planner(_response("game-1", contract_id))
+        request = _request("game-1")
+        store.save_planner_request(request)
+        engine = _engine(store, _Game(), planner)
+
+        await engine.tick()
+        proposal = store.list_strategic_research_proposals("game-1")[0]
+        await engine.tick()
+        _assert_proposal_wait(store, request, proposal)
+        exported = store.export_replay_state("game-1")
 
         restored = WorkflowStore(tmp_path / "restored.sqlite3")
         restored.import_replay_state(exported)
-        assert restored.export_replay_state("game-1") == exported
-        await _engine(restored, _Game(), planner).tick()
+        restored_game = _Game()
+        restored_game.snapshot = restored_game.snapshot.model_copy(
+            update={"turn": 2, "notifications": [{"after_replay": True}]}
+        )
+        result = await _engine(restored, restored_game, planner).tick()
+
+        assert result.runtime_state == RuntimeState.AWAITING_HUMAN
+        _assert_proposal_wait(restored, request, proposal)
         assert planner.calls == 1
-        assert restored.get_active_strategic_contract("game-1") is None
+
+    asyncio.run(scenario())
+
+
+def test_explicit_resume_after_intermediate_proposal_wait_does_not_apply(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "explicit-only.sqlite3")
+        active = _commit_contract(store, "game-1")
+        planner = _Planner(_response("game-1", active.contract_id))
+        game = _Game()
+        request = _request(
+            "game-1",
+            kind=PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+            contract_id=active.contract_id,
+            base_revision=active.revision,
+        )
+        store.save_planner_request(request)
+        engine = _engine(store, game, planner)
+
+        await engine.tick()
+        proposal = store.list_strategic_research_proposals("game-1")[0]
+        await engine.tick()
+        _assert_proposal_wait(store, request, proposal)
+
+        assert store.request_human_resume("game-1") is True
+        result = await engine.tick()
+
+        assert result.runtime_state != RuntimeState.AWAITING_HUMAN
+        assert store.human_wait_context("game-1") is None
+        unchanged = store.get_active_strategic_contract("game-1")
+        assert unchanged is not None
+        assert unchanged.revision == active.revision
+        assert unchanged.authority_scope_set.mission_graph_scopes == ()
+        assert unchanged.mission_graph.missions == ()
+        assert len(store.list_strategic_research_proposals("game-1")) == 1
+        assert store.list_tasks("game-1") == []
+        assert planner.calls == 1
 
     asyncio.run(scenario())
 

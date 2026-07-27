@@ -1051,7 +1051,17 @@ class WorkflowEngine:
         tick = validate_workflow_tick(tick_type(**common, **fields))
         human_wait_context = None
         if isinstance(tick, AwaitingHumanTick):
-            human_wait_context = self._human_wait_context(snapshot)
+            existing_wait = self.store.human_wait_context(snapshot.game_id)
+            if (
+                existing_wait is not None
+                and existing_wait.get("resume_requested") is not True
+                and existing_wait.get("wait_kind")
+                == "strategic_contract_proposal_ready"
+                and existing_wait.get("resume_policy") == "explicit_only"
+            ):
+                human_wait_context = dict(existing_wait)
+            else:
+                human_wait_context = self._human_wait_context(snapshot)
             human_wait_context["blocking_reason"] = tick.blocking_reason
 
         if attempt_update is None:
