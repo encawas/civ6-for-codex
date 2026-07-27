@@ -520,6 +520,37 @@ def test_store_schema_failure_requires_an_existing_request(tmp_path):
     assert store.get_planner_request(request.planner_request_id) is None
 
 
+def _save_schema_failure_lifecycle(
+    store: WorkflowStore,
+    request_id: str,
+    statuses: tuple[ProviderAttemptStatus, ...],
+) -> tuple[PlannerRequest, tuple[ProviderAttempt, ...]]:
+    pending = _request(request_id)
+    store.save_planner_request(pending)
+    in_progress = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.IN_PROGRESS,
+            "provider_attempt_count": len(statuses),
+        }
+    )
+    store.save_planner_request(in_progress)
+    attempts = tuple(
+        _attempt(in_progress, number, status)
+        for number, status in enumerate(statuses, start=1)
+    )
+    for attempt in attempts:
+        store.save_provider_attempt("game-1", attempt)
+    rejected = in_progress.model_copy(
+        update={
+            "status": PlannerRequestStatus.REJECTED,
+            "completed_at": NOW + timedelta(seconds=len(statuses)),
+            "failure_category": "planner_contract_failure",
+        }
+    )
+    store.save_planner_request(rejected)
+    return rejected, attempts
+
+
 @pytest.mark.parametrize(
     "attempt_status",
     [
@@ -624,7 +655,7 @@ def test_store_lifecycle_schema_failure_requires_declared_attempt_number(tmp_pat
         }
     )
 
-    with pytest.raises(ValueError, match="matching final ProviderAttempt"):
+    with pytest.raises(ValueError, match="maximum ProviderAttempt"):
         store.save_planner_request(rejected)
     assert store.get_planner_request(pending.planner_request_id) == in_progress
 
@@ -662,6 +693,94 @@ def test_store_save_and_startup_reject_schema_failure_after_attempt_loss(tmp_pat
         store.save_planner_request(rejected)
     with pytest.raises(ValueError, match="matching final ProviderAttempt"):
         WorkflowStore(path)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ProviderAttemptStatus.FAILED, ProviderAttemptStatus.ABANDONED],
+)
+def test_schema_failure_rolls_back_later_provider_attempt(tmp_path, status):
+    path = tmp_path / f"schema-failure-later-{status.value}.sqlite3"
+    store = WorkflowStore(path)
+    rejected, attempts = _save_schema_failure_lifecycle(
+        store,
+        f"schema-failure-later-{status.value}",
+        (ProviderAttemptStatus.SUCCEEDED,),
+    )
+    later = _attempt(rejected, 2, status)
+
+    with pytest.raises(ValueError, match="maximum ProviderAttempt"):
+        store.save_provider_attempt("game-1", later)
+
+    assert store.list_provider_attempts(rejected.planner_request_id) == list(attempts)
+    assert WorkflowStore(path).get_planner_request(
+        rejected.planner_request_id
+    ) == rejected
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ProviderAttemptStatus.FAILED, ProviderAttemptStatus.ABANDONED],
+)
+def test_startup_and_replay_reject_later_schema_failure_attempt(tmp_path, status):
+    path = tmp_path / f"invalid-later-{status.value}.sqlite3"
+    store = WorkflowStore(path)
+    rejected, attempts = _save_schema_failure_lifecycle(
+        store,
+        f"invalid-later-{status.value}",
+        (ProviderAttemptStatus.SUCCEEDED,),
+    )
+    later = _attempt(rejected, 2, status)
+    row = _provider_attempt_row(later)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_attempts(
+                provider_attempt_id, game_id, planner_request_id,
+                attempt_number, provider_request_id, status, attempt_json,
+                started_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(row[column] for column in (
+                "provider_attempt_id",
+                "game_id",
+                "planner_request_id",
+                "attempt_number",
+                "provider_request_id",
+                "status",
+                "attempt_json",
+                "started_at",
+                "completed_at",
+            )),
+        )
+
+    with pytest.raises(ValueError, match="maximum ProviderAttempt"):
+        WorkflowStore(path)
+
+    restored = WorkflowStore(tmp_path / f"replay-later-{status.value}.sqlite3")
+    with pytest.raises(ValueError, match="maximum ProviderAttempt"):
+        restored.import_replay_state(
+            _schema_failure_replay_state(
+                rejected,
+                attempts=(*attempts, later),
+            )
+        )
+    assert restored.get_planner_request(rejected.planner_request_id) is None
+
+
+def test_schema_failure_allows_failed_attempt_before_succeeded_maximum(tmp_path):
+    path = tmp_path / "schema-failure-retried.sqlite3"
+    store = WorkflowStore(path)
+    rejected, attempts = _save_schema_failure_lifecycle(
+        store,
+        "schema-failure-retried",
+        (ProviderAttemptStatus.FAILED, ProviderAttemptStatus.SUCCEEDED),
+    )
+
+    assert store.list_provider_attempts(rejected.planner_request_id) == list(attempts)
+    assert WorkflowStore(path).get_planner_request(
+        rejected.planner_request_id
+    ) == rejected
 
 
 def test_v8_read_and_startup_reject_the_same_missing_response_shape(tmp_path):
@@ -1884,7 +2003,7 @@ def test_replay_schema_failure_requires_declared_attempt_number(tmp_path):
     )
     attempt = _attempt(request, 1, ProviderAttemptStatus.SUCCEEDED)
 
-    with pytest.raises(ValueError, match="matching final ProviderAttempt"):
+    with pytest.raises(ValueError, match="maximum ProviderAttempt"):
         store.import_replay_state(
             _schema_failure_replay_state(request, attempts=(attempt,))
         )
@@ -1949,21 +2068,61 @@ def test_replay_schema_failure_allows_earlier_failed_attempts(tmp_path):
     assert store.list_provider_attempts(request.planner_request_id) == list(attempts)
 
 
-def test_planner_contract_failure_cannot_carry_response_evidence(tmp_path):
+@pytest.mark.parametrize(
+    "status",
+    [
+        PlannerRequestStatus.REJECTED,
+        PlannerRequestStatus.COMPLETED,
+        PlannerRequestStatus.PARTIALLY_COMPLETED,
+    ],
+)
+def test_planner_contract_failure_with_complete_response_is_canonical(
+    tmp_path, status
+):
     payload = canonical_workflow_plan_bundle_payload(
-        WorkflowPlanBundle(summary="not a schema failure")
+        WorkflowPlanBundle(summary="auditable contract rejection")
     )
     request = _request(
-        "schema-failure-with-payload",
-        status=PlannerRequestStatus.REJECTED,
+        f"contract-rejection-with-payload-{status.value}",
+        status=status,
         completed_at=NOW,
         response_payload=payload,
         response_hash=canonical_json_hash(payload),
         validation_result={"result": "rejected"},
     ).model_copy(update={"failure_category": "planner_contract_failure"})
-    store = WorkflowStore(tmp_path / "schema-failure-with-payload.sqlite3")
+    store = WorkflowStore(
+        tmp_path / f"contract-rejection-with-payload-{status.value}.sqlite3"
+    )
 
-    with pytest.raises(ValueError, match="invalid response facts"):
+    store.save_planner_request(request)
+
+    assert store.get_planner_request(request.planner_request_id) == request
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"response_payload": {"summary": "partial"}},
+        {"response_hash": "partial-hash"},
+        {"validation_result": {"result": "rejected"}},
+    ],
+    ids=["payload-only", "hash-only", "validation-only"],
+)
+def test_planner_contract_failure_rejects_partial_response_evidence(
+    tmp_path, evidence
+):
+    if "response_payload" in evidence:
+        with pytest.raises(ValidationError, match="response_payload requires"):
+            _schema_failure_request("partial-contract-response").model_copy(
+                update=evidence
+            )
+        return
+    request = _schema_failure_request("partial-contract-response").model_copy(
+        update=evidence
+    )
+    store = WorkflowStore(tmp_path / "partial-contract-response.sqlite3")
+
+    with pytest.raises(ValueError, match="completion requires"):
         store.save_planner_request(request)
 
     assert store.get_planner_request(request.planner_request_id) is None

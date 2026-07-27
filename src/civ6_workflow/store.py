@@ -3199,31 +3199,25 @@ class WorkflowStore:
             is PlannerResponseEvidenceCompatibility.LEGACY_V7_MISSING_PAYLOAD
         ):
             return _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD
-        if request.failure_category == "planner_contract_failure":
-            if (
-                request.target.kind
-                is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
-                and request.status is PlannerRequestStatus.REJECTED
-                and request.completed_at is not None
-                and request.response_payload is None
-                and request.response_hash is None
-                and request.validation_result is None
-                and request.response_evidence_compatibility is None
-            ):
-                return _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
-            raise ValueError(
-                "planner contract schema failure has invalid response facts"
-            )
         if request.status not in response_statuses:
             return _PlannerResponseFacts.NO_RESPONSE
         if request.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
             raise ValueError(
                 "non-legacy planner response contract is not enabled before Phase 1B"
             )
-        required_evidence = {
+        response_evidence = {
             "response_payload": request.response_payload,
             "response_hash": request.response_hash,
             "validation_result": request.validation_result,
+        }
+        if not any(value is not None for value in response_evidence.values()) and (
+            request.status is PlannerRequestStatus.REJECTED
+            and request.failure_category == "planner_contract_failure"
+        ):
+            return _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
+
+        required_evidence = {
+            **response_evidence,
             "completed_at": request.completed_at,
         }
         missing = [
@@ -3269,25 +3263,37 @@ class WorkflowStore:
                 "provider_attempt_count >= 1"
             )
 
-        final_attempt: ProviderAttempt | None = None
+        request_attempts: list[dict[str, Any]] = []
         for row in attempt_rows:
             normalized = cls._normalize_provider_attempt_row(row)
-            if (
-                normalized["game_id"] == request.game_session_id
-                and normalized["planner_request_id"]
-                == request.planner_request_id
-                and normalized["attempt_number"]
-                == request.provider_attempt_count
-            ):
-                final_attempt = ProviderAttempt.model_validate_json(
-                    str(normalized["attempt_json"])
-                )
-                break
-        if final_attempt is None:
+            if normalized["planner_request_id"] == request.planner_request_id:
+                request_attempts.append(normalized)
+        if not request_attempts:
             raise ValueError(
                 "planner contract schema failure requires a matching final "
                 "ProviderAttempt"
             )
+        maximum_attempt_number = max(
+            int(row["attempt_number"]) for row in request_attempts
+        )
+        if request.provider_attempt_count != maximum_attempt_number:
+            raise ValueError(
+                "planner contract schema failure requires provider_attempt_count "
+                "to match the maximum ProviderAttempt attempt_number"
+            )
+        final_row = next(
+            row
+            for row in request_attempts
+            if int(row["attempt_number"]) == maximum_attempt_number
+        )
+        if final_row["game_id"] != request.game_session_id:
+            raise ValueError(
+                "planner contract schema failure final ProviderAttempt belongs "
+                "to another game"
+            )
+        final_attempt = ProviderAttempt.model_validate_json(
+            str(final_row["attempt_json"])
+        )
         if (
             final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
             or final_attempt.completed_at is None
@@ -3783,6 +3789,26 @@ class WorkflowStore:
                 row["started_at"],
                 row["completed_at"],
             ),
+        )
+        parent_request = cls._planner_request_from_row(
+            conn.execute(
+                """
+                SELECT * FROM logical_planner_requests
+                WHERE planner_request_id=?
+                """,
+                (attempt.planner_request_id,),
+            ).fetchone()
+        )
+        cls._validate_contract_schema_failure_attempt(
+            parent_request,
+            conn.execute(
+                """
+                SELECT * FROM provider_attempts
+                WHERE planner_request_id=?
+                ORDER BY attempt_number
+                """,
+                (attempt.planner_request_id,),
+            ).fetchall(),
         )
 
     def save_provider_attempt(self, game_id: str, attempt: ProviderAttempt) -> None:

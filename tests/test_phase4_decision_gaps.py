@@ -636,6 +636,22 @@ class _InformationPlanner(_ResolvingPlanner):
         return await super().plan(request)
 
 
+class _InvalidInformationContractPlanner(_InformationPlanner):
+    async def plan(self, request):
+        bundle = await super().plan(request)
+        invalid = bundle.information_requests[0].model_copy(
+            update={"event_dedupe_key": "unknown-event"}
+        )
+        return bundle.model_copy(update={"information_requests": [invalid]})
+
+
+class _RepeatedInformationPlanner(_InformationPlanner):
+    async def plan(self, request):
+        return await super().plan(
+            request.model_copy(update={"information_results": {}})
+        )
+
+
 def _engine(tmp_path, planner):
     snapshot = RuntimeSnapshot(
         turn=1,
@@ -1440,6 +1456,94 @@ def test_ai_004_information_round_is_one_logical_request(tmp_path):
         assert planner.calls[0].logical_transaction_id == (
             planner.calls[1].logical_transaction_id
         )
+
+    asyncio.run(scenario())
+
+
+def _assert_auditable_contract_rejection_round_trip(
+    engine,
+    tmp_path,
+    result,
+    *,
+    expected_attempt_count,
+    restored_name,
+):
+    assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+    assert result.workflow_tick["outcome"] != TickOutcomeKind.SYSTEM_ERROR
+    assert engine.store.load_runtime_state("opening") is RuntimeState.AWAITING_HUMAN
+    gap = engine.store.list_decision_gaps("opening")[0]
+    assert gap.status is DecisionGapStatus.AWAITING_HUMAN
+    request = engine.store.get_planner_request(gap.logical_request_id)
+    assert request.status is PlannerRequestStatus.REJECTED
+    assert request.failure_category == "planner_contract_failure"
+    assert request.response_payload is not None
+    assert request.response_hash == canonical_json_hash(request.response_payload)
+    assert request.validation_result["result"] == "rejected"
+    attempts = engine.store.list_provider_attempts(request.planner_request_id)
+    assert len(attempts) == expected_attempt_count
+    assert all(
+        attempt.status is ProviderAttemptStatus.SUCCEEDED
+        and attempt.completed_at is not None
+        for attempt in attempts
+    )
+    assert request.provider_attempt_count == attempts[-1].attempt_number
+
+    source_ticks = engine.store.list_workflow_ticks("opening")
+    source_gaps = engine.store.list_decision_gaps("opening")
+    exported = engine.store.export_replay_state("opening")
+    restored = WorkflowStore(tmp_path / restored_name)
+    restored.import_replay_state(exported)
+    assert restored.get_planner_request(request.planner_request_id) == request
+    assert restored.list_provider_attempts(request.planner_request_id) == attempts
+    assert restored.list_workflow_ticks("opening") == source_ticks
+    assert restored.list_decision_gaps("opening") == source_gaps
+    assert restored.load_runtime_state("opening") is RuntimeState.AWAITING_HUMAN
+    assert restored.export_replay_state("opening") == exported
+
+
+def test_schema_valid_contract_rejection_preserves_response_evidence(tmp_path):
+    async def scenario():
+        engine, _, planner = _engine(
+            tmp_path,
+            _InvalidInformationContractPlanner(),
+        )
+
+        final = None
+        for _ in range(3):
+            final = await engine.tick()
+
+        _assert_auditable_contract_rejection_round_trip(
+            engine,
+            tmp_path,
+            final,
+            expected_attempt_count=1,
+            restored_name="restored-contract-rejection.sqlite3",
+        )
+        assert planner.summary.provider_attempts == 1
+
+    asyncio.run(scenario())
+
+
+def test_second_information_request_limit_preserves_response_evidence(tmp_path):
+    async def scenario():
+        engine, game, planner = _engine(
+            tmp_path,
+            _RepeatedInformationPlanner(),
+        )
+
+        final = None
+        for _ in range(5):
+            final = await engine.tick()
+
+        _assert_auditable_contract_rejection_round_trip(
+            engine,
+            tmp_path,
+            final,
+            expected_attempt_count=2,
+            restored_name="restored-information-limit.sqlite3",
+        )
+        assert planner.summary.provider_attempts == 2
+        assert game.query_count == 1
 
     asyncio.run(scenario())
 
