@@ -1,12 +1,14 @@
 import asyncio
 import copy
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from civ6_workflow.domain import (
     AuthorityScopeSet,
+    InformationRequestedTick,
     InformationRound,
     InformationRoundStatus,
     Mission,
@@ -815,14 +817,16 @@ def test_completed_proposal_rejects_a_higher_nonfinal_attempt(tmp_path, status):
     )
     before = store.export_replay_state("game-1")
 
-    with pytest.raises(ValueError, match="maximum Attempt"):
+    with pytest.raises(ValueError, match="start_provider_attempt"):
         store.save_provider_attempt("game-1", candidate)
 
     assert store.export_replay_state("game-1") == before
     assert store.list_provider_attempts(request.planner_request_id) == [attempt]
 
 
-def test_public_request_save_rejects_completed_nonlegacy_without_proposal(tmp_path):
+def test_public_attempt_and_request_saves_cannot_stage_completed_nonlegacy(
+    tmp_path,
+):
     _, completed, _proposal, attempt = asyncio.run(
         _completed_proposal_state(tmp_path / "completed-source.sqlite3")
     )
@@ -839,9 +843,10 @@ def test_public_request_save_rejects_completed_nonlegacy_without_proposal(tmp_pa
         }
     )
     store.save_planner_request(pending)
-    store.save_provider_attempt("game-1", attempt)
     before = store.export_replay_state("game-1")
 
+    with pytest.raises(ValueError, match="start_provider_attempt"):
+        store.save_provider_attempt("game-1", attempt)
     with pytest.raises(ValueError, match="atomic Runtime transaction"):
         store.save_planner_request(completed)
 
@@ -1780,3 +1785,378 @@ def test_startup_and_replay_reject_ready_without_collected_round(tmp_path):
         )
     with pytest.raises(ValueError, match="information_round_count"):
         WorkflowStore(path)
+
+
+def _start_strategic_attempt(store, request, *, suffix="1"):
+    store.save_planner_request(request)
+    started = ProviderAttempt(
+        provider_attempt_id=f"provider-strategic-boundary-{suffix}",
+        planner_request_id=request.planner_request_id,
+        attempt_number=1,
+        provider_request_id=f"provider-call-{suffix}",
+        status=ProviderAttemptStatus.STARTED,
+        started_at=NOW,
+    )
+    in_progress = store.start_provider_attempt("game-1", request, started)
+    return in_progress, started
+
+
+def test_public_strategic_provider_attempt_cannot_commit_success(tmp_path):
+    path = tmp_path / "public-strategic-success.sqlite3"
+    store = WorkflowStore(path)
+    request = _request("game-1")
+    in_progress, started = _start_strategic_attempt(store, request)
+    succeeded = started.model_copy(
+        update={
+            "status": ProviderAttemptStatus.SUCCEEDED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "latency_seconds": 1,
+        }
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="atomic Runtime transaction"):
+        store.save_provider_attempt("game-1", succeeded)
+
+    assert store.export_replay_state("game-1") == before
+    assert store.get_planner_request(request.planner_request_id) == in_progress
+    assert store.list_provider_attempts(request.planner_request_id) == [started]
+    _assert_replay_round_trip(tmp_path, store, "public-strategic-success")
+
+
+def test_public_strategic_provider_attempt_cannot_create_terminal_row(tmp_path):
+    store = WorkflowStore(tmp_path / "public-strategic-terminal.sqlite3")
+    request = _request("game-1")
+    store.save_planner_request(request)
+    succeeded = ProviderAttempt(
+        provider_attempt_id="provider-terminal-without-start",
+        planner_request_id=request.planner_request_id,
+        attempt_number=1,
+        provider_request_id="provider-call-without-start",
+        status=ProviderAttemptStatus.SUCCEEDED,
+        started_at=NOW,
+        completed_at=NOW + timedelta(seconds=1),
+        latency_seconds=1,
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="start_provider_attempt"):
+        store.save_provider_attempt("game-1", succeeded)
+
+    assert store.export_replay_state("game-1") == before
+    assert store.list_provider_attempts(request.planner_request_id) == []
+
+
+def test_startup_and_replay_reject_orphan_strategic_success(tmp_path):
+    path = tmp_path / "orphan-strategic-success.sqlite3"
+    store = WorkflowStore(path)
+    request = _request("game-1")
+    _in_progress, started = _start_strategic_attempt(store, request)
+    succeeded = started.model_copy(
+        update={
+            "status": ProviderAttemptStatus.SUCCEEDED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "latency_seconds": 1,
+        }
+    )
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    replay_row = invalid["tables"]["provider_attempts"][0]
+    replay_row["status"] = succeeded.status.value
+    replay_row["attempt_json"] = succeeded.model_dump_json()
+    replay_row["completed_at"] = succeeded.completed_at.isoformat()
+
+    _assert_invalid_replay_preserves_target(
+        tmp_path, invalid, "orphan-strategic-success"
+    )
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE provider_attempts
+            SET status=?, attempt_json=?, completed_at=?
+            WHERE provider_attempt_id=?
+            """,
+            (
+                succeeded.status.value,
+                succeeded.model_dump_json(),
+                succeeded.completed_at.isoformat(),
+                succeeded.provider_attempt_id,
+            ),
+        )
+    with pytest.raises(ValueError, match="SUCCEEDED ProviderAttempt"):
+        WorkflowStore(path)
+
+
+def _forged_information_requested_aggregate(
+    request,
+    *,
+    source_attempt_id,
+    source_attempt_number,
+):
+    pending = tuple(
+        item.model_dump(mode="json")
+        for item in _information_response().information_requests
+    )
+    awaiting = request.model_copy(
+        update={
+            "status": PlannerRequestStatus.AWAITING_INFORMATION,
+            "pending_information_requests": pending,
+        }
+    )
+    round_record = InformationRound(
+        information_round_id="forged-information-round",
+        planner_request_id=request.planner_request_id,
+        round_number=1,
+        source_provider_attempt_id=source_attempt_id,
+        source_provider_attempt_number=source_attempt_number,
+        status=InformationRoundStatus.REQUESTED,
+        requests=pending,
+        requested_at=NOW + timedelta(seconds=3),
+    )
+    tick = InformationRequestedTick(
+        tick_id="tick-forged-information-requested",
+        game_session_id="game-1",
+        turn_number=1,
+        starting_runtime_state=RuntimeState.REQUESTING_PLAN,
+        observation_ids=("obs-forged-information",),
+        started_at=NOW + timedelta(seconds=2),
+        completed_at=NOW + timedelta(seconds=4),
+        planner_request_id=request.planner_request_id,
+        information_round_id=round_record.information_round_id,
+    )
+    return awaiting, round_record, tick
+
+
+@pytest.mark.parametrize(
+    "source_state",
+    ["missing", "started", "failed", "nonmax"],
+)
+def test_forged_information_requested_aggregate_is_rejected(tmp_path, source_state):
+    store = WorkflowStore(
+        tmp_path / f"forged-information-source-{source_state}.sqlite3"
+    )
+    request = _request("game-1")
+    provider_attempts = ()
+    if source_state == "missing":
+        store.save_planner_request(request)
+        current = request
+        source_id = "provider-missing"
+        source_number = 1
+    else:
+        current, started = _start_strategic_attempt(store, request, suffix=source_state)
+        source_id = started.provider_attempt_id
+        source_number = started.attempt_number
+        if source_state == "started":
+            provider_attempts = (started,)
+        else:
+            failed = started.model_copy(
+                update={
+                    "status": ProviderAttemptStatus.FAILED,
+                    "completed_at": NOW + timedelta(seconds=1),
+                    "latency_seconds": 1,
+                    "failure_category": "injected_provider_failure",
+                }
+            )
+            store.save_provider_attempt("game-1", failed)
+            provider_attempts = (failed,)
+            if source_state == "nonmax":
+                second = ProviderAttempt(
+                    provider_attempt_id="provider-strategic-boundary-second",
+                    planner_request_id=request.planner_request_id,
+                    attempt_number=2,
+                    provider_request_id="provider-call-second",
+                    status=ProviderAttemptStatus.STARTED,
+                    started_at=NOW + timedelta(seconds=2),
+                )
+                current = store.start_provider_attempt("game-1", current, second)
+    awaiting, round_record, tick = _forged_information_requested_aggregate(
+        current,
+        source_attempt_id=source_id,
+        source_attempt_number=source_number,
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError):
+        store.persist_phase4_tick(
+            tick,
+            planner_request=awaiting,
+            provider_attempts=provider_attempts,
+            information_round=round_record,
+        )
+
+    assert store.export_replay_state("game-1") == before
+    assert store.list_information_rounds(request.planner_request_id) == []
+    _assert_replay_round_trip(
+        tmp_path, store, f"forged-information-source-{source_state}"
+    )
+
+
+def _move_collected_tick_before_requested(state):
+    requested_row = _workflow_tick_replay_row(
+        state, TickOutcomeKind.INFORMATION_REQUESTED
+    )
+    collected_row = _workflow_tick_replay_row(
+        state, TickOutcomeKind.INFORMATION_COLLECTED
+    )
+    requested_tick = WorkflowStore._load(requested_row["tick_json"])
+    bad_started_at = datetime.fromisoformat(requested_tick["started_at"]) - timedelta(
+        seconds=2
+    )
+    bad_completed_at = bad_started_at + timedelta(seconds=1)
+    collected_tick = WorkflowStore._load(collected_row["tick_json"])
+    collected_tick["started_at"] = bad_started_at.isoformat()
+    collected_tick["completed_at"] = bad_completed_at.isoformat()
+    collected_row["started_at"] = bad_started_at.isoformat()
+    collected_row["completed_at"] = bad_completed_at.isoformat()
+    collected_row["tick_json"] = WorkflowStore._dump(collected_tick)
+
+
+def test_startup_and_replay_reject_information_collected_before_requested(
+    tmp_path,
+):
+    async def setup():
+        path = tmp_path / "collected-before-requested.sqlite3"
+        store = WorkflowStore(path)
+        request = _request("game-1")
+        store.save_planner_request(request)
+        engine = _engine(
+            store,
+            _Game(),
+            _Planner(
+                _information_response(),
+                _response("game-1", build_strategic_contract_id("game-1")),
+            ),
+        )
+        await engine.tick()
+        await engine.tick()
+        assert (
+            store.get_planner_request(request.planner_request_id).status
+            is PlannerRequestStatus.READY_TO_CONTINUE
+        )
+        return path, store
+
+    path, store = asyncio.run(setup())
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    _move_collected_tick_before_requested(invalid)
+    _assert_invalid_replay_preserves_target(
+        tmp_path, invalid, "collected-before-requested"
+    )
+
+    corrupted_row = _workflow_tick_replay_row(
+        invalid, TickOutcomeKind.INFORMATION_COLLECTED
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE workflow_ticks
+            SET started_at=?, completed_at=?, tick_json=?
+            WHERE tick_id=?
+            """,
+            (
+                corrupted_row["started_at"],
+                corrupted_row["completed_at"],
+                corrupted_row["tick_json"],
+                corrupted_row["tick_id"],
+            ),
+        )
+    with pytest.raises(ValueError, match="collected before"):
+        WorkflowStore(path)
+
+
+def _start_tick_thread(engine):
+    result = {}
+
+    def run():
+        try:
+            result["value"] = asyncio.run(engine.tick())
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, result
+
+
+def test_resume_committed_after_tick_start_before_wait_read_is_consumed(tmp_path):
+    path = tmp_path / "resume-before-wait-read.sqlite3"
+    store, _request_record, _proposal, _attempt = asyncio.run(
+        _completed_proposal_state(path, repair=True)
+    )
+    game = _Game()
+    planner = _Planner()
+    engine = _engine(store, game, planner)
+    read_started = threading.Event()
+    allow_read = threading.Event()
+    original_read = game.read_snapshot
+
+    async def blocked_read(*, include_units=False):
+        read_started.set()
+        completed = await asyncio.to_thread(allow_read.wait, 5)
+        if not completed:
+            raise TimeoutError("test did not release snapshot read")
+        return await original_read(include_units=include_units)
+
+    game.read_snapshot = blocked_read
+    thread, result = _start_tick_thread(engine)
+    assert read_started.wait(5)
+    assert store.request_human_resume("game-1") is True
+    resume_request = store.list_strategic_proposal_wait_resume_requests("game-1")[0]
+    allow_read.set()
+    thread.join(10)
+
+    assert not thread.is_alive()
+    assert "error" not in result
+    tick_result = result["value"]
+    assert tick_result.workflow_tick["outcome"] == (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+    )
+    assert (
+        datetime.fromisoformat(tick_result.workflow_tick["started_at"])
+        <= resume_request.requested_at
+        <= datetime.fromisoformat(tick_result.workflow_tick["completed_at"])
+    )
+    assert store.human_wait_context("game-1") is None
+    assert planner.calls == 0
+
+
+def test_resume_committed_after_wait_read_before_persist_is_deferred(tmp_path):
+    path = tmp_path / "resume-before-wait-persist.sqlite3"
+    store, _request_record, _proposal, _attempt = asyncio.run(
+        _completed_proposal_state(path, repair=True)
+    )
+    planner = _Planner()
+    engine = _engine(store, _Game(), planner)
+    persist_started = threading.Event()
+    allow_persist = threading.Event()
+    original_persist = store.persist_tick_and_runtime_state
+
+    def blocked_persist(*args, **kwargs):
+        persist_started.set()
+        if not allow_persist.wait(5):
+            raise TimeoutError("test did not release Tick persistence")
+        return original_persist(*args, **kwargs)
+
+    store.persist_tick_and_runtime_state = blocked_persist
+    thread, result = _start_tick_thread(engine)
+    assert persist_started.wait(5)
+    assert store.request_human_resume("game-1") is True
+    allow_persist.set()
+    thread.join(10)
+    store.persist_tick_and_runtime_state = original_persist
+
+    assert not thread.is_alive()
+    assert "error" not in result
+    assert result["value"].workflow_tick["outcome"] == (TickOutcomeKind.AWAITING_HUMAN)
+    context = store.human_wait_context("game-1")
+    assert context is not None
+    assert context["wait_kind"] == "strategic_contract_proposal_ready"
+    assert context["resume_policy"] == "explicit_only"
+    assert context["resume_requested"] is True
+    assert len(store.list_strategic_proposal_wait_resume_requests("game-1")) == 1
+
+    resumed = asyncio.run(engine.tick())
+    assert resumed.workflow_tick["outcome"] == (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+    )
+    assert store.human_wait_context("game-1") is None
+    assert planner.calls == 0

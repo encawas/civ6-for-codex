@@ -1520,6 +1520,14 @@ class PlannerLifecycleCoordinator:
                     response_payload=canonical_response_payload,
                     failure_category="invalid_information_request",
                 )
+            if (
+                not provider_attempts
+                or provider_attempts[-1].status is not ProviderAttemptStatus.SUCCEEDED
+            ):
+                raise RuntimeError(
+                    "strategic information response has no successful ProviderAttempt"
+                )
+            source_attempt = provider_attempts[-1]
             round_id = f"info_round_{uuid4().hex}"
             pending = tuple(
                 request.model_dump(mode="json")
@@ -1529,6 +1537,8 @@ class PlannerLifecycleCoordinator:
                 information_round_id=round_id,
                 planner_request_id=logical_request.planner_request_id,
                 round_number=logical_request.information_round_count + 1,
+                source_provider_attempt_id=source_attempt.provider_attempt_id,
+                source_provider_attempt_number=source_attempt.attempt_number,
                 status=InformationRoundStatus.REQUESTED,
                 requests=pending,
                 requested_at=completed,

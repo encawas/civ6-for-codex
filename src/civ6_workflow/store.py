@@ -17,6 +17,7 @@ from .domain import (
     ApprovalDecision,
     ApprovalRecord,
     ApprovalStatus,
+    AwaitingHumanTick,
     AttemptReconciledTick,
     AttemptRecoveredTick,
     AttemptStatus,
@@ -1462,11 +1463,33 @@ class WorkflowStore:
     def _validate_strategic_information_round_state(
         cls,
         requests: Mapping[str, PlannerRequest],
+        attempt_rows: Sequence[Mapping[str, Any]],
         round_rows: Sequence[Mapping[str, Any]],
         tick_rows: Sequence[Mapping[str, Any]],
         *,
         require_canonical: bool,
     ) -> None:
+        attempts_by_request: dict[str, list[tuple[str, ProviderAttempt]]] = {}
+        for source_row in attempt_rows:
+            normalized = cls._normalize_provider_attempt_row(source_row)
+            parent = requests.get(str(normalized["planner_request_id"]))
+            if (
+                parent is None
+                or parent.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS
+            ):
+                continue
+            game_id = str(normalized["game_id"])
+            if game_id != parent.game_session_id:
+                raise ValueError(
+                    "strategic ProviderAttempt game disagrees with PlannerRequest"
+                )
+            attempt = ProviderAttempt.model_validate_json(
+                str(normalized["attempt_json"])
+            )
+            attempts_by_request.setdefault(parent.planner_request_id, []).append(
+                (game_id, attempt)
+            )
+
         rounds_by_request: dict[str, list[InformationRound]] = {}
         seen_round_ids: set[str] = set()
         seen_numbers: set[tuple[str, int]] = set()
@@ -1523,6 +1546,18 @@ class WorkflowStore:
         for request in requests.values():
             if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
                 continue
+            attempts = sorted(
+                attempts_by_request.get(request.planner_request_id, []),
+                key=lambda item: item[1].attempt_number,
+            )
+            attempt_numbers = [item[1].attempt_number for item in attempts]
+            maximum_attempt_number = attempt_numbers[-1] if attempt_numbers else 0
+            if request.provider_attempt_count != maximum_attempt_number:
+                raise ValueError(
+                    "strategic provider_attempt_count disagrees with Attempt history"
+                )
+            if attempt_numbers != list(range(1, maximum_attempt_number + 1)):
+                raise ValueError("strategic ProviderAttempt numbers must be contiguous")
             rounds = sorted(
                 rounds_by_request.get(request.planner_request_id, []),
                 key=lambda item: item.round_number,
@@ -1567,6 +1602,61 @@ class WorkflowStore:
                     raise ValueError(
                         "strategic InformationRound collection Tick disagrees"
                     )
+                source_attempts = [
+                    attempt
+                    for game_id, attempt in attempts
+                    if game_id == request.game_session_id
+                    and attempt.provider_attempt_id
+                    == round_record.source_provider_attempt_id
+                    and attempt.attempt_number
+                    == round_record.source_provider_attempt_number
+                ]
+                if len(source_attempts) != 1:
+                    raise ValueError(
+                        "strategic InformationRound requires one source ProviderAttempt"
+                    )
+                source_attempt = source_attempts[0]
+                if (
+                    source_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                    or source_attempt.completed_at is None
+                ):
+                    raise ValueError(
+                        "strategic InformationRound source ProviderAttempt must "
+                        "be completed and SUCCEEDED"
+                    )
+                requesting_tick = request_ticks[0]
+                if (
+                    source_attempt.completed_at > round_record.requested_at
+                    or round_record.requested_at > requesting_tick.completed_at
+                ):
+                    raise ValueError(
+                        "strategic InformationRound request timing is not causal"
+                    )
+                if any(
+                    attempt.attempt_number > source_attempt.attempt_number
+                    and attempt.started_at < requesting_tick.completed_at
+                    for _game_id, attempt in attempts
+                ):
+                    raise ValueError(
+                        "strategic InformationRound source was not the latest "
+                        "ProviderAttempt when requested"
+                    )
+                if collect_ticks:
+                    collected_tick = collect_ticks[0]
+                    if requesting_tick.completed_at > collected_tick.started_at:
+                        raise ValueError(
+                            "strategic information was collected before it was "
+                            "requested"
+                        )
+                    if (
+                        round_record.completed_at is None
+                        or round_record.completed_at < collected_tick.started_at
+                        or round_record.completed_at > collected_tick.completed_at
+                    ):
+                        raise ValueError(
+                            "strategic InformationRound completion timing disagrees "
+                            "with its collection Tick"
+                        )
             requested = [
                 item
                 for item in rounds
@@ -1645,6 +1735,59 @@ class WorkflowStore:
                     "AWAITING_INFORMATION PlannerRequest"
                 )
 
+            source_attempt_keys = {
+                (
+                    round_record.source_provider_attempt_id,
+                    round_record.source_provider_attempt_number,
+                )
+                for round_record in rounds
+            }
+            response_facts = cls._classify_planner_request_response(request)
+            final_response_uses_success = (
+                request.status in TERMINAL_PLANNER_STATUSES
+                and response_facts
+                in {
+                    _PlannerResponseFacts.CANONICAL_RESPONSE,
+                    _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE,
+                }
+            )
+            for _game_id, attempt in attempts:
+                if attempt.status is not ProviderAttemptStatus.SUCCEEDED:
+                    continue
+                if (
+                    attempt.provider_attempt_id,
+                    attempt.attempt_number,
+                ) in source_attempt_keys:
+                    continue
+                if (
+                    final_response_uses_success
+                    and attempt.attempt_number == maximum_attempt_number
+                ):
+                    continue
+                raise ValueError(
+                    "strategic SUCCEEDED ProviderAttempt has no response aggregate"
+                )
+            if (
+                request.status is PlannerRequestStatus.IN_PROGRESS
+                and attempts
+                and attempts[-1][1].status is ProviderAttemptStatus.SUCCEEDED
+            ):
+                raise ValueError(
+                    "IN_PROGRESS strategic PlannerRequest cannot end in a "
+                    "SUCCEEDED ProviderAttempt"
+                )
+            if request.status in {
+                PlannerRequestStatus.AWAITING_INFORMATION,
+                PlannerRequestStatus.READY_TO_CONTINUE,
+            } and (
+                not attempts
+                or attempts[-1][1].status is not ProviderAttemptStatus.SUCCEEDED
+            ):
+                raise ValueError(
+                    "strategic information lifecycle requires a final SUCCEEDED "
+                    "ProviderAttempt"
+                )
+
     @classmethod
     def _validate_strategic_proposal_lifecycle_v10(
         cls,
@@ -1678,6 +1821,7 @@ class WorkflowStore:
             requests[request.planner_request_id] = request
         cls._validate_strategic_information_round_state(
             requests,
+            attempt_rows,
             information_round_rows,
             tick_rows,
             require_canonical=require_canonical,
@@ -1800,7 +1944,7 @@ class WorkflowStore:
                     raise ValueError(
                         "Proposal wait-resumed Tick identity disagrees with Proposal"
                     )
-                if resumed.started_at < resume_request.requested_at:
+                if resumed.completed_at < resume_request.requested_at:
                     raise ValueError(
                         "Proposal wait-resumed Tick precedes its Resume Request"
                     )
@@ -4630,7 +4774,7 @@ class WorkflowStore:
             or resume_request.proposal_ready_tick_id != tick.proposal_ready_tick_id
             or resume_request.target_kind is not tick.target_kind
             or resume_request.expected_base_revision != tick.expected_base_revision
-            or tick.started_at < resume_request.requested_at
+            or tick.completed_at < resume_request.requested_at
         ):
             raise ValueError("Proposal Resume Tick disagrees with Resume Request")
         ready_row = conn.execute(
@@ -4646,6 +4790,35 @@ class WorkflowStore:
             or ready.proposal_id != tick.proposal_id
         ):
             raise ValueError("Proposal Resume Tick references the wrong Ready Tick")
+
+    @classmethod
+    def _preserve_concurrent_strategic_resume_context_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        candidate: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(tick, AwaitingHumanTick):
+            return candidate
+        row = conn.execute(
+            "SELECT value_json FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(tick.game_session_id),),
+        ).fetchone()
+        if row is None:
+            return candidate
+        current = cls._load(str(row["value_json"]))
+        if not isinstance(current, dict):
+            return candidate
+        if not (
+            current.get("wait_kind") == "strategic_contract_proposal_ready"
+            and current.get("resume_policy") == "explicit_only"
+            and current.get("resume_requested") is True
+        ):
+            return candidate
+        preserved = dict(current)
+        if candidate is not None and isinstance(candidate.get("blocking_reason"), str):
+            preserved["blocking_reason"] = candidate["blocking_reason"]
+        return preserved
 
     def persist_tick_and_runtime_state(
         self,
@@ -4675,8 +4848,14 @@ class WorkflowStore:
         failure_resolution: FailedAttemptResolution | None = None
         task_retry_count: int | None = None
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._validate_strategic_resume_transition_in_connection(
                 conn, tick, human_wait_context
+            )
+            human_wait_context = (
+                self._preserve_concurrent_strategic_resume_context_in_connection(
+                    conn, tick, human_wait_context
+                )
             )
             if attempt is not None:
                 self._update_action_attempt_in_connection(conn, attempt)
@@ -5640,10 +5819,12 @@ class WorkflowStore:
         conn: sqlite3.Connection,
         game_id: str,
         attempt: ProviderAttempt,
+        *,
+        validate_aggregate: bool = True,
     ) -> None:
         parent = conn.execute(
             """
-            SELECT game_id FROM logical_planner_requests
+            SELECT * FROM logical_planner_requests
             WHERE planner_request_id=?
             """,
             (attempt.planner_request_id,),
@@ -5654,12 +5835,21 @@ class WorkflowStore:
             raise ValueError(
                 "ProviderAttempt game_id conflicts with parent PlannerRequest"
             )
+        parent_request = cls._planner_request_from_row(parent)
         existing_row = conn.execute(
             """
             SELECT * FROM provider_attempts WHERE provider_attempt_id=?
             """,
             (attempt.provider_attempt_id,),
         ).fetchone()
+        if (
+            parent_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+            and existing_row is None
+            and attempt.status is not ProviderAttemptStatus.STARTED
+        ):
+            raise ValueError(
+                "new strategic ProviderAttempt must be persisted as STARTED"
+            )
         if existing_row is not None:
             existing = cls._provider_attempt_from_row(conn, existing_row)
             existing_game_id = str(existing_row["game_id"])
@@ -5720,10 +5910,7 @@ class WorkflowStore:
         )
         parent_request = cls._planner_request_from_row(
             conn.execute(
-                """
-                SELECT * FROM logical_planner_requests
-                WHERE planner_request_id=?
-                """,
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
                 (attempt.planner_request_id,),
             ).fetchone()
         )
@@ -5738,10 +5925,40 @@ class WorkflowStore:
                 (attempt.planner_request_id,),
             ).fetchall(),
         )
-        cls._validate_phase1b_proposals_v10(conn)
+        if validate_aggregate:
+            cls._validate_phase1b_proposals_v10(conn)
 
     def save_provider_attempt(self, game_id: str, attempt: ProviderAttempt) -> None:
         with self._connect() as conn:
+            parent_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (attempt.planner_request_id,),
+            ).fetchone()
+            if parent_row is None:
+                raise ValueError("ProviderAttempt parent PlannerRequest does not exist")
+            parent = self._planner_request_from_row(parent_row)
+            if parent.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                existing_row = conn.execute(
+                    "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+                    (attempt.provider_attempt_id,),
+                ).fetchone()
+                if existing_row is None:
+                    raise ValueError(
+                        "new strategic ProviderAttempt requires "
+                        "start_provider_attempt()"
+                    )
+                existing = self._provider_attempt_from_row(conn, existing_row)
+                if attempt == existing:
+                    self._validate_phase1b_proposals_v10(conn)
+                    return
+                if not (
+                    existing.status is ProviderAttemptStatus.STARTED
+                    and attempt.status is ProviderAttemptStatus.FAILED
+                ):
+                    raise ValueError(
+                        "strategic ProviderAttempt success requires an atomic "
+                        "Runtime transaction"
+                    )
             self._save_provider_attempt_in_connection(conn, game_id, attempt)
 
     def start_provider_attempt(
@@ -5929,6 +6146,8 @@ class WorkflowStore:
             game_id,
             round_record.planner_request_id,
             round_record.round_number,
+            round_record.source_provider_attempt_id,
+            round_record.source_provider_attempt_number,
             canonical_json(round_record.requests),
             round_record.requested_at,
         )
@@ -6063,6 +6282,134 @@ class WorkflowStore:
             ).fetchall()
             return [self._information_round_from_row(conn, row) for row in rows]
 
+    @classmethod
+    def _validate_strategic_information_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        planner_request: PlannerRequest | None,
+        provider_attempts: Sequence[ProviderAttempt],
+        information_round: InformationRound | None,
+    ) -> None:
+        if information_round is None:
+            return
+        parent_row = conn.execute(
+            "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+            (information_round.planner_request_id,),
+        ).fetchone()
+        if parent_row is None:
+            raise ValueError("InformationRound parent PlannerRequest does not exist")
+        current_request = cls._planner_request_from_row(parent_row)
+        if current_request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+            return
+        if (
+            planner_request is None
+            or planner_request.planner_request_id != current_request.planner_request_id
+            or planner_request.game_session_id != tick.game_session_id
+            or information_round.planner_request_id
+            != planner_request.planner_request_id
+        ):
+            raise ValueError(
+                "strategic InformationRound requires its PlannerRequest in the "
+                "same Runtime transaction"
+            )
+        existing_row = conn.execute(
+            "SELECT * FROM information_rounds WHERE information_round_id=?",
+            (information_round.information_round_id,),
+        ).fetchone()
+        if existing_row is None:
+            if (
+                not isinstance(tick, InformationRequestedTick)
+                or tick.planner_request_id != planner_request.planner_request_id
+                or tick.information_round_id != information_round.information_round_id
+                or current_request.status is not PlannerRequestStatus.IN_PROGRESS
+                or planner_request.status
+                is not PlannerRequestStatus.AWAITING_INFORMATION
+                or information_round.status is not InformationRoundStatus.REQUESTED
+            ):
+                raise ValueError(
+                    "strategic InformationRound request transition is invalid"
+                )
+            matching = [
+                attempt
+                for attempt in provider_attempts
+                if attempt.provider_attempt_id
+                == information_round.source_provider_attempt_id
+                and attempt.attempt_number
+                == information_round.source_provider_attempt_number
+                and attempt.planner_request_id == planner_request.planner_request_id
+            ]
+            if len(matching) != 1:
+                raise ValueError(
+                    "strategic InformationRound requires the successful "
+                    "ProviderAttempt in the same Runtime transaction"
+                )
+            source = matching[0]
+            source_row = conn.execute(
+                "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+                (source.provider_attempt_id,),
+            ).fetchone()
+            if source_row is None:
+                raise ValueError(
+                    "strategic InformationRound source ProviderAttempt was not started"
+                )
+            started = cls._provider_attempt_from_row(conn, source_row)
+            if (
+                started.status is not ProviderAttemptStatus.STARTED
+                or source.status is not ProviderAttemptStatus.SUCCEEDED
+                or source.completed_at is None
+                or source.attempt_number != current_request.provider_attempt_count
+                or planner_request.provider_attempt_count
+                != current_request.provider_attempt_count
+                or source.completed_at > information_round.requested_at
+            ):
+                raise ValueError(
+                    "strategic InformationRound source ProviderAttempt is not "
+                    "the completed current Attempt"
+                )
+            return
+
+        existing = cls._information_round_from_row(conn, existing_row)
+        if existing.status is not InformationRoundStatus.REQUESTED:
+            raise ValueError(
+                "terminal strategic InformationRound cannot transition again"
+            )
+        if cls._information_round_creation_definition(
+            tick.game_session_id, information_round
+        ) != cls._information_round_creation_definition(
+            str(existing_row["game_id"]), existing
+        ):
+            raise ValueError("InformationRound creation identity is immutable")
+        if provider_attempts:
+            raise ValueError(
+                "strategic InformationRound completion cannot add ProviderAttempts"
+            )
+        if information_round.status is InformationRoundStatus.COLLECTED:
+            if (
+                not isinstance(tick, InformationCollectedTick)
+                or tick.planner_request_id != planner_request.planner_request_id
+                or tick.information_round_id != information_round.information_round_id
+                or current_request.status
+                is not PlannerRequestStatus.AWAITING_INFORMATION
+                or planner_request.status is not PlannerRequestStatus.READY_TO_CONTINUE
+            ):
+                raise ValueError(
+                    "strategic InformationRound collection transition is invalid"
+                )
+            return
+        if information_round.status is InformationRoundStatus.FAILED:
+            if (
+                not isinstance(tick, AwaitingHumanTick)
+                or current_request.status
+                is not PlannerRequestStatus.AWAITING_INFORMATION
+                or planner_request.status not in TERMINAL_PLANNER_STATUSES
+            ):
+                raise ValueError(
+                    "strategic InformationRound failure transition is invalid"
+                )
+            return
+        raise ValueError("strategic InformationRound requires a lifecycle transition")
+
     def record_planner_suppression(
         self,
         game_id: str,
@@ -6109,8 +6456,16 @@ class WorkflowStore:
     ) -> None:
         tick = validate_workflow_tick(tick)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._validate_strategic_resume_transition_in_connection(
                 conn, tick, human_wait_context
+            )
+            self._validate_strategic_information_transition_in_connection(
+                conn,
+                tick,
+                planner_request,
+                provider_attempts,
+                information_round,
             )
             if plan_bundle is not None:
                 if plan_bundle_mode is None:
@@ -6150,7 +6505,10 @@ class WorkflowStore:
                 )
             for provider_attempt in provider_attempts:
                 self._save_provider_attempt_in_connection(
-                    conn, tick.game_session_id, provider_attempt
+                    conn,
+                    tick.game_session_id,
+                    provider_attempt,
+                    validate_aggregate=False,
                 )
             if planner_request is not None:
                 if planner_request.game_session_id != tick.game_session_id:
@@ -6194,6 +6552,11 @@ class WorkflowStore:
                         TaskStatus.AWAITING_CONFIRMATION.value,
                     ),
                 )
+            human_wait_context = (
+                self._preserve_concurrent_strategic_resume_context_in_connection(
+                    conn, tick, human_wait_context
+                )
+            )
             self._save_runtime_state_in_connection(
                 conn,
                 tick.game_session_id,
