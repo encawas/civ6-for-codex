@@ -333,6 +333,8 @@ class WorkflowEngine:
                     ctx,
                     snapshot,
                     StrategicProposalWaitResumedTick,
+                    resume_request_id=wait.get("resume_request_id"),
+                    proposal_ready_tick_id=wait.get("proposal_ready_tick_id"),
                     planner_request_id=wait.get("planner_request_id"),
                     proposal_id=wait.get("proposal_id"),
                     target_kind=wait.get("target_kind"),

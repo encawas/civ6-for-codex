@@ -14,6 +14,9 @@ from .planner import PlannerRequestTargetKind, canonical_json_hash
 
 
 STRATEGIC_RESEARCH_PROPOSAL_SCHEMA_VERSION = "strategic-research-proposal/v1"
+STRATEGIC_PROPOSAL_WAIT_RESUME_REQUEST_SCHEMA_VERSION = (
+    "strategic-proposal-wait-resume-request/v1"
+)
 STRATEGIC_PROPOSAL_TARGET_KINDS = frozenset(
     {
         PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
@@ -25,6 +28,52 @@ STRATEGIC_PROPOSAL_TARGET_KINDS = frozenset(
 def build_strategic_research_proposal_id(source_planner_request_id: str) -> str:
     digest = hashlib.sha256(source_planner_request_id.encode("utf-8")).hexdigest()[:24]
     return f"strategic_proposal_{digest}"
+
+
+def build_strategic_proposal_wait_resume_request_id(proposal_id: str) -> str:
+    digest = hashlib.sha256(proposal_id.encode("utf-8")).hexdigest()[:24]
+    return f"strategic_resume_request_{digest}"
+
+
+class StrategicProposalWaitResumeRequest(DomainModel):
+    """Immutable proof that a user explicitly requested Proposal wait release."""
+
+    schema_version: Literal["strategic-proposal-wait-resume-request/v1"] = (
+        STRATEGIC_PROPOSAL_WAIT_RESUME_REQUEST_SCHEMA_VERSION
+    )
+    resume_request_id: str = Field(min_length=1)
+    game_session_id: str = Field(min_length=1)
+    proposal_id: str = Field(min_length=1)
+    planner_request_id: str = Field(min_length=1)
+    proposal_ready_tick_id: str = Field(min_length=1)
+    target_kind: Literal[
+        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+    ]
+    expected_base_revision: int = Field(ge=0)
+    requested_at: datetime
+
+    @model_validator(mode="after")
+    def validate_resume_request(self) -> Self:
+        if self.resume_request_id != build_strategic_proposal_wait_resume_request_id(
+            self.proposal_id
+        ):
+            raise ValueError("Resume Request ID must be derived from the Proposal")
+        if (
+            self.target_kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION
+            and self.expected_base_revision != 0
+        ):
+            raise ValueError(
+                "Contract creation Resume Request requires base revision 0"
+            )
+        if (
+            self.target_kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+            and self.expected_base_revision < 1
+        ):
+            raise ValueError("Mission repair Resume Request requires a positive base")
+        if self.requested_at.tzinfo is None or self.requested_at.utcoffset() is None:
+            raise ValueError("Resume Request requested_at must include a timezone")
+        return self
 
 
 class StrategicResearchProposal(DomainModel):
@@ -117,3 +166,25 @@ def build_strategic_research_proposal(**fields: Any) -> StrategicResearchProposa
     }
     payload["proposal_hash"] = strategic_research_proposal_hash(payload)
     return StrategicResearchProposal.model_validate(payload)
+
+
+def build_strategic_proposal_wait_resume_request(
+    *,
+    game_session_id: str,
+    proposal_id: str,
+    planner_request_id: str,
+    proposal_ready_tick_id: str,
+    target_kind: PlannerRequestTargetKind,
+    expected_base_revision: int,
+    requested_at: datetime,
+) -> StrategicProposalWaitResumeRequest:
+    return StrategicProposalWaitResumeRequest(
+        resume_request_id=build_strategic_proposal_wait_resume_request_id(proposal_id),
+        game_session_id=game_session_id,
+        proposal_id=proposal_id,
+        planner_request_id=planner_request_id,
+        proposal_ready_tick_id=proposal_ready_tick_id,
+        target_kind=target_kind,
+        expected_base_revision=expected_base_revision,
+        requested_at=requested_at,
+    )

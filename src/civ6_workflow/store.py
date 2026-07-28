@@ -35,9 +35,11 @@ from .domain import (
     ProviderAttempt,
     StrategicContract,
     STRATEGIC_PROPOSAL_TARGET_KINDS,
+    StrategicProposalWaitResumeRequest,
     StrategicResearchProposal,
     StrategicProposalReadyTick,
     StrategicProposalWaitResumedTick,
+    build_strategic_proposal_wait_resume_request,
     build_strategic_contract_id,
     StrategicContractCommit,
     RuntimeState,
@@ -476,6 +478,24 @@ CREATE TABLE IF NOT EXISTS workflow_ticks (
 
 CREATE INDEX IF NOT EXISTS idx_workflow_ticks_game_turn
 ON workflow_ticks (game_id, turn);
+
+CREATE TABLE IF NOT EXISTS strategic_proposal_wait_resume_requests (
+    resume_request_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    proposal_id TEXT NOT NULL UNIQUE,
+    planner_request_id TEXT NOT NULL,
+    proposal_ready_tick_id TEXT NOT NULL UNIQUE,
+    target_kind TEXT NOT NULL,
+    expected_base_revision INTEGER NOT NULL CHECK (expected_base_revision >= 0),
+    request_json TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id)
+        REFERENCES strategic_research_proposals(proposal_id),
+    FOREIGN KEY (planner_request_id)
+        REFERENCES logical_planner_requests(planner_request_id),
+    FOREIGN KEY (proposal_ready_tick_id)
+        REFERENCES workflow_ticks(tick_id)
+);
 """
 
 REPLAY_STATE_TABLES = (
@@ -504,6 +524,7 @@ REPLAY_STATE_TABLES = (
     "action_attempt_transitions",
     "runtime_state",
     "workflow_ticks",
+    "strategic_proposal_wait_resume_requests",
 )
 
 
@@ -1136,6 +1157,72 @@ class WorkflowStore:
         return normalized
 
     @classmethod
+    def _normalize_strategic_proposal_wait_resume_request_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "resume_request_id",
+            "game_id",
+            "proposal_id",
+            "planner_request_id",
+            "proposal_ready_tick_id",
+            "target_kind",
+            "expected_base_revision",
+            "request_json",
+            "requested_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                "Strategic Proposal Resume Request row is missing columns: "
+                f"{sorted(missing)}"
+            )
+        try:
+            request = StrategicProposalWaitResumeRequest.model_validate_json(
+                str(normalized["request_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid Strategic Proposal Resume Request JSON") from exc
+        requested_at = cls._parse_audit_datetime(
+            normalized["requested_at"],
+            "Strategic Proposal Resume Request requested_at",
+        )
+        if requested_at is None or requested_at.tzinfo is None:
+            raise ValueError("Strategic Proposal Resume Request requires timezone")
+        relational = {
+            "resume_request_id": request.resume_request_id,
+            "game_id": request.game_session_id,
+            "proposal_id": request.proposal_id,
+            "planner_request_id": request.planner_request_id,
+            "proposal_ready_tick_id": request.proposal_ready_tick_id,
+            "target_kind": request.target_kind.value,
+            "expected_base_revision": request.expected_base_revision,
+            "requested_at": request.requested_at,
+        }
+        for column, expected in relational.items():
+            actual = requested_at if column == "requested_at" else normalized[column]
+            if column == "expected_base_revision":
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Strategic Proposal Resume Request base must be an integer"
+                    ) from exc
+            if actual != expected:
+                raise ValueError(
+                    "Strategic Proposal Resume Request columns disagree with JSON"
+                )
+        normalized.update(
+            {
+                "expected_base_revision": request.expected_base_revision,
+                "request_json": cls._dump(request.model_dump(mode="json")),
+                "requested_at": request.requested_at.isoformat(),
+            }
+        )
+        return normalized
+
+    @classmethod
     def _validate_strategic_proposal_attempt(
         cls,
         proposal: StrategicResearchProposal,
@@ -1453,11 +1540,17 @@ class WorkflowStore:
                         "terminal strategic PlannerRequest cannot retain a REQUESTED "
                         "InformationRound"
                     )
+            elif requested:
+                raise ValueError(
+                    "strategic REQUESTED InformationRound requires an "
+                    "AWAITING_INFORMATION PlannerRequest"
+                )
 
     @classmethod
     def _validate_strategic_proposal_lifecycle_v10(
         cls,
         proposal_rows: Sequence[Mapping[str, Any]],
+        resume_request_rows: Sequence[Mapping[str, Any]],
         request_rows: Sequence[Mapping[str, Any]],
         attempt_rows: Sequence[Mapping[str, Any]],
         information_round_rows: Sequence[Mapping[str, Any]],
@@ -1498,6 +1591,26 @@ class WorkflowStore:
             )
             proposals[proposal.proposal_id] = proposal
 
+        resume_requests_by_proposal: dict[
+            str, list[StrategicProposalWaitResumeRequest]
+        ] = {}
+        resume_request_ids: set[str] = set()
+        for row in resume_request_rows:
+            normalized = cls._normalize_strategic_proposal_wait_resume_request_row(row)
+            if require_canonical and dict(row) != normalized:
+                raise ValueError(
+                    "Strategic Proposal Resume Request row is not canonical"
+                )
+            resume_request = StrategicProposalWaitResumeRequest.model_validate_json(
+                str(normalized["request_json"])
+            )
+            if resume_request.resume_request_id in resume_request_ids:
+                raise ValueError("duplicate Strategic Proposal Resume Request identity")
+            resume_request_ids.add(resume_request.resume_request_id)
+            resume_requests_by_proposal.setdefault(
+                resume_request.proposal_id, []
+            ).append(resume_request)
+
         ticks = [cls._workflow_tick_from_row(row) for row in tick_rows]
         ready_by_proposal: dict[str, list[StrategicProposalReadyTick]] = {}
         resumed_by_proposal: dict[str, list[StrategicProposalWaitResumedTick]] = {}
@@ -1527,7 +1640,10 @@ class WorkflowStore:
                 raise ValueError("Human Wait context must be an object")
             wait_by_game[game_id] = context
 
-        unresolved_by_game: dict[str, StrategicResearchProposal] = {}
+        unresolved_by_game: dict[
+            str,
+            tuple[StrategicResearchProposal, StrategicProposalWaitResumeRequest | None],
+        ] = {}
         for proposal in proposals.values():
             ready_ticks = ready_by_proposal.get(proposal.proposal_id, [])
             if len(ready_ticks) != 1:
@@ -1542,28 +1658,56 @@ class WorkflowStore:
                 or ready.expected_base_revision != proposal.expected_base_revision
             ):
                 raise ValueError("Proposal-ready Tick identity disagrees with Proposal")
+            resume_requests = resume_requests_by_proposal.get(proposal.proposal_id, [])
+            if len(resume_requests) > 1:
+                raise ValueError("Proposal cannot have two Resume Requests")
+            resume_request = resume_requests[0] if resume_requests else None
+            if resume_request is not None:
+                if (
+                    resume_request.game_session_id != proposal.game_session_id
+                    or resume_request.planner_request_id
+                    != proposal.source_planner_request_id
+                    or resume_request.proposal_ready_tick_id != ready.tick_id
+                    or resume_request.target_kind is not proposal.target_kind
+                    or resume_request.expected_base_revision
+                    != proposal.expected_base_revision
+                ):
+                    raise ValueError(
+                        "Strategic Proposal Resume Request identity disagrees with "
+                        "Proposal or Ready Tick"
+                    )
+                if resume_request.requested_at < ready.completed_at:
+                    raise ValueError(
+                        "Strategic Proposal Resume Request precedes Proposal-ready Tick"
+                    )
             resumed_ticks = resumed_by_proposal.get(proposal.proposal_id, [])
             if len(resumed_ticks) > 1:
                 raise ValueError("Proposal cannot have two wait-resumed Ticks")
             if resumed_ticks:
+                if resume_request is None:
+                    raise ValueError(
+                        "Proposal wait-resumed Tick requires an immutable Resume Request"
+                    )
                 resumed = resumed_ticks[0]
                 if (
                     resumed.game_session_id != proposal.game_session_id
                     or resumed.planner_request_id != proposal.source_planner_request_id
                     or resumed.target_kind is not proposal.target_kind
                     or resumed.expected_base_revision != proposal.expected_base_revision
+                    or resumed.resume_request_id != resume_request.resume_request_id
+                    or resumed.proposal_ready_tick_id != ready.tick_id
                 ):
                     raise ValueError(
                         "Proposal wait-resumed Tick identity disagrees with Proposal"
                     )
-                if resumed.started_at <= ready.completed_at:
+                if resumed.started_at < resume_request.requested_at:
                     raise ValueError(
-                        "Proposal wait-resumed Tick must follow Proposal-ready Tick"
+                        "Proposal wait-resumed Tick precedes its Resume Request"
                     )
                 continue
             if proposal.game_session_id in unresolved_by_game:
                 raise ValueError("a game cannot have two unresolved Proposal waits")
-            unresolved_by_game[proposal.game_session_id] = proposal
+            unresolved_by_game[proposal.game_session_id] = (proposal, resume_request)
 
         for proposal_id in ready_by_proposal:
             if proposal_id not in proposals:
@@ -1573,8 +1717,12 @@ class WorkflowStore:
                 raise ValueError(
                     "Proposal wait-resumed Tick references an unknown Proposal"
                 )
+        for proposal_id in resume_requests_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError("Resume Request references an unknown Proposal")
 
-        for game_id, proposal in unresolved_by_game.items():
+        for game_id, unresolved in unresolved_by_game.items():
+            proposal, resume_request = unresolved
             if runtime_by_game.get(game_id) is not RuntimeState.AWAITING_HUMAN:
                 raise ValueError(
                     "unresolved Proposal wait requires AWAITING_HUMAN RuntimeState"
@@ -1597,12 +1745,38 @@ class WorkflowStore:
                 )
             if type(context.get("resume_requested")) is not bool:
                 raise ValueError("Proposal Human Wait resume_requested must be a bool")
+            if resume_request is None:
+                if context["resume_requested"] is not False:
+                    raise ValueError(
+                        "Proposal wait cannot be requested without a Resume Request"
+                    )
+                if "resume_request_id" in context or "resume_requested_at" in context:
+                    raise ValueError(
+                        "unrequested Proposal wait cannot contain Resume Request facts"
+                    )
+            else:
+                if context["resume_requested"] is not True:
+                    raise ValueError(
+                        "Proposal Resume Request requires resume_requested=True"
+                    )
+                if context.get("resume_request_id") != resume_request.resume_request_id:
+                    raise ValueError("Proposal Human Wait Resume Request ID disagrees")
+                requested_at = cls._parse_audit_datetime(
+                    context.get("resume_requested_at"),
+                    "Proposal Human Wait resume_requested_at",
+                )
+                if requested_at != resume_request.requested_at:
+                    raise ValueError("Proposal Human Wait requested_at disagrees")
+                if (
+                    context.get("proposal_ready_tick_id")
+                    != resume_request.proposal_ready_tick_id
+                ):
+                    raise ValueError("Proposal Human Wait Ready Tick ID disagrees")
 
         for game_id, context in wait_by_game.items():
             if context.get("wait_kind") != "strategic_contract_proposal_ready":
                 continue
-            proposal = unresolved_by_game.get(game_id)
-            if proposal is None:
+            if game_id not in unresolved_by_game:
                 raise ValueError(
                     "special Proposal Human Wait context references a resolved "
                     "or unknown Proposal"
@@ -1615,6 +1789,13 @@ class WorkflowStore:
                 dict(row)
                 for row in conn.execute(
                     "SELECT * FROM strategic_research_proposals ORDER BY proposal_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_proposal_wait_resume_requests "
+                    "ORDER BY requested_at, resume_request_id"
                 ).fetchall()
             ],
             [
@@ -2769,6 +2950,101 @@ class WorkflowStore:
         return [self._strategic_research_proposal_from_row(row) for row in rows]
 
     @classmethod
+    def _strategic_proposal_wait_resume_request_from_row(
+        cls, row: Mapping[str, Any]
+    ) -> StrategicProposalWaitResumeRequest:
+        normalized = cls._normalize_strategic_proposal_wait_resume_request_row(row)
+        if dict(row) != normalized:
+            raise ValueError("Strategic Proposal Resume Request row is not canonical")
+        return StrategicProposalWaitResumeRequest.model_validate_json(
+            str(normalized["request_json"])
+        )
+
+    @classmethod
+    def _insert_strategic_proposal_wait_resume_request_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        request: StrategicProposalWaitResumeRequest,
+    ) -> None:
+        row = cls._normalize_strategic_proposal_wait_resume_request_row(
+            {
+                "resume_request_id": request.resume_request_id,
+                "game_id": request.game_session_id,
+                "proposal_id": request.proposal_id,
+                "planner_request_id": request.planner_request_id,
+                "proposal_ready_tick_id": request.proposal_ready_tick_id,
+                "target_kind": request.target_kind.value,
+                "expected_base_revision": request.expected_base_revision,
+                "request_json": request.model_dump_json(),
+                "requested_at": request.requested_at.isoformat(),
+            }
+        )
+        columns = (
+            "resume_request_id",
+            "game_id",
+            "proposal_id",
+            "planner_request_id",
+            "proposal_ready_tick_id",
+            "target_kind",
+            "expected_base_revision",
+            "request_json",
+            "requested_at",
+        )
+        conn.execute(
+            """
+            INSERT INTO strategic_proposal_wait_resume_requests(
+                resume_request_id, game_id, proposal_id, planner_request_id,
+                proposal_ready_tick_id, target_kind, expected_base_revision,
+                request_json, requested_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(row[column] for column in columns),
+        )
+
+    def get_strategic_proposal_wait_resume_request(
+        self, resume_request_id: str
+    ) -> StrategicProposalWaitResumeRequest | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE resume_request_id=?",
+                (resume_request_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._strategic_proposal_wait_resume_request_from_row(row)
+        )
+
+    def strategic_proposal_wait_resume_request_for_proposal(
+        self, proposal_id: str
+    ) -> StrategicProposalWaitResumeRequest | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._strategic_proposal_wait_resume_request_from_row(row)
+        )
+
+    def list_strategic_proposal_wait_resume_requests(
+        self, game_session_id: str
+    ) -> list[StrategicProposalWaitResumeRequest]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE game_id=? ORDER BY requested_at, resume_request_id",
+                (game_session_id,),
+            ).fetchall()
+        return [
+            self._strategic_proposal_wait_resume_request_from_row(row) for row in rows
+        ]
+
+    @classmethod
     def _set_meta_in_connection(
         cls, conn: sqlite3.Connection, key: str, value: Any
     ) -> None:
@@ -2787,6 +3063,10 @@ class WorkflowStore:
         return f"human_wait:{game_id}"
 
     def set_meta(self, key: str, value: Any) -> None:
+        if key.startswith("human_wait:"):
+            raise ValueError(
+                "human_wait metadata must use the dedicated Human Wait APIs"
+            )
         with self._connect() as conn:
             self._set_meta_in_connection(conn, key, value)
 
@@ -2805,6 +3085,7 @@ class WorkflowStore:
         """Durably request one safe re-evaluation of an active human wait."""
 
         with self._connect() as conn:
+            self._validate_phase1b_proposals_v10(conn)
             state = conn.execute(
                 "SELECT state FROM runtime_state WHERE game_id=?", (game_id,)
             ).fetchone()
@@ -2817,6 +3098,88 @@ class WorkflowStore:
             context = {} if row is None else self._load(row["value_json"])
             if not isinstance(context, dict):
                 context = {}
+            if (
+                context.get("wait_kind") == "strategic_contract_proposal_ready"
+                and context.get("resume_policy") == "explicit_only"
+            ):
+                if type(context.get("resume_requested")) is not bool:
+                    raise ValueError(
+                        "Proposal Human Wait resume_requested must be a bool"
+                    )
+                proposal_row = conn.execute(
+                    "SELECT * FROM strategic_research_proposals "
+                    "WHERE proposal_id=? AND game_id=?",
+                    (context.get("proposal_id"), game_id),
+                ).fetchone()
+                if proposal_row is None:
+                    raise ValueError("Proposal Human Wait references no Proposal")
+                proposal = self._strategic_research_proposal_from_row(proposal_row)
+                ready_ticks = []
+                for tick_row in conn.execute(
+                    "SELECT * FROM workflow_ticks WHERE game_id=?",
+                    (game_id,),
+                ).fetchall():
+                    tick = self._workflow_tick_from_row(dict(tick_row))
+                    if (
+                        isinstance(tick, StrategicProposalReadyTick)
+                        and tick.proposal_id == proposal.proposal_id
+                    ):
+                        ready_ticks.append(tick)
+                if len(ready_ticks) != 1:
+                    raise ValueError(
+                        "Proposal Human Wait requires one Proposal-ready Tick"
+                    )
+                ready = ready_ticks[0]
+                existing_row = conn.execute(
+                    "SELECT * FROM strategic_proposal_wait_resume_requests "
+                    "WHERE proposal_id=?",
+                    (proposal.proposal_id,),
+                ).fetchone()
+                if context["resume_requested"] is True:
+                    if existing_row is None:
+                        raise ValueError(
+                            "Proposal context claims resume without an audit record"
+                        )
+                    existing = self._strategic_proposal_wait_resume_request_from_row(
+                        existing_row
+                    )
+                    if (
+                        context.get("resume_request_id") != existing.resume_request_id
+                        or context.get("proposal_ready_tick_id") != ready.tick_id
+                    ):
+                        raise ValueError(
+                            "Proposal Resume Request context disagrees with audit"
+                        )
+                    return True
+                if existing_row is not None:
+                    raise ValueError(
+                        "Proposal context omits an existing Resume Request"
+                    )
+                requested_at = max(datetime.now(UTC), ready.completed_at)
+                resume_request = build_strategic_proposal_wait_resume_request(
+                    game_session_id=game_id,
+                    proposal_id=proposal.proposal_id,
+                    planner_request_id=proposal.source_planner_request_id,
+                    proposal_ready_tick_id=ready.tick_id,
+                    target_kind=proposal.target_kind,
+                    expected_base_revision=proposal.expected_base_revision,
+                    requested_at=requested_at,
+                )
+                self._insert_strategic_proposal_wait_resume_request_in_connection(
+                    conn, resume_request
+                )
+                context.update(
+                    {
+                        "version": "human-wait/v1",
+                        "resume_requested": True,
+                        "resume_requested_at": requested_at.isoformat(),
+                        "resume_request_id": resume_request.resume_request_id,
+                        "proposal_ready_tick_id": ready.tick_id,
+                    }
+                )
+                self._set_meta_in_connection(conn, key, context)
+                self._validate_phase1b_proposals_v10(conn)
+                return True
             context.update(
                 {
                     "version": "human-wait/v1",
@@ -4052,6 +4415,7 @@ class WorkflowStore:
             self._save_runtime_state_in_connection(
                 conn, game_id, state, active_attempt_id
             )
+            self._validate_phase1b_proposals_v10(conn)
 
     @classmethod
     def _insert_workflow_tick_in_connection(
@@ -4107,6 +4471,82 @@ class WorkflowStore:
             self._insert_workflow_tick_in_connection(conn, tick)
             self._validate_phase1b_proposals_v10(conn)
 
+    @classmethod
+    def _validate_strategic_resume_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        human_wait_context: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(tick, StrategicProposalWaitResumedTick):
+            return
+        if human_wait_context is not None:
+            raise ValueError("Proposal wait resume must clear Human Wait context")
+        cls._validate_phase1b_proposals_v10(conn)
+        state_row = conn.execute(
+            "SELECT state FROM runtime_state WHERE game_id=?",
+            (tick.game_session_id,),
+        ).fetchone()
+        if state_row is None or state_row["state"] != RuntimeState.AWAITING_HUMAN.value:
+            raise ValueError("Proposal wait resume requires AWAITING_HUMAN")
+        wait_row = conn.execute(
+            "SELECT value_json FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(tick.game_session_id),),
+        ).fetchone()
+        if wait_row is None:
+            raise ValueError("Proposal wait resume requires Human Wait context")
+        context = cls._load(wait_row["value_json"])
+        if not isinstance(context, dict):
+            raise ValueError("Proposal Human Wait context must be an object")
+        expected = {
+            "wait_kind": "strategic_contract_proposal_ready",
+            "resume_policy": "explicit_only",
+            "resume_requested": True,
+            "resume_request_id": tick.resume_request_id,
+            "proposal_ready_tick_id": tick.proposal_ready_tick_id,
+            "planner_request_id": tick.planner_request_id,
+            "proposal_id": tick.proposal_id,
+            "target_kind": tick.target_kind.value,
+            "expected_base_revision": tick.expected_base_revision,
+        }
+        if any(context.get(key) != value for key, value in expected.items()):
+            raise ValueError("Proposal Resume Tick disagrees with Human Wait context")
+        resume_row = conn.execute(
+            "SELECT * FROM strategic_proposal_wait_resume_requests "
+            "WHERE resume_request_id=?",
+            (tick.resume_request_id,),
+        ).fetchone()
+        if resume_row is None:
+            raise ValueError(
+                "Proposal Resume Tick requires an immutable Resume Request"
+            )
+        resume_request = cls._strategic_proposal_wait_resume_request_from_row(
+            resume_row
+        )
+        if (
+            resume_request.game_session_id != tick.game_session_id
+            or resume_request.proposal_id != tick.proposal_id
+            or resume_request.planner_request_id != tick.planner_request_id
+            or resume_request.proposal_ready_tick_id != tick.proposal_ready_tick_id
+            or resume_request.target_kind is not tick.target_kind
+            or resume_request.expected_base_revision != tick.expected_base_revision
+            or tick.started_at < resume_request.requested_at
+        ):
+            raise ValueError("Proposal Resume Tick disagrees with Resume Request")
+        ready_row = conn.execute(
+            "SELECT * FROM workflow_ticks WHERE tick_id=?",
+            (tick.proposal_ready_tick_id,),
+        ).fetchone()
+        if ready_row is None:
+            raise ValueError("Proposal Resume Tick references no Ready Tick")
+        ready = cls._workflow_tick_from_row(dict(ready_row))
+        if (
+            not isinstance(ready, StrategicProposalReadyTick)
+            or ready.game_session_id != tick.game_session_id
+            or ready.proposal_id != tick.proposal_id
+        ):
+            raise ValueError("Proposal Resume Tick references the wrong Ready Tick")
+
     def persist_tick_and_runtime_state(
         self,
         tick: WorkflowTick,
@@ -4135,6 +4575,9 @@ class WorkflowStore:
         failure_resolution: FailedAttemptResolution | None = None
         task_retry_count: int | None = None
         with self._connect() as conn:
+            self._validate_strategic_resume_transition_in_connection(
+                conn, tick, human_wait_context
+            )
             if attempt is not None:
                 self._update_action_attempt_in_connection(conn, attempt)
                 if checkpoint is not None and attempt_checkpoint is not None:
@@ -5429,6 +5872,7 @@ class WorkflowStore:
     ) -> None:
         with self._connect() as conn:
             self._save_information_round_in_connection(conn, game_id, round_record)
+            self._validate_phase1b_proposals_v10(conn)
 
     def list_information_rounds(
         self, planner_request_id: str
@@ -5489,6 +5933,9 @@ class WorkflowStore:
     ) -> None:
         tick = validate_workflow_tick(tick)
         with self._connect() as conn:
+            self._validate_strategic_resume_transition_in_connection(
+                conn, tick, human_wait_context
+            )
             if plan_bundle is not None:
                 if plan_bundle_mode is None:
                     raise ValueError("plan bundle persistence requires execution mode")
@@ -5811,6 +6258,8 @@ class WorkflowStore:
                     row = cls._normalize_contract_commit_row(row)
                 elif table == "strategic_research_proposals":
                     row = cls._normalize_strategic_research_proposal_row(row)
+                elif table == "strategic_proposal_wait_resume_requests":
+                    row = cls._normalize_strategic_proposal_wait_resume_request_row(row)
                 elif table == "logical_planner_requests":
                     row = cls._normalize_planner_request_row(
                         row,
@@ -5875,6 +6324,14 @@ class WorkflowStore:
                 (game_id,),
             ).fetchall()
         ]
+        external_resume_requests = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
         external_requests = [
             dict(row)
             for row in conn.execute(
@@ -5921,6 +6378,10 @@ class WorkflowStore:
             [
                 *external_proposals,
                 *prepared["strategic_research_proposals"],
+            ],
+            [
+                *external_resume_requests,
+                *prepared["strategic_proposal_wait_resume_requests"],
             ],
             [
                 *external_requests,

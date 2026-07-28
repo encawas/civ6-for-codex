@@ -1427,14 +1427,20 @@ def test_all_target_kinds_reuse_provider_attempts_and_information_rounds(tmp_pat
             requests=({"query": "research"},),
             requested_at=NOW,
         )
-        store.save_information_round("game-1", round_record)
-        failed_round = round_record.model_copy(
-            update={
-                "status": InformationRoundStatus.FAILED,
-                "completed_at": NOW + timedelta(seconds=1),
-            }
-        )
-        store.save_information_round("game-1", failed_round)
+        if target.kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+            store.save_information_round("game-1", round_record)
+            failed_round = round_record.model_copy(
+                update={
+                    "status": InformationRoundStatus.FAILED,
+                    "completed_at": NOW + timedelta(seconds=1),
+                }
+            )
+            store.save_information_round("game-1", failed_round)
+            expected_rounds = [failed_round]
+        else:
+            with pytest.raises(ValueError, match="AWAITING_INFORMATION"):
+                store.save_information_round("game-1", round_record)
+            expected_rounds = []
         failed = in_progress.model_copy(
             update={
                 "status": PlannerRequestStatus.FAILED,
@@ -1447,9 +1453,9 @@ def test_all_target_kinds_reuse_provider_attempts_and_information_rounds(tmp_pat
         assert store.list_provider_attempts(request.planner_request_id)[0].status is (
             ProviderAttemptStatus.ABANDONED
         )
-        assert store.list_information_rounds(request.planner_request_id) == [
-            failed_round
-        ]
+        assert (
+            store.list_information_rounds(request.planner_request_id) == expected_rounds
+        )
 
 
 def test_response_payload_survives_store_restart(tmp_path):

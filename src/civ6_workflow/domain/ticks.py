@@ -180,6 +180,8 @@ class StrategicProposalWaitResumedTick(TickRecord):
     starting_runtime_state: Literal[RuntimeState.AWAITING_HUMAN]
     ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
     mutation_budget_used: Literal[0] = 0
+    resume_request_id: str
+    proposal_ready_tick_id: str
     planner_request_id: str
     proposal_id: str
     target_kind: Literal[

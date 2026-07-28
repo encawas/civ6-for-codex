@@ -13,6 +13,7 @@ from civ6_workflow.config import AppConfig
 from civ6_workflow.domain import (
     ActionAttempt,
     ApprovalStatus,
+    AwaitingHumanTick,
     AttemptStatus,
     ContinuationPolicy,
     LeaseValidationResult,
@@ -86,6 +87,31 @@ def _panel(tmp_path: Path, *, tick_result=None) -> ControlPanelState:
         store=store,
         run_tick_callback=lambda: tick_result or {"turn": 10, "paused": False},
         token="test-token",
+    )
+
+
+def _persist_generic_human_wait(
+    panel: ControlPanelState, *, blocking_reason: str
+) -> None:
+    now = datetime.now(UTC)
+    panel.store.persist_tick_and_runtime_state(
+        AwaitingHumanTick(
+            tick_id="tick-web-human-wait",
+            game_session_id="game-1",
+            turn_number=10,
+            starting_runtime_state=RuntimeState.OBSERVING,
+            observation_ids=("obs-web-human-wait",),
+            started_at=now,
+            completed_at=now,
+            blocking_reason=blocking_reason,
+        ),
+        human_wait_context={
+            "version": "human-wait/v1",
+            "execution_mode": "confirm",
+            "observation_projection_hash": "test",
+            "blocking_reason": blocking_reason,
+            "resume_requested": False,
+        },
     )
 
 
@@ -197,16 +223,7 @@ def test_http_api_requires_token_and_exposes_state(tmp_path: Path, monkeypatch):
 
 def test_http_resume_marks_a_durable_human_wait(tmp_path: Path):
     panel = _panel(tmp_path)
-    panel.store.save_runtime_state("game-1", RuntimeState.AWAITING_HUMAN)
-    panel.store.set_meta(
-        "human_wait:game-1",
-        {
-            "version": "human-wait/v1",
-            "execution_mode": "confirm",
-            "observation_projection_hash": "test",
-            "resume_requested": False,
-        },
-    )
+    _persist_generic_human_wait(panel, blocking_reason="input requires review")
     server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -389,15 +406,7 @@ def test_retry_endpoint_only_requeues_proven_not_sent_attempts(tmp_path: Path):
 
 def test_game_bound_resume_exposes_human_wait_state(tmp_path: Path):
     panel = _panel(tmp_path)
-    panel.store.save_runtime_state("game-1", RuntimeState.AWAITING_HUMAN)
-    panel.store.set_meta(
-        "human_wait:game-1",
-        {
-            "version": "human-wait/v1",
-            "blocking_reason": "input requires review",
-            "resume_requested": False,
-        },
-    )
+    _persist_generic_human_wait(panel, blocking_reason="input requires review")
     state = panel.snapshot()
     assert state["human_actions"]["runtime_state"] == "AWAITING_HUMAN"
     assert state["human_actions"]["human_wait"]["blocking_reason"] == (

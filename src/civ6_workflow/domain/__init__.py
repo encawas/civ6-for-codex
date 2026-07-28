@@ -81,8 +81,12 @@ from .plans import (
 )
 from .proposals import (
     STRATEGIC_PROPOSAL_TARGET_KINDS,
+    STRATEGIC_PROPOSAL_WAIT_RESUME_REQUEST_SCHEMA_VERSION,
     STRATEGIC_RESEARCH_PROPOSAL_SCHEMA_VERSION,
+    StrategicProposalWaitResumeRequest,
     StrategicResearchProposal,
+    build_strategic_proposal_wait_resume_request,
+    build_strategic_proposal_wait_resume_request_id,
     build_strategic_research_proposal,
     build_strategic_research_proposal_id,
     strategic_research_proposal_hash,
@@ -135,8 +139,12 @@ from .ticks import (
 __all__ = [
     "AuthorityScopeSet",
     "STRATEGIC_PROPOSAL_TARGET_KINDS",
+    "STRATEGIC_PROPOSAL_WAIT_RESUME_REQUEST_SCHEMA_VERSION",
     "STRATEGIC_RESEARCH_PROPOSAL_SCHEMA_VERSION",
+    "StrategicProposalWaitResumeRequest",
     "StrategicResearchProposal",
+    "build_strategic_proposal_wait_resume_request",
+    "build_strategic_proposal_wait_resume_request_id",
     "build_strategic_research_proposal",
     "build_strategic_research_proposal_id",
     "strategic_research_proposal_hash",
