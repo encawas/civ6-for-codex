@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -151,7 +152,7 @@ class PlannerLifecycleCoordinator:
                     return [], await self._collect_information(
                         ctx, observation, active, compatibility
                     )
-                backoff = engine._active_backoff()
+                backoff = engine._active_backoff(active)
                 if active.status is PlannerRequestStatus.BACKOFF and backoff:
                     engine.store.record_planner_suppression(
                         game_id,
@@ -1344,12 +1345,21 @@ class PlannerLifecycleCoordinator:
         provider_request = AgentRequest.model_validate(payload)
         provider_attempts: list[ProviderAttempt] = []
         active_provider_attempt: ProviderAttempt | None = None
+        pending_failed_attempt: ProviderAttempt | None = None
         provider_count = 0
 
         async def provider_attempt_hook(phase, details):
-            nonlocal logical_request, active_provider_attempt, provider_count
+            nonlocal logical_request
+            nonlocal active_provider_attempt
+            nonlocal pending_failed_attempt
+            nonlocal provider_count
             now = engine._now()
             if phase == "started":
+                if pending_failed_attempt is not None:
+                    engine.store.save_provider_attempt(
+                        snapshot.game_id, pending_failed_attempt
+                    )
+                    pending_failed_attempt = None
                 provider_request_id = str(
                     details.get("provider_request_id", provider_request.request_id)
                 )
@@ -1392,7 +1402,7 @@ class PlannerLifecycleCoordinator:
                         ),
                     }
                 )
-                engine.store.save_provider_attempt(snapshot.game_id, failed)
+                pending_failed_attempt = failed
                 active_provider_attempt = None
 
         setter = getattr(engine.planner, "set_provider_attempt_hook", None)
@@ -1464,6 +1474,8 @@ class PlannerLifecycleCoordinator:
                 }
             )
             provider_attempts = [completed_attempt]
+        elif pending_failed_attempt is not None:
+            provider_attempts = [pending_failed_attempt]
         ctx.metrics.provider_attempt_count += provider_count
         compatibility.agent_invoked = True
         compatibility.planner_request_id = logical_request.planner_request_id
@@ -1631,7 +1643,6 @@ class PlannerLifecycleCoordinator:
                 "failure_category": None,
             }
         )
-        engine._clear_backoff()
         compatibility.paused = True
         compatibility.pause_reason = "strategic_contract_proposal_ready"
         engine.store.record_agent_run(
@@ -1685,6 +1696,24 @@ class PlannerLifecycleCoordinator:
         engine = self.engine
         failure = engine._classify_planner_failure(error)
         transient = bool(failure["transient"])
+        retry_at = None
+        if transient:
+            existing_attempts = engine.store.list_provider_attempts(
+                logical_request.planner_request_id
+            )
+            failed_ids = {
+                attempt.provider_attempt_id
+                for attempt in existing_attempts
+                if attempt.status is ProviderAttemptStatus.FAILED
+            }
+            failed_ids.update(
+                attempt.provider_attempt_id
+                for attempt in provider_attempts
+                if attempt.status is ProviderAttemptStatus.FAILED
+            )
+            failure_count = max(1, len(failed_ids))
+            delay = min(120.0, 5.0 * (2 ** min(failure_count - 1, 5)))
+            retry_at = engine._now() + timedelta(seconds=delay)
         updated_request = logical_request.model_copy(
             update={
                 "status": (
@@ -1694,10 +1723,10 @@ class PlannerLifecycleCoordinator:
                 ),
                 "failure_category": str(failure["category"]),
                 "completed_at": None if transient else engine._now(),
+                "next_retry_at": retry_at,
             }
         )
         if transient:
-            engine._set_backoff(failure)
             return self._finish(
                 ctx,
                 snapshot,
@@ -3393,6 +3422,7 @@ class PlannerLifecycleCoordinator:
                     "resume_policy": "explicit_only",
                     "reason": "strategic_contract_proposal_ready",
                     "blocking_reason": tick.blocking_reason,
+                    "proposal_ready_tick_id": tick.tick_id,
                     "planner_request_id": tick.planner_request_id,
                     "proposal_id": tick.proposal_id,
                     "target_kind": tick.target_kind.value,

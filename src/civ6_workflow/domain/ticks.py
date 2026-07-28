@@ -42,6 +42,7 @@ class TickOutcomeKind(StrEnum):
     PLANNER_ATTEMPT_COMPLETED = "PLANNER_ATTEMPT_COMPLETED"
     STRATEGIC_PROPOSAL_READY = "STRATEGIC_PROPOSAL_READY"
     STRATEGIC_PROPOSAL_WAIT_RESUMED = "STRATEGIC_PROPOSAL_WAIT_RESUMED"
+    STRATEGIC_PROPOSAL_WAIT_ERROR = "STRATEGIC_PROPOSAL_WAIT_ERROR"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
     INFORMATION_COLLECTED = "INFORMATION_COLLECTED"
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
@@ -399,6 +400,27 @@ class SystemErrorTick(TickRecord):
     action_attempt_id: str | None = None
 
 
+class StrategicProposalWaitErrorTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_ERROR] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_ERROR
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    blocking_reason: str = Field(min_length=1)
+    error_category: str = Field(min_length=1)
+    diagnostic_summary: str = Field(min_length=1, max_length=500)
+    proposal_ready_tick_id: str
+    planner_request_id: str
+    proposal_id: str
+    target_kind: Literal[
+        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+    ]
+    expected_base_revision: int = Field(ge=0)
+
+
 class NoSafeActionTick(TickRecord):
     outcome: Literal[TickOutcomeKind.NO_SAFE_ACTION] = TickOutcomeKind.NO_SAFE_ACTION
     ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
@@ -415,6 +437,7 @@ WorkflowTick: TypeAlias = Annotated[
     | PlannerAttemptCompletedTick
     | StrategicProposalReadyTick
     | StrategicProposalWaitResumedTick
+    | StrategicProposalWaitErrorTick
     | InformationRequestedTick
     | InformationCollectedTick
     | ContextGatheredTick

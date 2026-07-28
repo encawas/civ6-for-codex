@@ -8,11 +8,13 @@ import pytest
 
 from civ6_workflow.domain import (
     AuthorityScopeSet,
+    AwaitingHumanTick,
     InformationRequestedTick,
     InformationRound,
     InformationRoundStatus,
     Mission,
     MissionGraph,
+    PlannerAttemptCompletedTick,
     ProviderAttempt,
     ProviderAttemptStatus,
     PlannerRequest,
@@ -2160,3 +2162,347 @@ def test_resume_committed_after_wait_read_before_persist_is_deferred(tmp_path):
     )
     assert store.human_wait_context("game-1") is None
     assert planner.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "updates"),
+    [
+        (
+            PlannerRequestStatus.IN_PROGRESS,
+            {
+                "status": PlannerRequestStatus.IN_PROGRESS,
+                "provider_attempt_count": 0,
+            },
+        ),
+        (
+            PlannerRequestStatus.BACKOFF,
+            {
+                "status": PlannerRequestStatus.BACKOFF,
+                "failure_category": "transient_provider_failure",
+                "next_retry_at": NOW + timedelta(minutes=5),
+            },
+        ),
+        (
+            PlannerRequestStatus.FAILED,
+            {
+                "status": PlannerRequestStatus.FAILED,
+                "failure_category": "planner_failure",
+                "completed_at": NOW + timedelta(seconds=1),
+            },
+        ),
+    ],
+)
+def test_phase4_rejects_forged_strategic_request_transition(tmp_path, status, updates):
+    path = tmp_path / f"forged-request-transition-{status.value}.sqlite3"
+    store = WorkflowStore(path)
+    request = _request("game-1")
+    store.save_planner_request(request)
+    forged = request.model_copy(update=updates)
+    tick = PlannerAttemptCompletedTick(
+        tick_id=f"tick-forged-{status.value.lower()}",
+        game_session_id="game-1",
+        turn_number=1,
+        starting_runtime_state=RuntimeState.REQUESTING_PLAN,
+        observation_ids=("obs-forged-request-transition",),
+        started_at=NOW,
+        completed_at=NOW + timedelta(seconds=2),
+        planner_request_id=request.planner_request_id,
+        provider_attempt_id="provider-does-not-exist",
+        provider_attempt_count=0,
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError):
+        store.persist_phase4_tick(tick, planner_request=forged)
+
+    assert store.export_replay_state("game-1") == before
+    assert store.get_planner_request(request.planner_request_id) == request
+    assert store.list_provider_attempts(request.planner_request_id) == []
+    WorkflowStore(path)
+    _assert_replay_round_trip(
+        tmp_path, store, f"forged-request-transition-{status.value}"
+    )
+
+
+def test_startup_and_replay_reject_backoff_without_attempt_or_tick(tmp_path):
+    path = tmp_path / "forged-backoff-without-evidence.sqlite3"
+    store = WorkflowStore(path)
+    request = _request("game-1")
+    store.save_planner_request(request)
+    forged = request.model_copy(
+        update={
+            "status": PlannerRequestStatus.BACKOFF,
+            "failure_category": "transient_provider_failure",
+            "next_retry_at": NOW + timedelta(minutes=5),
+        }
+    )
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    row = invalid["tables"]["logical_planner_requests"][0]
+    row["status"] = forged.status.value
+    row["request_json"] = WorkflowStore._dump(forged.model_dump(mode="json"))
+    _assert_invalid_replay_preserves_target(
+        tmp_path, invalid, "backoff-without-evidence"
+    )
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE logical_planner_requests
+            SET status=?, request_json=?
+            WHERE planner_request_id=?
+            """,
+            (
+                forged.status.value,
+                WorkflowStore._dump(forged.model_dump(mode="json")),
+                forged.planner_request_id,
+            ),
+        )
+    with pytest.raises(ValueError, match="BACKOFF"):
+        WorkflowStore(path)
+
+
+def test_superseded_requires_a_real_stale_contract_base(tmp_path):
+    path = tmp_path / "forged-superseded-with-current-base.sqlite3"
+    store = WorkflowStore(path)
+    request = _request("game-1")
+    store.save_planner_request(request)
+    forged = request.model_copy(
+        update={
+            "status": PlannerRequestStatus.SUPERSEDED,
+            "failure_category": "stale_strategic_contract_base",
+            "completed_at": NOW + timedelta(seconds=1),
+        }
+    )
+    tick = AwaitingHumanTick(
+        tick_id="tick-forged-superseded",
+        game_session_id="game-1",
+        turn_number=1,
+        starting_runtime_state=RuntimeState.REQUESTING_PLAN,
+        observation_ids=("obs-forged-superseded",),
+        started_at=NOW,
+        completed_at=NOW + timedelta(seconds=2),
+        blocking_reason="forged stale base",
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="SUPERSEDED"):
+        store.persist_phase4_tick(tick, planner_request=forged)
+
+    assert store.export_replay_state("game-1") == before
+    invalid = copy.deepcopy(before)
+    row = invalid["tables"]["logical_planner_requests"][0]
+    row["status"] = forged.status.value
+    row["completed_at"] = forged.completed_at.isoformat()
+    row["request_json"] = WorkflowStore._dump(forged.model_dump(mode="json"))
+    _assert_invalid_replay_preserves_target(
+        tmp_path, invalid, "superseded-with-current-base"
+    )
+
+
+class _RetryThenTransientFailurePlanner:
+    def __init__(self):
+        self.hook = None
+        self.calls = 0
+        self.last_diagnostics = {"attempt_count": 2, "backend": "test"}
+
+    def set_provider_attempt_hook(self, hook):
+        self.hook = hook
+        return True
+
+    async def plan(self, request):
+        self.calls += 1
+        await self.hook("started", {"provider_request_id": f"{request.request_id}:1"})
+        await self.hook("failed", {"failure_category": "retry-1"})
+        await self.hook("started", {"provider_request_id": f"{request.request_id}:2"})
+        raise TimeoutError("transport failed after retry")
+
+
+def test_strategic_backoff_derives_failure_count_from_attempt_history(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "strategic-backoff-retry.sqlite3")
+        request = _request("game-1")
+        store.save_planner_request(request)
+        planner = _RetryThenTransientFailurePlanner()
+        engine = _engine(store, _Game(), planner)
+
+        result = await engine.tick()
+
+        stored = store.get_planner_request(request.planner_request_id)
+        attempts = store.list_provider_attempts(request.planner_request_id)
+        assert stored.status is PlannerRequestStatus.BACKOFF
+        assert stored.provider_attempt_count == 2
+        assert [item.status for item in attempts] == [
+            ProviderAttemptStatus.FAILED,
+            ProviderAttemptStatus.FAILED,
+        ]
+        assert result.workflow_tick["provider_attempt_id"] == (
+            attempts[-1].provider_attempt_id
+        )
+        assert result.workflow_tick["provider_attempt_count"] == 2
+        assert engine._active_backoff(stored)["failure_count"] == 2
+        assert stored.next_retry_at >= attempts[-1].completed_at + timedelta(seconds=9)
+        _assert_replay_round_trip(tmp_path, store, "strategic-backoff-retry")
+
+    asyncio.run(scenario())
+
+
+def test_strategic_backoff_is_atomic_durable_and_replay_stable(tmp_path):
+    async def scenario():
+        source_path = tmp_path / "strategic-backoff-source.sqlite3"
+        store = WorkflowStore(source_path)
+        request = _request("game-1")
+        store.save_planner_request(request)
+        planner = _Planner(TimeoutError("transport failed"))
+        result = await _engine(store, _Game(), planner).tick()
+
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.PLANNER_ATTEMPT_COMPLETED
+        )
+        stored = store.get_planner_request(request.planner_request_id)
+        assert stored.status is PlannerRequestStatus.BACKOFF
+        assert stored.next_retry_at is not None
+        assert stored.next_retry_at.utcoffset() is not None
+        attempts = store.list_provider_attempts(request.planner_request_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is ProviderAttemptStatus.FAILED
+        assert result.workflow_tick["provider_attempt_id"] == (
+            attempts[0].provider_attempt_id
+        )
+        assert store.get_meta("planner_provider_backoff") is None
+        assert store.get_meta("planner_transient_failure_count") is None
+        early_attempt = ProviderAttempt(
+            provider_attempt_id="provider-before-retry-deadline",
+            planner_request_id=request.planner_request_id,
+            attempt_number=2,
+            provider_request_id="provider-before-retry-deadline",
+            status=ProviderAttemptStatus.STARTED,
+            started_at=stored.next_retry_at - timedelta(microseconds=1),
+        )
+        before_early_retry = store.export_replay_state("game-1")
+        with pytest.raises(ValueError, match="before next_retry_at"):
+            store.start_provider_attempt("game-1", stored, early_attempt)
+        assert store.export_replay_state("game-1") == before_early_retry
+        WorkflowStore(source_path)
+
+        exported = store.export_replay_state("game-1")
+        restored = WorkflowStore(tmp_path / "strategic-backoff-restored.sqlite3")
+        restored.set_meta(
+            "planner_provider_backoff",
+            {
+                "category": "target-residue",
+                "until_epoch": 4102444800,
+            },
+        )
+        restored.set_meta("planner_transient_failure_count", 99)
+        restored.import_replay_state(copy.deepcopy(exported))
+        restored_request = restored.get_planner_request(request.planner_request_id)
+        assert restored_request == stored
+        assert restored.export_replay_state("game-1") == exported
+
+        waiting_planner = _Planner()
+        waiting_engine = _engine(restored, _Game(), waiting_planner)
+        waiting_engine._now = lambda: stored.next_retry_at - timedelta(seconds=1)
+        backoff = waiting_engine._active_backoff(restored_request)
+        assert backoff["until"] == stored.next_retry_at.isoformat()
+        waiting = await waiting_engine.tick()
+        assert waiting.workflow_tick["outcome"] == TickOutcomeKind.PLANNER_BACKOFF
+        assert waiting_planner.calls == 0
+
+    asyncio.run(scenario())
+
+
+def _install_proposal_wait_preflight_failure(engine, game, monkeypatch, failure):
+    if failure == "read_snapshot":
+
+        async def fail_read_snapshot(*, include_units=False):
+            raise TimeoutError("snapshot unavailable")
+
+        game.read_snapshot = fail_read_snapshot
+    elif failure == "normalization":
+
+        def fail_normalization(*args, **kwargs):
+            raise ValueError("normalization failed")
+
+        monkeypatch.setattr(engine, "_normalize_snapshot", fail_normalization)
+    else:
+
+        async def fail_list_tools():
+            raise ConnectionError("tool surface unavailable")
+
+        game.list_tools = fail_list_tools
+
+
+@pytest.mark.parametrize("failure", ["read_snapshot", "normalization", "list_tools"])
+def test_proposal_wait_preflight_failure_is_durable_and_preserves_wait(
+    tmp_path, monkeypatch, failure
+):
+    path = tmp_path / f"proposal-wait-error-{failure}.sqlite3"
+    store, request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(path, repair=True)
+    )
+    original_wait = store.human_wait_context("game-1")
+    game = _Game()
+    planner = _Planner()
+    engine = _engine(store, game, planner)
+    _install_proposal_wait_preflight_failure(engine, game, monkeypatch, failure)
+
+    result = asyncio.run(engine.tick())
+
+    assert result.workflow_tick["outcome"] == (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_ERROR
+    )
+    assert result.runtime_state == RuntimeState.AWAITING_HUMAN
+    assert result.paused is True
+    updated_wait = store.human_wait_context("game-1")
+    assert updated_wait["blocking_reason"] == (
+        "workflow Tick failed while Proposal wait remains active"
+    )
+    assert {
+        key: value for key, value in updated_wait.items() if key != "blocking_reason"
+    } == {
+        key: value for key, value in original_wait.items() if key != "blocking_reason"
+    }
+    assert store.get_strategic_research_proposal(proposal.proposal_id) == proposal
+    assert store.get_planner_request(request.planner_request_id) == request
+    assert planner.calls == 0
+    WorkflowStore(path)
+    _assert_replay_round_trip(tmp_path, store, f"proposal-wait-error-{failure}")
+
+
+def test_requested_resume_survives_wait_error_restart_and_replay(tmp_path, monkeypatch):
+    path = tmp_path / "proposal-wait-requested-error.sqlite3"
+    store, request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(path, repair=True)
+    )
+    assert store.request_human_resume("game-1") is True
+    game = _Game()
+    planner = _Planner()
+    engine = _engine(store, game, planner)
+    _install_proposal_wait_preflight_failure(engine, game, monkeypatch, "read_snapshot")
+
+    failed = asyncio.run(engine.tick())
+
+    assert failed.workflow_tick["outcome"] == (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_ERROR
+    )
+    context = store.human_wait_context("game-1")
+    assert context["resume_requested"] is True
+    assert context["proposal_id"] == proposal.proposal_id
+    restarted = WorkflowStore(path)
+    assert restarted.human_wait_context("game-1") == context
+
+    exported = restarted.export_replay_state("game-1")
+    restored = WorkflowStore(tmp_path / "proposal-wait-requested-restored.sqlite3")
+    restored.import_replay_state(copy.deepcopy(exported))
+    resume_planner = _Planner()
+    resumed = asyncio.run(_engine(restored, _Game(), resume_planner).tick())
+
+    assert resumed.workflow_tick["outcome"] == (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+    )
+    assert restored.human_wait_context("game-1") is None
+    assert restored.get_strategic_research_proposal(proposal.proposal_id) == proposal
+    assert restored.get_planner_request(request.planner_request_id) == request
+    assert restored.get_active_strategic_contract("game-1") is not None
+    assert restored.list_tasks("game-1") == []
+    assert resume_planner.calls == 0

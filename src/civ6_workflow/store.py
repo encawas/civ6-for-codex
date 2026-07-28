@@ -28,8 +28,11 @@ from .domain import (
     InformationRound,
     InformationRoundStatus,
     InformationRequestedTick,
+    LogicalPlannerRequestCreatedTick,
     PlanLease,
     PlanLeaseStatus,
+    PlannerAttemptCompletedTick,
+    PlannerBackoffTick,
     PlannerRequest,
     PlannerResponseEvidenceCompatibility,
     PlannerRequestStatus,
@@ -41,6 +44,7 @@ from .domain import (
     StrategicProposalWaitResumeRequest,
     StrategicResearchProposal,
     StrategicProposalReadyTick,
+    StrategicProposalWaitErrorTick,
     StrategicProposalWaitResumedTick,
     build_strategic_proposal_wait_resume_request,
     build_strategic_contract_id,
@@ -1530,6 +1534,7 @@ class WorkflowStore:
         }
         requested_ticks: dict[tuple[str, str], list[InformationRequestedTick]] = {}
         collected_ticks: dict[tuple[str, str], list[InformationCollectedTick]] = {}
+        attempt_completed_ticks: dict[str, list[PlannerAttemptCompletedTick]] = {}
         for source_row in tick_rows:
             tick = cls._workflow_tick_from_row(source_row)
             if isinstance(tick, InformationRequestedTick):
@@ -1541,6 +1546,11 @@ class WorkflowStore:
                 if tick.planner_request_id in strategic_request_ids:
                     collected_ticks.setdefault(
                         (tick.planner_request_id, tick.information_round_id), []
+                    ).append(tick)
+            elif isinstance(tick, PlannerAttemptCompletedTick):
+                if tick.planner_request_id in strategic_request_ids:
+                    attempt_completed_ticks.setdefault(
+                        tick.planner_request_id, []
                     ).append(tick)
 
         for request in requests.values():
@@ -1558,6 +1568,110 @@ class WorkflowStore:
                 )
             if attempt_numbers != list(range(1, maximum_attempt_number + 1)):
                 raise ValueError("strategic ProviderAttempt numbers must be contiguous")
+            attempts_by_id = {
+                attempt.provider_attempt_id: attempt for _game_id, attempt in attempts
+            }
+            completion_ticks = attempt_completed_ticks.get(
+                request.planner_request_id, []
+            )
+            for completion_tick in completion_ticks:
+                attempt = attempts_by_id.get(completion_tick.provider_attempt_id)
+                if (
+                    attempt is None
+                    or completion_tick.game_session_id != request.game_session_id
+                    or completion_tick.provider_attempt_count < 1
+                    or attempt.status is ProviderAttemptStatus.STARTED
+                    or attempt.completed_at is None
+                    or completion_tick.completed_at < attempt.completed_at
+                ):
+                    raise ValueError(
+                        "strategic PlannerAttemptCompletedTick has no matching "
+                        "completed ProviderAttempt"
+                    )
+            latest_attempt = attempts[-1][1] if attempts else None
+            if request.status is PlannerRequestStatus.PENDING:
+                if attempts:
+                    raise ValueError(
+                        "PENDING strategic PlannerRequest cannot have ProviderAttempts"
+                    )
+            elif request.status is PlannerRequestStatus.IN_PROGRESS:
+                if (
+                    latest_attempt is not None
+                    and latest_attempt.status is ProviderAttemptStatus.SUCCEEDED
+                ):
+                    raise ValueError(
+                        "IN_PROGRESS strategic PlannerRequest cannot end in a "
+                        "SUCCEEDED ProviderAttempt"
+                    )
+                if latest_attempt is None or latest_attempt.status not in {
+                    ProviderAttemptStatus.STARTED,
+                    ProviderAttemptStatus.FAILED,
+                }:
+                    raise ValueError(
+                        "IN_PROGRESS strategic PlannerRequest requires a current "
+                        "ProviderAttempt"
+                    )
+            elif request.status is PlannerRequestStatus.BACKOFF:
+                retry_at = request.next_retry_at
+                if (
+                    latest_attempt is None
+                    or latest_attempt.status is not ProviderAttemptStatus.FAILED
+                    or latest_attempt.completed_at is None
+                    or retry_at is None
+                    or retry_at.utcoffset() is None
+                ):
+                    raise ValueError(
+                        "strategic BACKOFF requires a final FAILED ProviderAttempt "
+                        "and timezone-aware next_retry_at"
+                    )
+                matching_ticks = [
+                    item
+                    for item in completion_ticks
+                    if item.provider_attempt_id == latest_attempt.provider_attempt_id
+                ]
+                if len(matching_ticks) != 1:
+                    raise ValueError(
+                        "strategic BACKOFF requires one matching "
+                        "PlannerAttemptCompletedTick"
+                    )
+            if (
+                request.status is not PlannerRequestStatus.BACKOFF
+                and request.next_retry_at is not None
+            ):
+                raise ValueError("only strategic BACKOFF may retain next_retry_at")
+            if request.status in {
+                PlannerRequestStatus.PARTIALLY_COMPLETED,
+                PlannerRequestStatus.CANCELLED,
+            }:
+                raise ValueError(
+                    "strategic PlannerRequest uses an unsupported lifecycle status"
+                )
+            if (
+                request.status is PlannerRequestStatus.SUPERSEDED
+                and request.failure_category != "stale_strategic_contract_base"
+            ):
+                raise ValueError("strategic SUPERSEDED requires a stale Contract base")
+            if request.status is PlannerRequestStatus.FAILED and (
+                latest_attempt is None
+                or latest_attempt.status is not ProviderAttemptStatus.FAILED
+                or latest_attempt.completed_at is None
+            ):
+                raise ValueError(
+                    "FAILED strategic PlannerRequest requires a final FAILED "
+                    "ProviderAttempt"
+                )
+            if request.status in {
+                PlannerRequestStatus.COMPLETED,
+                PlannerRequestStatus.REJECTED,
+            } and (
+                latest_attempt is None
+                or latest_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or latest_attempt.completed_at is None
+            ):
+                raise ValueError(
+                    "response-terminal strategic PlannerRequest requires a final "
+                    "SUCCEEDED ProviderAttempt"
+                )
             rounds = sorted(
                 rounds_by_request.get(request.planner_request_id, []),
                 key=lambda item: item.round_number,
@@ -1788,6 +1902,40 @@ class WorkflowStore:
                     "ProviderAttempt"
                 )
 
+    @staticmethod
+    def _strategic_request_base_is_stale(
+        request: PlannerRequest,
+        contract_root: Mapping[str, Any] | None,
+    ) -> bool:
+        target = request.target
+        if target.kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            target_contract_id = build_strategic_contract_id(request.game_session_id)
+            expected_base_revision = 0
+            base_is_stale = contract_root is not None
+        elif target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR:
+            target_contract_id = target.strategic_contract_id
+            expected_base_revision = target.base_contract_revision
+            base_is_stale = (
+                contract_root is None
+                or str(contract_root["contract_id"]) != target_contract_id
+                or int(contract_root["active_revision"]) != expected_base_revision
+            )
+        else:
+            return False
+        projection_context = request.input_projection.get(
+            "strategic_proposal_context", request.input_projection
+        )
+        if not isinstance(projection_context, Mapping):
+            return True
+        projection_is_stale = (
+            target.strategic_scope != "research"
+            or projection_context.get("target_contract_id") != target_contract_id
+            or projection_context.get("expected_base_revision")
+            != expected_base_revision
+            or projection_context.get("strategic_scope") != "research"
+        )
+        return base_is_stale or projection_is_stale
+
     @classmethod
     def _validate_strategic_proposal_lifecycle_v10(
         cls,
@@ -1799,6 +1947,7 @@ class WorkflowStore:
         tick_rows: Sequence[Mapping[str, Any]],
         runtime_rows: Sequence[Mapping[str, Any]],
         workflow_meta_rows: Sequence[Mapping[str, Any]],
+        contract_root_rows: Sequence[Mapping[str, Any]],
         *,
         require_canonical: bool,
     ) -> None:
@@ -1808,6 +1957,16 @@ class WorkflowStore:
             attempt_rows,
             require_canonical=require_canonical,
         )
+        roots_by_game: dict[str, dict[str, Any]] = {}
+        for row in contract_root_rows:
+            normalized = cls._normalize_contract_root_row(row)
+            if require_canonical and dict(row) != normalized:
+                raise ValueError("StrategicContract root row is not canonical")
+            game_id = str(normalized["game_id"])
+            if game_id in roots_by_game:
+                raise ValueError("duplicate StrategicContract root game identity")
+            roots_by_game[game_id] = normalized
+
         requests: dict[str, PlannerRequest] = {}
         for row in request_rows:
             normalized = cls._normalize_planner_request_row(
@@ -1818,6 +1977,16 @@ class WorkflowStore:
             )
             if request.planner_request_id in requests:
                 raise ValueError("duplicate PlannerRequest identity")
+            if (
+                request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+                and request.status is PlannerRequestStatus.SUPERSEDED
+                and not cls._strategic_request_base_is_stale(
+                    request, roots_by_game.get(request.game_session_id)
+                )
+            ):
+                raise ValueError(
+                    "strategic SUPERSEDED Request has no stale Contract base"
+                )
             requests[request.planner_request_id] = request
         cls._validate_strategic_information_round_state(
             requests,
@@ -1858,11 +2027,14 @@ class WorkflowStore:
         ticks = [cls._workflow_tick_from_row(row) for row in tick_rows]
         ready_by_proposal: dict[str, list[StrategicProposalReadyTick]] = {}
         resumed_by_proposal: dict[str, list[StrategicProposalWaitResumedTick]] = {}
+        errors_by_proposal: dict[str, list[StrategicProposalWaitErrorTick]] = {}
         for tick in ticks:
             if isinstance(tick, StrategicProposalReadyTick):
                 ready_by_proposal.setdefault(tick.proposal_id, []).append(tick)
             elif isinstance(tick, StrategicProposalWaitResumedTick):
                 resumed_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+            elif isinstance(tick, StrategicProposalWaitErrorTick):
+                errors_by_proposal.setdefault(tick.proposal_id, []).append(tick)
 
         runtime_by_game: dict[str, RuntimeState] = {}
         for row in runtime_rows:
@@ -1924,6 +2096,20 @@ class WorkflowStore:
                     raise ValueError(
                         "Strategic Proposal Resume Request precedes Proposal-ready Tick"
                     )
+            for error_tick in errors_by_proposal.get(proposal.proposal_id, []):
+                if (
+                    error_tick.game_session_id != proposal.game_session_id
+                    or error_tick.planner_request_id
+                    != proposal.source_planner_request_id
+                    or error_tick.proposal_ready_tick_id != ready.tick_id
+                    or error_tick.target_kind is not proposal.target_kind
+                    or error_tick.expected_base_revision
+                    != proposal.expected_base_revision
+                    or error_tick.started_at < ready.completed_at
+                ):
+                    raise ValueError(
+                        "Proposal wait-error Tick identity disagrees with Proposal"
+                    )
             resumed_ticks = resumed_by_proposal.get(proposal.proposal_id, [])
             if len(resumed_ticks) > 1:
                 raise ValueError("Proposal cannot have two wait-resumed Ticks")
@@ -1960,6 +2146,11 @@ class WorkflowStore:
             if proposal_id not in proposals:
                 raise ValueError(
                     "Proposal wait-resumed Tick references an unknown Proposal"
+                )
+        for proposal_id in errors_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError(
+                    "Proposal wait-error Tick references an unknown Proposal"
                 )
         for proposal_id in resume_requests_by_proposal:
             if proposal_id not in proposals:
@@ -2078,6 +2269,12 @@ class WorkflowStore:
                 for row in conn.execute(
                     "SELECT * FROM workflow_meta WHERE key LIKE 'human_wait:%' "
                     "ORDER BY key"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_roots ORDER BY game_id"
                 ).fetchall()
             ],
             require_canonical=True,
@@ -4798,7 +4995,7 @@ class WorkflowStore:
         tick: WorkflowTick,
         candidate: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        if not isinstance(tick, AwaitingHumanTick):
+        if not isinstance(tick, (AwaitingHumanTick, StrategicProposalWaitErrorTick)):
             return candidate
         row = conn.execute(
             "SELECT value_json FROM workflow_meta WHERE key=?",
@@ -5974,6 +6171,37 @@ class WorkflowStore:
         if request.game_session_id != game_id:
             raise ValueError("planner request belongs to another game")
         with self._connect() as conn:
+            request_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (request.planner_request_id,),
+            ).fetchone()
+            if request_row is None:
+                raise ValueError("PlannerRequest does not exist")
+            stored_request = self._planner_request_from_row(request_row)
+            if (
+                request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+                or stored_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+            ):
+                if request != stored_request:
+                    raise ValueError(
+                        "strategic ProviderAttempt must start from the current Request"
+                    )
+                if request.status not in {
+                    PlannerRequestStatus.PENDING,
+                    PlannerRequestStatus.IN_PROGRESS,
+                    PlannerRequestStatus.BACKOFF,
+                    PlannerRequestStatus.READY_TO_CONTINUE,
+                }:
+                    raise ValueError(
+                        "strategic ProviderAttempt cannot start from this Request status"
+                    )
+                if request.status is PlannerRequestStatus.BACKOFF and (
+                    request.next_retry_at is None
+                    or attempt.started_at < request.next_retry_at
+                ):
+                    raise ValueError(
+                        "strategic ProviderAttempt cannot start before next_retry_at"
+                    )
             rows = conn.execute(
                 """
                 SELECT * FROM provider_attempts
@@ -5999,7 +6227,9 @@ class WorkflowStore:
                         },
                     }
                 )
-                self._save_provider_attempt_in_connection(conn, game_id, interrupted)
+                self._save_provider_attempt_in_connection(
+                    conn, game_id, interrupted, validate_aggregate=False
+                )
             expected = int(
                 conn.execute(
                     """
@@ -6015,12 +6245,18 @@ class WorkflowStore:
                     f"provider attempt_number must be {expected}, "
                     f"got {attempt.attempt_number}"
                 )
-            in_progress = request.model_copy(
-                update={
-                    "status": PlannerRequestStatus.IN_PROGRESS,
-                    "provider_attempt_count": attempt.attempt_number,
-                }
-            )
+            updates = {
+                "status": PlannerRequestStatus.IN_PROGRESS,
+                "provider_attempt_count": attempt.attempt_number,
+            }
+            if request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                updates.update(
+                    {
+                        "failure_category": None,
+                        "next_retry_at": None,
+                    }
+                )
+            in_progress = request.model_copy(update=updates)
             self._save_planner_request_in_connection(conn, in_progress)
             self._save_provider_attempt_in_connection(conn, game_id, attempt)
         return in_progress
@@ -6283,6 +6519,230 @@ class WorkflowStore:
             return [self._information_round_from_row(conn, row) for row in rows]
 
     @classmethod
+    def _validate_strategic_request_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        planner_request: PlannerRequest | None,
+        provider_attempts: Sequence[ProviderAttempt],
+        information_round: InformationRound | None,
+        strategic_research_proposal: StrategicResearchProposal | None,
+    ) -> None:
+        referenced_request_id = getattr(tick, "planner_request_id", None)
+        referenced_row = (
+            None
+            if not isinstance(referenced_request_id, str)
+            else conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (referenced_request_id,),
+            ).fetchone()
+        )
+        referenced_request = (
+            None
+            if referenced_row is None
+            else cls._planner_request_from_row(referenced_row)
+        )
+        if planner_request is None:
+            if (
+                referenced_request is not None
+                and referenced_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+                and isinstance(
+                    tick,
+                    (
+                        PlannerAttemptCompletedTick,
+                        PlannerBackoffTick,
+                        InformationRequestedTick,
+                        InformationCollectedTick,
+                        StrategicProposalReadyTick,
+                    ),
+                )
+            ):
+                raise ValueError(
+                    "strategic PlannerRequest Tick requires its Request aggregate"
+                )
+            return
+
+        existing_row = conn.execute(
+            "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+            (planner_request.planner_request_id,),
+        ).fetchone()
+        existing = (
+            None
+            if existing_row is None
+            else cls._planner_request_from_row(existing_row)
+        )
+        strategic = planner_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS or (
+            existing is not None
+            and existing.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+        )
+        if not strategic:
+            return
+        if (
+            planner_request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS
+            or planner_request.game_session_id != tick.game_session_id
+        ):
+            raise ValueError("strategic PlannerRequest aggregate identity disagrees")
+        if existing is None:
+            if (
+                not isinstance(tick, LogicalPlannerRequestCreatedTick)
+                or tick.planner_request_id != planner_request.planner_request_id
+                or tick.request_target_kind is not planner_request.target.kind
+                or not cls._is_clean_initial_strategic_request(planner_request)
+                or provider_attempts
+                or information_round is not None
+                or strategic_research_proposal is not None
+            ):
+                raise ValueError(
+                    "strategic PlannerRequest creation aggregate is invalid"
+                )
+            return
+        if existing.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+            raise ValueError("PlannerRequest target kind cannot change")
+        if planner_request == existing:
+            if (
+                isinstance(tick, PlannerBackoffTick)
+                and existing.status is PlannerRequestStatus.BACKOFF
+                and tick.planner_request_id == existing.planner_request_id
+                and not provider_attempts
+                and information_round is None
+                and strategic_research_proposal is None
+            ):
+                return
+            raise ValueError(
+                "strategic PlannerRequest aggregate has no valid lifecycle transition"
+            )
+
+        transition = (existing.status, planner_request.status)
+        information_transitions = {
+            (
+                PlannerRequestStatus.IN_PROGRESS,
+                PlannerRequestStatus.AWAITING_INFORMATION,
+            ),
+            (
+                PlannerRequestStatus.AWAITING_INFORMATION,
+                PlannerRequestStatus.READY_TO_CONTINUE,
+            ),
+            (
+                PlannerRequestStatus.AWAITING_INFORMATION,
+                PlannerRequestStatus.FAILED,
+            ),
+        }
+        if transition in information_transitions:
+            return
+        if planner_request.status is PlannerRequestStatus.SUPERSEDED:
+            contract_root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (existing.game_session_id,),
+            ).fetchone()
+            if (
+                isinstance(tick, AwaitingHumanTick)
+                and planner_request.failure_category == "stale_strategic_contract_base"
+                and planner_request.completed_at is not None
+                and planner_request.next_retry_at is None
+                and not provider_attempts
+                and strategic_research_proposal is None
+                and cls._strategic_request_base_is_stale(
+                    existing,
+                    None if contract_root is None else dict(contract_root),
+                )
+            ):
+                return
+            raise ValueError("strategic SUPERSEDED transition is invalid")
+        if existing.status is not PlannerRequestStatus.IN_PROGRESS:
+            raise ValueError(
+                "strategic PlannerRequest status transition is not allowed"
+            )
+        if len(provider_attempts) != 1:
+            raise ValueError(
+                "strategic Provider completion requires one ProviderAttempt "
+                "in the same Runtime transaction"
+            )
+        final_attempt = provider_attempts[0]
+        stored_attempt_row = conn.execute(
+            "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+            (final_attempt.provider_attempt_id,),
+        ).fetchone()
+        stored_attempt = (
+            None
+            if stored_attempt_row is None
+            else cls._provider_attempt_from_row(conn, stored_attempt_row)
+        )
+        if (
+            stored_attempt is None
+            or stored_attempt.status is not ProviderAttemptStatus.STARTED
+            or final_attempt.planner_request_id != existing.planner_request_id
+            or final_attempt.attempt_number != existing.provider_attempt_count
+            or planner_request.provider_attempt_count != existing.provider_attempt_count
+            or final_attempt.completed_at is None
+        ):
+            raise ValueError(
+                "strategic Request transition requires its current completed "
+                "ProviderAttempt"
+            )
+
+        if planner_request.status is PlannerRequestStatus.BACKOFF:
+            if (
+                not isinstance(tick, PlannerAttemptCompletedTick)
+                or tick.planner_request_id != existing.planner_request_id
+                or tick.provider_attempt_id != final_attempt.provider_attempt_id
+                or tick.provider_attempt_count < 1
+                or final_attempt.status is not ProviderAttemptStatus.FAILED
+                or planner_request.next_retry_at is None
+                or planner_request.next_retry_at.utcoffset() is None
+                or planner_request.failure_category != "transient_provider_failure"
+                or planner_request.completed_at is not None
+                or information_round is not None
+                or strategic_research_proposal is not None
+            ):
+                raise ValueError("strategic BACKOFF transition is invalid")
+            return
+        if planner_request.status is PlannerRequestStatus.FAILED:
+            if (
+                not isinstance(tick, AwaitingHumanTick)
+                or final_attempt.status is not ProviderAttemptStatus.FAILED
+                or planner_request.completed_at is None
+                or planner_request.next_retry_at is not None
+                or information_round is not None
+                or strategic_research_proposal is not None
+            ):
+                raise ValueError("strategic FAILED transition is invalid")
+            return
+        if planner_request.status is PlannerRequestStatus.REJECTED:
+            if (
+                not isinstance(tick, AwaitingHumanTick)
+                or final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or planner_request.completed_at is None
+                or planner_request.next_retry_at is not None
+                or information_round is not None
+                or strategic_research_proposal is not None
+                or cls._classify_planner_request_response(planner_request)
+                not in {
+                    _PlannerResponseFacts.CANONICAL_RESPONSE,
+                    _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE,
+                }
+            ):
+                raise ValueError("strategic REJECTED transition is invalid")
+            return
+        if planner_request.status is PlannerRequestStatus.COMPLETED:
+            if (
+                not isinstance(tick, StrategicProposalReadyTick)
+                or tick.planner_request_id != existing.planner_request_id
+                or final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or planner_request.completed_at is None
+                or planner_request.next_retry_at is not None
+                or information_round is not None
+                or strategic_research_proposal is None
+                or strategic_research_proposal.source_planner_request_id
+                != existing.planner_request_id
+                or strategic_research_proposal.source_provider_attempt_id
+                != final_attempt.provider_attempt_id
+                or strategic_research_proposal.proposal_id != tick.proposal_id
+            ):
+                raise ValueError("strategic COMPLETED transition is invalid")
+            return
+        raise ValueError("strategic PlannerRequest transition is invalid")
+
+    @classmethod
     def _validate_strategic_information_transition_in_connection(
         cls,
         conn: sqlite3.Connection,
@@ -6459,6 +6919,14 @@ class WorkflowStore:
             conn.execute("BEGIN IMMEDIATE")
             self._validate_strategic_resume_transition_in_connection(
                 conn, tick, human_wait_context
+            )
+            self._validate_strategic_request_transition_in_connection(
+                conn,
+                tick,
+                planner_request,
+                provider_attempts,
+                information_round,
+                strategic_research_proposal,
             )
             self._validate_strategic_information_transition_in_connection(
                 conn,
@@ -6913,6 +7381,13 @@ class WorkflowStore:
                 (cls._human_wait_meta_key(game_id),),
             ).fetchall()
         ]
+        external_roots = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
         cls._validate_strategic_proposal_lifecycle_v10(
             [
                 *external_proposals,
@@ -6937,15 +7412,9 @@ class WorkflowStore:
             [*external_ticks, *prepared["workflow_ticks"]],
             [*external_runtime, *prepared["runtime_state"]],
             [*external_wait_meta, *prepared["workflow_meta"]],
+            [*external_roots, *prepared["strategic_contract_roots"]],
             require_canonical=True,
         )
-        external_roots = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM strategic_contract_roots WHERE game_id<>?",
-                (game_id,),
-            ).fetchall()
-        ]
         external_revisions = [
             dict(row)
             for row in conn.execute(
