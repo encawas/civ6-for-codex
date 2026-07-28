@@ -1438,7 +1438,7 @@ def test_all_target_kinds_reuse_provider_attempts_and_information_rounds(tmp_pat
             store.save_information_round("game-1", failed_round)
             expected_rounds = [failed_round]
         else:
-            with pytest.raises(ValueError, match="AWAITING_INFORMATION"):
+            with pytest.raises(ValueError, match="atomic Runtime transaction"):
                 store.save_information_round("game-1", round_record)
             expected_rounds = []
         failed = in_progress.model_copy(
@@ -1448,10 +1448,19 @@ def test_all_target_kinds_reuse_provider_attempts_and_information_rounds(tmp_pat
                 "failure_category": "test_failure",
             }
         )
-        store.save_planner_request(failed)
+        if target.kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+            store.save_planner_request(failed)
+            expected_request = failed
+            expected_attempt_status = ProviderAttemptStatus.ABANDONED
+        else:
+            with pytest.raises(ValueError, match="atomic Runtime transaction"):
+                store.save_planner_request(failed)
+            expected_request = in_progress
+            expected_attempt_status = ProviderAttemptStatus.STARTED
 
+        assert store.get_planner_request(request.planner_request_id) == expected_request
         assert store.list_provider_attempts(request.planner_request_id)[0].status is (
-            ProviderAttemptStatus.ABANDONED
+            expected_attempt_status
         )
         assert (
             store.list_information_rounds(request.planner_request_id) == expected_rounds
@@ -1663,7 +1672,7 @@ def test_store_rejects_legacy_bundle_for_strategic_target(tmp_path):
         target=_repair_target(),
     )
 
-    with pytest.raises(ValueError, match="StrategicResearchProposalResponse"):
+    with pytest.raises(ValueError, match="clean PENDING request"):
         store.save_planner_request(request)
     assert store.get_planner_request(request.planner_request_id) is None
 

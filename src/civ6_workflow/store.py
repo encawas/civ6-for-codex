@@ -23,8 +23,10 @@ from .domain import (
     DecisionGap,
     DecisionGapStatus,
     DecisionGroup,
+    InformationCollectedTick,
     InformationRound,
     InformationRoundStatus,
+    InformationRequestedTick,
     PlanLease,
     PlanLeaseStatus,
     PlannerRequest,
@@ -1461,6 +1463,7 @@ class WorkflowStore:
         cls,
         requests: Mapping[str, PlannerRequest],
         round_rows: Sequence[Mapping[str, Any]],
+        tick_rows: Sequence[Mapping[str, Any]],
         *,
         require_canonical: bool,
     ) -> None:
@@ -1497,6 +1500,26 @@ class WorkflowStore:
                 round_record
             )
 
+        strategic_request_ids = {
+            request.planner_request_id
+            for request in requests.values()
+            if request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+        }
+        requested_ticks: dict[tuple[str, str], list[InformationRequestedTick]] = {}
+        collected_ticks: dict[tuple[str, str], list[InformationCollectedTick]] = {}
+        for source_row in tick_rows:
+            tick = cls._workflow_tick_from_row(source_row)
+            if isinstance(tick, InformationRequestedTick):
+                if tick.planner_request_id in strategic_request_ids:
+                    requested_ticks.setdefault(
+                        (tick.planner_request_id, tick.information_round_id), []
+                    ).append(tick)
+            elif isinstance(tick, InformationCollectedTick):
+                if tick.planner_request_id in strategic_request_ids:
+                    collected_ticks.setdefault(
+                        (tick.planner_request_id, tick.information_round_id), []
+                    ).append(tick)
+
         for request in requests.values():
             if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
                 continue
@@ -1504,11 +1527,87 @@ class WorkflowStore:
                 rounds_by_request.get(request.planner_request_id, []),
                 key=lambda item: item.round_number,
             )
+            if len(rounds) > 1 or any(
+                round_record.round_number != 1 for round_record in rounds
+            ):
+                raise ValueError(
+                    "strategic PlannerRequest supports exactly one information round"
+                )
+            round_keys = {
+                (request.planner_request_id, item.information_round_id)
+                for item in rounds
+            }
+            tick_keys = {
+                key
+                for key in (*requested_ticks.keys(), *collected_ticks.keys())
+                if key[0] == request.planner_request_id
+            }
+            if tick_keys - round_keys:
+                raise ValueError(
+                    "strategic information Tick references no InformationRound"
+                )
+            for round_record in rounds:
+                key = (request.planner_request_id, round_record.information_round_id)
+                request_ticks = requested_ticks.get(key, [])
+                collect_ticks = collected_ticks.get(key, [])
+                if (
+                    len(request_ticks) != 1
+                    or request_ticks[0].game_session_id != request.game_session_id
+                ):
+                    raise ValueError(
+                        "strategic InformationRound requires one requesting Tick"
+                    )
+                expected_collected_ticks = (
+                    1 if round_record.status is InformationRoundStatus.COLLECTED else 0
+                )
+                if len(collect_ticks) != expected_collected_ticks or any(
+                    tick.game_session_id != request.game_session_id
+                    for tick in collect_ticks
+                ):
+                    raise ValueError(
+                        "strategic InformationRound collection Tick disagrees"
+                    )
             requested = [
                 item
                 for item in rounds
                 if item.status is InformationRoundStatus.REQUESTED
             ]
+            collected = [
+                item
+                for item in rounds
+                if item.status is InformationRoundStatus.COLLECTED
+            ]
+            failed = [
+                item for item in rounds if item.status is InformationRoundStatus.FAILED
+            ]
+            if request.information_round_count != len(collected):
+                raise ValueError(
+                    "strategic information_round_count disagrees with collected history"
+                )
+            if bool(request.information_results) != bool(collected):
+                raise ValueError(
+                    "strategic information_results disagree with collected history"
+                )
+            if collected and canonical_json(
+                request.information_results
+            ) != canonical_json(collected[0].results):
+                raise ValueError(
+                    "strategic information_results disagree with collected Round"
+                )
+            if failed and request.status not in TERMINAL_PLANNER_STATUSES:
+                raise ValueError(
+                    "strategic failed InformationRound requires a terminal Request"
+                )
+            for round_record in rounds:
+                current_round_allowance = (
+                    0 if round_record.status is InformationRoundStatus.COLLECTED else 1
+                )
+                if round_record.round_number > (
+                    request.information_round_count + current_round_allowance
+                ):
+                    raise ValueError(
+                        "strategic InformationRound exceeds proven lifecycle count"
+                    )
             if request.status is PlannerRequestStatus.AWAITING_INFORMATION:
                 if not request.pending_information_requests:
                     raise ValueError(
@@ -1580,6 +1679,7 @@ class WorkflowStore:
         cls._validate_strategic_information_round_state(
             requests,
             information_round_rows,
+            tick_rows,
             require_canonical=require_canonical,
         )
 
@@ -5245,8 +5345,57 @@ class WorkflowStore:
                 conn, request.game_session_id, abandoned
             )
 
+    @staticmethod
+    def _is_clean_initial_strategic_request(request: PlannerRequest) -> bool:
+        return (
+            request.status is PlannerRequestStatus.PENDING
+            and request.provider_attempt_count == 0
+            and request.information_round_count == 0
+            and request.pending_information_requests == ()
+            and not request.information_results
+            and request.completed_at is None
+            and request.response_payload is None
+            and request.response_hash is None
+            and request.validation_result is None
+            and request.response_evidence_compatibility is None
+            and request.failure_category is None
+            and request.next_retry_at is None
+        )
+
     def save_planner_request(self, request: PlannerRequest) -> None:
         with self._connect() as conn:
+            existing_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (request.planner_request_id,),
+            ).fetchone()
+            existing = (
+                None
+                if existing_row is None
+                else self._planner_request_from_row(existing_row)
+            )
+            strategic_candidate = request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+            strategic_existing = (
+                existing is not None
+                and existing.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+            )
+            if strategic_candidate or strategic_existing:
+                if existing is None:
+                    if not strategic_candidate or not (
+                        self._is_clean_initial_strategic_request(request)
+                    ):
+                        raise ValueError(
+                            "new strategic PlannerRequest must be a clean PENDING request"
+                        )
+                    self._save_planner_request_in_connection(conn, request)
+                    self._validate_phase1b_proposals_v10(conn)
+                    return
+                if request != existing:
+                    raise ValueError(
+                        "strategic PlannerRequest lifecycle requires an atomic "
+                        "Runtime transaction"
+                    )
+                self._validate_phase1b_proposals_v10(conn)
+                return
             self._save_planner_request_in_connection(conn, request)
             self._validate_phase1b_proposals_v10(conn)
 
@@ -5871,6 +6020,33 @@ class WorkflowStore:
         self, game_id: str, round_record: InformationRound
     ) -> None:
         with self._connect() as conn:
+            parent_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (round_record.planner_request_id,),
+            ).fetchone()
+            if parent_row is None:
+                raise ValueError(
+                    "InformationRound parent PlannerRequest does not exist"
+                )
+            parent = self._planner_request_from_row(parent_row)
+            if parent.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                existing_row = conn.execute(
+                    "SELECT * FROM information_rounds WHERE information_round_id=?",
+                    (round_record.information_round_id,),
+                ).fetchone()
+                if existing_row is None:
+                    raise ValueError(
+                        "strategic InformationRound creation requires an atomic "
+                        "Runtime transaction"
+                    )
+                existing = self._information_round_from_row(conn, existing_row)
+                if str(existing_row["game_id"]) != game_id or round_record != existing:
+                    raise ValueError(
+                        "strategic InformationRound lifecycle requires an atomic "
+                        "Runtime transaction"
+                    )
+                self._validate_phase1b_proposals_v10(conn)
+                return
             self._save_information_round_in_connection(conn, game_id, round_record)
             self._validate_phase1b_proposals_v10(conn)
 

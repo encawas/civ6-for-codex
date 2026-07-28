@@ -7,6 +7,7 @@ import pytest
 
 from civ6_workflow.domain import (
     AuthorityScopeSet,
+    InformationRound,
     InformationRoundStatus,
     Mission,
     MissionGraph,
@@ -489,7 +490,25 @@ def test_information_round_then_proposal_and_second_round_limit(tmp_path):
         engine = _engine(store, game, planner)
 
         first = await engine.tick()
+        awaiting = store.get_planner_request(request.planner_request_id)
+        requested_round = store.list_information_rounds(request.planner_request_id)[0]
+        assert awaiting is not None
+        assert awaiting.status is PlannerRequestStatus.AWAITING_INFORMATION
+        assert requested_round.status is InformationRoundStatus.REQUESTED
+        store.save_planner_request(awaiting)
+        store.save_information_round("game-1", requested_round)
+
         second = await engine.tick()
+        ready = store.get_planner_request(request.planner_request_id)
+        collected_round = store.list_information_rounds(request.planner_request_id)[0]
+        assert ready is not None
+        assert ready.status is PlannerRequestStatus.READY_TO_CONTINUE
+        assert ready.information_round_count == 1
+        assert ready.information_results == collected_round.results
+        assert collected_round.status is InformationRoundStatus.COLLECTED
+        store.save_planner_request(ready)
+        store.save_information_round("game-1", collected_round)
+
         third = await engine.tick()
 
         assert first.workflow_tick["outcome"] == TickOutcomeKind.INFORMATION_REQUESTED
@@ -497,8 +516,17 @@ def test_information_round_then_proposal_and_second_round_limit(tmp_path):
         assert (
             third.workflow_tick["outcome"] == TickOutcomeKind.STRATEGIC_PROPOSAL_READY
         )
+        assert store.request_human_resume("game-1") is True
+        fourth = await engine.tick()
+        assert fourth.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+        )
         assert game.query_count == 1
         assert planner.calls == 2
+        assert store.human_wait_context("game-1") is None
+        assert len(store.list_strategic_proposal_wait_resume_requests("game-1")) == 1
+        assert store.get_active_strategic_contract("game-1") is None
+        assert store.list_tasks("game-1") == []
 
     async def limited_round():
         store = WorkflowStore(tmp_path / "information-limit.sqlite3")
@@ -814,9 +842,7 @@ def test_public_request_save_rejects_completed_nonlegacy_without_proposal(tmp_pa
     store.save_provider_attempt("game-1", attempt)
     before = store.export_replay_state("game-1")
 
-    with pytest.raises(
-        ValueError, match="COMPLETED non-legacy PlannerRequest requires Proposal"
-    ):
+    with pytest.raises(ValueError, match="atomic Runtime transaction"):
         store.save_planner_request(completed)
 
     assert store.export_replay_state("game-1") == before
@@ -1625,4 +1651,132 @@ def test_startup_rejects_deleted_resume_request_after_resume_tick(tmp_path):
     with sqlite3.connect(path) as conn:
         conn.execute("DELETE FROM strategic_proposal_wait_resume_requests")
     with pytest.raises(ValueError):
+        WorkflowStore(path)
+
+
+def _terminal_information_round(request, status):
+    fields = {
+        "information_round_id": f"forged-round-{status.value.lower()}",
+        "planner_request_id": request.planner_request_id,
+        "round_number": 1,
+        "status": status,
+        "requests": ({"query": "research"},),
+        "requested_at": NOW,
+        "completed_at": NOW + timedelta(seconds=1),
+    }
+    if status is InformationRoundStatus.COLLECTED:
+        fields["results"] = {"research": {"current": "TECH_WRITING"}}
+    return InformationRound(**fields)
+
+
+def _assert_replay_round_trip(tmp_path, store, label):
+    exported = store.export_replay_state("game-1")
+    WorkflowStore(store.path)
+    restored = WorkflowStore(tmp_path / f"{label}-restored.sqlite3")
+    restored.import_replay_state(copy.deepcopy(exported))
+    assert restored.export_replay_state("game-1") == exported
+
+
+@pytest.mark.parametrize(
+    "status", [InformationRoundStatus.FAILED, InformationRoundStatus.COLLECTED]
+)
+def test_public_round_save_rejects_forged_terminal_round_for_pending_request(
+    tmp_path, status
+):
+    store = WorkflowStore(tmp_path / f"pending-forged-{status.value}.sqlite3")
+    request = _request("game-1")
+    store.save_planner_request(request)
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="atomic Runtime transaction"):
+        store.save_information_round(
+            "game-1", _terminal_information_round(request, status)
+        )
+
+    assert store.export_replay_state("game-1") == before
+    assert store.list_information_rounds(request.planner_request_id) == []
+    _assert_replay_round_trip(tmp_path, store, f"pending-forged-{status.value}")
+
+
+@pytest.mark.parametrize(
+    "status", [InformationRoundStatus.FAILED, InformationRoundStatus.COLLECTED]
+)
+def test_public_round_save_rejects_forged_round_for_completed_proposal(
+    tmp_path, status
+):
+    store, request, _proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / f"completed-forged-{status.value}.sqlite3")
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="atomic Runtime transaction"):
+        store.save_information_round(
+            "game-1", _terminal_information_round(request, status)
+        )
+
+    assert store.export_replay_state("game-1") == before
+    assert store.list_information_rounds(request.planner_request_id) == []
+    _assert_replay_round_trip(tmp_path, store, f"completed-forged-{status.value}")
+
+
+@pytest.mark.parametrize("save_mode", ["new", "update"])
+def test_public_request_save_rejects_forged_ready_to_continue(tmp_path, save_mode):
+    store = WorkflowStore(tmp_path / f"forged-ready-{save_mode}.sqlite3")
+    pending = _request("game-1")
+    if save_mode == "update":
+        store.save_planner_request(pending)
+        store.save_planner_request(pending)
+    forged = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.READY_TO_CONTINUE,
+            "information_round_count": 1,
+            "information_results": {"research": {"current": "TECH_WRITING"}},
+        }
+    )
+    planner = _Planner(_response("game-1", build_strategic_contract_id("game-1")))
+
+    with pytest.raises(ValueError):
+        store.save_planner_request(forged)
+
+    assert planner.calls == 0
+    if save_mode == "new":
+        assert store.get_planner_request(pending.planner_request_id) is None
+    else:
+        assert store.get_planner_request(pending.planner_request_id) == pending
+        _assert_replay_round_trip(tmp_path, store, "forged-ready-update")
+
+
+def test_startup_and_replay_reject_ready_without_collected_round(tmp_path):
+    path = tmp_path / "forged-ready-aggregate.sqlite3"
+    store = WorkflowStore(path)
+    pending = _request("game-1")
+    store.save_planner_request(pending)
+    forged = pending.model_copy(
+        update={
+            "status": PlannerRequestStatus.READY_TO_CONTINUE,
+            "information_round_count": 1,
+            "information_results": {"research": {"current": "TECH_WRITING"}},
+        }
+    )
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    row = invalid["tables"]["logical_planner_requests"][0]
+    row["status"] = forged.status.value
+    row["request_json"] = WorkflowStore._dump(forged.model_dump(mode="json"))
+
+    _assert_invalid_replay_preserves_target(tmp_path, invalid, "forged-ready-aggregate")
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE logical_planner_requests
+            SET status=?, request_json=?
+            WHERE planner_request_id=?
+            """,
+            (
+                forged.status.value,
+                WorkflowStore._dump(forged.model_dump(mode="json")),
+                forged.planner_request_id,
+            ),
+        )
+    with pytest.raises(ValueError, match="information_round_count"):
         WorkflowStore(path)
