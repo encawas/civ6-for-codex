@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -6,6 +7,7 @@ import pytest
 
 from civ6_workflow.domain import (
     AuthorityScopeSet,
+    InformationRoundStatus,
     Mission,
     MissionGraph,
     ProviderAttempt,
@@ -657,7 +659,13 @@ def test_explicit_resume_after_intermediate_proposal_wait_does_not_apply(tmp_pat
         assert store.request_human_resume("game-1") is True
         result = await engine.tick()
 
-        assert result.runtime_state != RuntimeState.AWAITING_HUMAN
+        assert (
+            result.workflow_tick["outcome"]
+            == TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+        )
+        assert result.workflow_tick["starting_runtime_state"] == "AWAITING_HUMAN"
+        assert result.workflow_tick["ending_runtime_state"] == "ROUTING"
+        assert result.workflow_tick["mutation_budget_used"] == 0
         assert store.human_wait_context("game-1") is None
         unchanged = store.get_active_strategic_contract("game-1")
         assert unchanged is not None
@@ -883,7 +891,10 @@ def test_public_proposal_save_rejects_noncompleted_parent(tmp_path, status):
             ),
         )
 
-    with pytest.raises(ValueError, match="parent PlannerRequest must be COMPLETED"):
+    with pytest.raises(
+        ValueError,
+        match="complete Proposal-ready Tick transaction",
+    ):
         store.save_strategic_research_proposal(proposal)
 
     assert store.list_strategic_research_proposals("game-1") == []
@@ -1032,3 +1043,363 @@ def test_v9_upgrade_creates_empty_proposal_table_without_changing_state(tmp_path
     assert upgraded.list_strategic_research_proposals("game-1") == []
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+
+
+@pytest.mark.parametrize("kind", ["creation", "repair"])
+def test_stale_base_terminates_requested_information_round_atomically(tmp_path, kind):
+    async def scenario():
+        path = tmp_path / f"stale-information-{kind}.sqlite3"
+        store = WorkflowStore(path)
+        if kind == "repair":
+            active = _commit_contract(store, "game-1")
+            request = _request(
+                "game-1",
+                kind=PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+                contract_id=active.contract_id,
+                base_revision=active.revision,
+            )
+        else:
+            active = None
+            request = _request("game-1")
+        planner = _Planner(
+            _information_response(),
+            _response("game-1", build_strategic_contract_id("game-1")),
+        )
+        game = _Game()
+        store.save_planner_request(request)
+        engine = _engine(store, game, planner)
+
+        first = await engine.tick()
+        assert first.workflow_tick["outcome"] == TickOutcomeKind.INFORMATION_REQUESTED
+        awaiting = store.get_planner_request(request.planner_request_id)
+        assert awaiting is not None
+        assert awaiting.status is PlannerRequestStatus.AWAITING_INFORMATION
+        rounds = store.list_information_rounds(request.planner_request_id)
+        assert len(rounds) == 1
+        assert rounds[0].status is InformationRoundStatus.REQUESTED
+
+        if active is None:
+            _commit_contract(store, "game-1")
+        else:
+            _commit_contract(store, "game-1", revision=active.revision + 1)
+        provider_calls = planner.calls
+        query_calls = game.query_count
+
+        result = await engine.tick()
+
+        stored = store.get_planner_request(request.planner_request_id)
+        assert stored is not None
+        assert stored.status is PlannerRequestStatus.SUPERSEDED
+        assert stored.failure_category == "stale_strategic_contract_base"
+        assert stored.pending_information_requests == ()
+        failed_round = store.list_information_rounds(request.planner_request_id)[0]
+        assert failed_round.status is InformationRoundStatus.FAILED
+        assert failed_round.completed_at is not None
+        assert stored.completed_at is not None
+        assert failed_round.completed_at >= stored.completed_at
+        assert result.runtime_state == RuntimeState.AWAITING_HUMAN
+        assert result.workflow_tick["outcome"] != TickOutcomeKind.SYSTEM_ERROR
+        assert planner.calls == provider_calls
+        assert game.query_count == query_calls
+        assert store.list_strategic_research_proposals("game-1") == []
+
+        exported = store.export_replay_state("game-1")
+        restored = WorkflowStore(
+            tmp_path / f"stale-information-restored-{kind}.sqlite3"
+        )
+        restored.import_replay_state(copy.deepcopy(exported))
+        assert restored.export_replay_state("game-1") == exported
+
+    asyncio.run(scenario())
+
+
+def _human_wait_replay_row(state):
+    rows = [
+        row
+        for row in state["tables"]["workflow_meta"]
+        if row["key"] == "human_wait:game-1"
+    ]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def _workflow_tick_replay_row(state, outcome):
+    rows = [
+        row for row in state["tables"]["workflow_ticks"] if row["outcome"] == outcome
+    ]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def _change_replay_tick(state, outcome, **updates):
+    row = _workflow_tick_replay_row(state, outcome)
+    payload = WorkflowStore._load(row["tick_json"])
+    payload.update(updates)
+    row["tick_json"] = WorkflowStore._dump(payload)
+    relational = {
+        "game_session_id": "game_id",
+        "planner_request_id": "planner_request_id",
+        "outcome": "outcome",
+        "starting_runtime_state": "starting_runtime_state",
+        "ending_runtime_state": "ending_runtime_state",
+        "mutation_budget_used": "mutation_budget_used",
+        "turn_number": "turn",
+    }
+    for field, column in relational.items():
+        if field in updates:
+            value = updates[field]
+            row[column] = value.value if hasattr(value, "value") else value
+
+
+def _assert_invalid_replay_preserves_target(tmp_path, invalid, label):
+    target, _request_record, _proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / f"invalid-target-{label}.sqlite3")
+    )
+    before = target.export_replay_state("game-1")
+    with pytest.raises(ValueError):
+        target.import_replay_state(invalid)
+    assert target.export_replay_state("game-1") == before
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_wait",
+        "missing_runtime",
+        "missing_ready_tick",
+        "wrong_context_proposal",
+        "wrong_context_request",
+        "generic_context",
+        "wrong_resume_policy",
+        "string_resume_requested",
+        "integer_resume_requested",
+        "wrong_ready_target",
+        "wrong_ready_base",
+    ],
+)
+def test_replay_rejects_incomplete_unresolved_proposal_lifecycle_before_delete(
+    tmp_path, corruption
+):
+    source, _request_record, _proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / f"invalid-source-{corruption}.sqlite3")
+    )
+    invalid = copy.deepcopy(source.export_replay_state("game-1"))
+    tables = invalid["tables"]
+    if corruption == "missing_wait":
+        tables["workflow_meta"] = [
+            row for row in tables["workflow_meta"] if row["key"] != "human_wait:game-1"
+        ]
+    elif corruption == "missing_runtime":
+        tables["runtime_state"] = []
+    elif corruption == "missing_ready_tick":
+        tables["workflow_ticks"] = [
+            row
+            for row in tables["workflow_ticks"]
+            if row["outcome"] != TickOutcomeKind.STRATEGIC_PROPOSAL_READY
+        ]
+    elif corruption in {
+        "wrong_context_proposal",
+        "wrong_context_request",
+        "generic_context",
+        "wrong_resume_policy",
+        "string_resume_requested",
+        "integer_resume_requested",
+    }:
+        row = _human_wait_replay_row(invalid)
+        context = WorkflowStore._load(row["value_json"])
+        if corruption == "wrong_context_proposal":
+            context["proposal_id"] = "proposal-other"
+        elif corruption == "wrong_context_request":
+            context["planner_request_id"] = "request-other"
+        elif corruption == "generic_context":
+            context = {"version": "human-wait/v1", "resume_requested": False}
+        elif corruption == "wrong_resume_policy":
+            context["resume_policy"] = "observation_change"
+        elif corruption == "string_resume_requested":
+            context["resume_requested"] = "true"
+        else:
+            context["resume_requested"] = 1
+        row["value_json"] = WorkflowStore._dump(context)
+    elif corruption == "wrong_ready_target":
+        _change_replay_tick(
+            invalid,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_READY,
+            target_kind=PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+        )
+    else:
+        ready = WorkflowStore._load(
+            _workflow_tick_replay_row(
+                invalid, TickOutcomeKind.STRATEGIC_PROPOSAL_READY
+            )["tick_json"]
+        )
+        _change_replay_tick(
+            invalid,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_READY,
+            expected_base_revision=ready["expected_base_revision"] + 1,
+        )
+
+    _assert_invalid_replay_preserves_target(tmp_path, invalid, corruption)
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing_wait", "missing_runtime", "missing_ready_tick"]
+)
+def test_startup_rejects_incomplete_unresolved_proposal_lifecycle(tmp_path, corruption):
+    path = tmp_path / f"startup-{corruption}.sqlite3"
+    asyncio.run(_completed_proposal_state(path))
+    with sqlite3.connect(path) as conn:
+        if corruption == "missing_wait":
+            conn.execute("DELETE FROM workflow_meta WHERE key='human_wait:game-1'")
+        elif corruption == "missing_runtime":
+            conn.execute("DELETE FROM runtime_state WHERE game_id='game-1'")
+        else:
+            conn.execute(
+                "DELETE FROM workflow_ticks WHERE game_id='game-1' AND outcome=?",
+                (TickOutcomeKind.STRATEGIC_PROPOSAL_READY.value,),
+            )
+
+    with pytest.raises(ValueError):
+        WorkflowStore(path)
+
+
+async def _resumed_proposal_state(path):
+    store = WorkflowStore(path)
+    active = _commit_contract(store, "game-1")
+    request = _request(
+        "game-1",
+        kind=PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+        contract_id=active.contract_id,
+        base_revision=active.revision,
+    )
+    planner = _Planner(_response("game-1", active.contract_id))
+    game = _Game()
+    store.save_planner_request(request)
+    engine = _engine(store, game, planner)
+    await engine.tick()
+    await engine.tick()
+    proposal = store.list_strategic_research_proposals("game-1")[0]
+    assert store.request_human_resume("game-1") is True
+    resumed = await engine.tick()
+    assert (
+        resumed.workflow_tick["outcome"]
+        == TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+    )
+    return store, request, proposal, active, planner, engine
+
+
+def test_resumed_proposal_lifecycle_survives_restart_and_replay(tmp_path):
+    path = tmp_path / "resumed-source.sqlite3"
+    store, request, proposal, active, planner, _engine_instance = asyncio.run(
+        _resumed_proposal_state(path)
+    )
+
+    restarted = WorkflowStore(path)
+    assert restarted.human_wait_context("game-1") is None
+    assert restarted.get_strategic_research_proposal(proposal.proposal_id) == proposal
+    assert (
+        restarted.get_planner_request(request.planner_request_id).status
+        is PlannerRequestStatus.COMPLETED
+    )
+    unchanged = restarted.get_active_strategic_contract("game-1")
+    assert unchanged == active
+    assert unchanged.authority_scope_set.mission_graph_scopes == ()
+    assert unchanged.mission_graph.missions == ()
+    assert restarted.list_tasks("game-1") == []
+    assert planner.calls == 1
+
+    exported = restarted.export_replay_state("game-1")
+    restored = WorkflowStore(tmp_path / "resumed-restored.sqlite3")
+    restored.import_replay_state(copy.deepcopy(exported))
+    assert restored.export_replay_state("game-1") == exported
+
+
+def test_startup_rejects_resumed_proposal_without_resume_tick(tmp_path):
+    path = tmp_path / "resumed-startup-missing-tick.sqlite3"
+    asyncio.run(_resumed_proposal_state(path))
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "DELETE FROM workflow_ticks WHERE game_id='game-1' AND outcome=?",
+            (TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED.value,),
+        )
+
+    with pytest.raises(ValueError):
+        WorkflowStore(path)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing", "proposal_id", "planner_request_id", "target_kind", "base_revision"],
+)
+def test_replay_rejects_missing_or_tampered_proposal_resume_tick(tmp_path, corruption):
+    source, _request, _proposal, _active, _planner, _engine_instance = asyncio.run(
+        _resumed_proposal_state(
+            tmp_path / f"resumed-invalid-source-{corruption}.sqlite3"
+        )
+    )
+    invalid = copy.deepcopy(source.export_replay_state("game-1"))
+    if corruption == "missing":
+        invalid["tables"]["workflow_ticks"] = [
+            row
+            for row in invalid["tables"]["workflow_ticks"]
+            if row["outcome"] != TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+        ]
+    elif corruption == "proposal_id":
+        _change_replay_tick(
+            invalid,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED,
+            proposal_id="proposal-other",
+        )
+    elif corruption == "planner_request_id":
+        _change_replay_tick(
+            invalid,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED,
+            planner_request_id="request-other",
+        )
+    elif corruption == "target_kind":
+        _change_replay_tick(
+            invalid,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED,
+            target_kind=PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+        )
+    else:
+        resumed = WorkflowStore._load(
+            _workflow_tick_replay_row(
+                invalid, TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+            )["tick_json"]
+        )
+        _change_replay_tick(
+            invalid,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED,
+            expected_base_revision=resumed["expected_base_revision"] + 1,
+        )
+
+    _assert_invalid_replay_preserves_target(tmp_path, invalid, f"resumed-{corruption}")
+
+
+def test_resumed_historical_proposal_allows_later_generic_human_wait(tmp_path):
+    async def scenario():
+        path = tmp_path / "resumed-then-generic.sqlite3"
+        (
+            store,
+            _request,
+            proposal,
+            active,
+            planner,
+            engine,
+        ) = await _resumed_proposal_state(path)
+
+        later = await engine.tick()
+
+        assert (
+            later.workflow_tick["outcome"]
+            != TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+        )
+        context = store.human_wait_context("game-1")
+        if context is not None:
+            assert context.get("wait_kind") != "strategic_contract_proposal_ready"
+        assert store.get_strategic_research_proposal(proposal.proposal_id) == proposal
+        assert store.get_active_strategic_contract("game-1") == active
+        assert planner.calls == 1
+        WorkflowStore(path)
+
+    asyncio.run(scenario())

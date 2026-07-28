@@ -35,6 +35,7 @@ from .domain import (
     NoSafeActionTick,
     PlanRequestedTick,
     RuntimeState,
+    StrategicProposalWaitResumedTick,
     SystemErrorTick,
     TaskCreatedTick,
     TaskInvalidatedTick,
@@ -323,6 +324,21 @@ class WorkflowEngine:
 
         if ctx.starting_state is RuntimeState.AWAITING_HUMAN:
             wait = self.store.human_wait_context(snapshot.game_id) or {}
+            if (
+                wait.get("wait_kind") == "strategic_contract_proposal_ready"
+                and wait.get("resume_policy") == "explicit_only"
+                and wait.get("resume_requested") is True
+            ):
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    StrategicProposalWaitResumedTick,
+                    planner_request_id=wait.get("planner_request_id"),
+                    proposal_id=wait.get("proposal_id"),
+                    target_kind=wait.get("target_kind"),
+                    expected_base_revision=wait.get("expected_base_revision"),
+                    resume_reason="explicit_user_resume",
+                )
             if wait.get("requires_unit_details") is True and snapshot.units is None:
                 raw = await self._read_snapshot(ctx.metrics, include_units=True)
                 observation = self._normalize_snapshot(raw, ctx.metrics)
@@ -1064,7 +1080,11 @@ class WorkflowEngine:
                 human_wait_context = self._human_wait_context(snapshot)
             human_wait_context["blocking_reason"] = tick.blocking_reason
 
-        if attempt_update is None:
+        if isinstance(tick, StrategicProposalWaitResumedTick):
+            if attempt_update is not None:
+                raise ValueError("Proposal wait resume cannot update an ActionAttempt")
+            self.store.persist_phase4_tick(tick, human_wait_context=None)
+        elif attempt_update is None:
             self.store.persist_tick_and_runtime_state(
                 tick,
                 active_attempt_id=runtime_active_attempt_id,

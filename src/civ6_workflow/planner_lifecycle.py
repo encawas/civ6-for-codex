@@ -1260,11 +1260,38 @@ class PlannerLifecycleCoordinator:
         compatibility: TickResult,
         reason: str,
     ) -> TickResult:
+        now = self.engine._now()
+        failed_round = None
+        if logical_request.status is PlannerRequestStatus.AWAITING_INFORMATION:
+            rounds = self.engine.store.list_information_rounds(
+                logical_request.planner_request_id
+            )
+            requested = [
+                round_record
+                for round_record in rounds
+                if round_record.status is InformationRoundStatus.REQUESTED
+            ]
+            if (
+                len(requested) != 1
+                or not rounds
+                or rounds[-1].information_round_id != requested[0].information_round_id
+            ):
+                raise RuntimeError(
+                    "awaiting-information strategic request requires one latest "
+                    "REQUESTED InformationRound"
+                )
+            failed_round = requested[0].model_copy(
+                update={
+                    "status": InformationRoundStatus.FAILED,
+                    "completed_at": now,
+                }
+            )
         updated_request = logical_request.model_copy(
             update={
                 "status": PlannerRequestStatus.SUPERSEDED,
-                "completed_at": self.engine._now(),
+                "completed_at": now,
                 "failure_category": "stale_strategic_contract_base",
+                "pending_information_requests": (),
             }
         )
         compatibility.paused = True
@@ -1276,6 +1303,7 @@ class PlannerLifecycleCoordinator:
             AwaitingHumanTick,
             compatibility=compatibility,
             planner_request=updated_request,
+            information_round=failed_round,
             blocking_reason=reason,
         )
 

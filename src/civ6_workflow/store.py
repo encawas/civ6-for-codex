@@ -36,12 +36,15 @@ from .domain import (
     StrategicContract,
     STRATEGIC_PROPOSAL_TARGET_KINDS,
     StrategicResearchProposal,
+    StrategicProposalReadyTick,
+    StrategicProposalWaitResumedTick,
     build_strategic_contract_id,
     StrategicContractCommit,
     RuntimeState,
     TurnTransitionConfirmedTick,
     WorkflowTick,
     validate_workflow_tick,
+    validate_workflow_tick_json,
     ProviderAttemptStatus,
     canonical_json,
     canonical_json_hash,
@@ -1257,6 +1260,36 @@ class WorkflowStore:
                 )
             if request.status is not PlannerRequestStatus.COMPLETED:
                 raise ValueError("Proposal parent PlannerRequest must be COMPLETED")
+            if proposal.created_from_observation_id != request.observation_id:
+                raise ValueError(
+                    "Proposal observation identity disagrees with PlannerRequest"
+                )
+            validation = request.validation_result
+            if (
+                validation is None
+                or validation.get("proposal_id") != proposal.proposal_id
+                or validation.get("proposal_hash") != proposal.proposal_hash
+            ):
+                raise ValueError(
+                    "Proposal identity disagrees with PlannerRequest validation result"
+                )
+            projection_context = request.input_projection.get(
+                "strategic_proposal_context", request.input_projection
+            )
+            if not isinstance(projection_context, Mapping):
+                raise ValueError("Proposal PlannerRequest input projection is missing")
+            expected_projection = {
+                "target_contract_id": proposal.target_contract_id,
+                "expected_base_revision": proposal.expected_base_revision,
+                "strategic_scope": "research",
+            }
+            if any(
+                projection_context.get(key) != value
+                for key, value in expected_projection.items()
+            ):
+                raise ValueError(
+                    "Proposal identity disagrees with frozen input projection"
+                )
             cls._validate_strategic_proposal_target(proposal, request)
             cls._validate_strategic_proposal_attempt(
                 proposal, request, normalized_attempts
@@ -1277,8 +1310,307 @@ class WorkflowStore:
                 raise ValueError("non-COMPLETED PlannerRequest cannot own Proposal")
 
     @classmethod
-    def _validate_phase1b_proposals_v10(cls, conn: sqlite3.Connection) -> None:
+    def _workflow_tick_from_row(cls, row: Mapping[str, Any]) -> WorkflowTick:
+        required = {
+            "tick_id",
+            "game_id",
+            "turn",
+            "outcome",
+            "starting_runtime_state",
+            "ending_runtime_state",
+            "observation_ids_json",
+            "mutation_budget_used",
+            "planner_request_id",
+            "started_at",
+            "completed_at",
+            "tick_json",
+        }
+        missing = required - row.keys()
+        if missing:
+            raise ValueError(f"WorkflowTick row is missing columns: {sorted(missing)}")
+        try:
+            tick = validate_workflow_tick_json(str(row["tick_json"]))
+        except Exception as exc:
+            raise ValueError("invalid WorkflowTick JSON") from exc
+        checks = {
+            "tick_id": tick.tick_id,
+            "game_id": tick.game_session_id,
+            "turn": tick.turn_number,
+            "outcome": tick.outcome.value,
+            "starting_runtime_state": tick.starting_runtime_state.value,
+            "ending_runtime_state": tick.ending_runtime_state.value,
+            "mutation_budget_used": tick.mutation_budget_used,
+            "planner_request_id": getattr(tick, "planner_request_id", None),
+        }
+        for column, expected in checks.items():
+            actual = row[column]
+            if column in {"turn", "mutation_budget_used"}:
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"WorkflowTick {column} must be an integer"
+                    ) from exc
+            elif actual is not None:
+                actual = str(actual)
+            if actual != expected:
+                raise ValueError(f"WorkflowTick {column} conflicts with tick_json")
+        try:
+            observation_ids = tuple(cls._load(str(row["observation_ids_json"])))
+        except Exception as exc:
+            raise ValueError("invalid WorkflowTick observation IDs") from exc
+        if observation_ids != tick.observation_ids:
+            raise ValueError("WorkflowTick observation IDs conflict with tick_json")
+        for column, expected in (
+            ("started_at", tick.started_at),
+            ("completed_at", tick.completed_at),
+        ):
+            if cls._parse_audit_datetime(row[column], column) != expected:
+                raise ValueError(f"WorkflowTick {column} conflicts with tick_json")
+        return tick
+
+    @classmethod
+    def _validate_strategic_information_round_state(
+        cls,
+        requests: Mapping[str, PlannerRequest],
+        round_rows: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        rounds_by_request: dict[str, list[InformationRound]] = {}
+        seen_round_ids: set[str] = set()
+        seen_numbers: set[tuple[str, int]] = set()
+        for source_row in round_rows:
+            normalized = cls._normalize_information_round_row(source_row)
+            round_record = InformationRound.model_validate_json(
+                str(normalized["round_json"])
+            )
+            parent = requests.get(round_record.planner_request_id)
+            if parent is None:
+                raise ValueError(
+                    "InformationRound parent PlannerRequest does not exist"
+                )
+            if parent.game_session_id != str(normalized["game_id"]):
+                raise ValueError("InformationRound game disagrees with PlannerRequest")
+            if parent.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                continue
+            if require_canonical and dict(source_row) != normalized:
+                raise ValueError("strategic InformationRound row is not canonical")
+            if round_record.information_round_id in seen_round_ids:
+                raise ValueError("duplicate strategic InformationRound identity")
+            seen_round_ids.add(round_record.information_round_id)
+            number_key = (
+                round_record.planner_request_id,
+                round_record.round_number,
+            )
+            if number_key in seen_numbers:
+                raise ValueError("duplicate strategic InformationRound number")
+            seen_numbers.add(number_key)
+            rounds_by_request.setdefault(round_record.planner_request_id, []).append(
+                round_record
+            )
+
+        for request in requests.values():
+            if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                continue
+            rounds = sorted(
+                rounds_by_request.get(request.planner_request_id, []),
+                key=lambda item: item.round_number,
+            )
+            requested = [
+                item
+                for item in rounds
+                if item.status is InformationRoundStatus.REQUESTED
+            ]
+            if request.status is PlannerRequestStatus.AWAITING_INFORMATION:
+                if not request.pending_information_requests:
+                    raise ValueError(
+                        "strategic AWAITING_INFORMATION Request requires pending inputs"
+                    )
+                if (
+                    len(requested) != 1
+                    or not rounds
+                    or requested[0].round_number != rounds[-1].round_number
+                ):
+                    raise ValueError(
+                        "strategic AWAITING_INFORMATION Request requires one latest "
+                        "REQUESTED InformationRound"
+                    )
+                if canonical_json(requested[0].requests) != canonical_json(
+                    request.pending_information_requests
+                ):
+                    raise ValueError(
+                        "strategic InformationRound requests disagree with "
+                        "PlannerRequest pending inputs"
+                    )
+            elif request.status in TERMINAL_PLANNER_STATUSES:
+                if request.pending_information_requests:
+                    raise ValueError(
+                        "terminal strategic PlannerRequest cannot retain pending inputs"
+                    )
+                if requested:
+                    raise ValueError(
+                        "terminal strategic PlannerRequest cannot retain a REQUESTED "
+                        "InformationRound"
+                    )
+
+    @classmethod
+    def _validate_strategic_proposal_lifecycle_v10(
+        cls,
+        proposal_rows: Sequence[Mapping[str, Any]],
+        request_rows: Sequence[Mapping[str, Any]],
+        attempt_rows: Sequence[Mapping[str, Any]],
+        information_round_rows: Sequence[Mapping[str, Any]],
+        tick_rows: Sequence[Mapping[str, Any]],
+        runtime_rows: Sequence[Mapping[str, Any]],
+        workflow_meta_rows: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
         cls._validate_strategic_proposal_state(
+            proposal_rows,
+            request_rows,
+            attempt_rows,
+            require_canonical=require_canonical,
+        )
+        requests: dict[str, PlannerRequest] = {}
+        for row in request_rows:
+            normalized = cls._normalize_planner_request_row(
+                row, validate_response_contract=True
+            )
+            request = PlannerRequest.model_validate_json(
+                str(normalized["request_json"])
+            )
+            if request.planner_request_id in requests:
+                raise ValueError("duplicate PlannerRequest identity")
+            requests[request.planner_request_id] = request
+        cls._validate_strategic_information_round_state(
+            requests,
+            information_round_rows,
+            require_canonical=require_canonical,
+        )
+
+        proposals: dict[str, StrategicResearchProposal] = {}
+        for row in proposal_rows:
+            normalized = cls._normalize_strategic_research_proposal_row(row)
+            proposal = StrategicResearchProposal.model_validate_json(
+                str(normalized["proposal_json"])
+            )
+            proposals[proposal.proposal_id] = proposal
+
+        ticks = [cls._workflow_tick_from_row(row) for row in tick_rows]
+        ready_by_proposal: dict[str, list[StrategicProposalReadyTick]] = {}
+        resumed_by_proposal: dict[str, list[StrategicProposalWaitResumedTick]] = {}
+        for tick in ticks:
+            if isinstance(tick, StrategicProposalReadyTick):
+                ready_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+            elif isinstance(tick, StrategicProposalWaitResumedTick):
+                resumed_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+
+        runtime_by_game: dict[str, RuntimeState] = {}
+        for row in runtime_rows:
+            game_id = str(row["game_id"])
+            if game_id in runtime_by_game:
+                raise ValueError("duplicate RuntimeState game identity")
+            runtime_by_game[game_id] = RuntimeState(str(row["state"]))
+
+        wait_by_game: dict[str, dict[str, Any]] = {}
+        for row in workflow_meta_rows:
+            key = str(row["key"])
+            if not key.startswith("human_wait:"):
+                continue
+            game_id = key.split(":", 1)[1]
+            if game_id in wait_by_game:
+                raise ValueError("duplicate Human Wait context")
+            context = cls._load(str(row["value_json"]))
+            if not isinstance(context, dict):
+                raise ValueError("Human Wait context must be an object")
+            wait_by_game[game_id] = context
+
+        unresolved_by_game: dict[str, StrategicResearchProposal] = {}
+        for proposal in proposals.values():
+            ready_ticks = ready_by_proposal.get(proposal.proposal_id, [])
+            if len(ready_ticks) != 1:
+                raise ValueError(
+                    "Proposal requires exactly one matching Proposal-ready Tick"
+                )
+            ready = ready_ticks[0]
+            if (
+                ready.game_session_id != proposal.game_session_id
+                or ready.planner_request_id != proposal.source_planner_request_id
+                or ready.target_kind is not proposal.target_kind
+                or ready.expected_base_revision != proposal.expected_base_revision
+            ):
+                raise ValueError("Proposal-ready Tick identity disagrees with Proposal")
+            resumed_ticks = resumed_by_proposal.get(proposal.proposal_id, [])
+            if len(resumed_ticks) > 1:
+                raise ValueError("Proposal cannot have two wait-resumed Ticks")
+            if resumed_ticks:
+                resumed = resumed_ticks[0]
+                if (
+                    resumed.game_session_id != proposal.game_session_id
+                    or resumed.planner_request_id != proposal.source_planner_request_id
+                    or resumed.target_kind is not proposal.target_kind
+                    or resumed.expected_base_revision != proposal.expected_base_revision
+                ):
+                    raise ValueError(
+                        "Proposal wait-resumed Tick identity disagrees with Proposal"
+                    )
+                if resumed.started_at <= ready.completed_at:
+                    raise ValueError(
+                        "Proposal wait-resumed Tick must follow Proposal-ready Tick"
+                    )
+                continue
+            if proposal.game_session_id in unresolved_by_game:
+                raise ValueError("a game cannot have two unresolved Proposal waits")
+            unresolved_by_game[proposal.game_session_id] = proposal
+
+        for proposal_id in ready_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError("Proposal-ready Tick references an unknown Proposal")
+        for proposal_id in resumed_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError(
+                    "Proposal wait-resumed Tick references an unknown Proposal"
+                )
+
+        for game_id, proposal in unresolved_by_game.items():
+            if runtime_by_game.get(game_id) is not RuntimeState.AWAITING_HUMAN:
+                raise ValueError(
+                    "unresolved Proposal wait requires AWAITING_HUMAN RuntimeState"
+                )
+            context = wait_by_game.get(game_id)
+            if context is None:
+                raise ValueError("unresolved Proposal wait requires Human Wait context")
+            expected = {
+                "wait_kind": "strategic_contract_proposal_ready",
+                "resume_policy": "explicit_only",
+                "reason": "strategic_contract_proposal_ready",
+                "planner_request_id": proposal.source_planner_request_id,
+                "proposal_id": proposal.proposal_id,
+                "target_kind": proposal.target_kind.value,
+                "expected_base_revision": proposal.expected_base_revision,
+            }
+            if any(context.get(key) != value for key, value in expected.items()):
+                raise ValueError(
+                    "Proposal Human Wait context disagrees with unresolved Proposal"
+                )
+            if type(context.get("resume_requested")) is not bool:
+                raise ValueError("Proposal Human Wait resume_requested must be a bool")
+
+        for game_id, context in wait_by_game.items():
+            if context.get("wait_kind") != "strategic_contract_proposal_ready":
+                continue
+            proposal = unresolved_by_game.get(game_id)
+            if proposal is None:
+                raise ValueError(
+                    "special Proposal Human Wait context references a resolved "
+                    "or unknown Proposal"
+                )
+
+    @classmethod
+    def _validate_phase1b_proposals_v10(cls, conn: sqlite3.Connection) -> None:
+        cls._validate_strategic_proposal_lifecycle_v10(
             [
                 dict(row)
                 for row in conn.execute(
@@ -1295,6 +1627,32 @@ class WorkflowStore:
                 dict(row)
                 for row in conn.execute(
                     "SELECT * FROM provider_attempts ORDER BY planner_request_id, attempt_number"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM information_rounds "
+                    "ORDER BY planner_request_id, round_number"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_ticks ORDER BY started_at, tick_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM runtime_state ORDER BY game_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_meta WHERE key LIKE 'human_wait:%' "
+                    "ORDER BY key"
                 ).fetchall()
             ],
             require_canonical=True,
@@ -2364,7 +2722,17 @@ class WorkflowStore:
         self, proposal: StrategicResearchProposal
     ) -> StrategicResearchProposal:
         with self._connect() as conn:
-            saved = self._save_strategic_research_proposal_in_connection(conn, proposal)
+            existing_row = conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE proposal_id=?",
+                (proposal.proposal_id,),
+            ).fetchone()
+            if existing_row is None:
+                raise ValueError(
+                    "new Proposal requires the complete Proposal-ready Tick transaction"
+                )
+            saved = self._strategic_research_proposal_from_row(existing_row)
+            if saved != proposal:
+                raise ValueError("Proposal identity was reused with new content")
             self._validate_phase1b_proposals_v10(conn)
             return saved
 
@@ -3737,6 +4105,7 @@ class WorkflowStore:
         tick = validate_workflow_tick(tick)
         with self._connect() as conn:
             self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1b_proposals_v10(conn)
 
     def persist_tick_and_runtime_state(
         self,
@@ -3823,6 +4192,7 @@ class WorkflowStore:
             if checkpoint is not None:
                 checkpoint("after_runtime_state_update")
             self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1b_proposals_v10(conn)
         return failure_resolution
 
     def finalize_attempt_success(
@@ -5169,7 +5539,6 @@ class WorkflowStore:
                 self._save_strategic_research_proposal_in_connection(
                     conn, strategic_research_proposal
                 )
-                self._validate_phase1b_proposals_v10(conn)
             if information_round is not None:
                 self._save_information_round_in_connection(
                     conn, tick.game_session_id, information_round
@@ -5215,6 +5584,7 @@ class WorkflowStore:
                 human_wait_context,
             )
             self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1b_proposals_v10(conn)
 
     def planner_metrics(self, game_id: str) -> dict[str, Any]:
         with self._connect() as conn:
@@ -5519,7 +5889,35 @@ class WorkflowStore:
                 (game_id,),
             ).fetchall()
         ]
-        cls._validate_strategic_proposal_state(
+        external_information_rounds = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM information_rounds WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_ticks = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM workflow_ticks WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_runtime = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM runtime_state WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_wait_meta = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM workflow_meta WHERE key LIKE 'human_wait:%' AND key<>?",
+                (cls._human_wait_meta_key(game_id),),
+            ).fetchall()
+        ]
+        cls._validate_strategic_proposal_lifecycle_v10(
             [
                 *external_proposals,
                 *prepared["strategic_research_proposals"],
@@ -5532,6 +5930,13 @@ class WorkflowStore:
                 *external_attempts,
                 *prepared["provider_attempts"],
             ],
+            [
+                *external_information_rounds,
+                *prepared["information_rounds"],
+            ],
+            [*external_ticks, *prepared["workflow_ticks"]],
+            [*external_runtime, *prepared["runtime_state"]],
+            [*external_wait_meta, *prepared["workflow_meta"]],
             require_canonical=True,
         )
         external_roots = [

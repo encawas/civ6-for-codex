@@ -1428,6 +1428,13 @@ def test_all_target_kinds_reuse_provider_attempts_and_information_rounds(tmp_pat
             requested_at=NOW,
         )
         store.save_information_round("game-1", round_record)
+        failed_round = round_record.model_copy(
+            update={
+                "status": InformationRoundStatus.FAILED,
+                "completed_at": NOW + timedelta(seconds=1),
+            }
+        )
+        store.save_information_round("game-1", failed_round)
         failed = in_progress.model_copy(
             update={
                 "status": PlannerRequestStatus.FAILED,
@@ -1441,7 +1448,7 @@ def test_all_target_kinds_reuse_provider_attempts_and_information_rounds(tmp_pat
             ProviderAttemptStatus.ABANDONED
         )
         assert store.list_information_rounds(request.planner_request_id) == [
-            round_record
+            failed_round
         ]
 
 

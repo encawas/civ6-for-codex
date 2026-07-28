@@ -41,6 +41,7 @@ class TickOutcomeKind(StrEnum):
     LOGICAL_PLANNER_REQUEST_CREATED = "LOGICAL_PLANNER_REQUEST_CREATED"
     PLANNER_ATTEMPT_COMPLETED = "PLANNER_ATTEMPT_COMPLETED"
     STRATEGIC_PROPOSAL_READY = "STRATEGIC_PROPOSAL_READY"
+    STRATEGIC_PROPOSAL_WAIT_RESUMED = "STRATEGIC_PROPOSAL_WAIT_RESUMED"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
     INFORMATION_COLLECTED = "INFORMATION_COLLECTED"
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
@@ -170,6 +171,23 @@ class StrategicProposalReadyTick(TickRecord):
     ]
     expected_base_revision: int = Field(ge=0)
     blocking_reason: str = Field(min_length=1)
+
+
+class StrategicProposalWaitResumedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+    )
+    starting_runtime_state: Literal[RuntimeState.AWAITING_HUMAN]
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    proposal_id: str
+    target_kind: Literal[
+        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+    ]
+    expected_base_revision: int = Field(ge=0)
+    resume_reason: Literal["explicit_user_resume"] = "explicit_user_resume"
 
 
 class InformationRequestedTick(TickRecord):
@@ -394,6 +412,7 @@ WorkflowTick: TypeAlias = Annotated[
     | LogicalPlannerRequestCreatedTick
     | PlannerAttemptCompletedTick
     | StrategicProposalReadyTick
+    | StrategicProposalWaitResumedTick
     | InformationRequestedTick
     | InformationCollectedTick
     | ContextGatheredTick
