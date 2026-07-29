@@ -24,6 +24,7 @@ from civ6_workflow.domain import (
     RuntimeState,
     StrategicContract,
     StrategicContractCommit,
+    StrategicProposalWaitErrorTick,
     StrategicProposalWaitResumedTick,
     SubjectRef,
     TickOutcomeKind,
@@ -2506,3 +2507,206 @@ def test_requested_resume_survives_wait_error_restart_and_replay(tmp_path, monke
     assert restored.get_active_strategic_contract("game-1") is not None
     assert restored.list_tasks("game-1") == []
     assert resume_planner.calls == 0
+
+
+@pytest.mark.parametrize("kind", ["creation", "repair"])
+def test_stale_contract_base_supersedes_strategic_backoff(tmp_path, kind):
+    async def scenario():
+        path = tmp_path / f"strategic-backoff-stale-{kind}.sqlite3"
+        store = WorkflowStore(path)
+        if kind == "creation":
+            request = _request("game-1")
+        else:
+            active = _commit_contract(store, "game-1")
+            request = _request(
+                "game-1",
+                kind=PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+                contract_id=active.contract_id,
+                base_revision=active.revision,
+            )
+        planner = _Planner(TimeoutError("transport failed"))
+        store.save_planner_request(request)
+        engine = _engine(store, _Game(), planner)
+
+        await engine.tick()
+
+        backoff = store.get_planner_request(request.planner_request_id)
+        assert backoff.status is PlannerRequestStatus.BACKOFF
+        assert backoff.next_retry_at is not None
+        if kind == "creation":
+            _commit_contract(store, "game-1")
+        else:
+            _commit_contract(store, "game-1", revision=2)
+
+        result = await engine.tick()
+
+        stored = store.get_planner_request(request.planner_request_id)
+        assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert result.runtime_state == RuntimeState.AWAITING_HUMAN.value
+        assert stored.status is PlannerRequestStatus.SUPERSEDED
+        assert stored.failure_category == "stale_strategic_contract_base"
+        assert stored.next_retry_at is None
+        assert planner.calls == 1
+        WorkflowStore(path)
+        _assert_replay_round_trip(tmp_path, store, f"strategic-backoff-stale-{kind}")
+
+    asyncio.run(scenario())
+
+
+def test_creation_with_explicit_contract_id_uses_that_identity_for_staleness(
+    tmp_path,
+):
+    custom_contract_id = "contract-custom"
+    request = _request("game-1", contract_id=custom_contract_id)
+    forged = request.model_copy(
+        update={
+            "status": PlannerRequestStatus.SUPERSEDED,
+            "failure_category": "stale_strategic_contract_base",
+            "completed_at": NOW + timedelta(minutes=3),
+        }
+    )
+    tick = AwaitingHumanTick(
+        tick_id="tick-explicit-contract-superseded",
+        game_session_id="game-1",
+        turn_number=1,
+        starting_runtime_state=RuntimeState.REQUESTING_PLAN,
+        observation_ids=("obs-explicit-contract-superseded",),
+        started_at=NOW + timedelta(minutes=3),
+        completed_at=NOW + timedelta(minutes=3, seconds=1),
+        blocking_reason="explicit Contract base became stale",
+    )
+
+    invalid_path = tmp_path / "explicit-contract-not-stale.sqlite3"
+    invalid_store = WorkflowStore(invalid_path)
+    invalid_store.save_planner_request(request)
+    before = invalid_store.export_replay_state("game-1")
+    with pytest.raises(ValueError, match="SUPERSEDED"):
+        invalid_store.persist_phase4_tick(tick, planner_request=forged)
+    assert invalid_store.export_replay_state("game-1") == before
+
+    invalid_replay = copy.deepcopy(before)
+    row = invalid_replay["tables"]["logical_planner_requests"][0]
+    row["status"] = forged.status.value
+    row["completed_at"] = forged.completed_at.isoformat()
+    row["request_json"] = WorkflowStore._dump(forged.model_dump(mode="json"))
+    _assert_invalid_replay_preserves_target(
+        tmp_path, invalid_replay, "explicit-contract-not-stale"
+    )
+
+    with sqlite3.connect(invalid_path) as conn:
+        conn.execute(
+            """
+            UPDATE logical_planner_requests
+            SET status=?, completed_at=?, request_json=?
+            WHERE planner_request_id=?
+            """,
+            (
+                forged.status.value,
+                forged.completed_at.isoformat(),
+                WorkflowStore._dump(forged.model_dump(mode="json")),
+                forged.planner_request_id,
+            ),
+        )
+    with pytest.raises(ValueError, match="SUPERSEDED"):
+        WorkflowStore(invalid_path)
+
+    valid_path = tmp_path / "explicit-contract-now-stale.sqlite3"
+    valid_store = WorkflowStore(valid_path)
+    valid_store.save_planner_request(request)
+    _commit_contract(valid_store, "game-1")
+    valid_store.persist_phase4_tick(tick, planner_request=forged)
+    assert (
+        valid_store.get_planner_request(request.planner_request_id).status
+        is PlannerRequestStatus.SUPERSEDED
+    )
+    WorkflowStore(valid_path)
+    _assert_replay_round_trip(tmp_path, valid_store, "explicit-contract-now-stale")
+
+
+def test_wait_error_tick_cannot_be_appended_after_proposal_resume(tmp_path):
+    async def scenario():
+        path = tmp_path / "proposal-wait-error-after-resume.sqlite3"
+        store, request, proposal, _attempt = await _completed_proposal_state(
+            path, repair=True
+        )
+        ready = _proposal_ready_tick(store, proposal.proposal_id)
+        error_tick = StrategicProposalWaitErrorTick(
+            tick_id="tick-proposal-wait-error-before-resume",
+            game_session_id="game-1",
+            turn_number=ready.turn_number,
+            starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+            observation_ids=("obs-wait-error-before-resume",),
+            started_at=ready.completed_at + timedelta(seconds=1),
+            completed_at=ready.completed_at + timedelta(seconds=2),
+            blocking_reason="Proposal wait preflight failed",
+            error_category="TimeoutError",
+            diagnostic_summary="snapshot unavailable",
+            proposal_ready_tick_id=ready.tick_id,
+            planner_request_id=request.planner_request_id,
+            proposal_id=proposal.proposal_id,
+            target_kind=proposal.target_kind,
+            expected_base_revision=proposal.expected_base_revision,
+        )
+        context = store.human_wait_context("game-1")
+        context["blocking_reason"] = error_tick.blocking_reason
+        store.persist_phase4_tick(error_tick, human_wait_context=context)
+        assert store.request_human_resume("game-1") is True
+        planner = _Planner()
+        resume_engine = _engine(store, _Game(), planner)
+        resume_engine._now = lambda: error_tick.completed_at + timedelta(seconds=1)
+        resumed_result = await resume_engine.tick()
+        assert resumed_result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+        )
+        resumed = next(
+            tick
+            for tick in store.list_workflow_ticks("game-1")
+            if tick.outcome is TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+        )
+        forged = error_tick.model_copy(
+            update={
+                "tick_id": "tick-proposal-wait-error-after-resume",
+                "started_at": resumed.completed_at + timedelta(seconds=1),
+                "completed_at": resumed.completed_at + timedelta(seconds=2),
+            }
+        )
+        before = store.export_replay_state("game-1")
+        with pytest.raises(ValueError, match="persisted atomically"):
+            store.save_workflow_tick(forged)
+        assert store.export_replay_state("game-1") == before
+        assert planner.calls == 0
+        return path, store, resumed
+
+    path, store, resumed = asyncio.run(scenario())
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    error_row = _workflow_tick_replay_row(
+        invalid, TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_ERROR
+    )
+    error_payload = WorkflowStore._load(error_row["tick_json"])
+    error_started_at = resumed.completed_at + timedelta(seconds=1)
+    error_completed_at = resumed.completed_at + timedelta(seconds=2)
+    error_payload["started_at"] = error_started_at.isoformat()
+    error_payload["completed_at"] = error_completed_at.isoformat()
+    error_row["started_at"] = error_started_at.isoformat()
+    error_row["completed_at"] = error_completed_at.isoformat()
+    error_row["tick_json"] = WorkflowStore._dump(error_payload)
+    _assert_invalid_replay_preserves_target(
+        tmp_path, invalid, "wait-error-after-resume"
+    )
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE workflow_ticks
+            SET started_at=?, completed_at=?, tick_json=?
+            WHERE tick_id=?
+            """,
+            (
+                error_row["started_at"],
+                error_row["completed_at"],
+                error_row["tick_json"],
+                error_row["tick_id"],
+            ),
+        )
+    with pytest.raises(ValueError, match="after Proposal wait resumed"):
+        WorkflowStore(path)

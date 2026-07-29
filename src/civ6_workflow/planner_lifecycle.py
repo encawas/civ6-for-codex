@@ -1293,6 +1293,7 @@ class PlannerLifecycleCoordinator:
                 "completed_at": now,
                 "failure_category": "stale_strategic_contract_base",
                 "pending_information_requests": (),
+                "next_retry_at": None,
             }
         )
         compatibility.paused = True

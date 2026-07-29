@@ -1909,7 +1909,10 @@ class WorkflowStore:
     ) -> bool:
         target = request.target
         if target.kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
-            target_contract_id = build_strategic_contract_id(request.game_session_id)
+            target_contract_id = (
+                target.strategic_contract_id
+                or build_strategic_contract_id(request.game_session_id)
+            )
             expected_base_revision = 0
             base_is_stale = contract_root is not None
         elif target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR:
@@ -2133,6 +2136,13 @@ class WorkflowStore:
                 if resumed.completed_at < resume_request.requested_at:
                     raise ValueError(
                         "Proposal wait-resumed Tick precedes its Resume Request"
+                    )
+                if any(
+                    error_tick.completed_at > resumed.started_at
+                    for error_tick in errors_by_proposal.get(proposal.proposal_id, [])
+                ):
+                    raise ValueError(
+                        "Proposal wait-error Tick occurred after Proposal wait resumed"
                     )
                 continue
             if proposal.game_session_id in unresolved_by_game:
@@ -4908,6 +4918,10 @@ class WorkflowStore:
 
     def save_workflow_tick(self, tick: WorkflowTick) -> None:
         tick = validate_workflow_tick(tick)
+        if isinstance(tick, StrategicProposalWaitErrorTick):
+            raise ValueError(
+                "Strategic Proposal wait-error Tick must be persisted atomically"
+            )
         with self._connect() as conn:
             self._insert_workflow_tick_in_connection(conn, tick)
             self._validate_phase1b_proposals_v10(conn)
