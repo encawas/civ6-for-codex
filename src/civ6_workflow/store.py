@@ -1944,6 +1944,42 @@ class WorkflowStore:
         return base_is_stale or projection_is_stale
 
     @classmethod
+    def _validate_explicit_wait_tick_interval(
+        cls,
+        ticks: Sequence[WorkflowTick],
+        opening_tick: WorkflowTick,
+        resumed_tick: WorkflowTick | None,
+        allowed_tick_types: tuple[type[Any], ...],
+        *,
+        label: str,
+    ) -> None:
+        for tick in ticks:
+            if (
+                tick.game_session_id != opening_tick.game_session_id
+                or tick.tick_id == opening_tick.tick_id
+                or (resumed_tick is not None and tick.tick_id == resumed_tick.tick_id)
+                or tick.completed_at <= opening_tick.completed_at
+                or (
+                    resumed_tick is not None
+                    and tick.started_at > resumed_tick.started_at
+                )
+            ):
+                continue
+            if (
+                not isinstance(tick, allowed_tick_types)
+                or tick.starting_runtime_state is not RuntimeState.AWAITING_HUMAN
+                or tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN
+                or tick.started_at < opening_tick.completed_at
+                or (
+                    resumed_tick is not None
+                    and tick.completed_at > resumed_tick.started_at
+                )
+            ):
+                raise ValueError(
+                    f"{label} explicit-only wait interval contains an invalid Tick"
+                )
+
+    @classmethod
     def _validate_strategic_terminal_wait_state(
         cls,
         requests: Mapping[str, PlannerRequest],
@@ -2077,30 +2113,21 @@ class WorkflowStore:
                     raise ValueError(
                         "strategic Request wait-error Tick occurred after wait resumed"
                     )
-                if any(
-                    tick.tick_id != resumed.tick_id
-                    and tick.game_session_id == request.game_session_id
-                    and termination.completed_at
-                    <= tick.started_at
-                    <= resumed.started_at
-                    and tick.starting_runtime_state is RuntimeState.AWAITING_HUMAN
-                    and tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN
-                    for tick in ticks
-                ):
-                    raise ValueError(
-                        "only a strategic Request wait-resumed Tick may leave the wait"
-                    )
-                continue
-            if any(
-                tick.game_session_id == request.game_session_id
-                and tick.started_at >= termination.completed_at
-                and tick.starting_runtime_state is RuntimeState.AWAITING_HUMAN
-                and tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN
-                for tick in ticks
-            ):
-                raise ValueError(
-                    "strategic Request termination wait has no resumed Tick"
+                cls._validate_explicit_wait_tick_interval(
+                    ticks,
+                    termination,
+                    resumed,
+                    (AwaitingHumanTick, StrategicRequestWaitErrorTick),
+                    label="strategic Request terminal",
                 )
+                continue
+            cls._validate_explicit_wait_tick_interval(
+                ticks,
+                termination,
+                None,
+                (AwaitingHumanTick, StrategicRequestWaitErrorTick),
+                label="strategic Request terminal",
+            )
             if request.game_session_id in unresolved_by_game:
                 raise ValueError(
                     "a game cannot have two unresolved strategic Request waits"
@@ -2377,7 +2404,21 @@ class WorkflowStore:
                     raise ValueError(
                         "Proposal wait-error Tick occurred after Proposal wait resumed"
                     )
+                cls._validate_explicit_wait_tick_interval(
+                    ticks,
+                    ready,
+                    resumed,
+                    (AwaitingHumanTick, StrategicProposalWaitErrorTick),
+                    label="strategic Proposal",
+                )
                 continue
+            cls._validate_explicit_wait_tick_interval(
+                ticks,
+                ready,
+                None,
+                (AwaitingHumanTick, StrategicProposalWaitErrorTick),
+                label="strategic Proposal",
+            )
             if proposal.game_session_id in unresolved_by_game:
                 raise ValueError("a game cannot have two unresolved Proposal waits")
             unresolved_by_game[proposal.game_session_id] = (proposal, resume_request)

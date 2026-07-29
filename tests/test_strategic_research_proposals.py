@@ -1194,12 +1194,12 @@ def _change_replay_tick(state, outcome, **updates):
             row[column] = value.value if hasattr(value, "value") else value
 
 
-def _assert_invalid_replay_preserves_target(tmp_path, invalid, label):
+def _assert_invalid_replay_preserves_target(tmp_path, invalid, label, *, match=None):
     target, _request_record, _proposal, _attempt = asyncio.run(
         _completed_proposal_state(tmp_path / f"invalid-target-{label}.sqlite3")
     )
     before = target.export_replay_state("game-1")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=match):
         target.import_replay_state(invalid)
     assert target.export_replay_state("game-1") == before
 
@@ -3289,3 +3289,185 @@ def test_nonterminal_strategic_request_rejects_orphan_wait_tick():
             {},
             {},
         )
+
+
+def _append_forged_observed_replay_tick(
+    state,
+    *,
+    tick_id,
+    started_at,
+    completed_at,
+):
+    template = state["tables"]["workflow_ticks"][0]
+    tick = ObservedOnlyTick(
+        tick_id=tick_id,
+        game_session_id=template["game_id"],
+        turn_number=template["turn"],
+        starting_runtime_state=RuntimeState.OBSERVING,
+        observation_ids=(f"obs-{tick_id}",),
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+    row = copy.deepcopy(template)
+    row.update(
+        {
+            "tick_id": tick.tick_id,
+            "game_id": tick.game_session_id,
+            "turn": tick.turn_number,
+            "outcome": tick.outcome.value,
+            "starting_runtime_state": tick.starting_runtime_state.value,
+            "ending_runtime_state": tick.ending_runtime_state.value,
+            "observation_ids_json": WorkflowStore._dump(list(tick.observation_ids)),
+            "mutation_budget_used": tick.mutation_budget_used,
+            "selected_task_id": None,
+            "action_attempt_id": None,
+            "planner_request_id": None,
+            "started_at": tick.started_at.isoformat(),
+            "completed_at": tick.completed_at.isoformat(),
+            "metrics_json": WorkflowStore._dump({}),
+            "tick_json": tick.model_dump_json(),
+        }
+    )
+    state["tables"]["workflow_ticks"].append(row)
+    metric_template = state["tables"]["turn_metrics"][0]
+    metric = copy.deepcopy(metric_template)
+    metric.update(
+        {
+            "tick_id": tick.tick_id,
+            "game_id": tick.game_session_id,
+            "turn": tick.turn_number,
+            "metrics_json": WorkflowStore._dump({}),
+        }
+    )
+    state["tables"]["turn_metrics"].append(metric)
+    return row, metric
+
+
+def _insert_forged_replay_tick(path, row, metric):
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO workflow_ticks(
+                tick_id, game_id, turn, outcome,
+                starting_runtime_state, ending_runtime_state,
+                observation_ids_json, mutation_budget_used,
+                selected_task_id, action_attempt_id,
+                planner_request_id, started_at, completed_at,
+                metrics_json, tick_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["tick_id"],
+                row["game_id"],
+                row["turn"],
+                row["outcome"],
+                row["starting_runtime_state"],
+                row["ending_runtime_state"],
+                row["observation_ids_json"],
+                row["mutation_budget_used"],
+                row["selected_task_id"],
+                row["action_attempt_id"],
+                row["planner_request_id"],
+                row["started_at"],
+                row["completed_at"],
+                row["metrics_json"],
+                row["tick_json"],
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO turn_metrics(tick_id, game_id, turn, metrics_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                metric["tick_id"],
+                metric["game_id"],
+                metric["turn"],
+                metric["metrics_json"],
+            ),
+        )
+
+
+@pytest.mark.parametrize("resolved", [False, True], ids=["unresolved", "resolved"])
+def test_terminal_wait_interval_rejects_forged_nonwaiting_tick(tmp_path, resolved):
+    path = tmp_path / f"terminal-interval-{resolved}.sqlite3"
+    store, _request_record, terminal = asyncio.run(
+        _terminal_strategic_request_state(path, PlannerRequestStatus.FAILED)
+    )
+    resumed = None
+    if resolved:
+        assert store.request_human_resume("game-1") is True
+        result = asyncio.run(_engine(store, _Game(), _Planner()).tick())
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED
+        )
+        resumed = next(
+            tick
+            for tick in store.list_workflow_ticks("game-1")
+            if isinstance(tick, StrategicRequestWaitResumedTick)
+        )
+        started_at = terminal.completed_at + timedelta(microseconds=1)
+        assert started_at < resumed.started_at
+    else:
+        started_at = max(
+            tick.completed_at for tick in store.list_workflow_ticks("game-1")
+        ) + timedelta(microseconds=1)
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    row, metric = _append_forged_observed_replay_tick(
+        invalid,
+        tick_id=f"tick-forged-terminal-interval-{resolved}",
+        started_at=started_at,
+        completed_at=started_at,
+    )
+
+    _assert_invalid_replay_preserves_target(
+        tmp_path,
+        invalid,
+        f"terminal-interval-{resolved}",
+        match="explicit-only wait interval",
+    )
+
+    _insert_forged_replay_tick(path, row, metric)
+    with pytest.raises(ValueError, match="explicit-only wait interval"):
+        WorkflowStore(path)
+
+
+@pytest.mark.parametrize("resolved", [False, True], ids=["unresolved", "resolved"])
+def test_proposal_wait_interval_rejects_forged_nonwaiting_tick(tmp_path, resolved):
+    path = tmp_path / f"proposal-interval-{resolved}.sqlite3"
+    if resolved:
+        store, _request_record, proposal, _active, _planner, _engine_instance = (
+            asyncio.run(_resumed_proposal_state(path))
+        )
+        ready = _proposal_ready_tick(store, proposal.proposal_id)
+        resumed = next(
+            tick
+            for tick in store.list_workflow_ticks("game-1")
+            if isinstance(tick, StrategicProposalWaitResumedTick)
+        )
+        started_at = ready.completed_at + timedelta(microseconds=1)
+        assert started_at < resumed.started_at
+    else:
+        store, _request_record, proposal, _attempt = asyncio.run(
+            _completed_proposal_state(path)
+        )
+        ready = _proposal_ready_tick(store, proposal.proposal_id)
+        started_at = ready.completed_at + timedelta(microseconds=1)
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    row, metric = _append_forged_observed_replay_tick(
+        invalid,
+        tick_id=f"tick-forged-proposal-interval-{resolved}",
+        started_at=started_at,
+        completed_at=started_at,
+    )
+
+    _assert_invalid_replay_preserves_target(
+        tmp_path,
+        invalid,
+        f"proposal-interval-{resolved}",
+        match="explicit-only wait interval",
+    )
+
+    _insert_forged_replay_tick(path, row, metric)
+    with pytest.raises(ValueError, match="explicit-only wait interval"):
+        WorkflowStore(path)
