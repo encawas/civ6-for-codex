@@ -8,6 +8,7 @@ import pytest
 
 from civ6_workflow.domain import (
     AuthorityScopeSet,
+    AwaitingHumanTick,
     InformationRequestedTick,
     InformationRound,
     InformationRoundStatus,
@@ -3291,23 +3292,8 @@ def test_nonterminal_strategic_request_rejects_orphan_wait_tick():
         )
 
 
-def _append_forged_observed_replay_tick(
-    state,
-    *,
-    tick_id,
-    started_at,
-    completed_at,
-):
+def _append_forged_replay_tick(state, tick):
     template = state["tables"]["workflow_ticks"][0]
-    tick = ObservedOnlyTick(
-        tick_id=tick_id,
-        game_session_id=template["game_id"],
-        turn_number=template["turn"],
-        starting_runtime_state=RuntimeState.OBSERVING,
-        observation_ids=(f"obs-{tick_id}",),
-        started_at=started_at,
-        completed_at=completed_at,
-    )
     row = copy.deepcopy(template)
     row.update(
         {
@@ -3320,8 +3306,8 @@ def _append_forged_observed_replay_tick(
             "observation_ids_json": WorkflowStore._dump(list(tick.observation_ids)),
             "mutation_budget_used": tick.mutation_budget_used,
             "selected_task_id": None,
-            "action_attempt_id": None,
-            "planner_request_id": None,
+            "action_attempt_id": getattr(tick, "action_attempt_id", None),
+            "planner_request_id": getattr(tick, "planner_request_id", None),
             "started_at": tick.started_at.isoformat(),
             "completed_at": tick.completed_at.isoformat(),
             "metrics_json": WorkflowStore._dump({}),
@@ -3341,6 +3327,26 @@ def _append_forged_observed_replay_tick(
     )
     state["tables"]["turn_metrics"].append(metric)
     return row, metric
+
+
+def _append_forged_observed_replay_tick(
+    state,
+    *,
+    tick_id,
+    started_at,
+    completed_at,
+):
+    template = state["tables"]["workflow_ticks"][0]
+    tick = ObservedOnlyTick(
+        tick_id=tick_id,
+        game_session_id=template["game_id"],
+        turn_number=template["turn"],
+        starting_runtime_state=RuntimeState.OBSERVING,
+        observation_ids=(f"obs-{tick_id}",),
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+    return _append_forged_replay_tick(state, tick)
 
 
 def _insert_forged_replay_tick(path, row, metric):
@@ -3578,6 +3584,14 @@ def _resume_during_snapshot_read(store, resumed_type):
     read_started = threading.Event()
     allow_read = threading.Event()
     original_read = game.read_snapshot
+    completion_floor = {"value": None}
+
+    def controlled_now():
+        current = datetime.now(UTC)
+        floor = completion_floor["value"]
+        return current if floor is None or current >= floor else floor
+
+    engine._now = controlled_now
 
     async def blocked_read(*, include_units=False):
         read_started.set()
@@ -3599,6 +3613,7 @@ def _resume_during_snapshot_read(store, resumed_type):
             authorized_at = datetime.fromisoformat(
                 store.human_wait_context("game-1")["resume_requested_at"]
             )
+        completion_floor["value"] = authorized_at + timedelta(seconds=1)
     finally:
         allow_read.set()
     thread.join(10)
@@ -3634,6 +3649,114 @@ def _terminal_resume_during_tick_state(path):
         store, StrategicRequestWaitResumedTick
     )
     return store, opening, resumed, authorized_at
+
+
+def _resume_after_existing_authorization(store, resumed_type, authorized_at):
+    engine = _engine(store, _Game(), _Planner())
+    times = iter(
+        (
+            authorized_at + timedelta(seconds=1),
+            authorized_at + timedelta(seconds=3),
+        )
+    )
+    engine._now = lambda: next(times)
+    result = asyncio.run(engine.tick())
+    resumed = next(
+        tick
+        for tick in store.list_workflow_ticks("game-1")
+        if isinstance(tick, resumed_type)
+    )
+    assert resumed.started_at > authorized_at
+    assert resumed.completed_at > resumed.started_at
+    assert result.workflow_tick["outcome"] == resumed.outcome
+    return resumed
+
+
+def _proposal_resume_before_tick_state(path):
+    store, _request_record, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(path, repair=True)
+    )
+    opening = _proposal_ready_tick(store, proposal.proposal_id)
+    assert store.request_human_resume("game-1") is True
+    authorized_at = store.list_strategic_proposal_wait_resume_requests("game-1")[
+        0
+    ].requested_at
+    resumed = _resume_after_existing_authorization(
+        store, StrategicProposalWaitResumedTick, authorized_at
+    )
+    return store, opening, resumed, authorized_at
+
+
+def _terminal_resume_before_tick_state(path):
+    store, _request_record, opening = asyncio.run(
+        _terminal_strategic_request_state(path, PlannerRequestStatus.FAILED)
+    )
+    assert store.request_human_resume("game-1") is True
+    authorized_at = datetime.fromisoformat(
+        store.human_wait_context("game-1")["resume_requested_at"]
+    )
+    resumed = _resume_after_existing_authorization(
+        store, StrategicRequestWaitResumedTick, authorized_at
+    )
+    return store, opening, resumed, authorized_at
+
+
+def _resume_transition_state(path, wait_kind, transition_case):
+    if transition_case == "authorized_during_resume":
+        setup = (
+            _proposal_resume_during_tick_state
+            if wait_kind == "proposal"
+            else _terminal_resume_during_tick_state
+        )
+    else:
+        setup = (
+            _proposal_resume_before_tick_state
+            if wait_kind == "proposal"
+            else _terminal_resume_before_tick_state
+        )
+    return setup(path)
+
+
+def _forged_resume_transition_tick(
+    opening, resumed, authorized_at, wait_kind, transition_case
+):
+    if transition_case == "authorized_before_resume":
+        assert authorized_at < resumed.started_at
+        started_at = authorized_at + (resumed.started_at - authorized_at) / 2
+        return ObservedOnlyTick(
+            tick_id=f"tick-forged-{wait_kind}-after-authorization-before-resume",
+            game_session_id="game-1",
+            turn_number=opening.turn_number,
+            starting_runtime_state=RuntimeState.OBSERVING,
+            observation_ids=(f"obs-forged-{wait_kind}-before-resume",),
+            started_at=started_at,
+            completed_at=started_at,
+        )
+    if transition_case == "authorized_during_resume":
+        assert resumed.started_at < authorized_at < resumed.completed_at
+        started_at = authorized_at + (resumed.completed_at - authorized_at) / 2
+        return ObservedOnlyTick(
+            tick_id=f"tick-forged-{wait_kind}-during-resume",
+            game_session_id="game-1",
+            turn_number=opening.turn_number,
+            starting_runtime_state=RuntimeState.OBSERVING,
+            observation_ids=(f"obs-forged-{wait_kind}-during-resume",),
+            started_at=started_at,
+            completed_at=started_at,
+        )
+    assert transition_case == "waiting_overlaps_resume"
+    started_at = opening.completed_at + (resumed.started_at - opening.completed_at) / 2
+    completed_at = resumed.started_at + (resumed.completed_at - resumed.started_at) / 2
+    return AwaitingHumanTick(
+        tick_id=f"tick-forged-{wait_kind}-waiting-overlap",
+        game_session_id="game-1",
+        turn_number=opening.turn_number,
+        starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+        observation_ids=(f"obs-forged-{wait_kind}-waiting-overlap",),
+        started_at=started_at,
+        completed_at=completed_at,
+        blocking_reason="forged waiting Tick overlaps the Resume transition",
+    )
 
 
 @pytest.mark.parametrize("wait_kind", ["proposal", "terminal"])
@@ -3691,6 +3814,71 @@ def test_startup_and_replay_reject_tick_before_resume_authorization(
         tmp_path,
         invalid,
         f"{wait_kind}-authorization-interval",
+        match="explicit-only wait interval",
+    )
+
+    _insert_forged_replay_tick(path, row, metric)
+    with pytest.raises(ValueError, match="explicit-only wait interval"):
+        WorkflowStore(path)
+
+
+@pytest.mark.parametrize("wait_kind", ["proposal", "terminal"])
+@pytest.mark.parametrize(
+    "transition_case",
+    [
+        "authorized_before_resume",
+        "authorized_during_resume",
+        "waiting_overlaps_resume",
+    ],
+)
+def test_save_workflow_tick_rejects_tick_before_resume_transition_completes(
+    tmp_path, wait_kind, transition_case
+):
+    path = tmp_path / f"{wait_kind}-{transition_case}-public-save.sqlite3"
+    store, opening, resumed, authorized_at = _resume_transition_state(
+        path, wait_kind, transition_case
+    )
+    forged = _forged_resume_transition_tick(
+        opening, resumed, authorized_at, wait_kind, transition_case
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="explicit-only wait interval"):
+        store.save_workflow_tick(forged)
+
+    assert store.export_replay_state("game-1") == before
+    WorkflowStore(path)
+    _assert_replay_round_trip(
+        tmp_path, store, f"{wait_kind}-{transition_case}-public-save"
+    )
+
+
+@pytest.mark.parametrize("wait_kind", ["proposal", "terminal"])
+@pytest.mark.parametrize(
+    "transition_case",
+    [
+        "authorized_before_resume",
+        "authorized_during_resume",
+        "waiting_overlaps_resume",
+    ],
+)
+def test_startup_and_replay_reject_tick_before_resume_transition_completes(
+    tmp_path, wait_kind, transition_case
+):
+    path = tmp_path / f"{wait_kind}-{transition_case}-replay.sqlite3"
+    store, opening, resumed, authorized_at = _resume_transition_state(
+        path, wait_kind, transition_case
+    )
+    forged = _forged_resume_transition_tick(
+        opening, resumed, authorized_at, wait_kind, transition_case
+    )
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    row, metric = _append_forged_replay_tick(invalid, forged)
+
+    _assert_invalid_replay_preserves_target(
+        tmp_path,
+        invalid,
+        f"{wait_kind}-{transition_case}-interval",
         match="explicit-only wait interval",
     )
 

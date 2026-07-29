@@ -1966,6 +1966,12 @@ class WorkflowStore:
             and resume_authorized_at < opening_tick.completed_at
         ):
             raise ValueError(f"{label} resume authorization precedes the wait")
+        if (
+            resumed_tick is not None
+            and resume_authorized_at is not None
+            and resume_authorized_at > resumed_tick.completed_at
+        ):
+            raise ValueError(f"{label} resume Tick completes before authorization")
         for tick in ticks:
             if (
                 tick.game_session_id != opening_tick.game_session_id
@@ -1973,8 +1979,8 @@ class WorkflowStore:
                 or (resumed_tick is not None and tick.tick_id == resumed_tick.tick_id)
                 or tick.completed_at <= opening_tick.completed_at
                 or (
-                    resume_authorized_at is not None
-                    and tick.started_at > resume_authorized_at
+                    resumed_tick is not None
+                    and tick.started_at >= resumed_tick.completed_at
                 )
             ):
                 continue
@@ -1983,6 +1989,10 @@ class WorkflowStore:
                 or tick.starting_runtime_state is not RuntimeState.AWAITING_HUMAN
                 or tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN
                 or tick.started_at < opening_tick.completed_at
+                or (
+                    resumed_tick is not None
+                    and tick.completed_at > resumed_tick.started_at
+                )
             ):
                 raise ValueError(
                     f"{label} explicit-only wait interval contains an invalid Tick"
