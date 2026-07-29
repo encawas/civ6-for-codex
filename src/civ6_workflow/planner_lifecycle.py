@@ -3457,6 +3457,7 @@ class PlannerLifecycleCoordinator:
                 human_wait_context.update(
                     {
                         "wait_kind": "strategic_request_terminated",
+                        "resume_policy": "explicit_only",
                         "planner_request_id": tick.planner_request_id,
                         "terminal_tick_id": tick.tick_id,
                         "terminal_status": tick.terminal_status.value,

@@ -45,6 +45,8 @@ from .domain import (
     StrategicResearchProposal,
     StrategicProposalReadyTick,
     StrategicRequestTerminatedTick,
+    StrategicRequestWaitErrorTick,
+    StrategicRequestWaitResumedTick,
     StrategicProposalWaitErrorTick,
     StrategicProposalWaitResumedTick,
     build_strategic_proposal_wait_resume_request,
@@ -1960,11 +1962,17 @@ class WorkflowStore:
                 attempt
             )
         terminated_by_request: dict[str, list[StrategicRequestTerminatedTick]] = {}
+        resumed_by_request: dict[str, list[StrategicRequestWaitResumedTick]] = {}
+        errors_by_request: dict[str, list[StrategicRequestWaitErrorTick]] = {}
         for tick in ticks:
             if isinstance(tick, StrategicRequestTerminatedTick):
                 terminated_by_request.setdefault(tick.planner_request_id, []).append(
                     tick
                 )
+            elif isinstance(tick, StrategicRequestWaitResumedTick):
+                resumed_by_request.setdefault(tick.planner_request_id, []).append(tick)
+            elif isinstance(tick, StrategicRequestWaitErrorTick):
+                errors_by_request.setdefault(tick.planner_request_id, []).append(tick)
 
         unresolved_by_game: dict[
             str, tuple[PlannerRequest, StrategicRequestTerminatedTick]
@@ -1979,9 +1987,14 @@ class WorkflowStore:
             for request in requests.values()
             if request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
         }
-        if set(terminated_by_request) - strategic_request_ids:
+        referenced_request_ids = (
+            set(terminated_by_request)
+            | set(resumed_by_request)
+            | set(errors_by_request)
+        )
+        if referenced_request_ids - strategic_request_ids:
             raise ValueError(
-                "Strategic Request termination Tick references an unknown Request"
+                "Strategic Request wait Tick references an unknown Request"
             )
         for request in requests.values():
             if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
@@ -1990,9 +2003,13 @@ class WorkflowStore:
                 request.planner_request_id, []
             )
             if request.status not in terminal_statuses:
-                if termination_ticks:
+                if (
+                    termination_ticks
+                    or resumed_by_request.get(request.planner_request_id)
+                    or errors_by_request.get(request.planner_request_id)
+                ):
                     raise ValueError(
-                        "non-terminal strategic Request has a termination Tick"
+                        "non-terminal strategic Request has a terminal-wait Tick"
                     )
                 continue
             if len(termination_ticks) != 1:
@@ -2026,16 +2043,64 @@ class WorkflowStore:
                 raise ValueError(
                     "strategic Request termination Tick disagrees with Request or Attempt"
                 )
-            recovered = any(
-                tick.tick_id != termination.tick_id
-                and tick.game_session_id == request.game_session_id
+            resume_ticks = resumed_by_request.get(request.planner_request_id, [])
+            if len(resume_ticks) > 1:
+                raise ValueError("strategic Request wait cannot have two resumed Ticks")
+            error_ticks = errors_by_request.get(request.planner_request_id, [])
+            for error_tick in error_ticks:
+                if (
+                    error_tick.game_session_id != request.game_session_id
+                    or error_tick.terminal_tick_id != termination.tick_id
+                    or error_tick.terminal_status is not request.status
+                    or error_tick.failure_category != request.failure_category
+                    or error_tick.started_at < termination.completed_at
+                ):
+                    raise ValueError(
+                        "strategic Request wait-error Tick disagrees with termination"
+                    )
+            if resume_ticks:
+                resumed = resume_ticks[0]
+                if (
+                    resumed.game_session_id != request.game_session_id
+                    or resumed.terminal_tick_id != termination.tick_id
+                    or resumed.terminal_status is not request.status
+                    or resumed.started_at < termination.completed_at
+                    or resumed.resumed_at < termination.completed_at
+                ):
+                    raise ValueError(
+                        "strategic Request wait-resumed Tick disagrees with termination"
+                    )
+                if any(
+                    error_tick.completed_at > resumed.started_at
+                    for error_tick in error_ticks
+                ):
+                    raise ValueError(
+                        "strategic Request wait-error Tick occurred after wait resumed"
+                    )
+                if any(
+                    tick.tick_id != resumed.tick_id
+                    and tick.game_session_id == request.game_session_id
+                    and termination.completed_at
+                    <= tick.started_at
+                    <= resumed.started_at
+                    and tick.starting_runtime_state is RuntimeState.AWAITING_HUMAN
+                    and tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN
+                    for tick in ticks
+                ):
+                    raise ValueError(
+                        "only a strategic Request wait-resumed Tick may leave the wait"
+                    )
+                continue
+            if any(
+                tick.game_session_id == request.game_session_id
                 and tick.started_at >= termination.completed_at
                 and tick.starting_runtime_state is RuntimeState.AWAITING_HUMAN
                 and tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN
                 for tick in ticks
-            )
-            if recovered:
-                continue
+            ):
+                raise ValueError(
+                    "strategic Request termination wait has no resumed Tick"
+                )
             if request.game_session_id in unresolved_by_game:
                 raise ValueError(
                     "a game cannot have two unresolved strategic Request waits"
@@ -2050,11 +2115,11 @@ class WorkflowStore:
             context = wait_by_game.get(game_id)
             expected = {
                 "wait_kind": "strategic_request_terminated",
+                "resume_policy": "explicit_only",
                 "planner_request_id": request.planner_request_id,
                 "terminal_tick_id": termination.tick_id,
                 "terminal_status": request.status.value,
                 "failure_category": request.failure_category,
-                "blocking_reason": termination.blocking_reason,
             }
             if context is None or any(
                 context.get(key) != value for key, value in expected.items()
@@ -2062,9 +2127,34 @@ class WorkflowStore:
                 raise ValueError(
                     "strategic Request termination Human Wait context disagrees"
                 )
+            request_error_ticks = errors_by_request.get(request.planner_request_id, [])
+            expected_blocking_reason = (
+                max(
+                    request_error_ticks, key=lambda item: item.completed_at
+                ).blocking_reason
+                if request_error_ticks
+                else termination.blocking_reason
+            )
+            if context.get("blocking_reason") != expected_blocking_reason:
+                raise ValueError(
+                    "strategic Request termination blocking reason disagrees"
+                )
             if type(context.get("resume_requested")) is not bool:
                 raise ValueError(
                     "strategic Request termination resume_requested must be a bool"
+                )
+            if context["resume_requested"] is True:
+                requested_at = cls._parse_audit_datetime(
+                    context.get("resume_requested_at"),
+                    "strategic Request wait resume_requested_at",
+                )
+                if requested_at < termination.completed_at:
+                    raise ValueError(
+                        "strategic Request wait resume precedes termination"
+                    )
+            elif "resume_requested_at" in context:
+                raise ValueError(
+                    "unrequested strategic Request wait contains resume timestamp"
                 )
         for game_id, context in wait_by_game.items():
             if context.get("wait_kind") != "strategic_request_terminated":
@@ -3679,6 +3769,7 @@ class WorkflowStore:
         """Durably request one safe re-evaluation of an active human wait."""
 
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._validate_phase1b_proposals_v10(conn)
             state = conn.execute(
                 "SELECT state FROM runtime_state WHERE game_id=?", (game_id,)
@@ -3692,6 +3783,52 @@ class WorkflowStore:
             context = {} if row is None else self._load(row["value_json"])
             if not isinstance(context, dict):
                 context = {}
+            if context.get("wait_kind") == "strategic_request_terminated":
+                if type(context.get("resume_requested")) is not bool:
+                    raise ValueError(
+                        "strategic Request wait resume_requested must be a bool"
+                    )
+                terminal_row = conn.execute(
+                    "SELECT * FROM workflow_ticks WHERE tick_id=? AND game_id=?",
+                    (context.get("terminal_tick_id"), game_id),
+                ).fetchone()
+                if terminal_row is None:
+                    raise ValueError(
+                        "strategic Request wait references no termination Tick"
+                    )
+                terminal = self._workflow_tick_from_row(dict(terminal_row))
+                expected = {
+                    "resume_policy": "explicit_only",
+                    "planner_request_id": getattr(terminal, "planner_request_id", None),
+                    "terminal_tick_id": getattr(terminal, "tick_id", None),
+                    "terminal_status": getattr(
+                        getattr(terminal, "terminal_status", None), "value", None
+                    ),
+                    "failure_category": getattr(terminal, "failure_category", None),
+                }
+                if not isinstance(terminal, StrategicRequestTerminatedTick) or any(
+                    context.get(field) != value for field, value in expected.items()
+                ):
+                    raise ValueError(
+                        "strategic Request wait disagrees with termination Tick"
+                    )
+                if context["resume_requested"] is True:
+                    self._parse_audit_datetime(
+                        context.get("resume_requested_at"),
+                        "strategic Request wait resume_requested_at",
+                    )
+                    return True
+                requested_at = max(datetime.now(UTC), terminal.completed_at)
+                context.update(
+                    {
+                        "version": "human-wait/v1",
+                        "resume_requested": True,
+                        "resume_requested_at": requested_at.isoformat(),
+                    }
+                )
+                self._set_meta_in_connection(conn, key, context)
+                self._validate_phase1b_proposals_v10(conn)
+                return True
             if (
                 context.get("wait_kind") == "strategic_contract_proposal_ready"
                 and context.get("resume_policy") == "explicit_only"
@@ -5061,9 +5198,16 @@ class WorkflowStore:
 
     def save_workflow_tick(self, tick: WorkflowTick) -> None:
         tick = validate_workflow_tick(tick)
-        if isinstance(tick, StrategicProposalWaitErrorTick):
+        if isinstance(
+            tick,
+            (
+                StrategicProposalWaitErrorTick,
+                StrategicRequestWaitErrorTick,
+                StrategicRequestWaitResumedTick,
+            ),
+        ):
             raise ValueError(
-                "Strategic Proposal wait-error Tick must be persisted atomically"
+                "Strategic wait transition Tick must be persisted atomically"
             )
         with self._connect() as conn:
             self._insert_workflow_tick_in_connection(conn, tick)
@@ -5152,7 +5296,14 @@ class WorkflowStore:
         tick: WorkflowTick,
         candidate: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        if not isinstance(tick, (AwaitingHumanTick, StrategicProposalWaitErrorTick)):
+        if not isinstance(
+            tick,
+            (
+                AwaitingHumanTick,
+                StrategicProposalWaitErrorTick,
+                StrategicRequestWaitErrorTick,
+            ),
+        ):
             return candidate
         row = conn.execute(
             "SELECT value_json FROM workflow_meta WHERE key=?",
@@ -5163,16 +5314,131 @@ class WorkflowStore:
         current = cls._load(str(row["value_json"]))
         if not isinstance(current, dict):
             return candidate
-        if not (
+        is_proposal_resume = (
             current.get("wait_kind") == "strategic_contract_proposal_ready"
             and current.get("resume_policy") == "explicit_only"
             and current.get("resume_requested") is True
-        ):
+        )
+        is_terminal_resume = (
+            current.get("wait_kind") == "strategic_request_terminated"
+            and current.get("resume_policy") == "explicit_only"
+            and current.get("resume_requested") is True
+        )
+        if not (is_proposal_resume or is_terminal_resume):
             return candidate
         preserved = dict(current)
         if candidate is not None and isinstance(candidate.get("blocking_reason"), str):
             preserved["blocking_reason"] = candidate["blocking_reason"]
         return preserved
+
+    @classmethod
+    def _validate_strategic_request_wait_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        human_wait_context: dict[str, Any] | None,
+    ) -> None:
+        state_row = conn.execute(
+            "SELECT state FROM runtime_state WHERE game_id=?",
+            (tick.game_session_id,),
+        ).fetchone()
+        wait_row = conn.execute(
+            "SELECT value_json FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(tick.game_session_id),),
+        ).fetchone()
+        current = None if wait_row is None else cls._load(str(wait_row["value_json"]))
+        active = (
+            state_row is not None
+            and state_row["state"] == RuntimeState.AWAITING_HUMAN.value
+            and isinstance(current, dict)
+            and current.get("wait_kind") == "strategic_request_terminated"
+            and current.get("resume_policy") == "explicit_only"
+        )
+        is_special_tick = isinstance(
+            tick, (StrategicRequestWaitResumedTick, StrategicRequestWaitErrorTick)
+        )
+        if not active:
+            if is_special_tick:
+                raise ValueError(
+                    "strategic Request wait transition requires an active wait"
+                )
+            return
+        if tick.starting_runtime_state is not RuntimeState.AWAITING_HUMAN:
+            raise ValueError(
+                "strategic Request wait transition must start AWAITING_HUMAN"
+            )
+        expected = {
+            "planner_request_id": getattr(tick, "planner_request_id", None),
+            "terminal_tick_id": getattr(tick, "terminal_tick_id", None),
+            "terminal_status": getattr(
+                getattr(tick, "terminal_status", None), "value", None
+            ),
+        }
+        if isinstance(tick, StrategicRequestWaitResumedTick):
+            if human_wait_context is not None:
+                raise ValueError(
+                    "strategic Request wait resume must clear Human Wait context"
+                )
+            expected["resume_requested"] = True
+            if any(current.get(field) != value for field, value in expected.items()):
+                raise ValueError(
+                    "strategic Request wait-resumed Tick disagrees with context"
+                )
+            requested_at = cls._parse_audit_datetime(
+                current.get("resume_requested_at"),
+                "strategic Request wait resume_requested_at",
+            )
+            if tick.resumed_at != requested_at:
+                raise ValueError(
+                    "strategic Request wait-resumed Tick has the wrong resume time"
+                )
+            existing_rows = conn.execute(
+                "SELECT * FROM workflow_ticks WHERE game_id=? AND outcome=?",
+                (
+                    tick.game_session_id,
+                    TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED.value,
+                ),
+            ).fetchall()
+            if any(
+                isinstance(
+                    existing := cls._workflow_tick_from_row(dict(row)),
+                    StrategicRequestWaitResumedTick,
+                )
+                and existing.planner_request_id == tick.planner_request_id
+                for row in existing_rows
+            ):
+                raise ValueError("strategic Request wait already has a resumed Tick")
+            return
+        if tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN:
+            raise ValueError(
+                "only a strategic Request wait-resumed Tick may leave the wait"
+            )
+        if not isinstance(tick, (AwaitingHumanTick, StrategicRequestWaitErrorTick)):
+            raise ValueError(
+                "strategic Request wait only accepts waiting or diagnostic Ticks"
+            )
+        stable_identity = {
+            "wait_kind": "strategic_request_terminated",
+            "resume_policy": "explicit_only",
+            "planner_request_id": current.get("planner_request_id"),
+            "terminal_tick_id": current.get("terminal_tick_id"),
+            "terminal_status": current.get("terminal_status"),
+            "failure_category": current.get("failure_category"),
+        }
+        if not isinstance(human_wait_context, dict) or any(
+            human_wait_context.get(field) != value
+            for field, value in stable_identity.items()
+        ):
+            raise ValueError(
+                "strategic Request wait Tick requires matching persistence context"
+            )
+        if isinstance(tick, StrategicRequestWaitErrorTick) and (
+            tick.planner_request_id != current.get("planner_request_id")
+            or tick.terminal_tick_id != current.get("terminal_tick_id")
+            or tick.terminal_status.value != current.get("terminal_status")
+            or tick.failure_category != current.get("failure_category")
+        ):
+            raise ValueError("strategic Request wait-error Tick disagrees with context")
 
     @classmethod
     def _validate_strategic_wait_error_transition_in_connection(
@@ -5271,6 +5537,9 @@ class WorkflowStore:
                 conn, tick, human_wait_context
             )
             self._validate_strategic_wait_error_transition_in_connection(
+                conn, tick, human_wait_context
+            )
+            self._validate_strategic_request_wait_transition_in_connection(
                 conn, tick, human_wait_context
             )
             human_wait_context = (
@@ -7173,6 +7442,9 @@ class WorkflowStore:
                 conn, tick, human_wait_context
             )
             self._validate_strategic_wait_error_transition_in_connection(
+                conn, tick, human_wait_context
+            )
+            self._validate_strategic_request_wait_transition_in_connection(
                 conn, tick, human_wait_context
             )
             self._validate_strategic_request_transition_in_connection(

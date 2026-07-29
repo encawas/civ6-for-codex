@@ -41,6 +41,8 @@ from .domain import (
     STRATEGIC_PROPOSAL_TARGET_KINDS,
     StrategicProposalWaitErrorTick,
     StrategicProposalWaitResumedTick,
+    StrategicRequestWaitErrorTick,
+    StrategicRequestWaitResumedTick,
     SystemErrorTick,
     TaskCreatedTick,
     TaskInvalidatedTick,
@@ -346,6 +348,28 @@ class WorkflowEngine:
                     target_kind=wait.get("target_kind"),
                     expected_base_revision=wait.get("expected_base_revision"),
                     resume_reason="explicit_user_resume",
+                )
+            if wait.get("wait_kind") == "strategic_request_terminated":
+                if wait.get("resume_requested") is True:
+                    return self._finish(
+                        ctx,
+                        snapshot,
+                        StrategicRequestWaitResumedTick,
+                        planner_request_id=wait.get("planner_request_id"),
+                        terminal_tick_id=wait.get("terminal_tick_id"),
+                        terminal_status=wait.get("terminal_status"),
+                        resume_reason="explicit_user_resume",
+                        resumed_at=datetime.fromisoformat(
+                            str(wait.get("resume_requested_at")).replace("Z", "+00:00")
+                        ),
+                    )
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    AwaitingHumanTick,
+                    blocking_reason=str(
+                        wait.get("blocking_reason") or "human review is required"
+                    ),
                 )
             if wait.get("requires_unit_details") is True and snapshot.units is None:
                 raw = await self._read_snapshot(ctx.metrics, include_units=True)
@@ -1074,7 +1098,14 @@ class WorkflowEngine:
         }
         tick = validate_workflow_tick(tick_type(**common, **fields))
         human_wait_context = None
-        if isinstance(tick, (AwaitingHumanTick, StrategicProposalWaitErrorTick)):
+        if isinstance(
+            tick,
+            (
+                AwaitingHumanTick,
+                StrategicProposalWaitErrorTick,
+                StrategicRequestWaitErrorTick,
+            ),
+        ):
             existing_wait = self.store.human_wait_context(snapshot.game_id)
             if existing_wait is not None and (
                 (
@@ -1089,7 +1120,9 @@ class WorkflowEngine:
                 human_wait_context = self._human_wait_context(snapshot)
             human_wait_context["blocking_reason"] = tick.blocking_reason
 
-        if isinstance(tick, StrategicProposalWaitResumedTick):
+        if isinstance(
+            tick, (StrategicProposalWaitResumedTick, StrategicRequestWaitResumedTick)
+        ):
             if attempt_update is not None:
                 raise ValueError("Proposal wait resume cannot update an ActionAttempt")
             self.store.persist_phase4_tick(tick, human_wait_context=None)
@@ -1154,7 +1187,13 @@ class WorkflowEngine:
         if blocked_task_ids:
             result.blocked_task_ids.extend(blocked_task_ids)
         if isinstance(
-            tick, (AwaitingHumanTick, StrategicProposalWaitErrorTick, SystemErrorTick)
+            tick,
+            (
+                AwaitingHumanTick,
+                StrategicProposalWaitErrorTick,
+                StrategicRequestWaitErrorTick,
+                SystemErrorTick,
+            ),
         ):
             result.paused = True
             result.pause_reason = tick.blocking_reason
@@ -1253,6 +1292,26 @@ class WorkflowEngine:
                     proposal_id=wait.get("proposal_id"),
                     target_kind=wait.get("target_kind"),
                     expected_base_revision=wait.get("expected_base_revision"),
+                    runtime_active_attempt_id=active_attempt_id,
+                )
+            if (
+                ctx.starting_state is RuntimeState.AWAITING_HUMAN
+                and isinstance(wait, dict)
+                and wait.get("wait_kind") == "strategic_request_terminated"
+            ):
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    StrategicRequestWaitErrorTick,
+                    blocking_reason=(
+                        "workflow Tick failed while strategic Request wait remains active"
+                    ),
+                    error_category=category,
+                    diagnostic_summary=summary,
+                    planner_request_id=wait.get("planner_request_id"),
+                    terminal_tick_id=wait.get("terminal_tick_id"),
+                    terminal_status=wait.get("terminal_status"),
+                    failure_category=wait.get("failure_category"),
                     runtime_active_attempt_id=active_attempt_id,
                 )
             return self._finish(

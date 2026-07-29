@@ -13,6 +13,7 @@ from civ6_workflow.domain import (
     InformationRoundStatus,
     Mission,
     MissionGraph,
+    ObservedOnlyTick,
     PlannerAttemptCompletedTick,
     ProviderAttempt,
     ProviderAttemptStatus,
@@ -24,6 +25,8 @@ from civ6_workflow.domain import (
     StrategicContract,
     StrategicContractCommit,
     StrategicRequestTerminatedTick,
+    StrategicRequestWaitErrorTick,
+    StrategicRequestWaitResumedTick,
     StrategicProposalWaitErrorTick,
     StrategicProposalWaitResumedTick,
     SubjectRef,
@@ -2629,6 +2632,7 @@ def test_creation_with_explicit_contract_id_uses_that_identity_for_staleness(
     context.update(
         {
             "wait_kind": "strategic_request_terminated",
+            "resume_policy": "explicit_only",
             "planner_request_id": request.planner_request_id,
             "terminal_tick_id": tick.tick_id,
             "terminal_status": PlannerRequestStatus.SUPERSEDED.value,
@@ -2893,3 +2897,395 @@ def test_atomic_tick_entrypoints_reject_backdated_wait_error_after_resume(
     assert planner.calls == 1
     WorkflowStore(path)
     _assert_replay_round_trip(tmp_path, store, f"backdated-wait-error-{entrypoint}")
+
+
+@pytest.mark.parametrize("entrypoint", ["tick_and_runtime", "phase4"])
+def test_terminal_wait_rejects_generic_tick_that_leaves_human_wait(
+    tmp_path, entrypoint
+):
+    path = tmp_path / f"terminal-wait-bypass-{entrypoint}.sqlite3"
+    store, _request_record, terminal = asyncio.run(
+        _terminal_strategic_request_state(path, PlannerRequestStatus.FAILED)
+    )
+    started_at = max(
+        tick.completed_at for tick in store.list_workflow_ticks("game-1")
+    ) + timedelta(seconds=1)
+    forged = ObservedOnlyTick(
+        tick_id=f"tick-forged-terminal-resume-{entrypoint}",
+        game_session_id="game-1",
+        turn_number=terminal.turn_number,
+        starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+        observation_ids=("obs-forged-terminal-resume",),
+        started_at=started_at,
+        completed_at=started_at + timedelta(seconds=1),
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="only a strategic Request wait-resumed Tick"):
+        if entrypoint == "tick_and_runtime":
+            store.persist_tick_and_runtime_state(forged, human_wait_context=None)
+        else:
+            store.persist_phase4_tick(forged, human_wait_context=None)
+
+    assert store.export_replay_state("game-1") == before
+    assert store.load_runtime_state("game-1") is RuntimeState.AWAITING_HUMAN
+    assert store.human_wait_context("game-1") is not None
+    WorkflowStore(path)
+
+    if entrypoint == "tick_and_runtime":
+        invalid = copy.deepcopy(before)
+        template = next(
+            row
+            for row in invalid["tables"]["workflow_ticks"]
+            if row["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        )
+        forged_row = copy.deepcopy(template)
+        forged_row.update(
+            {
+                "tick_id": forged.tick_id,
+                "outcome": forged.outcome.value,
+                "starting_runtime_state": forged.starting_runtime_state.value,
+                "ending_runtime_state": forged.ending_runtime_state.value,
+                "observation_ids_json": WorkflowStore._dump(
+                    list(forged.observation_ids)
+                ),
+                "mutation_budget_used": forged.mutation_budget_used,
+                "planner_request_id": None,
+                "started_at": forged.started_at.isoformat(),
+                "completed_at": forged.completed_at.isoformat(),
+                "metrics_json": WorkflowStore._dump({}),
+                "tick_json": forged.model_dump_json(),
+            }
+        )
+        invalid["tables"]["workflow_ticks"].append(forged_row)
+        metric_template = next(
+            row
+            for row in invalid["tables"]["turn_metrics"]
+            if row["tick_id"] == template["tick_id"]
+        )
+        forged_metric = copy.deepcopy(metric_template)
+        forged_metric["tick_id"] = forged.tick_id
+        forged_metric["metrics_json"] = WorkflowStore._dump({})
+        invalid["tables"]["turn_metrics"].append(forged_metric)
+        invalid["tables"]["runtime_state"][0]["state"] = RuntimeState.OBSERVING.value
+        invalid["tables"]["runtime_state"][0]["active_attempt_id"] = None
+        invalid["tables"]["workflow_meta"] = [
+            row
+            for row in invalid["tables"]["workflow_meta"]
+            if row["key"] != "human_wait:game-1"
+        ]
+        _assert_invalid_replay_preserves_target(
+            tmp_path, invalid, "terminal-wait-generic-bypass"
+        )
+
+
+def test_terminal_wait_preflight_failure_preserves_wait_and_writes_diagnostic(
+    tmp_path,
+):
+    async def scenario():
+        path = tmp_path / "terminal-wait-system-error.sqlite3"
+        store, request, terminal = await _terminal_strategic_request_state(
+            path, PlannerRequestStatus.FAILED
+        )
+        before_context = store.human_wait_context("game-1")
+        planner = _Planner()
+        game = _Game()
+
+        async def failed_snapshot(*, include_units=False):
+            raise TimeoutError("snapshot unavailable")
+
+        game.read_snapshot = failed_snapshot
+        result = await _engine(store, game, planner).tick()
+
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_WAIT_ERROR
+        )
+        assert result.runtime_state == RuntimeState.AWAITING_HUMAN.value
+        assert planner.calls == 0
+        context = store.human_wait_context("game-1")
+        for field in (
+            "wait_kind",
+            "resume_policy",
+            "planner_request_id",
+            "terminal_tick_id",
+            "terminal_status",
+            "failure_category",
+            "resume_requested",
+        ):
+            assert context[field] == before_context[field]
+        errors = [
+            tick
+            for tick in store.list_workflow_ticks("game-1")
+            if isinstance(tick, StrategicRequestWaitErrorTick)
+        ]
+        assert len(errors) == 1
+        assert errors[0].planner_request_id == request.planner_request_id
+        assert errors[0].terminal_tick_id == terminal.tick_id
+        WorkflowStore(path)
+        _assert_replay_round_trip(tmp_path, store, "terminal-wait-system-error")
+
+    asyncio.run(scenario())
+
+
+def test_terminal_wait_explicit_resume_is_auditable_restartable_and_replayable(
+    tmp_path,
+):
+    async def scenario():
+        path = tmp_path / "terminal-wait-explicit-resume.sqlite3"
+        store, request, terminal = await _terminal_strategic_request_state(
+            path, PlannerRequestStatus.FAILED
+        )
+        assert store.request_human_resume("game-1") is True
+        requested_context = store.human_wait_context("game-1")
+        assert requested_context["resume_requested"] is True
+        requested_at = datetime.fromisoformat(requested_context["resume_requested_at"])
+
+        restarted = WorkflowStore(path)
+        assert restarted.human_wait_context("game-1") == requested_context
+        exported = restarted.export_replay_state("game-1")
+        restored = WorkflowStore(tmp_path / "terminal-wait-requested-restored.sqlite3")
+        restored.import_replay_state(copy.deepcopy(exported))
+        assert restored.human_wait_context("game-1") == requested_context
+        assert restored.export_replay_state("game-1") == exported
+
+        planner = _Planner()
+        result = await _engine(restarted, _Game(), planner).tick()
+
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED
+        )
+        resumed = next(
+            tick
+            for tick in restarted.list_workflow_ticks("game-1")
+            if isinstance(tick, StrategicRequestWaitResumedTick)
+        )
+        assert resumed.planner_request_id == request.planner_request_id
+        assert resumed.terminal_tick_id == terminal.tick_id
+        assert resumed.terminal_status is PlannerRequestStatus.FAILED
+        assert resumed.resume_reason == "explicit_user_resume"
+        assert resumed.resumed_at == requested_at
+        assert restarted.load_runtime_state("game-1") is RuntimeState.ROUTING
+        assert restarted.human_wait_context("game-1") is None
+        assert planner.calls == 0
+        WorkflowStore(path)
+        _assert_replay_round_trip(tmp_path, restarted, "terminal-wait-resumed")
+
+    asyncio.run(scenario())
+
+
+def test_terminal_resume_committed_before_wait_read_is_consumed(tmp_path):
+    path = tmp_path / "terminal-resume-before-wait-read.sqlite3"
+    store, _request_record, _terminal = asyncio.run(
+        _terminal_strategic_request_state(path, PlannerRequestStatus.FAILED)
+    )
+    game = _Game()
+    planner = _Planner()
+    engine = _engine(store, game, planner)
+    read_started = threading.Event()
+    allow_read = threading.Event()
+    original_read = game.read_snapshot
+
+    async def blocked_read(*, include_units=False):
+        read_started.set()
+        completed = await asyncio.to_thread(allow_read.wait, 5)
+        if not completed:
+            raise TimeoutError("test did not release snapshot read")
+        return await original_read(include_units=include_units)
+
+    game.read_snapshot = blocked_read
+    thread, result = _start_tick_thread(engine)
+    assert read_started.wait(5)
+    assert store.request_human_resume("game-1") is True
+    requested_at = datetime.fromisoformat(
+        store.human_wait_context("game-1")["resume_requested_at"]
+    )
+    allow_read.set()
+    thread.join(10)
+
+    assert not thread.is_alive()
+    assert "error" not in result
+    assert result["value"].workflow_tick["outcome"] == (
+        TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED
+    )
+    resumed = next(
+        tick
+        for tick in store.list_workflow_ticks("game-1")
+        if isinstance(tick, StrategicRequestWaitResumedTick)
+    )
+    assert resumed.resumed_at == requested_at
+    assert store.human_wait_context("game-1") is None
+    assert planner.calls == 0
+    WorkflowStore(path)
+    _assert_replay_round_trip(tmp_path, store, "terminal-resume-before-read")
+
+
+def test_terminal_resume_committed_after_wait_read_before_persist_is_preserved(
+    tmp_path,
+):
+    path = tmp_path / "terminal-resume-before-wait-persist.sqlite3"
+    store, _request_record, _terminal = asyncio.run(
+        _terminal_strategic_request_state(path, PlannerRequestStatus.FAILED)
+    )
+    planner = _Planner()
+    engine = _engine(store, _Game(), planner)
+    persist_started = threading.Event()
+    allow_persist = threading.Event()
+    original_persist = store.persist_tick_and_runtime_state
+
+    def blocked_persist(*args, **kwargs):
+        persist_started.set()
+        if not allow_persist.wait(5):
+            raise TimeoutError("test did not release Tick persistence")
+        return original_persist(*args, **kwargs)
+
+    store.persist_tick_and_runtime_state = blocked_persist
+    thread, result = _start_tick_thread(engine)
+    assert persist_started.wait(5)
+    assert store.request_human_resume("game-1") is True
+    requested_context = store.human_wait_context("game-1")
+    allow_persist.set()
+    thread.join(10)
+    store.persist_tick_and_runtime_state = original_persist
+
+    assert not thread.is_alive()
+    assert "error" not in result
+    assert result["value"].workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+    assert store.human_wait_context("game-1") == requested_context
+    restarted = WorkflowStore(path)
+    assert restarted.human_wait_context("game-1") == requested_context
+    exported = restarted.export_replay_state("game-1")
+    restored = WorkflowStore(tmp_path / "terminal-resume-race-restored.sqlite3")
+    restored.import_replay_state(copy.deepcopy(exported))
+    assert restored.human_wait_context("game-1") == requested_context
+    assert restored.export_replay_state("game-1") == exported
+
+    resumed = asyncio.run(_engine(restarted, _Game(), planner).tick())
+    assert resumed.workflow_tick["outcome"] == (
+        TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED
+    )
+    assert restarted.human_wait_context("game-1") is None
+    assert planner.calls == 0
+
+
+def test_terminal_wait_aggregate_binds_latest_diagnostic_per_request():
+    request_one = _request("game-1").model_copy(
+        update={
+            "status": PlannerRequestStatus.FAILED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "failure_category": "planner_failure",
+        }
+    )
+    request_two = _request("game-2").model_copy(
+        update={
+            "status": PlannerRequestStatus.SUPERSEDED,
+            "completed_at": NOW + timedelta(seconds=1),
+            "failure_category": "stale_strategic_contract_base",
+        }
+    )
+    terminal_one = StrategicRequestTerminatedTick(
+        tick_id="tick-terminal-game-1",
+        game_session_id="game-1",
+        turn_number=1,
+        starting_runtime_state=RuntimeState.REQUESTING_PLAN,
+        observation_ids=("obs-terminal-game-1",),
+        started_at=NOW + timedelta(seconds=2),
+        completed_at=NOW + timedelta(seconds=3),
+        planner_request_id=request_one.planner_request_id,
+        terminal_status=request_one.status,
+        failure_category=request_one.failure_category,
+        blocking_reason="game one terminated",
+    )
+    error_one = StrategicRequestWaitErrorTick(
+        tick_id="tick-terminal-error-game-1",
+        game_session_id="game-1",
+        turn_number=1,
+        starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+        observation_ids=("obs-terminal-error-game-1",),
+        started_at=NOW + timedelta(seconds=4),
+        completed_at=NOW + timedelta(seconds=5),
+        planner_request_id=request_one.planner_request_id,
+        terminal_tick_id=terminal_one.tick_id,
+        terminal_status=request_one.status,
+        failure_category=request_one.failure_category,
+        blocking_reason="game one diagnostic",
+        error_category="TimeoutError",
+        diagnostic_summary="snapshot unavailable",
+    )
+    terminal_two = StrategicRequestTerminatedTick(
+        tick_id="tick-terminal-game-2",
+        game_session_id="game-2",
+        turn_number=1,
+        starting_runtime_state=RuntimeState.REQUESTING_PLAN,
+        observation_ids=("obs-terminal-game-2",),
+        started_at=NOW + timedelta(seconds=2),
+        completed_at=NOW + timedelta(seconds=3),
+        planner_request_id=request_two.planner_request_id,
+        terminal_status=request_two.status,
+        failure_category=request_two.failure_category,
+        blocking_reason="game two terminated",
+    )
+    contexts = {
+        "game-1": {
+            "wait_kind": "strategic_request_terminated",
+            "resume_policy": "explicit_only",
+            "planner_request_id": request_one.planner_request_id,
+            "terminal_tick_id": terminal_one.tick_id,
+            "terminal_status": request_one.status.value,
+            "failure_category": request_one.failure_category,
+            "blocking_reason": error_one.blocking_reason,
+            "resume_requested": False,
+        },
+        "game-2": {
+            "wait_kind": "strategic_request_terminated",
+            "resume_policy": "explicit_only",
+            "planner_request_id": request_two.planner_request_id,
+            "terminal_tick_id": terminal_two.tick_id,
+            "terminal_status": request_two.status.value,
+            "failure_category": request_two.failure_category,
+            "blocking_reason": terminal_two.blocking_reason,
+            "resume_requested": False,
+        },
+    }
+
+    WorkflowStore._validate_strategic_terminal_wait_state(
+        {
+            request_one.planner_request_id: request_one,
+            request_two.planner_request_id: request_two,
+        },
+        [],
+        [terminal_one, error_one, terminal_two],
+        {
+            "game-1": RuntimeState.AWAITING_HUMAN,
+            "game-2": RuntimeState.AWAITING_HUMAN,
+        },
+        contexts,
+    )
+
+
+def test_nonterminal_strategic_request_rejects_orphan_wait_tick():
+    request = _request("game-1")
+    orphan = StrategicRequestWaitErrorTick(
+        tick_id="tick-orphan-terminal-error",
+        game_session_id="game-1",
+        turn_number=1,
+        starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+        observation_ids=("obs-orphan-terminal-error",),
+        started_at=NOW,
+        completed_at=NOW + timedelta(seconds=1),
+        planner_request_id=request.planner_request_id,
+        terminal_tick_id="tick-missing-termination",
+        terminal_status=PlannerRequestStatus.FAILED,
+        failure_category="planner_failure",
+        blocking_reason="orphan diagnostic",
+        error_category="TimeoutError",
+        diagnostic_summary="orphan",
+    )
+
+    with pytest.raises(ValueError, match="non-terminal strategic Request"):
+        WorkflowStore._validate_strategic_terminal_wait_state(
+            {request.planner_request_id: request},
+            [],
+            [orphan],
+            {},
+            {},
+        )

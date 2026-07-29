@@ -42,6 +42,8 @@ class TickOutcomeKind(StrEnum):
     PLANNER_ATTEMPT_COMPLETED = "PLANNER_ATTEMPT_COMPLETED"
     STRATEGIC_PROPOSAL_READY = "STRATEGIC_PROPOSAL_READY"
     STRATEGIC_REQUEST_TERMINATED = "STRATEGIC_REQUEST_TERMINATED"
+    STRATEGIC_REQUEST_WAIT_RESUMED = "STRATEGIC_REQUEST_WAIT_RESUMED"
+    STRATEGIC_REQUEST_WAIT_ERROR = "STRATEGIC_REQUEST_WAIT_ERROR"
     STRATEGIC_PROPOSAL_WAIT_RESUMED = "STRATEGIC_PROPOSAL_WAIT_RESUMED"
     STRATEGIC_PROPOSAL_WAIT_ERROR = "STRATEGIC_PROPOSAL_WAIT_ERROR"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
@@ -211,6 +213,54 @@ class StrategicRequestTerminatedTick(TickRecord):
     failure_category: str = Field(min_length=1)
     provider_attempt_id: str | None = None
     blocking_reason: str = Field(min_length=1)
+
+
+class StrategicRequestWaitResumedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED] = (
+        TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED
+    )
+    starting_runtime_state: Literal[RuntimeState.AWAITING_HUMAN]
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    terminal_tick_id: str
+    terminal_status: Literal[
+        PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.REJECTED,
+        PlannerRequestStatus.SUPERSEDED,
+    ]
+    resume_reason: Literal["explicit_user_resume"] = "explicit_user_resume"
+    resumed_at: datetime
+
+    @model_validator(mode="after")
+    def validate_resume_time(self) -> Self:
+        try:
+            if self.resumed_at > self.completed_at:
+                raise ValueError("resumed_at must not follow completed_at")
+        except TypeError as exc:
+            raise ValueError("resume timestamp must use a compatible timezone") from exc
+        return self
+
+
+class StrategicRequestWaitErrorTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_REQUEST_WAIT_ERROR] = (
+        TickOutcomeKind.STRATEGIC_REQUEST_WAIT_ERROR
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    terminal_tick_id: str
+    terminal_status: Literal[
+        PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.REJECTED,
+        PlannerRequestStatus.SUPERSEDED,
+    ]
+    failure_category: str = Field(min_length=1)
+    blocking_reason: str = Field(min_length=1)
+    error_category: str = Field(min_length=1)
+    diagnostic_summary: str = Field(min_length=1, max_length=500)
 
 
 class InformationRequestedTick(TickRecord):
@@ -457,6 +507,8 @@ WorkflowTick: TypeAlias = Annotated[
     | PlannerAttemptCompletedTick
     | StrategicProposalReadyTick
     | StrategicRequestTerminatedTick
+    | StrategicRequestWaitResumedTick
+    | StrategicRequestWaitErrorTick
     | StrategicProposalWaitResumedTick
     | StrategicProposalWaitErrorTick
     | InformationRequestedTick
