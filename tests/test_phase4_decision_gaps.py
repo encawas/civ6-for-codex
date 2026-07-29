@@ -731,7 +731,9 @@ def test_nonlegacy_request_is_superseded_before_legacy_stale_routing(tmp_path):
 
         result = await engine.tick()
 
-        assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
+        )
         assert result.workflow_tick["blocking_reason"] == (
             "MissionGraph repair requires an active Contract"
         )

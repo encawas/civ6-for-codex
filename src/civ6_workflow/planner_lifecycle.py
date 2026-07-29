@@ -53,6 +53,7 @@ from .domain import (
     ProviderAttemptStatus,
     RuntimeState,
     StrategicProposalReadyTick,
+    StrategicRequestTerminatedTick,
     SubjectRef,
     build_strategic_contract_id,
     build_strategic_research_proposal,
@@ -1299,13 +1300,24 @@ class PlannerLifecycleCoordinator:
         compatibility.paused = True
         compatibility.pause_reason = reason
         compatibility.planner_request_id = logical_request.planner_request_id
+        existing_attempts = self.engine.store.list_provider_attempts(
+            logical_request.planner_request_id
+        )
         return self._finish(
             ctx,
             snapshot,
-            AwaitingHumanTick,
+            StrategicRequestTerminatedTick,
             compatibility=compatibility,
             planner_request=updated_request,
             information_round=failed_round,
+            planner_request_id=logical_request.planner_request_id,
+            terminal_status=PlannerRequestStatus.SUPERSEDED,
+            failure_category="stale_strategic_contract_base",
+            provider_attempt_id=(
+                None
+                if not existing_attempts
+                else existing_attempts[-1].provider_attempt_id
+            ),
             blocking_reason=reason,
         )
 
@@ -1746,10 +1758,14 @@ class PlannerLifecycleCoordinator:
         return self._finish(
             ctx,
             snapshot,
-            AwaitingHumanTick,
+            StrategicRequestTerminatedTick,
             compatibility=compatibility,
             planner_request=updated_request,
             provider_attempts=provider_attempts,
+            planner_request_id=logical_request.planner_request_id,
+            terminal_status=PlannerRequestStatus.FAILED,
+            failure_category=str(failure["category"]),
+            provider_attempt_id=provider_attempts[-1].provider_attempt_id,
             blocking_reason=compatibility.pause_reason,
         )
 
@@ -1791,10 +1807,14 @@ class PlannerLifecycleCoordinator:
         return self._finish(
             ctx,
             snapshot,
-            AwaitingHumanTick,
+            StrategicRequestTerminatedTick,
             compatibility=compatibility,
             planner_request=updated_request,
             provider_attempts=provider_attempts,
+            planner_request_id=logical_request.planner_request_id,
+            terminal_status=PlannerRequestStatus.REJECTED,
+            failure_category=failure_category,
+            provider_attempt_id=provider_attempts[-1].provider_attempt_id,
             blocking_reason=compatibility.pause_reason,
         )
 
@@ -3430,9 +3450,19 @@ class PlannerLifecycleCoordinator:
                     "expected_base_revision": tick.expected_base_revision,
                 }
             )
-        elif isinstance(tick, AwaitingHumanTick):
+        elif isinstance(tick, (AwaitingHumanTick, StrategicRequestTerminatedTick)):
             human_wait_context = engine._human_wait_context(snapshot)
             human_wait_context["blocking_reason"] = tick.blocking_reason
+            if isinstance(tick, StrategicRequestTerminatedTick):
+                human_wait_context.update(
+                    {
+                        "wait_kind": "strategic_request_terminated",
+                        "planner_request_id": tick.planner_request_id,
+                        "terminal_tick_id": tick.tick_id,
+                        "terminal_status": tick.terminal_status.value,
+                        "failure_category": tick.failure_category,
+                    }
+                )
         engine.store.persist_phase4_tick(
             tick,
             decision_gaps=decision_gaps,

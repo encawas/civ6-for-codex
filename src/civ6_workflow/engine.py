@@ -1076,11 +1076,13 @@ class WorkflowEngine:
         human_wait_context = None
         if isinstance(tick, (AwaitingHumanTick, StrategicProposalWaitErrorTick)):
             existing_wait = self.store.human_wait_context(snapshot.game_id)
-            if (
-                existing_wait is not None
-                and existing_wait.get("wait_kind")
-                == "strategic_contract_proposal_ready"
-                and existing_wait.get("resume_policy") == "explicit_only"
+            if existing_wait is not None and (
+                (
+                    existing_wait.get("wait_kind")
+                    == "strategic_contract_proposal_ready"
+                    and existing_wait.get("resume_policy") == "explicit_only"
+                )
+                or existing_wait.get("wait_kind") == "strategic_request_terminated"
             ):
                 human_wait_context = dict(existing_wait)
             else:

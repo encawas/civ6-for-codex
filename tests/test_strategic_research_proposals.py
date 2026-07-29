@@ -8,7 +8,6 @@ import pytest
 
 from civ6_workflow.domain import (
     AuthorityScopeSet,
-    AwaitingHumanTick,
     InformationRequestedTick,
     InformationRound,
     InformationRoundStatus,
@@ -24,6 +23,7 @@ from civ6_workflow.domain import (
     RuntimeState,
     StrategicContract,
     StrategicContractCommit,
+    StrategicRequestTerminatedTick,
     StrategicProposalWaitErrorTick,
     StrategicProposalWaitResumedTick,
     SubjectRef,
@@ -385,7 +385,9 @@ def test_contract_change_during_provider_rejects_with_canonical_evidence(tmp_pat
         result = await _engine(store, _Game(), planner).tick()
 
         stored = store.get_planner_request(request.planner_request_id)
-        assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
+        )
         assert stored.status is PlannerRequestStatus.REJECTED
         assert stored.failure_category == "stale_strategic_contract_base"
         assert stored.response_payload is not None
@@ -2274,7 +2276,7 @@ def test_superseded_requires_a_real_stale_contract_base(tmp_path):
             "completed_at": NOW + timedelta(seconds=1),
         }
     )
-    tick = AwaitingHumanTick(
+    tick = StrategicRequestTerminatedTick(
         tick_id="tick-forged-superseded",
         game_session_id="game-1",
         turn_number=1,
@@ -2282,6 +2284,9 @@ def test_superseded_requires_a_real_stale_contract_base(tmp_path):
         observation_ids=("obs-forged-superseded",),
         started_at=NOW,
         completed_at=NOW + timedelta(seconds=2),
+        planner_request_id=request.planner_request_id,
+        terminal_status=PlannerRequestStatus.SUPERSEDED,
+        failure_category="stale_strategic_contract_base",
         blocking_reason="forged stale base",
     )
     before = store.export_replay_state("game-1")
@@ -2541,7 +2546,9 @@ def test_stale_contract_base_supersedes_strategic_backoff(tmp_path, kind):
         result = await engine.tick()
 
         stored = store.get_planner_request(request.planner_request_id)
-        assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
+        )
         assert result.runtime_state == RuntimeState.AWAITING_HUMAN.value
         assert stored.status is PlannerRequestStatus.SUPERSEDED
         assert stored.failure_category == "stale_strategic_contract_base"
@@ -2565,7 +2572,7 @@ def test_creation_with_explicit_contract_id_uses_that_identity_for_staleness(
             "completed_at": NOW + timedelta(minutes=3),
         }
     )
-    tick = AwaitingHumanTick(
+    tick = StrategicRequestTerminatedTick(
         tick_id="tick-explicit-contract-superseded",
         game_session_id="game-1",
         turn_number=1,
@@ -2573,6 +2580,9 @@ def test_creation_with_explicit_contract_id_uses_that_identity_for_staleness(
         observation_ids=("obs-explicit-contract-superseded",),
         started_at=NOW + timedelta(minutes=3),
         completed_at=NOW + timedelta(minutes=3, seconds=1),
+        planner_request_id=request.planner_request_id,
+        terminal_status=PlannerRequestStatus.SUPERSEDED,
+        failure_category="stale_strategic_contract_base",
         blocking_reason="explicit Contract base became stale",
     )
 
@@ -2614,7 +2624,21 @@ def test_creation_with_explicit_contract_id_uses_that_identity_for_staleness(
     valid_store = WorkflowStore(valid_path)
     valid_store.save_planner_request(request)
     _commit_contract(valid_store, "game-1")
-    valid_store.persist_phase4_tick(tick, planner_request=forged)
+    game = _Game()
+    context = _engine(valid_store, game, _Planner())._human_wait_context(game.snapshot)
+    context.update(
+        {
+            "wait_kind": "strategic_request_terminated",
+            "planner_request_id": request.planner_request_id,
+            "terminal_tick_id": tick.tick_id,
+            "terminal_status": PlannerRequestStatus.SUPERSEDED.value,
+            "failure_category": "stale_strategic_contract_base",
+            "blocking_reason": tick.blocking_reason,
+        }
+    )
+    valid_store.persist_phase4_tick(
+        tick, planner_request=forged, human_wait_context=context
+    )
     assert (
         valid_store.get_planner_request(request.planner_request_id).status
         is PlannerRequestStatus.SUPERSEDED
@@ -2710,3 +2734,162 @@ def test_wait_error_tick_cannot_be_appended_after_proposal_resume(tmp_path):
         )
     with pytest.raises(ValueError, match="after Proposal wait resumed"):
         WorkflowStore(path)
+
+
+async def _terminal_strategic_request_state(path, status):
+    store = WorkflowStore(path)
+    request = _request("game-1")
+    if status is PlannerRequestStatus.SUPERSEDED:
+        _commit_contract(store, "game-1")
+        planner = _Planner()
+    elif status is PlannerRequestStatus.REJECTED:
+        planner = _Planner(
+            _response(
+                "game-1",
+                build_strategic_contract_id("game-1"),
+                candidates=2,
+            )
+        )
+    else:
+        planner = _Planner(ValueError("permanent provider failure"))
+    game = _Game()
+    store.save_planner_request(request)
+    engine = _engine(store, game, planner)
+
+    result = await engine.tick()
+
+    stored = store.get_planner_request(request.planner_request_id)
+    assert stored.status is status
+    assert result.workflow_tick["outcome"] == (
+        TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
+    )
+    terminal = next(
+        tick
+        for tick in store.list_workflow_ticks("game-1")
+        if isinstance(tick, StrategicRequestTerminatedTick)
+    )
+    attempts = store.list_provider_attempts(request.planner_request_id)
+    assert terminal.planner_request_id == request.planner_request_id
+    assert terminal.terminal_status is status
+    assert terminal.failure_category == stored.failure_category
+    assert terminal.provider_attempt_id == (
+        None if not attempts else attempts[-1].provider_attempt_id
+    )
+    context = store.human_wait_context("game-1")
+    assert context["wait_kind"] == "strategic_request_terminated"
+    assert context["terminal_tick_id"] == terminal.tick_id
+    assert context["planner_request_id"] == request.planner_request_id
+    assert context["terminal_status"] == status.value
+    assert context["failure_category"] == stored.failure_category
+    provider_calls = planner.calls
+
+    waiting = await engine.tick()
+
+    assert waiting.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+    assert planner.calls == provider_calls
+    assert store.human_wait_context("game-1") == context
+    WorkflowStore(path)
+    return store, request, terminal
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.REJECTED,
+        PlannerRequestStatus.SUPERSEDED,
+    ],
+)
+def test_terminal_strategic_wait_evidence_is_required_by_startup_and_replay(
+    tmp_path, status
+):
+    path = tmp_path / f"terminal-wait-evidence-{status.value}.sqlite3"
+    store, _request, terminal = asyncio.run(
+        _terminal_strategic_request_state(path, status)
+    )
+    exported = store.export_replay_state("game-1")
+    invalid = copy.deepcopy(exported)
+    invalid["tables"]["workflow_ticks"] = [
+        row
+        for row in invalid["tables"]["workflow_ticks"]
+        if row["tick_id"] != terminal.tick_id
+    ]
+    invalid["tables"]["runtime_state"] = []
+    invalid["tables"]["workflow_meta"] = [
+        row
+        for row in invalid["tables"]["workflow_meta"]
+        if row["key"] != "human_wait:game-1"
+    ]
+    target, _target_request, _proposal, _attempt = asyncio.run(
+        _completed_proposal_state(
+            tmp_path / f"terminal-wait-target-{status.value}.sqlite3"
+        )
+    )
+    before = target.export_replay_state("game-1")
+    with pytest.raises(ValueError, match="termination Tick"):
+        target.import_replay_state(copy.deepcopy(invalid))
+    assert target.export_replay_state("game-1") == before
+
+    tampered = copy.deepcopy(exported)
+    _change_replay_tick(
+        tampered,
+        TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED,
+        failure_category="tampered_failure_category",
+    )
+    with pytest.raises(ValueError, match="termination Tick"):
+        target.import_replay_state(tampered)
+    assert target.export_replay_state("game-1") == before
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("DELETE FROM workflow_ticks WHERE tick_id=?", (terminal.tick_id,))
+        conn.execute("DELETE FROM runtime_state WHERE game_id='game-1'")
+        conn.execute("DELETE FROM workflow_meta WHERE key='human_wait:game-1'")
+    with pytest.raises(ValueError, match="termination Tick"):
+        WorkflowStore(path)
+
+
+@pytest.mark.parametrize("entrypoint", ["tick_and_runtime", "phase4"])
+def test_atomic_tick_entrypoints_reject_backdated_wait_error_after_resume(
+    tmp_path, entrypoint
+):
+    path = tmp_path / f"backdated-wait-error-{entrypoint}.sqlite3"
+    store, request, proposal, _active, planner, _engine_instance = asyncio.run(
+        _resumed_proposal_state(path)
+    )
+    ready = _proposal_ready_tick(store, proposal.proposal_id)
+    resumed = next(
+        tick
+        for tick in store.list_workflow_ticks("game-1")
+        if tick.outcome is TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+    )
+    forged = StrategicProposalWaitErrorTick(
+        tick_id=f"tick-backdated-wait-error-{entrypoint}",
+        game_session_id="game-1",
+        turn_number=ready.turn_number,
+        starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+        observation_ids=("obs-backdated-wait-error",),
+        started_at=ready.completed_at,
+        completed_at=resumed.started_at,
+        blocking_reason="forged backdated Proposal wait error",
+        error_category="TimeoutError",
+        diagnostic_summary="forged after resume with an earlier timestamp",
+        proposal_ready_tick_id=ready.tick_id,
+        planner_request_id=request.planner_request_id,
+        proposal_id=proposal.proposal_id,
+        target_kind=proposal.target_kind,
+        expected_base_revision=proposal.expected_base_revision,
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="active AWAITING_HUMAN"):
+        if entrypoint == "tick_and_runtime":
+            store.persist_tick_and_runtime_state(forged, human_wait_context=None)
+        else:
+            store.persist_phase4_tick(forged, human_wait_context=None)
+
+    assert store.export_replay_state("game-1") == before
+    assert store.load_runtime_state("game-1") is RuntimeState.ROUTING
+    assert store.human_wait_context("game-1") is None
+    assert planner.calls == 1
+    WorkflowStore(path)
+    _assert_replay_round_trip(tmp_path, store, f"backdated-wait-error-{entrypoint}")

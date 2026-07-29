@@ -12,7 +12,7 @@ from pydantic_core import to_json
 
 from .attempts import AttemptStatus
 from .base import DomainModel, ImmutableJsonObject
-from .planner import PlannerRequestTargetKind
+from .planner import PlannerRequestStatus, PlannerRequestTargetKind
 
 
 class RuntimeState(StrEnum):
@@ -41,6 +41,7 @@ class TickOutcomeKind(StrEnum):
     LOGICAL_PLANNER_REQUEST_CREATED = "LOGICAL_PLANNER_REQUEST_CREATED"
     PLANNER_ATTEMPT_COMPLETED = "PLANNER_ATTEMPT_COMPLETED"
     STRATEGIC_PROPOSAL_READY = "STRATEGIC_PROPOSAL_READY"
+    STRATEGIC_REQUEST_TERMINATED = "STRATEGIC_REQUEST_TERMINATED"
     STRATEGIC_PROPOSAL_WAIT_RESUMED = "STRATEGIC_PROPOSAL_WAIT_RESUMED"
     STRATEGIC_PROPOSAL_WAIT_ERROR = "STRATEGIC_PROPOSAL_WAIT_ERROR"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
@@ -191,6 +192,25 @@ class StrategicProposalWaitResumedTick(TickRecord):
     ]
     expected_base_revision: int = Field(ge=0)
     resume_reason: Literal["explicit_user_resume"] = "explicit_user_resume"
+
+
+class StrategicRequestTerminatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED] = (
+        TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    terminal_status: Literal[
+        PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.REJECTED,
+        PlannerRequestStatus.SUPERSEDED,
+    ]
+    failure_category: str = Field(min_length=1)
+    provider_attempt_id: str | None = None
+    blocking_reason: str = Field(min_length=1)
 
 
 class InformationRequestedTick(TickRecord):
@@ -436,6 +456,7 @@ WorkflowTick: TypeAlias = Annotated[
     | LogicalPlannerRequestCreatedTick
     | PlannerAttemptCompletedTick
     | StrategicProposalReadyTick
+    | StrategicRequestTerminatedTick
     | StrategicProposalWaitResumedTick
     | StrategicProposalWaitErrorTick
     | InformationRequestedTick
