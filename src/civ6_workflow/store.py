@@ -1953,6 +1953,11 @@ class WorkflowStore:
         *,
         label: str,
     ) -> None:
+        if (
+            resumed_tick is not None
+            and resumed_tick.started_at < opening_tick.completed_at
+        ):
+            raise ValueError(f"{label} resume Tick precedes the explicit-only wait")
         for tick in ticks:
             if (
                 tick.game_session_id != opening_tick.game_session_id
@@ -5329,6 +5334,8 @@ class WorkflowStore:
             or ready.proposal_id != tick.proposal_id
         ):
             raise ValueError("Proposal Resume Tick references the wrong Ready Tick")
+        if tick.started_at < ready.completed_at:
+            raise ValueError("Proposal Resume Tick precedes the Proposal Ready Tick")
 
     @classmethod
     def _preserve_concurrent_strategic_resume_context_in_connection(

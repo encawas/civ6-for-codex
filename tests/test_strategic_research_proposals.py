@@ -3471,3 +3471,101 @@ def test_proposal_wait_interval_rejects_forged_nonwaiting_tick(tmp_path, resolve
     _insert_forged_replay_tick(path, row, metric)
     with pytest.raises(ValueError, match="explicit-only wait interval"):
         WorkflowStore(path)
+
+
+@pytest.mark.parametrize("entrypoint", ["tick_and_runtime", "phase4"])
+def test_proposal_resume_rejects_tick_started_before_ready(tmp_path, entrypoint):
+    path = tmp_path / f"proposal-backdated-resume-{entrypoint}.sqlite3"
+    store, _request_record, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(path, repair=True)
+    )
+    ready = _proposal_ready_tick(store, proposal.proposal_id)
+    assert store.request_human_resume("game-1") is True
+    resume_request = store.list_strategic_proposal_wait_resume_requests("game-1")[0]
+    completed_at = max(ready.completed_at, resume_request.requested_at) + timedelta(
+        microseconds=1
+    )
+    forged = StrategicProposalWaitResumedTick(
+        tick_id=f"tick-backdated-proposal-resume-{entrypoint}",
+        game_session_id="game-1",
+        turn_number=ready.turn_number,
+        starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+        observation_ids=("obs-backdated-proposal-resume",),
+        started_at=ready.completed_at - timedelta(microseconds=1),
+        completed_at=completed_at,
+        resume_request_id=resume_request.resume_request_id,
+        proposal_ready_tick_id=ready.tick_id,
+        planner_request_id=proposal.source_planner_request_id,
+        proposal_id=proposal.proposal_id,
+        target_kind=proposal.target_kind,
+        expected_base_revision=proposal.expected_base_revision,
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="precedes the Proposal Ready Tick"):
+        if entrypoint == "tick_and_runtime":
+            store.persist_tick_and_runtime_state(forged, human_wait_context=None)
+        else:
+            store.persist_phase4_tick(forged, human_wait_context=None)
+
+    assert store.export_replay_state("game-1") == before
+    assert store.load_runtime_state("game-1") is RuntimeState.AWAITING_HUMAN
+    context = store.human_wait_context("game-1")
+    assert context is not None
+    assert context["resume_requested"] is True
+    WorkflowStore(path)
+    _assert_replay_round_trip(tmp_path, store, f"backdated-resume-{entrypoint}")
+
+
+def test_startup_and_replay_reject_backdated_proposal_resume_interval(tmp_path):
+    path = tmp_path / "proposal-backdated-resume-interval.sqlite3"
+    store, _request_record, proposal, _active, _planner, _engine_instance = asyncio.run(
+        _resumed_proposal_state(path)
+    )
+    ready = _proposal_ready_tick(store, proposal.proposal_id)
+    resumed = next(
+        tick
+        for tick in store.list_workflow_ticks("game-1")
+        if isinstance(tick, StrategicProposalWaitResumedTick)
+    )
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    resumed_row = _workflow_tick_replay_row(
+        invalid, TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+    )
+    resumed_payload = WorkflowStore._load(resumed_row["tick_json"])
+    backdated_at = ready.completed_at - timedelta(microseconds=1)
+    resumed_row["started_at"] = backdated_at.isoformat()
+    resumed_payload["started_at"] = backdated_at.isoformat()
+    resumed_row["tick_json"] = WorkflowStore._dump(resumed_payload)
+    forged_at = ready.completed_at + timedelta(microseconds=1)
+    assert forged_at < resumed.completed_at
+    row, metric = _append_forged_observed_replay_tick(
+        invalid,
+        tick_id="tick-forged-after-ready-before-backdated-resume-completion",
+        started_at=forged_at,
+        completed_at=forged_at,
+    )
+
+    _assert_invalid_replay_preserves_target(
+        tmp_path,
+        invalid,
+        "backdated-proposal-resume-interval",
+        match="resume Tick precedes the explicit-only wait",
+    )
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE workflow_ticks
+            SET started_at=?, tick_json=?
+            WHERE tick_id=?
+            """,
+            (
+                resumed_row["started_at"],
+                resumed_row["tick_json"],
+                resumed_row["tick_id"],
+            ),
+        )
+    _insert_forged_replay_tick(path, row, metric)
+    with pytest.raises(ValueError, match="resume Tick precedes the explicit-only wait"):
+        WorkflowStore(path)
