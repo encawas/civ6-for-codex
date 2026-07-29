@@ -1949,15 +1949,23 @@ class WorkflowStore:
         ticks: Sequence[WorkflowTick],
         opening_tick: WorkflowTick,
         resumed_tick: WorkflowTick | None,
+        resume_authorized_at: datetime | None,
         allowed_tick_types: tuple[type[Any], ...],
         *,
         label: str,
     ) -> None:
+        if (resumed_tick is None) != (resume_authorized_at is None):
+            raise ValueError(f"{label} resume Tick and authorization must agree")
         if (
             resumed_tick is not None
             and resumed_tick.started_at < opening_tick.completed_at
         ):
             raise ValueError(f"{label} resume Tick precedes the explicit-only wait")
+        if (
+            resume_authorized_at is not None
+            and resume_authorized_at < opening_tick.completed_at
+        ):
+            raise ValueError(f"{label} resume authorization precedes the wait")
         for tick in ticks:
             if (
                 tick.game_session_id != opening_tick.game_session_id
@@ -1965,8 +1973,8 @@ class WorkflowStore:
                 or (resumed_tick is not None and tick.tick_id == resumed_tick.tick_id)
                 or tick.completed_at <= opening_tick.completed_at
                 or (
-                    resumed_tick is not None
-                    and tick.started_at > resumed_tick.started_at
+                    resume_authorized_at is not None
+                    and tick.started_at > resume_authorized_at
                 )
             ):
                 continue
@@ -1975,10 +1983,6 @@ class WorkflowStore:
                 or tick.starting_runtime_state is not RuntimeState.AWAITING_HUMAN
                 or tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN
                 or tick.started_at < opening_tick.completed_at
-                or (
-                    resumed_tick is not None
-                    and tick.completed_at > resumed_tick.started_at
-                )
             ):
                 raise ValueError(
                     f"{label} explicit-only wait interval contains an invalid Tick"
@@ -2122,6 +2126,7 @@ class WorkflowStore:
                     ticks,
                     termination,
                     resumed,
+                    resumed.resumed_at,
                     (AwaitingHumanTick, StrategicRequestWaitErrorTick),
                     label="strategic Request terminal",
                 )
@@ -2129,6 +2134,7 @@ class WorkflowStore:
             cls._validate_explicit_wait_tick_interval(
                 ticks,
                 termination,
+                None,
                 None,
                 (AwaitingHumanTick, StrategicRequestWaitErrorTick),
                 label="strategic Request terminal",
@@ -2413,6 +2419,7 @@ class WorkflowStore:
                     ticks,
                     ready,
                     resumed,
+                    resume_request.requested_at,
                     (AwaitingHumanTick, StrategicProposalWaitErrorTick),
                     label="strategic Proposal",
                 )
@@ -2420,6 +2427,7 @@ class WorkflowStore:
             cls._validate_explicit_wait_tick_interval(
                 ticks,
                 ready,
+                None,
                 None,
                 (AwaitingHumanTick, StrategicProposalWaitErrorTick),
                 label="strategic Proposal",

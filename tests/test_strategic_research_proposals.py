@@ -3569,3 +3569,131 @@ def test_startup_and_replay_reject_backdated_proposal_resume_interval(tmp_path):
     _insert_forged_replay_tick(path, row, metric)
     with pytest.raises(ValueError, match="resume Tick precedes the explicit-only wait"):
         WorkflowStore(path)
+
+
+def _resume_during_snapshot_read(store, resumed_type):
+    game = _Game()
+    planner = _Planner()
+    engine = _engine(store, game, planner)
+    read_started = threading.Event()
+    allow_read = threading.Event()
+    original_read = game.read_snapshot
+
+    async def blocked_read(*, include_units=False):
+        read_started.set()
+        completed = await asyncio.to_thread(allow_read.wait, 5)
+        if not completed:
+            raise TimeoutError("test did not release snapshot read")
+        return await original_read(include_units=include_units)
+
+    game.read_snapshot = blocked_read
+    thread, result = _start_tick_thread(engine)
+    assert read_started.wait(5)
+    try:
+        assert store.request_human_resume("game-1") is True
+        if resumed_type is StrategicProposalWaitResumedTick:
+            authorized_at = store.list_strategic_proposal_wait_resume_requests(
+                "game-1"
+            )[0].requested_at
+        else:
+            authorized_at = datetime.fromisoformat(
+                store.human_wait_context("game-1")["resume_requested_at"]
+            )
+    finally:
+        allow_read.set()
+    thread.join(10)
+
+    assert not thread.is_alive()
+    assert "error" not in result
+    resumed = next(
+        tick
+        for tick in store.list_workflow_ticks("game-1")
+        if isinstance(tick, resumed_type)
+    )
+    assert resumed.started_at < authorized_at <= resumed.completed_at
+    assert planner.calls == 0
+    return resumed, authorized_at
+
+
+def _proposal_resume_during_tick_state(path):
+    store, _request_record, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(path, repair=True)
+    )
+    opening = _proposal_ready_tick(store, proposal.proposal_id)
+    resumed, authorized_at = _resume_during_snapshot_read(
+        store, StrategicProposalWaitResumedTick
+    )
+    return store, opening, resumed, authorized_at
+
+
+def _terminal_resume_during_tick_state(path):
+    store, _request_record, opening = asyncio.run(
+        _terminal_strategic_request_state(path, PlannerRequestStatus.FAILED)
+    )
+    resumed, authorized_at = _resume_during_snapshot_read(
+        store, StrategicRequestWaitResumedTick
+    )
+    return store, opening, resumed, authorized_at
+
+
+@pytest.mark.parametrize("wait_kind", ["proposal", "terminal"])
+def test_save_workflow_tick_rejects_tick_before_resume_authorization(
+    tmp_path, wait_kind
+):
+    path = tmp_path / f"{wait_kind}-authorization-public-save.sqlite3"
+    setup = (
+        _proposal_resume_during_tick_state
+        if wait_kind == "proposal"
+        else _terminal_resume_during_tick_state
+    )
+    store, opening, resumed, authorized_at = setup(path)
+    forged_at = resumed.started_at + (authorized_at - resumed.started_at) / 2
+    forged = ObservedOnlyTick(
+        tick_id=f"tick-forged-before-{wait_kind}-resume-authorization",
+        game_session_id="game-1",
+        turn_number=opening.turn_number,
+        starting_runtime_state=RuntimeState.OBSERVING,
+        observation_ids=(f"obs-forged-before-{wait_kind}-authorization",),
+        started_at=forged_at,
+        completed_at=forged_at,
+    )
+    before = store.export_replay_state("game-1")
+
+    with pytest.raises(ValueError, match="explicit-only wait interval"):
+        store.save_workflow_tick(forged)
+
+    assert store.export_replay_state("game-1") == before
+    WorkflowStore(path)
+    _assert_replay_round_trip(tmp_path, store, f"{wait_kind}-authorization-save")
+
+
+@pytest.mark.parametrize("wait_kind", ["proposal", "terminal"])
+def test_startup_and_replay_reject_tick_before_resume_authorization(
+    tmp_path, wait_kind
+):
+    path = tmp_path / f"{wait_kind}-authorization-replay.sqlite3"
+    setup = (
+        _proposal_resume_during_tick_state
+        if wait_kind == "proposal"
+        else _terminal_resume_during_tick_state
+    )
+    store, _opening, resumed, authorized_at = setup(path)
+    forged_at = resumed.started_at + (authorized_at - resumed.started_at) / 2
+    invalid = copy.deepcopy(store.export_replay_state("game-1"))
+    row, metric = _append_forged_observed_replay_tick(
+        invalid,
+        tick_id=f"tick-forged-before-{wait_kind}-authorization-replay",
+        started_at=forged_at,
+        completed_at=forged_at,
+    )
+
+    _assert_invalid_replay_preserves_target(
+        tmp_path,
+        invalid,
+        f"{wait_kind}-authorization-interval",
+        match="explicit-only wait interval",
+    )
+
+    _insert_forged_replay_tick(path, row, metric)
+    with pytest.raises(ValueError, match="explicit-only wait interval"):
+        WorkflowStore(path)
