@@ -69,16 +69,22 @@ Approval executes under BEGIN IMMEDIATE and re-reads all mutable aggregate state
 2. Prove no human terminal decision and no system invalidation.
 3. Validate source PlannerRequest, final ProviderAttempt, Ready Tick, and explicit-only wait.
 4. Re-read the Contract head and compare target identity and expected base.
-5. Write ApprovalRecord(APPROVED).
-6. Append Contract revision = expected base + 1 from Proposal content.
-7. Write the structured StrategicContractCommit.
-8. Write StrategicProposalAppliedTick.
-9. Transfer research AuthorityScopeSet ownership to MissionGraph.
-10. Set Runtime to ROUTING and clear Human Wait context.
-11. Commit.
+5. Re-read every legacy research StoredTask, all associated ActionAttempts, and pending task confirmation.
+6. Move PENDING, READY, BLOCKED, FAILED, ESCALATED, and AWAITING_CONFIRMATION tasks to CANCELLED; close legacy confirmations and audit their prior state plus authority-switch reason.
+7. Block and roll back for RUNNING, VERIFYING, or UNCERTAIN tasks or any associated PREPARED, VERIFYING, or UNCERTAIN ActionAttempt.
+8. Prove no legacy research work remains claimable, in flight, verifying, uncertain, or revivable.
+9. Write ApprovalRecord(APPROVED).
+10. Append Contract revision = expected base + 1 from Proposal content.
+11. Write the structured StrategicContractCommit.
+12. Write StrategicProposalAppliedTick with legacy execution disposition audit.
+13. Transfer research AuthorityScopeSet ownership to MissionGraph.
+14. Set Runtime to ROUTING and clear Human Wait context.
+15. Commit.
 ```
 
-The ApprovalRecord, Contract revision, ContractCommit, Applied Tick, research Mission, AuthorityScopeSet change, Runtime transition, and wait clearance all commit or all roll back. No observer can see an approved Proposal without its effective Contract or see MissionGraph research content while legacy research still owns writes.
+The legacy execution disposition, ApprovalRecord, Contract revision, ContractCommit, Applied Tick, research Mission, AuthorityScopeSet change, Runtime transition, and wait clearance all commit or all roll back. No observer can see an approved Proposal without its effective Contract or see MissionGraph research content while legacy research remains claimable.
+
+The cutover matrix is deterministic: PENDING, READY, BLOCKED, FAILED, ESCALATED, and AWAITING_CONFIRMATION tasks become permanently non-revivable CANCELLED tasks in the transaction; the associated legacy confirmation is closed. RUNNING, VERIFYING, and UNCERTAIN tasks block activation, as does any associated ActionAttempt in PREPARED, VERIFYING, or UNCERTAIN. DONE, CANCELLED, and EXPIRED tasks remain inert history when no unresolved Attempt exists. Preflight cleanup cannot authorize activation; the re-read under BEGIN IMMEDIATE is authoritative. Startup and replay reject switched authority with any claimable, in-flight, verifying, uncertain, or revivable legacy research execution.
 
 A stale target discovered in step 4 produces INVALIDATED through its own atomic transaction. It does not write Approval or automatically rebase or recall the Provider.
 

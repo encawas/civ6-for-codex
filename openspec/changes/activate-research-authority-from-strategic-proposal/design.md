@@ -82,16 +82,31 @@ BEGIN IMMEDIATE
 2. Prove no human terminal decision and no system invalidation.
 3. Validate source PlannerRequest, final ProviderAttempt, Ready Tick, and explicit-only wait.
 4. Re-read the active Contract root and compare target identity and expected base revision.
-5. Insert APPROVED ApprovalRecord.
-6. Append StrategicContract revision = expected base + 1 from Proposal content.
-7. Insert structured StrategicContractCommit.
-8. Insert StrategicProposalAppliedTick.
-9. Transfer research AuthorityScopeSet ownership to MissionGraph.
-10. Set Runtime to ROUTING and clear Human Wait context.
+5. Re-read every legacy research StoredTask, all associated ActionAttempts, and pending task confirmation.
+6. Move PENDING, READY, BLOCKED, FAILED, ESCALATED, and AWAITING_CONFIRMATION tasks to CANCELLED; close legacy confirmations and record prior state plus authority-switch reason.
+7. If a task is RUNNING, VERIFYING, or UNCERTAIN, or any Attempt is PREPARED, VERIFYING, or UNCERTAIN, roll back and block activation.
+8. Prove no legacy research work remains claimable, in flight, verifying, uncertain, or revivable.
+9. Insert APPROVED ApprovalRecord.
+10. Append StrategicContract revision = expected base + 1 from Proposal content.
+11. Insert structured StrategicContractCommit.
+12. Insert StrategicProposalAppliedTick with legacy execution disposition audit.
+13. Transfer research AuthorityScopeSet ownership to MissionGraph.
+14. Set Runtime to ROUTING and clear Human Wait context.
 COMMIT
 ```
 
-The Contract revision, MissionGraph Mission, and research authority change are one aggregate write. A fault at any point rolls everything back.
+Legacy execution disposition, the Contract revision, MissionGraph Mission, and research authority change are one aggregate write. A fault at any point rolls everything back. Preflight cleanup is advisory only; the locked re-read and disposition are authoritative.
+
+| Existing legacy research state | Treatment while approval holds the writer lock |
+| --- | --- |
+| PENDING, READY, BLOCKED, FAILED, ESCALATED | Move to CANCELLED and audit the previous state and authority-switch reason |
+| AWAITING_CONFIRMATION | Move the task to CANCELLED and close the legacy confirmation without treating it as Contract approval |
+| RUNNING | Block activation until recovery proves the mutation boundary is resolved |
+| VERIFYING | Block activation until fresh verification completes |
+| UNCERTAIN | Block activation until fact-based or human reconciliation completes |
+| DONE, CANCELLED, EXPIRED | Preserve as inert history when no unresolved Attempt exists |
+
+CANCELLED is permanently non-revivable for this cutover. After authority transfer, every legacy research task-creation, retry, release, and confirmation path reads AuthorityScopeSet and fails closed. Any ActionAttempt in PREPARED, VERIFYING, or UNCERTAIN blocks activation regardless of the task status. Startup and replay enforce the same closure.
 
 Rejection performs one transaction that writes REJECTED ApprovalRecord and StrategicProposalRejectedTick, resumes ROUTING, and clears the wait without touching Contract or authority.
 

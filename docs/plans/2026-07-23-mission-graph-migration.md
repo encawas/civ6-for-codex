@@ -355,7 +355,8 @@ Other Strategic Scopes remain legacy-owned.
   base-revision binding.
 - Add atomic approve, reject, and invalidate transitions.
 - Switch research AuthorityScopeSet ownership only with the approved Contract
-  revision and research Mission.
+  revision, research Mission, and locked disposition of all legacy research
+  execution.
 - Stop legacy research writes after switch and route from the active
   Contract/Mission revision.
 - Preserve StoredTask temporarily as execution authority, but never create it
@@ -382,9 +383,9 @@ Other Strategic Scopes remain legacy-owned.
 - Implement dedicated BEGIN IMMEDIATE approved, rejected, and invalidated
   full-aggregate services. No standalone ApprovalRecord or terminal Tick public
   save method may bypass them.
-- Atomically persist Approval, Contract revision, ContractCommit, transition
-  Tick, research Mission, AuthorityScopeSet, Runtime transition, and wait
-  clearance as applicable.
+- Atomically persist legacy research execution disposition, Approval, Contract
+  revision, ContractCommit, transition Tick, research Mission,
+  AuthorityScopeSet, Runtime transition, and wait clearance as applicable.
 - Close legacy research writes after ownership changes.
 - Add active Contract/Mission routing projection and stale-revision guards.
 - Add crash, restart, replay, concurrency, and idempotency coverage.
@@ -421,14 +422,29 @@ Other Strategic Scopes remain legacy-owned.
 - Active legacy PlannerRequest completes, supersedes, or follows an explicit
   migration path.
 - Research PlanLease completes, invalidates, or blocks switch.
-- Legacy READY StoredTask is cancelled, superseded, or otherwise made
-  unclaimable before activation. If safe disposition cannot be proved,
-  activation is blocked.
-- VERIFYING StoredTask completes fresh verification before switch.
-- UNCERTAIN ActionAttempt blocks authority switch and equivalent mutation until
-  observed or human reconciliation.
-- Pending legacy approval completes, invalidates, or resubmits against the new
-  revision.
+- Approval holds BEGIN IMMEDIATE before the authoritative execution check.
+  Preflight cleanup is advisory and cannot authorize activation.
+
+| Existing legacy research state | Locked activation treatment |
+| --- | --- |
+| PENDING, READY, BLOCKED, FAILED, ESCALATED | Move to CANCELLED and record previous state plus authority-switch reason |
+| AWAITING_CONFIRMATION | Cancel the task and close its legacy confirmation without treating it as Contract approval |
+| RUNNING | Block activation until mutation-boundary recovery completes |
+| VERIFYING | Block activation until fresh verification completes |
+| UNCERTAIN | Block activation until fact-based or human reconciliation completes |
+| DONE, CANCELLED, EXPIRED | Preserve as inert history when no unresolved Attempt exists |
+
+- Any ActionAttempt in PREPARED, VERIFYING, or UNCERTAIN blocks activation
+  regardless of the StoredTask state.
+- The locked transaction re-reads all legacy research tasks, all Attempts,
+  and pending confirmations; applies safe cancellations; and proves no
+  claimable, in-flight, verifying, uncertain, or revivable work remains.
+- A READY task created after preflight but before lock acquisition is observed
+  and cancelled in the activation transaction or causes the transaction to
+  roll back.
+- CANCELLED is permanently non-revivable for this cutover. After authority
+  transfer, legacy task creation, retry, release, and confirmation paths fail
+  closed from the persisted AuthorityScopeSet.
 - Proposal decision and activation do not directly create StoredTask.
 - After activation and the Decision/Activation Tick complete, later Routing
   reads the active Contract/Mission revision, performs a separate deterministic
@@ -449,7 +465,12 @@ Other Strategic Scopes remain legacy-owned.
   ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal
   facts, duplicate Invalidated Ticks, and partial authority state.
 - Replay failure occurs before target-game deletion.
-- Research and Contract activate atomically; legacy research writes fail
+- Startup and replay reject MissionGraph research authority with claimable,
+  in-flight, verifying, uncertain, or revivable legacy research execution.
+- A READY task created after preflight but before BEGIN IMMEDIATE is acquired is
+  observed by the locked re-read and cannot survive activation.
+- Research, Contract, and legacy execution disposition commit atomically; no
+  old research work remains claimable or revivable and legacy writes fail
   afterward.
 - With research MissionGraph-owned and civic legacy-owned, MissionGraph-owned
   research strategic writes may pass scope validation, while writes targeting
@@ -477,8 +498,8 @@ revision.
   INVALIDATED disposition from canonical durable facts.
 - Approved content, Contract revision, ContractCommit, Applied Tick, research
   Mission, and AuthorityScopeSet are one atomic aggregate.
-- Research strategy is MissionGraph-owned and legacy research writes are
-  closed only after successful activation.
+- Research strategy is MissionGraph-owned only after legacy execution is
+  quiescent and legacy research writes are closed by the successful activation.
 - Research execution remains solely StoredTask-owned until Phase 3.
 - Startup, replay, concurrency, crash recovery, and protected Tick
   ordering pass.
@@ -792,14 +813,20 @@ migration audit, replay fixtures, and control-surface reads.
 | OPEN/REQUESTED DecisionGap | Complete or supersede before switch |
 | Active PlannerRequest | Complete, supersede, or explicitly migrate |
 | PlanLease | Invalidate, complete, or block switch |
-| READY StoredTask | Cancel, supersede, or otherwise make the old task unclaimable before activation; block activation if safe disposition cannot be proved |
-| VERIFYING StoredTask | Finish fresh verification before switch |
-| UNCERTAIN ActionAttempt | Reconcile manually or from facts; never generate equivalent replacement mutation |
+| PENDING, READY, BLOCKED, FAILED, ESCALATED StoredTask | Move to CANCELLED under the authority-switch lock and audit previous state plus reason |
+| AWAITING_CONFIRMATION StoredTask | Cancel task and close legacy confirmation under the same lock |
+| RUNNING StoredTask | Block switch until mutation-boundary recovery completes |
+| VERIFYING StoredTask | Block switch until fresh verification completes |
+| UNCERTAIN StoredTask | Block switch until fact-based or human reconciliation completes |
+| PREPARED, VERIFYING, UNCERTAIN ActionAttempt | Block switch regardless of StoredTask state |
+| DONE, CANCELLED, EXPIRED StoredTask | Preserve as inert history when no unresolved Attempt exists |
 | Pending approval | Complete, invalidate, or resubmit on new revision |
 | Provider BACKOFF | Preserve ordinary budget semantics; migration cannot bypass it |
 
-An UNCERTAIN ActionAttempt blocks any switch that could generate the same
-semantic mutation.
+The authority-switch transaction re-reads every affected task, all Attempts,
+and pending confirmations while holding its writer lock. Preflight cleanup is
+not authoritative. A task created after preflight is cancelled under the lock
+or blocks the switch, and no unresolved mutation may survive.
 
 The authority-switch transaction does not create a Mission-derived StoredTask.
 After activation and its dedicated Tick complete, later Routing may create a
@@ -816,9 +843,10 @@ provenance, and leaves at most one equivalent action claimable.
   research strategic writes may pass scope validation, while writes targeting
   legacy-owned non-research scopes are rejected.
 - No equivalent legacy/new action is claimable.
-- A legacy READY research task is cancelled, superseded, or made unclaimable
-  before authority activation; any Mission-derived replacement can become
-  claimable only after later Routing projection and the normal Planner lifecycle.
+- All safely disposable legacy execution is cancelled under the switch lock;
+  in-flight, verifying, or uncertain work blocks activation, and startup/replay
+  reject a switched scope with claimable or revivable legacy execution.
+- A READY task created after preflight cannot survive the locked re-read.
 - Active-object migration and rollback fixtures.
 - Multi-game isolation, replay, approvals, crash injection, and rebaseline.
 - Unmigrated scopes remain unchanged.

@@ -42,6 +42,40 @@ After research becomes MissionGraph-owned, every legacy path that could create o
 - **WHEN** an application version that lacks MissionGraph research authority encounters an already switched game
 - **THEN** it fails closed rather than resume legacy research writes
 
+### Requirement: Legacy research execution is quiescent at activation
+
+While holding the BEGIN IMMEDIATE writer lock and before committing the research AuthorityScopeSet transfer, approval activation SHALL re-read every legacy research StoredTask, all associated ActionAttempts, and any pending task-confirmation state. The same transaction SHALL leave no claimable, in-flight, verifying, uncertain, or otherwise revivable legacy research work. If quiescence cannot be proved, the entire activation SHALL roll back.
+
+#### Scenario: Safely disposable work is cancelled atomically
+
+- **WHEN** legacy research tasks are PENDING, READY, BLOCKED, FAILED, ESCALATED, or AWAITING_CONFIRMATION when approval holds the writer lock
+- **THEN** the activation transaction moves them to the permanently non-revivable CANCELLED state, records their previous state and authority-switch reason in activation audit, and closes any legacy confirmation without treating it as Contract approval
+
+#### Scenario: In-flight or unresolved work blocks activation
+
+- **WHEN** a legacy research task is RUNNING, VERIFYING, or UNCERTAIN, or any associated ActionAttempt is PREPARED, VERIFYING, or UNCERTAIN
+- **THEN** activation rolls back before Approval, Contract, MissionGraph authority, Runtime, or wait state changes
+
+#### Scenario: Permanent terminal history remains unchanged
+
+- **WHEN** a legacy research task is DONE, CANCELLED, or EXPIRED and has no unresolved ActionAttempt
+- **THEN** activation preserves that task and its execution evidence as inert history
+
+#### Scenario: Task appears after preflight
+
+- **WHEN** preflight found no claimable task but legacy routing commits a READY research task before approval acquires BEGIN IMMEDIATE
+- **THEN** the locked re-read observes and cancels that task in the activation transaction or blocks activation
+
+#### Scenario: Forged switched history retains legacy execution
+
+- **WHEN** startup or replay contains MissionGraph research authority together with claimable, in-flight, verifying, uncertain, or revivable legacy research work
+- **THEN** aggregate validation fails closed and replay rejects the import before deleting target data
+
+#### Scenario: Quiescence creates no replacement task
+
+- **WHEN** the activation transaction disposes legacy research execution
+- **THEN** it creates no Mission-derived StoredTask and later Routing remains the only path to a new revision-bound Planner lifecycle
+
 ### Requirement: Non-research scopes remain unchanged
 
 The research activation transaction SHALL NOT transfer or modify the write authority, Missions, legacy plans, or execution work of any non-research scope.

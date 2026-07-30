@@ -289,6 +289,14 @@ rebase, or Provider recall. No intermediate state may expose partial approval,
 effective research strategy without matching authority, or dual research
 writers.
 
+Before writing approval or changing AuthorityScopeSet, the same BEGIN IMMEDIATE
+transaction re-reads every legacy research StoredTask, all ActionAttempts,
+and pending task confirmation. It performs the durable cutover disposition and
+proves execution quiescence while holding the writer lock. Cleanup observed
+before lock acquisition is not authority. Switched authority with claimable,
+in-flight, verifying, uncertain, or revivable legacy execution is invalid at
+ordinary save, startup, and replay.
+
 RuntimeState, Human Wait context, Applied, Rejected, Resume, and Error Ticks
 are transition or interaction evidence. None substitutes for ApprovalRecord.
 Ordinary work begins only after the dedicated decision or activation Tick
@@ -513,17 +521,36 @@ references its Mission and Contract revision. Planner cannot create an
 independently strategic StoredTask. A stale Contract makes old StoredTask
 unclaimable, and an action cannot have two execution authorities.
 
-Before a Scope authority switch, every legacy-authority READY StoredTask must
-be cancelled, superseded, or otherwise made unclaimable. If that cannot be
-proved safe, activation is blocked. The authority-switch or Proposal-application
-transaction never creates a Mission-derived StoredTask. After activation and
-the dedicated Decision/Activation Tick complete, a later Routing step reads the
-active Contract and Mission, performs a separate deterministic revision-bound
+The approval transaction freezes legacy research execution under the same
+writer lock as the Contract and AuthorityScopeSet commit:
+
+| Existing legacy research state | Atomic cutover treatment |
+| --- | --- |
+| PENDING, READY, BLOCKED, FAILED, ESCALATED | Move to CANCELLED and audit the previous state and authority-switch reason |
+| AWAITING_CONFIRMATION | Cancel the task and close the legacy confirmation; never interpret it as Contract approval |
+| RUNNING | Block activation until mutation-boundary recovery completes |
+| VERIFYING | Block activation until fresh verification completes |
+| UNCERTAIN | Block activation until fact-based or human reconciliation completes |
+| DONE, CANCELLED, EXPIRED | Preserve as inert history when no unresolved Attempt exists |
+
+Any ActionAttempt in PREPARED, VERIFYING, or UNCERTAIN blocks activation
+regardless of task status. CANCELLED is permanently non-revivable for this
+cutover. The locked transaction re-reads all affected rows, applies every safe
+cancellation, records legacy disposition in the activation audit, and proves no
+claimable, in-flight, verifying, uncertain, or revivable research execution
+remains before switching authority. A READY task created after preflight but
+before lock acquisition is therefore observed and cancelled or blocks the
+transaction.
+
+The authority-switch or Proposal-application transaction never creates a
+Mission-derived StoredTask. After activation and the dedicated
+Decision/Activation Tick complete, a later Routing step reads the active
+Contract and Mission, performs a separate deterministic revision-bound
 projection, and enters the normal Planner lifecycle before a replacement
-StoredTask may be created. The old task remains unclaimable, its provenance is
-not rewritten, and at most one equivalent action may be claimable. VERIFYING
-StoredTask completes fresh verification before switching; an UNCERTAIN
-ActionAttempt blocks the switch and any equivalent mutation.
+StoredTask may be created. Old execution provenance remains auditable and at
+most one equivalent action may be claimable. After cutover, every legacy task
+creation, retry, release, and confirmation path reads AuthorityScopeSet and
+fails closed.
 
 Phase 3 makes `domain.Task` and TurnActionGraph the research execution
 authority. `workflow_tasks` and `models.StoredTask` stop deciding research

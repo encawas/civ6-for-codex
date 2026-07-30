@@ -11,6 +11,7 @@ Phase 1C must define that boundary before implementation so three follow-up PRs 
 - Require structured ContractCommit provenance binding to Proposal identity and hash, Approval identity, source PlannerRequest, and expected base revision.
 - Define fail-closed startup and replay evidence validation, concurrency and idempotency behavior, crash recovery, and explicit-only wait transition ordering.
 - Stop legacy research writes only when the atomic authority switch commits; leave all non-research scopes under their existing authority.
+- Require the locked approval transaction to atomically dispose safely cancellable legacy research execution and block activation for claimable, in-flight, verifying, uncertain, or otherwise revivable old work.
 - Keep Proposal application separate from StoredTask creation. Later routing consumes the committed MissionGraph revision and performs an independent deterministic projection.
 - Replace the PR 0 Phase 1B implementation assumption with the actual Phase 1A/1B baseline and a three-PR Phase 1C rollout:
   - PR 1C-1: protocol and persistence foundation, with no Engine or user entry point.

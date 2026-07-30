@@ -6,7 +6,7 @@ Defines the all-or-nothing evidence and revision rules that make an approved Str
 
 ### Requirement: Approved activation is atomic
 
-Approval of an eligible OPEN Proposal SHALL atomically persist the APPROVED ApprovalRecord, one StrategicContractCommit, one new StrategicContract revision, one StrategicProposalAppliedTick, the research AuthorityScopeSet transfer, Runtime transition to ROUTING, and Human Wait clearance. No observer SHALL see a committed subset.
+Approval of an eligible OPEN Proposal SHALL atomically persist the durable disposition and quiescence proof for legacy research execution, the APPROVED ApprovalRecord, one StrategicContractCommit, one new StrategicContract revision, one StrategicProposalAppliedTick carrying immutable disposition audit references, the research AuthorityScopeSet transfer, Runtime transition to ROUTING, and Human Wait clearance. No observer SHALL see a committed subset.
 
 #### Scenario: Approval succeeds
 
@@ -21,7 +21,7 @@ Approval of an eligible OPEN Proposal SHALL atomically persist the APPROVED Appr
 #### Scenario: Crash after Contract write
 
 - **WHEN** a fault occurs after preparing or writing the Contract revision but before the transaction commits
-- **THEN** the ApprovalRecord, Contract revision, ContractCommit, authority switch, Applied Tick, Runtime change, and wait clearance all roll back
+- **THEN** the legacy execution disposition, ApprovalRecord, Contract revision, ContractCommit, authority switch, Applied Tick, Runtime change, and wait clearance all roll back
 
 #### Scenario: Crash before Applied Tick
 
@@ -101,7 +101,7 @@ A Proposal-derived Contract revision SHALL set approval_status to APPROVED and S
 
 ### Requirement: Complete approval evidence is required
 
-The durable APPROVED disposition SHALL consist of the immutable Proposal, matching APPROVED ApprovalRecord, matching StrategicContractCommit, expected StrategicContract revision, and matching StrategicProposalAppliedTick. The evidence SHALL exclude any invalidation fact.
+The durable APPROVED disposition SHALL consist of the immutable Proposal, matching APPROVED ApprovalRecord, matching StrategicContractCommit, expected StrategicContract revision, matching StrategicProposalAppliedTick with immutable legacy execution disposition audit references, and aggregate proof that no claimable, in-flight, verifying, uncertain, or revivable legacy research execution survived activation. The evidence SHALL exclude any invalidation fact.
 
 #### Scenario: Applied Tick missing
 
