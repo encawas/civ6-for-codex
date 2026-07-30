@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 import json
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from uuid import uuid4
 
 from pydantic import AfterValidator, Field, PlainSerializer, field_validator
@@ -44,6 +44,7 @@ class SlotValue(DomainModel):
 
 EMPTY_SLOT_STRINGS = frozenset({"", "none", "nothing", "null"})
 NORMALIZATION_VERSION = "civ6-observation/v1"
+OBSERVATION_SOURCE_VERSION = "civ6-runtime-snapshot/v1"
 
 
 def normalize_slot(value: Any, *, loaded: bool = True) -> SlotValue:
@@ -115,17 +116,51 @@ class UnitSummary(DomainModel):
         return bool(self.detail_reasons) and not self.details_loaded
 
 
+class ObservationCompleteness(DomainModel):
+    """Explicitly records which canonical projections are safe to compare."""
+
+    cities: bool = False
+    current_research: bool = False
+    available_research: bool = False
+    current_civic: bool = False
+    available_civics: bool = False
+    units: bool = False
+    blockers: bool = False
+
+    def supports_scope(self, scope: str) -> bool:
+        if scope == "research":
+            return self.current_research and self.available_research
+        if scope == "civic":
+            return self.current_civic and self.available_civics
+        return False
+
+
 class NormalizedObservation(DomainModel):
     observation_id: str = Field(default_factory=lambda: f"obs_{uuid4().hex}")
     game_session_id: str
     turn_number: int = Field(ge=0)
-    normalization_version: Literal["civ6-observation/v1"] = NORMALIZATION_VERSION
+    observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    normalization_version: str = Field(
+        default=NORMALIZATION_VERSION,
+        min_length=1,
+    )
+    source_version: str = Field(
+        default=OBSERVATION_SOURCE_VERSION,
+        min_length=1,
+    )
+    completeness: ObservationCompleteness = ObservationCompleteness()
     raw_observation: ImmutableJsonObject
     cities: tuple[NormalizedCity, ...] = ()
     progression: ProgressionState
     units: tuple[NormalizedUnit, ...] | None = None
     blockers: tuple[NormalizedBlocker, ...] = ()
     unit_summary: UnitSummary
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError(
+                "NormalizedObservation observed_at must include a timezone"
+            )
 
     def city(self, entity_id: str | int) -> NormalizedCity | None:
         expected = str(entity_id).strip()
@@ -147,7 +182,7 @@ class NormalizedObservation(DomainModel):
     def projection_hash(self) -> str:
         projection = self.model_dump(
             mode="json",
-            exclude={"observation_id", "raw_observation"},
+            exclude={"observation_id", "observed_at", "raw_observation"},
         )
         encoded = json.dumps(
             projection,

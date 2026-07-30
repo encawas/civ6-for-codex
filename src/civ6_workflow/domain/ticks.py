@@ -50,6 +50,7 @@ class TickOutcomeKind(StrEnum):
     STRATEGIC_PROPOSAL_APPLIED = "STRATEGIC_PROPOSAL_APPLIED"
     STRATEGIC_PROPOSAL_REJECTED = "STRATEGIC_PROPOSAL_REJECTED"
     STRATEGIC_PROPOSAL_INVALIDATED = "STRATEGIC_PROPOSAL_INVALIDATED"
+    MISSION_GRAPH_PATCHED = "MISSION_GRAPH_PATCHED"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
     INFORMATION_COLLECTED = "INFORMATION_COLLECTED"
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
@@ -179,6 +180,22 @@ class StrategicProposalReadyTick(TickRecord):
     ]
     expected_base_revision: int = Field(ge=0)
     blocking_reason: str = Field(min_length=1)
+
+
+class MissionGraphPatchedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.MISSION_GRAPH_PATCHED] = (
+        TickOutcomeKind.MISSION_GRAPH_PATCHED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str = Field(min_length=1)
+    provider_attempt_id: str = Field(min_length=1)
+    patch_id: str = Field(min_length=1)
+    state_delta_id: str = Field(min_length=1)
+    contract_id: str = Field(min_length=1)
+    committed_revision: int = Field(ge=2)
+    previous_baseline_observation_id: str = Field(min_length=1)
+    accepted_observation_id: str = Field(min_length=1)
 
 
 class StrategicProposalWaitResumedTick(TickRecord):
@@ -652,6 +669,7 @@ WorkflowTick: TypeAlias = Annotated[
     | LogicalPlannerRequestCreatedTick
     | PlannerAttemptCompletedTick
     | StrategicProposalReadyTick
+    | MissionGraphPatchedTick
     | StrategicRequestTerminatedTick
     | StrategicRequestWaitResumedTick
     | StrategicRequestWaitErrorTick

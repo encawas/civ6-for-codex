@@ -256,6 +256,23 @@ class StrategicResearchProposalResponse(StrictModel):
         return self
 
 
+class MissionGraphPatchCandidate(StrictModel):
+    mission_updates: tuple[Mission, ...] = Field(min_length=1)
+    created_from_observation_id: str = Field(min_length=1)
+
+
+class MissionGraphPatchResponse(StrictModel):
+    schema_version: Literal["mission-graph-patch-response/v1"]
+    information_requests: tuple[InformationRequest, ...] = ()
+    patch_candidates: tuple[MissionGraphPatchCandidate, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> Self:
+        if self.information_requests and self.patch_candidates:
+            raise ValueError("information response cannot include patch candidates")
+        return self
+
+
 def canonical_workflow_plan_bundle_payload(value: Any) -> dict[str, Any]:
     source = (
         value.model_dump(mode="python")
@@ -280,15 +297,31 @@ def canonical_strategic_research_proposal_response_payload(
     return response.model_dump(mode="json")
 
 
+def canonical_mission_graph_patch_response_payload(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump_json"):
+        source_json = value.model_dump_json()
+    elif isinstance(value, str):
+        source_json = value
+    else:
+        source_json = json.dumps(
+            thaw_json(value), ensure_ascii=False, separators=(",", ":")
+        )
+    response = MissionGraphPatchResponse.model_validate_json(source_json)
+    return response.model_dump(mode="json")
+
+
 def planner_response_model_for_request(
     request: "WorkflowAgentRequest",
-) -> type[WorkflowPlanBundle] | type[StrategicResearchProposalResponse]:
+) -> (
+    type[WorkflowPlanBundle]
+    | type[StrategicResearchProposalResponse]
+    | type[MissionGraphPatchResponse]
+):
     target_kind = request.constraints.get("planner_request_target_kind")
-    if target_kind in {
-        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value,
-        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR.value,
-    }:
+    if target_kind == PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value:
         return StrategicResearchProposalResponse
+    if target_kind == PlannerRequestTargetKind.MISSION_GRAPH_REPAIR.value:
+        return MissionGraphPatchResponse
     return WorkflowPlanBundle
 
 

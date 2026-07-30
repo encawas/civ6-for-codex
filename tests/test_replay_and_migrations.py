@@ -102,7 +102,7 @@ def test_legacy_database_migrates_retry_state(tmp_path: Path):
     assert task.source_mission_id is None
     assert task.source_mission_revision is None
     with sqlite3.connect(database) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
         row = conn.execute(
             """
             SELECT source_contract_id, source_contract_revision,

@@ -148,6 +148,12 @@ class StrategicContractCommit(DomainModel):
     source_planner_request_id: str | None = Field(default=None, min_length=1)
     source_mission_id: str | None = Field(default=None, min_length=1)
     source_mission_revision: int | None = Field(default=None, ge=1)
+    source_patch_id: str | None = Field(default=None, min_length=1)
+    source_state_delta_id: str | None = Field(default=None, min_length=1)
+    source_patch_planner_request_id: str | None = Field(default=None, min_length=1)
+    source_patch_provider_attempt_id: str | None = Field(default=None, min_length=1)
+    source_patch_mission_id: str | None = Field(default=None, min_length=1)
+    source_patch_mission_revision: int | None = Field(default=None, ge=1)
 
     def model_post_init(self, __context: object) -> None:
         if self.committed_at.tzinfo is None or self.committed_at.utcoffset() is None:
@@ -158,7 +164,7 @@ class StrategicContractCommit(DomainModel):
             raise ValueError("commit and Contract identities must agree")
         if self.contract.revision != self.expected_base_revision + 1:
             raise ValueError("Contract revision must immediately follow its base")
-        provenance = (
+        proposal_provenance = (
             self.source_proposal_id,
             self.source_proposal_hash,
             self.source_approval_id,
@@ -166,11 +172,29 @@ class StrategicContractCommit(DomainModel):
             self.source_mission_id,
             self.source_mission_revision,
         )
-        if any(value is not None for value in provenance) and not all(
-            value is not None for value in provenance
+        if any(value is not None for value in proposal_provenance) and not all(
+            value is not None for value in proposal_provenance
         ):
             raise ValueError(
                 "Proposal-derived Contract provenance must be all present or all null"
+            )
+        patch_provenance = (
+            self.source_patch_id,
+            self.source_state_delta_id,
+            self.source_patch_planner_request_id,
+            self.source_patch_provider_attempt_id,
+            self.source_patch_mission_id,
+            self.source_patch_mission_revision,
+        )
+        if any(value is not None for value in patch_provenance) and not all(
+            value is not None for value in patch_provenance
+        ):
+            raise ValueError(
+                "Patch-derived Contract provenance must be all present or all null"
+            )
+        if self.source_proposal_id is not None and self.source_patch_id is not None:
+            raise ValueError(
+                "Contract commit cannot be both Proposal-derived and Patch-derived"
             )
         if self.source_proposal_id is not None:
             if self.contract.approval_status is not ApprovalStatus.APPROVED:
@@ -186,6 +210,18 @@ class StrategicContractCommit(DomainModel):
             if len(matching) != 1:
                 raise ValueError(
                     "Proposal-derived Contract provenance must identify one Mission"
+                )
+            research_mission_action(matching[0])
+        if self.source_patch_id is not None:
+            matching = tuple(
+                mission
+                for mission in self.contract.mission_graph.missions
+                if mission.mission_id == self.source_patch_mission_id
+                and mission.mission_revision == self.source_patch_mission_revision
+            )
+            if len(matching) != 1:
+                raise ValueError(
+                    "Patch-derived Contract provenance must identify one Mission"
                 )
             research_mission_action(matching[0])
 

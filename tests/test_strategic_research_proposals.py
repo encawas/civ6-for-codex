@@ -21,6 +21,7 @@ from civ6_workflow.domain import (
     LeaseValidationResult,
     Mission,
     MissionGraph,
+    MissionGraphPatchedTick,
     MissionStatus,
     ObservedOnlyTick,
     PlannerAttemptCompletedTick,
@@ -57,7 +58,7 @@ from civ6_workflow.domain import (
     build_strategic_research_proposal_id,
     canonical_json_hash,
 )
-from civ6_workflow.engine import EngineConfig, WorkflowEngine
+from civ6_workflow.engine import EngineConfig, InjectedCrashBoundary, WorkflowEngine
 from civ6_workflow.models import (
     ExecutionMode,
     PlanBundle,
@@ -71,6 +72,8 @@ from civ6_workflow.store import WorkflowStore
 from civ6_workflow.web_ui import ControlPanelState
 from civ6_workflow.workflow_protocol import (
     InformationRequest,
+    MissionGraphPatchCandidate,
+    MissionGraphPatchResponse,
     StrategicResearchProposalCandidate,
     StrategicResearchProposalResponse,
     WorkflowAgentRequest,
@@ -1115,7 +1118,7 @@ def test_v9_upgrade_creates_empty_proposal_table_without_changing_state(tmp_path
     )
     assert upgraded.list_strategic_research_proposals("game-1") == []
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
 
 
 @pytest.mark.parametrize("kind", ["creation", "repair"])
@@ -5116,6 +5119,301 @@ def test_dormant_approval_atomically_activates_research_and_is_idempotent(tmp_pa
     restored = WorkflowStore(tmp_path / "atomic-approval-restored.sqlite3")
     restored.import_replay_state(replay)
     assert restored.export_replay_state(proposal.game_session_id) == replay
+
+
+def test_active_research_change_commits_local_mission_patch_and_replays(tmp_path):
+    async def scenario():
+        path = tmp_path / "phase2-repair.sqlite3"
+        store, _request_record, proposal, _attempt = await _completed_proposal_state(
+            path
+        )
+        store = _dormant_store(store)
+        store.approve_strategic_research_proposal(
+            proposal.game_session_id,
+            _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
+        )
+        active = store.get_active_strategic_contract(proposal.game_session_id)
+        assert active is not None
+
+        game = _Game(proposal.game_session_id)
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "tech_civics": {
+                    "current_research_type": "TECH_WRITING",
+                    "available_techs": [
+                        {"tech_type": "TECH_WRITING"},
+                        {"tech_type": "TECH_MINING"},
+                    ],
+                }
+            }
+        )
+        planner = _Planner()
+        engine = _engine(store, game, planner)
+        runtime_clock = [
+            store.list_strategic_contract_commits(proposal.game_session_id)[
+                -1
+            ].committed_at
+            + timedelta(seconds=10)
+        ]
+
+        def next_runtime_time():
+            runtime_clock[0] += timedelta(milliseconds=1)
+            return runtime_clock[0]
+
+        engine._now = next_runtime_time
+
+        await engine.tick()
+        baseline = store.get_accepted_observation_baseline(proposal.game_session_id)
+        assert baseline is not None
+        assert planner.calls == 0
+
+        engine.config.execution_mode = ExecutionMode.READONLY
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 2,
+                "overview": {"turn": 2, "player_id": 1, "num_cities": 1},
+                "cities": [
+                    {
+                        "city_id": 1,
+                        "currently_building": "BUILDING_MONUMENT",
+                    }
+                ],
+            }
+        )
+        await engine.tick()
+        unrelated_baseline = store.get_accepted_observation_baseline(
+            proposal.game_session_id
+        )
+        assert unrelated_baseline is not None
+        assert unrelated_baseline.observation_id != baseline.observation_id
+        assert planner.calls == 0
+
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 3,
+                "overview": {"turn": 3, "player_id": 1, "num_cities": 1},
+                "tech_civics": {
+                    "current_research_type": "TECH_MINING",
+                    "available_techs": [
+                        {"tech_type": "TECH_WRITING"},
+                        {"tech_type": "TECH_MINING"},
+                    ],
+                },
+            }
+        )
+        request_tick = await engine.tick()
+        assert (
+            request_tick.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        repair_request = store.active_planner_request(proposal.game_session_id)
+        assert repair_request is not None
+        assert (
+            repair_request.target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+        )
+        assert planner.calls == 0
+        assert (
+            store.get_accepted_observation_baseline(proposal.game_session_id)
+            == unrelated_baseline
+        )
+
+        prior_mission = active.mission_graph.missions[0]
+        repaired_mission = prior_mission.model_copy(
+            update={
+                "mission_revision": prior_mission.mission_revision + 1,
+                "objective": "Continue Mining",
+                "desired_outcome": {"technology": "TECH_MINING"},
+                "evidence_refs": (f"observation:{repair_request.observation_id}",),
+            }
+        )
+        planner.responses.append(
+            MissionGraphPatchResponse(
+                schema_version="mission-graph-patch-response/v1",
+                patch_candidates=(
+                    MissionGraphPatchCandidate(
+                        mission_updates=(repaired_mission,),
+                        created_from_observation_id=repair_request.observation_id,
+                    ),
+                ),
+            )
+        )
+        patch_tick = await engine.tick()
+
+        persisted_tick = store.list_workflow_ticks(proposal.game_session_id)[-1]
+        assert isinstance(persisted_tick, MissionGraphPatchedTick), (
+            persisted_tick.blocking_reason
+        )
+        assert (
+            patch_tick.workflow_tick["outcome"] == TickOutcomeKind.MISSION_GRAPH_PATCHED
+        )
+        assert planner.calls == 1
+        updated = store.get_active_strategic_contract(proposal.game_session_id)
+        assert updated is not None
+        assert updated.revision == active.revision + 1
+        assert updated.mission_graph.missions == (repaired_mission,)
+        assert len(store.list_mission_graph_patches(proposal.game_session_id)) == 1
+        assert (
+            store.get_accepted_observation_baseline(
+                proposal.game_session_id
+            ).observation_id
+            == repair_request.observation_id
+        )
+        patch = store.list_mission_graph_patches(proposal.game_session_id)[0]
+        completed_request = store.get_planner_request(repair_request.planner_request_id)
+        final_attempt = store.list_provider_attempts(repair_request.planner_request_id)[
+            -1
+        ]
+        patch_commit = store.list_strategic_contract_commits(proposal.game_session_id)[
+            -1
+        ]
+        repeated = store.apply_mission_graph_patch(
+            tick=persisted_tick,
+            planner_request=completed_request,
+            provider_attempt=final_attempt,
+            patch=patch,
+            commit=patch_commit,
+        )
+        assert repeated == updated
+        assert (
+            len(store.list_strategic_contract_revisions(proposal.game_session_id)) == 2
+        )
+        assert planner.calls == 1
+
+        replay = store.export_replay_state(proposal.game_session_id)
+        restored = WorkflowStore(tmp_path / "phase2-repair-restored.sqlite3")
+        restored.import_replay_state(replay)
+        assert restored.export_replay_state(proposal.game_session_id) == replay
+        assert (
+            restored.get_active_strategic_contract(proposal.game_session_id) == updated
+        )
+
+        invalid_replay = copy.deepcopy(replay)
+        invalid_replay["tables"]["mission_graph_patches"] = []
+        target = WorkflowStore(tmp_path / "phase2-repair-target.sqlite3")
+        target.set_meta("last_game_id", proposal.game_session_id)
+        before = target.export_replay_state(proposal.game_session_id)
+        with pytest.raises(ValueError, match="MissionGraphPatch"):
+            target.import_replay_state(invalid_replay)
+        assert target.export_replay_state(proposal.game_session_id) == before
+
+        with sqlite3.connect(restored.path) as conn:
+            conn.execute("DELETE FROM mission_graph_patches")
+        with pytest.raises(ValueError, match="MissionGraphPatch"):
+            WorkflowStore(restored.path)
+
+    asyncio.run(scenario())
+
+
+def test_mission_graph_patch_transaction_rolls_back_before_completion_tick(tmp_path):
+    async def scenario():
+        path = tmp_path / "phase2-repair-crash.sqlite3"
+        store, _request_record, proposal, _attempt = await _completed_proposal_state(
+            path
+        )
+        store = _dormant_store(store)
+        store.approve_strategic_research_proposal(
+            proposal.game_session_id,
+            _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
+        )
+        active = store.get_active_strategic_contract(proposal.game_session_id)
+        assert active is not None
+
+        game = _Game(proposal.game_session_id)
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "tech_civics": {
+                    "current_research_type": "TECH_WRITING",
+                    "available_techs": [
+                        {"tech_type": "TECH_WRITING"},
+                        {"tech_type": "TECH_MINING"},
+                    ],
+                }
+            }
+        )
+        planner = _Planner()
+        engine = _engine(store, game, planner)
+        runtime_clock = [
+            store.list_strategic_contract_commits(proposal.game_session_id)[
+                -1
+            ].committed_at
+            + timedelta(seconds=10)
+        ]
+
+        def next_runtime_time():
+            runtime_clock[0] += timedelta(milliseconds=1)
+            return runtime_clock[0]
+
+        engine._now = next_runtime_time
+        engine.config.execution_mode = ExecutionMode.READONLY
+        await engine.tick()
+        baseline = store.get_accepted_observation_baseline(proposal.game_session_id)
+        assert baseline is not None
+
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 2,
+                "overview": {"turn": 2, "player_id": 1, "num_cities": 1},
+                "tech_civics": {
+                    "current_research_type": "TECH_MINING",
+                    "available_techs": [
+                        {"tech_type": "TECH_WRITING"},
+                        {"tech_type": "TECH_MINING"},
+                    ],
+                },
+            }
+        )
+        await engine.tick()
+        request = store.active_planner_request(proposal.game_session_id)
+        assert request is not None
+        repaired_mission = active.mission_graph.missions[0].model_copy(
+            update={
+                "mission_revision": 2,
+                "objective": "Continue Mining",
+                "desired_outcome": {"technology": "TECH_MINING"},
+            }
+        )
+        planner.responses.append(
+            MissionGraphPatchResponse(
+                schema_version="mission-graph-patch-response/v1",
+                patch_candidates=(
+                    MissionGraphPatchCandidate(
+                        mission_updates=(repaired_mission,),
+                        created_from_observation_id=request.observation_id,
+                    ),
+                ),
+            )
+        )
+
+        class CrashBeforeTick:
+            @staticmethod
+            def checkpoint(name):
+                if name == "before_mission_patch_tick":
+                    raise RuntimeError(name)
+
+        engine.crash_injector = CrashBeforeTick()
+        with pytest.raises(InjectedCrashBoundary, match="before_mission_patch_tick"):
+            await engine.tick()
+
+        assert store.get_active_strategic_contract(proposal.game_session_id) == active
+        assert store.list_mission_graph_patches(proposal.game_session_id) == []
+        assert (
+            store.get_accepted_observation_baseline(proposal.game_session_id)
+            == baseline
+        )
+        assert not any(
+            isinstance(tick, MissionGraphPatchedTick)
+            for tick in store.list_workflow_ticks(proposal.game_session_id)
+        )
+        in_progress = store.get_planner_request(request.planner_request_id)
+        assert in_progress is not None
+        assert in_progress.status is PlannerRequestStatus.IN_PROGRESS
+        assert (
+            store.list_provider_attempts(request.planner_request_id)[-1].status
+            is ProviderAttemptStatus.STARTED
+        )
+        WorkflowStore(path)
+
+    asyncio.run(scenario())
 
 
 def test_dormant_rejection_is_atomic_idempotent_and_conflicts_with_approval(tmp_path):

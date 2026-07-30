@@ -413,6 +413,12 @@ class WorkflowEngine:
             self._active_observation_id = observation_id
             ctx.observation_ids.append(observation_id)
 
+        mission_repair_tick = await self.planner_lifecycle.advance_mission_repair(
+            ctx, observation
+        )
+        if mission_repair_tick is not None:
+            return mission_repair_tick
+
         before = self.store.task_ids(snapshot.game_id)
         materialization_started = self._monotonic()
         rule_compilation = self.rules.compile(observation)
@@ -1259,9 +1265,7 @@ class WorkflowEngine:
 
     @staticmethod
     def _observation_id(observation: NormalizedRuntimeObservation) -> str:
-        payload = observation.canonical.model_dump_json()
-        digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
-        return f"obs_{digest}_{uuid4().hex[:12]}"
+        return observation.canonical.observation_id
 
     def _task_invalidation(
         self, task: StoredTask, observation: NormalizedRuntimeObservation

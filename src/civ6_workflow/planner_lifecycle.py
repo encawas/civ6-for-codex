@@ -40,6 +40,10 @@ from .domain import (
     InformationRoundStatus,
     LeaseValidationResult,
     LogicalPlannerRequestCreatedTick,
+    MissionGraph,
+    MissionGraphPatchedTick,
+    MissionImpactAnalyzer,
+    ObservationComparisonKind,
     PlanLease,
     PlanLeaseStatus,
     PlanLeaseUpdatedTick,
@@ -52,10 +56,14 @@ from .domain import (
     ProviderAttempt,
     ProviderAttemptStatus,
     RuntimeState,
+    StrategicContract,
+    StrategicContractCommit,
     StrategicProposalReadyTick,
     StrategicRequestTerminatedTick,
     SubjectRef,
     build_strategic_contract_id,
+    build_mission_graph_patch,
+    build_mission_graph_patch_id,
     build_strategic_research_proposal,
     build_strategic_research_proposal_id,
     validate_workflow_tick,
@@ -74,8 +82,10 @@ from .workflow_protocol import (
     InformationRequest,
     WorkflowAgentRequest as AgentRequest,
     ResolutionDisposition,
+    MissionGraphPatchResponse,
     StrategicResearchProposalResponse,
     WorkflowPlanBundle,
+    canonical_mission_graph_patch_response_payload,
     canonical_strategic_research_proposal_response_payload,
     canonical_workflow_plan_bundle_payload,
     validate_event_resolution_contract,
@@ -118,6 +128,208 @@ class PlannerLifecycleCoordinator:
             ctx, observation, compatibility, current_events=current_events
         )
 
+    async def advance_mission_repair(self, ctx, observation):
+        """Advance the active research repair before legacy task projection."""
+
+        engine = self.engine
+        snapshot = observation.snapshot
+        active_request = engine.store.active_planner_request(snapshot.game_id)
+        if (
+            active_request is not None
+            and active_request.target.kind
+            is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+        ):
+            compatibility = TickResult(
+                turn=snapshot.turn,
+                metrics=ctx.metrics,
+                events=[],
+            )
+            return await self._advance_active_strategic_request(
+                ctx,
+                observation,
+                active_request,
+                compatibility,
+            )
+        if active_request is not None:
+            return None
+
+        active_contract = engine.store.get_active_strategic_contract(snapshot.game_id)
+        if (
+            active_contract is None
+            or "research"
+            not in active_contract.authority_scope_set.mission_graph_scopes
+        ):
+            return None
+
+        current = observation.canonical
+        comparison = engine.store.record_observation_comparison(
+            current,
+            detected_at=engine._now(),
+        )
+        baseline = engine.store.get_accepted_observation_baseline(snapshot.game_id)
+        if comparison.kind is ObservationComparisonKind.STATE_DELTA:
+            assert comparison.state_delta is not None
+            affected_mission_ids = MissionImpactAnalyzer().affected_mission_ids(
+                comparison.state_delta,
+                active_contract.mission_graph,
+            )
+            if affected_mission_ids and current.completeness.supports_scope("research"):
+                affected = tuple(
+                    mission
+                    for mission in active_contract.mission_graph.missions
+                    if mission.mission_id in affected_mission_ids
+                )
+                base_context = {
+                    "target_contract_id": active_contract.contract_id,
+                    "expected_base_revision": active_contract.revision,
+                    "strategic_scope": "research",
+                }
+                repair_context = {
+                    "source_state_delta_id": comparison.state_delta.state_delta_id,
+                    "baseline_observation_id": (
+                        comparison.state_delta.baseline_observation_id
+                    ),
+                    "current_observation_id": (
+                        comparison.state_delta.current_observation_id
+                    ),
+                    "current_observation_projection_hash": current.projection_hash,
+                    "affected_mission_ids": list(affected_mission_ids),
+                    "affected_missions": [
+                        mission.model_dump(mode="json") for mission in affected
+                    ],
+                }
+                projection = {
+                    "strategic_proposal_context": base_context,
+                    "mission_repair_context": repair_context,
+                    "planner_input_contract_revision": (
+                        PLANNER_INPUT_CONTRACT_REVISION
+                    ),
+                }
+                request_payload = AgentRequest(
+                    turn=snapshot.turn,
+                    execution_mode=engine.config.execution_mode,
+                    trigger_events=[],
+                    relevant_state={
+                        "state_delta": comparison.state_delta.model_dump(mode="json"),
+                        "affected_missions": repair_context["affected_missions"],
+                    },
+                    constraints={
+                        "planning_phase": "initial",
+                        "allow_information_requests": True,
+                        "planner_request_target_kind": (
+                            PlannerRequestTargetKind.MISSION_GRAPH_REPAIR.value
+                        ),
+                        "response_schema_version": ("mission-graph-patch-response/v1"),
+                    },
+                )
+                request_id = (
+                    "mission_repair_request_"
+                    + canonical_json_hash(
+                        {
+                            "contract_id": active_contract.contract_id,
+                            "base_revision": active_contract.revision,
+                            "state_delta_id": comparison.state_delta.state_delta_id,
+                            "affected_mission_ids": affected_mission_ids,
+                        }
+                    )[:24]
+                )
+                request = PlannerRequest(
+                    planner_request_id=request_id,
+                    game_session_id=snapshot.game_id,
+                    turn_number=snapshot.turn,
+                    observation_id=current.observation_id,
+                    target=PlannerRequestTarget(
+                        kind=PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+                        strategic_contract_id=active_contract.contract_id,
+                        base_contract_revision=active_contract.revision,
+                        strategic_scope="research",
+                        affected_mission_ids=affected_mission_ids,
+                    ),
+                    input_projection_hash=canonical_json_hash(projection),
+                    input_projection_version="mission-repair-input/v1",
+                    input_projection=projection,
+                    request_payload=request_payload.model_dump(mode="json"),
+                    policy_revision="mission-graph-repair-policy/v1",
+                    approval_contract_hash=canonical_json_hash(
+                        {"approval": "not-required"}
+                    ),
+                    allowed_actions_hash=canonical_json_hash(["set_research"]),
+                    model_settings={"provider": type(engine.planner).__name__},
+                    status=PlannerRequestStatus.PENDING,
+                    created_at=engine._now(),
+                    context_bytes=len(canonical_json(projection).encode("utf-8")),
+                )
+                ctx.metrics.logical_planner_request_count += 1
+                ctx.metrics.planner_context_bytes += request.context_bytes
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    LogicalPlannerRequestCreatedTick,
+                    planner_request=request,
+                    planner_request_id=request.planner_request_id,
+                    request_target_kind=request.target.kind,
+                    decision_gap_ids=(),
+                )
+
+        if current.completeness.supports_scope("research"):
+            expected_previous = None if baseline is None else baseline.observation_id
+            engine.store.accept_observation_baseline(
+                current.observation_id,
+                expected_previous_observation_id=expected_previous,
+                reason=f"accepted after {comparison.kind.value}",
+                accepted_at=engine._now(),
+            )
+        return None
+
+    async def _advance_active_strategic_request(
+        self,
+        ctx,
+        observation,
+        active: PlannerRequest,
+        compatibility: TickResult,
+    ):
+        engine = self.engine
+        snapshot = observation.snapshot
+        try:
+            proposal_context = self._strategic_proposal_context(
+                active, observation=observation
+            )
+        except ValueError as exc:
+            return self._supersede_strategic_request(
+                ctx, snapshot, active, compatibility, str(exc)
+            )
+        if active.status is PlannerRequestStatus.AWAITING_INFORMATION:
+            return await self._collect_information(
+                ctx, observation, active, compatibility
+            )
+        backoff = engine._active_backoff(active)
+        if active.status is PlannerRequestStatus.BACKOFF and backoff:
+            engine.store.record_planner_suppression(
+                snapshot.game_id,
+                snapshot.turn,
+                reason="provider_backoff",
+                relevant_input_hash=active.input_projection_hash,
+            )
+            return self._finish(
+                ctx,
+                snapshot,
+                PlannerBackoffTick,
+                compatibility=compatibility,
+                planner_request=active,
+                planner_request_id=active.planner_request_id,
+                blocking_reason=(
+                    "planner provider backoff remains active for "
+                    f"{backoff['remaining_seconds']:.1f}s"
+                ),
+            )
+        return await self._continue_strategic_proposal_request(
+            ctx,
+            observation,
+            active,
+            compatibility,
+            proposal_context,
+        )
+
     async def advance(
         self, ctx, observation, agent_events, compatibility, *, current_events=None
     ):
@@ -143,42 +355,8 @@ class PlannerLifecycleCoordinator:
                 PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
                 PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
             }:
-                try:
-                    proposal_context = self._strategic_proposal_context(active)
-                except ValueError as exc:
-                    return [], self._supersede_strategic_request(
-                        ctx, snapshot, active, compatibility, str(exc)
-                    )
-                if active.status is PlannerRequestStatus.AWAITING_INFORMATION:
-                    return [], await self._collect_information(
-                        ctx, observation, active, compatibility
-                    )
-                backoff = engine._active_backoff(active)
-                if active.status is PlannerRequestStatus.BACKOFF and backoff:
-                    engine.store.record_planner_suppression(
-                        game_id,
-                        snapshot.turn,
-                        reason="provider_backoff",
-                        relevant_input_hash=active.input_projection_hash,
-                    )
-                    return [], self._finish(
-                        ctx,
-                        snapshot,
-                        PlannerBackoffTick,
-                        compatibility=compatibility,
-                        planner_request=active,
-                        planner_request_id=active.planner_request_id,
-                        blocking_reason=(
-                            "planner provider backoff remains active for "
-                            f"{backoff['remaining_seconds']:.1f}s"
-                        ),
-                    )
-                return [], await self._continue_strategic_proposal_request(
-                    ctx,
-                    observation,
-                    active,
-                    compatibility,
-                    proposal_context,
+                return [], await self._advance_active_strategic_request(
+                    ctx, observation, active, compatibility
                 )
             if active.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
                 raise RuntimeError("unsupported PlannerRequest target kind")
@@ -1226,7 +1404,7 @@ class PlannerLifecycleCoordinator:
         )
 
     def _strategic_proposal_context(
-        self, logical_request: PlannerRequest
+        self, logical_request: PlannerRequest, *, observation=None
     ) -> tuple[str, int]:
         target = logical_request.target
         if target.strategic_scope != "research":
@@ -1267,6 +1445,24 @@ class PlannerLifecycleCoordinator:
             for key, value in expected_projection.items()
         ):
             raise ValueError("strategic Proposal input projection is stale")
+        if target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR:
+            repair_context = projection.get("mission_repair_context")
+            if not isinstance(repair_context, dict):
+                # Phase 1B repair-target Proposal requests remain readable.
+                return contract_id, expected_base_revision
+            if (
+                repair_context.get("affected_mission_ids")
+                != list(target.affected_mission_ids)
+                or repair_context.get("current_observation_id")
+                != logical_request.observation_id
+            ):
+                raise ValueError("MissionGraph repair input identity is stale")
+            if (
+                observation is not None
+                and repair_context.get("current_observation_projection_hash")
+                != observation.canonical.projection_hash
+            ):
+                raise ValueError("MissionGraph repair Observation is stale")
         return contract_id, expected_base_revision
 
     def _supersede_strategic_request(
@@ -1347,6 +1543,15 @@ class PlannerLifecycleCoordinator:
         engine = self.engine
         snapshot = observation.snapshot
         target_contract_id, expected_base_revision = proposal_context
+        mission_repair = (
+            logical_request.target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+            and isinstance(
+                thaw_json(logical_request.input_projection).get(
+                    "mission_repair_context"
+                ),
+                dict,
+            )
+        )
         payload = thaw_json(logical_request.request_payload)
         payload["request_id"] = f"req_{uuid4().hex}"
         constraints = thaw_json(payload.get("constraints", {}))
@@ -1356,7 +1561,11 @@ class PlannerLifecycleCoordinator:
                 "target_contract_id": target_contract_id,
                 "expected_base_revision": expected_base_revision,
                 "strategic_scope": "research",
-                "response_schema_version": ("strategic-research-proposal-response/v1"),
+                "response_schema_version": (
+                    "mission-graph-patch-response/v1"
+                    if mission_repair
+                    else "strategic-research-proposal-response/v1"
+                ),
             }
         )
         if logical_request.information_results:
@@ -1443,7 +1652,9 @@ class PlannerLifecycleCoordinator:
             )
 
         started_monotonic = time.perf_counter()
-        response: StrategicResearchProposalResponse | None = None
+        response: (
+            StrategicResearchProposalResponse | MissionGraphPatchResponse | None
+        ) = None
         canonical_response_payload: dict[str, Any] | None = None
         error: Exception | None = None
         contract_error: Exception | None = None
@@ -1464,12 +1675,22 @@ class PlannerLifecycleCoordinator:
             error = exc
         else:
             try:
-                canonical_response_payload = (
-                    canonical_strategic_research_proposal_response_payload(raw_response)
-                )
-                response = StrategicResearchProposalResponse.model_validate_json(
-                    json.dumps(canonical_response_payload)
-                )
+                if mission_repair:
+                    canonical_response_payload = (
+                        canonical_mission_graph_patch_response_payload(raw_response)
+                    )
+                    response = MissionGraphPatchResponse.model_validate_json(
+                        json.dumps(canonical_response_payload)
+                    )
+                else:
+                    canonical_response_payload = (
+                        canonical_strategic_research_proposal_response_payload(
+                            raw_response
+                        )
+                    )
+                    response = StrategicResearchProposalResponse.model_validate_json(
+                        json.dumps(canonical_response_payload)
+                    )
             except Exception as exc:
                 contract_error = exc
         finally:
@@ -1602,6 +1823,20 @@ class PlannerLifecycleCoordinator:
                 information_round_id=round_id,
             )
 
+        if isinstance(response, MissionGraphPatchResponse):
+            return self._complete_mission_graph_patch(
+                ctx,
+                observation,
+                logical_request,
+                compatibility,
+                response,
+                canonical_response_payload,
+                provider_request,
+                provider_attempts,
+                duration,
+                completed,
+            )
+
         if len(response.proposal_candidates) != 1:
             return self._strategic_contract_failure(
                 ctx,
@@ -1710,6 +1945,206 @@ class PlannerLifecycleCoordinator:
             )
         engine._checkpoint("after_provider_attempt_finalized")
         return result
+
+    def _complete_mission_graph_patch(
+        self,
+        ctx,
+        observation,
+        logical_request: PlannerRequest,
+        compatibility: TickResult,
+        response: MissionGraphPatchResponse,
+        canonical_response_payload: dict[str, Any],
+        provider_request: AgentRequest,
+        provider_attempts: list[ProviderAttempt],
+        duration: float,
+        completed,
+    ) -> TickResult:
+        engine = self.engine
+        snapshot = observation.snapshot
+        if len(response.patch_candidates) != 1:
+            return self._strategic_contract_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                len(provider_attempts),
+                "final response requires exactly one MissionGraphPatch candidate",
+                response_payload=canonical_response_payload,
+                failure_category="invalid_mission_graph_patch",
+            )
+        if (
+            not provider_attempts
+            or provider_attempts[-1].status is not ProviderAttemptStatus.SUCCEEDED
+        ):
+            raise RuntimeError("MissionGraphPatch has no final ProviderAttempt")
+
+        target = logical_request.target
+        active = engine.store.get_active_strategic_contract(snapshot.game_id)
+        projection = thaw_json(logical_request.input_projection)
+        repair_context = projection.get("mission_repair_context")
+        candidate = response.patch_candidates[0]
+        try:
+            if (
+                active is None
+                or target.strategic_contract_id != active.contract_id
+                or target.base_contract_revision != active.revision
+            ):
+                raise ValueError("MissionGraphPatch Contract base is stale")
+            if not isinstance(repair_context, dict):
+                raise ValueError("MissionGraphPatch input context is missing")
+            if candidate.created_from_observation_id != logical_request.observation_id:
+                raise ValueError(
+                    "MissionGraphPatch observation identity does not match Request"
+                )
+            source_attempt = provider_attempts[-1]
+            patch = build_mission_graph_patch(
+                patch_id=build_mission_graph_patch_id(
+                    logical_request.planner_request_id
+                ),
+                game_session_id=snapshot.game_id,
+                contract_id=active.contract_id,
+                expected_base_revision=active.revision,
+                source_state_delta_id=str(repair_context["source_state_delta_id"]),
+                source_planner_request_id=logical_request.planner_request_id,
+                source_provider_attempt_id=source_attempt.provider_attempt_id,
+                source_provider_attempt_number=source_attempt.attempt_number,
+                affected_mission_ids=target.affected_mission_ids,
+                mission_updates=tuple(
+                    sorted(
+                        candidate.mission_updates,
+                        key=lambda mission: mission.mission_id,
+                    )
+                ),
+                created_from_observation_id=candidate.created_from_observation_id,
+                created_at=completed,
+            )
+            by_id = {
+                mission.mission_id: mission for mission in active.mission_graph.missions
+            }
+            by_id.update(
+                {mission.mission_id: mission for mission in patch.mission_updates}
+            )
+            updated_graph = MissionGraph(
+                missions=tuple(sorted(by_id.values(), key=lambda item: item.mission_id))
+            )
+            next_contract = StrategicContract(
+                contract_id=active.contract_id,
+                game_session_id=active.game_session_id,
+                revision=active.revision + 1,
+                authority_scope_set=active.authority_scope_set,
+                mission_graph=updated_graph,
+                strategic_objectives=active.strategic_objectives,
+                global_constraints=active.global_constraints,
+                created_from_observation_id=patch.created_from_observation_id,
+                approval_status=active.approval_status,
+                policy_snapshot=thaw_json(active.policy_snapshot),
+            )
+            source_mission = patch.mission_updates[0]
+            commit = StrategicContractCommit(
+                commit_id=f"mission_graph_patch_commit_{patch.patch_id}",
+                game_session_id=snapshot.game_id,
+                contract_id=active.contract_id,
+                expected_base_revision=active.revision,
+                contract=next_contract,
+                committed_at=completed,
+                reason="deterministic local MissionGraph repair",
+                source_patch_id=patch.patch_id,
+                source_state_delta_id=patch.source_state_delta_id,
+                source_patch_planner_request_id=logical_request.planner_request_id,
+                source_patch_provider_attempt_id=source_attempt.provider_attempt_id,
+                source_patch_mission_id=source_mission.mission_id,
+                source_patch_mission_revision=source_mission.mission_revision,
+            )
+        except Exception as exc:
+            return self._strategic_contract_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                len(provider_attempts),
+                str(exc),
+                response_payload=canonical_response_payload,
+                failure_category="invalid_mission_graph_patch",
+            )
+
+        updated_request = logical_request.model_copy(
+            update={
+                "status": PlannerRequestStatus.COMPLETED,
+                "completed_at": completed,
+                "response_payload": canonical_response_payload,
+                "response_hash": canonical_json_hash(canonical_response_payload),
+                "validation_result": {
+                    "result": "completed",
+                    "patch_id": patch.patch_id,
+                    "patch_hash": patch.patch_hash,
+                },
+                "failure_category": None,
+            }
+        )
+        ctx.metrics.mcp_call_count = engine.game.call_count - ctx.call_count_before
+        ctx.metrics.mutation_count = ctx.budget.used
+        ctx.metrics.total_seconds = engine._monotonic() - ctx.started_monotonic
+        tick_completed = engine._now()
+        tick = validate_workflow_tick(
+            MissionGraphPatchedTick(
+                tick_id=ctx.tick_id,
+                game_session_id=snapshot.game_id,
+                turn_number=snapshot.turn,
+                starting_runtime_state=ctx.starting_state,
+                observation_ids=tuple(ctx.observation_ids),
+                started_at=ctx.started_at,
+                completed_at=tick_completed,
+                metrics=ctx.metrics.model_dump(mode="json"),
+                planner_request_id=logical_request.planner_request_id,
+                provider_attempt_id=source_attempt.provider_attempt_id,
+                patch_id=patch.patch_id,
+                state_delta_id=patch.source_state_delta_id,
+                contract_id=patch.contract_id,
+                committed_revision=next_contract.revision,
+                previous_baseline_observation_id=str(
+                    repair_context["baseline_observation_id"]
+                ),
+                accepted_observation_id=patch.created_from_observation_id,
+            )
+        )
+        engine.store.record_agent_run(
+            snapshot.game_id,
+            provider_request,
+            response=response,
+            success=True,
+            error=None,
+            duration_seconds=duration,
+        )
+        try:
+            engine.store.apply_mission_graph_patch(
+                tick=tick,
+                planner_request=updated_request,
+                provider_attempt=source_attempt,
+                patch=patch,
+                commit=commit,
+                checkpoint=engine._checkpoint,
+            )
+        except ValueError as exc:
+            return self._strategic_contract_failure(
+                ctx,
+                snapshot,
+                logical_request,
+                compatibility,
+                provider_attempts,
+                len(provider_attempts),
+                str(exc),
+                response_payload=canonical_response_payload,
+                failure_category="stale_mission_graph_patch",
+            )
+        engine._checkpoint("after_provider_attempt_finalized")
+        compatibility.metrics = ctx.metrics
+        compatibility.tick_id = tick.tick_id
+        compatibility.runtime_state = tick.ending_runtime_state.value
+        compatibility.workflow_tick = tick.model_dump(mode="json")
+        compatibility.planner_request_id = logical_request.planner_request_id
+        return compatibility
 
     def _strategic_provider_failure(
         self,

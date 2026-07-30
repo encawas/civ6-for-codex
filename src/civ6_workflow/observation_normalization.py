@@ -11,6 +11,7 @@ from .domain.observations import (
     NormalizedBlocker,
     NormalizedCity,
     NormalizedObservation,
+    ObservationCompleteness,
     NormalizedUnit,
     ProgressionState,
     SlotState,
@@ -51,10 +52,28 @@ def normalize_runtime_snapshot(
         units,
         blockers,
     )
+    progress_source = (
+        snapshot.tech_civics if isinstance(snapshot.tech_civics, dict) else {}
+    )
     canonical = NormalizedObservation(
         game_session_id=snapshot.game_id,
         turn_number=snapshot.turn,
         raw_observation=raw,
+        completeness=ObservationCompleteness(
+            cities=True,
+            current_research=(
+                "current_research" in progress_source
+                or "current_research_type" in progress_source
+            ),
+            available_research="available_techs" in progress_source,
+            current_civic=(
+                "current_civic" in progress_source
+                or "current_civic_type" in progress_source
+            ),
+            available_civics="available_civics" in progress_source,
+            units=units is not None,
+            blockers=True,
+        ),
         cities=tuple(cities),
         progression=progression,
         units=None if units is None else tuple(units),
@@ -228,7 +247,14 @@ def _available_progression(
             )
         )
         rows.append(normalized)
-    return identifiers, rows
+    ordered = sorted(
+        zip(identifiers, rows, strict=True),
+        key=lambda item: item[0].value,
+    )
+    return (
+        [identifier for identifier, _row in ordered],
+        [row for _identifier, row in ordered],
+    )
 
 
 def _normalize_units(

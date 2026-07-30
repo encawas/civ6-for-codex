@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from .domain import (
     Mission,
+    MissionGraphPatch,
+    MissionGraphPatchedTick,
+    NormalizedObservation,
+    ObservationComparisonResult,
+    PlannerRequest,
+    ProviderAttempt,
+    StateDelta,
     StrategicContract,
     StrategicContractCommit,
     StrategicProposalAppliedTick,
@@ -113,6 +121,47 @@ class WorkflowStorePort(Protocol):
     def active_research_mission(
         self, game_id: str
     ) -> tuple[StrategicContract, Mission] | None: ...
+
+    def save_normalized_observation(
+        self, observation: NormalizedObservation
+    ) -> NormalizedObservation: ...
+
+    def get_accepted_observation_baseline(
+        self, game_id: str
+    ) -> NormalizedObservation | None: ...
+
+    def accept_observation_baseline(
+        self,
+        observation_id: str,
+        *,
+        expected_previous_observation_id: str | None,
+        reason: str,
+        accepted_at: datetime,
+    ) -> NormalizedObservation: ...
+
+    def record_observation_comparison(
+        self,
+        observation: NormalizedObservation,
+        *,
+        detected_at: datetime,
+    ) -> ObservationComparisonResult: ...
+
+    def list_state_deltas(self, game_id: str) -> list[StateDelta]: ...
+
+    def get_mission_graph_patch(self, patch_id: str) -> MissionGraphPatch | None: ...
+
+    def list_mission_graph_patches(self, game_id: str) -> list[MissionGraphPatch]: ...
+
+    def apply_mission_graph_patch(
+        self,
+        *,
+        tick: MissionGraphPatchedTick,
+        planner_request: PlannerRequest,
+        provider_attempt: ProviderAttempt,
+        patch: MissionGraphPatch,
+        commit: StrategicContractCommit,
+        **kwargs: Any,
+    ) -> StrategicContract: ...
 
     def __getattr__(self, name: str) -> Any: ...
 

@@ -480,5 +480,9 @@ def test_codex_cli_uses_target_specific_strategic_schema(tmp_path, monkeypatch):
     assert raw == "not-json-yet"
     schema_path = state_directory / "requests" / request.request_id / "plan.schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    assert "proposal_candidates" in schema["properties"]
+    assert "patch_candidates" in schema["properties"]
+    assert (
+        schema["properties"]["schema_version"]["const"]
+        == "mission-graph-patch-response/v1"
+    )
     assert "tasks" not in schema["properties"]

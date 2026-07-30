@@ -35,6 +35,12 @@ from .domain import (
     LogicalPlannerRequestCreatedTick,
     Mission,
     MissionGraph,
+    MissionGraphPatch,
+    MissionGraphPatchedTick,
+    NormalizedObservation,
+    ObservationComparisonResult,
+    StateDelta,
+    StateDeltaBuilder,
     PlanLease,
     PlanLeaseStatus,
     PlannerAttemptCompletedTick,
@@ -89,6 +95,7 @@ from .models import (
 )
 from .workflow_protocol import (
     canonical_strategic_research_proposal_response_payload,
+    canonical_mission_graph_patch_response_payload,
     canonical_workflow_plan_bundle_payload,
 )
 
@@ -166,6 +173,48 @@ ON strategic_contract_revisions (contract_id, revision);
 
 CREATE INDEX IF NOT EXISTS idx_contract_commits_game_revision
 ON strategic_contract_commits (game_id, committed_revision);
+
+CREATE TABLE IF NOT EXISTS normalized_observations (
+    observation_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    turn INTEGER NOT NULL CHECK (turn >= 0),
+    normalization_version TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    projection_hash TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    observation_json TEXT NOT NULL,
+    UNIQUE (game_id, observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS observation_baseline_acceptances (
+    baseline_acceptance_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    observation_id TEXT NOT NULL,
+    previous_observation_id TEXT,
+    reason TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    UNIQUE (game_id, sequence),
+    UNIQUE (game_id, observation_id),
+    FOREIGN KEY (observation_id)
+        REFERENCES normalized_observations(observation_id),
+    FOREIGN KEY (previous_observation_id)
+        REFERENCES normalized_observations(observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS state_deltas (
+    state_delta_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    baseline_observation_id TEXT NOT NULL,
+    current_observation_id TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    delta_json TEXT NOT NULL,
+    UNIQUE (game_id, baseline_observation_id, current_observation_id),
+    FOREIGN KEY (baseline_observation_id)
+        REFERENCES normalized_observations(observation_id),
+    FOREIGN KEY (current_observation_id)
+        REFERENCES normalized_observations(observation_id)
+);
 
 CREATE TABLE IF NOT EXISTS strategy_state (
     game_id TEXT PRIMARY KEY,
@@ -357,6 +406,30 @@ CREATE TABLE IF NOT EXISTS strategic_research_proposals (
 CREATE INDEX IF NOT EXISTS idx_strategic_research_proposals_game
 ON strategic_research_proposals (game_id, target_kind, target_contract_id);
 
+CREATE TABLE IF NOT EXISTS mission_graph_patches (
+    patch_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    contract_id TEXT NOT NULL,
+    expected_base_revision INTEGER NOT NULL CHECK (expected_base_revision >= 1),
+    state_delta_id TEXT NOT NULL UNIQUE,
+    planner_request_id TEXT NOT NULL UNIQUE,
+    provider_attempt_id TEXT NOT NULL UNIQUE,
+    committed_revision INTEGER NOT NULL CHECK (committed_revision >= 2),
+    commit_id TEXT NOT NULL UNIQUE,
+    patch_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (state_delta_id)
+        REFERENCES state_deltas(state_delta_id),
+    FOREIGN KEY (planner_request_id)
+        REFERENCES logical_planner_requests(planner_request_id),
+    FOREIGN KEY (provider_attempt_id)
+        REFERENCES provider_attempts(provider_attempt_id),
+    FOREIGN KEY (game_id, committed_revision)
+        REFERENCES strategic_contract_revisions(game_id, revision),
+    FOREIGN KEY (commit_id)
+        REFERENCES strategic_contract_commits(commit_id)
+);
+
 CREATE TABLE IF NOT EXISTS plan_leases (
     plan_lease_id TEXT PRIMARY KEY,
 
@@ -531,6 +604,9 @@ REPLAY_STATE_TABLES = (
     "strategic_contract_roots",
     "strategic_contract_revisions",
     "strategic_contract_commits",
+    "normalized_observations",
+    "observation_baseline_acceptances",
+    "state_deltas",
     "strategy_state",
     "city_plans",
     "unit_plans",
@@ -544,6 +620,7 @@ REPLAY_STATE_TABLES = (
     "provider_attempts",
     "strategic_research_proposals",
     "information_rounds",
+    "mission_graph_patches",
     "plan_leases",
     "planner_suppressions",
     "agent_runs",
@@ -558,6 +635,15 @@ REPLAY_STATE_TABLES = (
 
 
 class WorkflowStore:
+    _PATCH_COMMIT_FIELDS = (
+        "source_patch_id",
+        "source_state_delta_id",
+        "source_patch_planner_request_id",
+        "source_patch_provider_attempt_id",
+        "source_patch_mission_id",
+        "source_patch_mission_revision",
+    )
+
     def __init__(
         self,
         path: str | Path,
@@ -570,10 +656,10 @@ class WorkflowStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > 11:
+            if version > 12:
                 raise ValueError(
                     f"unsupported workflow database version {version}; "
-                    "maximum supported version is 11"
+                    "maximum supported version is 12"
                 )
             conn.executescript(SCHEMA)
             self._migrate(conn)
@@ -781,10 +867,10 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > 11:
+        if version > 12:
             raise ValueError(
                 f"unsupported workflow database version {version}; "
-                "maximum supported version is 11"
+                "maximum supported version is 12"
             )
         upgraded_from_pre_v7 = version < 7
         if upgraded_from_pre_v7:
@@ -831,11 +917,94 @@ class WorkflowStore:
         else:
             WorkflowStore._validate_phase1c_v11(conn)
 
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < 12:
+            WorkflowStore._migrate_phase2_v12(conn)
+            conn.execute("PRAGMA user_version=12")
+        else:
+            WorkflowStore._validate_phase2_v12(conn)
+
     @classmethod
     def _migrate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
         """Add the empty Contract aggregate tables without changing legacy authority."""
 
         cls._validate_phase1b_v9(conn)
+
+    @classmethod
+    def _migrate_phase2_v12(cls, conn: sqlite3.Connection) -> None:
+        """Add empty accepted-Observation and StateDelta history."""
+
+        cls._validate_phase2_v12(conn)
+
+    @classmethod
+    def _validate_phase2_v12(cls, conn: sqlite3.Connection) -> None:
+        cls._validate_phase2_observation_state(
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM normalized_observations ORDER BY game_id, observed_at"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM observation_baseline_acceptances "
+                    "ORDER BY game_id, sequence"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM state_deltas ORDER BY game_id, detected_at"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM mission_graph_patches ORDER BY game_id, created_at"
+                ).fetchall()
+            ],
+            require_canonical=True,
+        )
+        cls._validate_phase2_patch_aggregate(
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM mission_graph_patches ORDER BY game_id, created_at"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM provider_attempts ORDER BY planner_request_id, attempt_number"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_revisions ORDER BY game_id, revision"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_commits ORDER BY game_id, committed_revision"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_ticks ORDER BY game_id, started_at, tick_id"
+                ).fetchall()
+            ],
+            require_canonical=True,
+        )
 
     @classmethod
     def _validate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
@@ -1242,9 +1411,552 @@ class WorkflowStore:
             )
         normalized["expected_base_revision"] = expected_base
         normalized["committed_revision"] = committed_revision
-        normalized["commit_json"] = cls._dump(commit.model_dump(mode="json"))
+        source_payload = cls._load(str(normalized["commit_json"]))
+        commit_payload = (
+            commit.model_dump(mode="json")
+            if any(field in source_payload for field in cls._PATCH_COMMIT_FIELDS)
+            else cls._contract_commit_payload(commit)
+        )
+        normalized["commit_json"] = cls._dump(commit_payload)
         normalized["committed_at"] = committed_at.isoformat()
         return normalized
+
+    @classmethod
+    def _normalize_observation_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "observation_id",
+            "game_id",
+            "turn",
+            "normalization_version",
+            "source_version",
+            "projection_hash",
+            "observed_at",
+            "observation_json",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"NormalizedObservation row is missing columns: {sorted(missing)}"
+            )
+        try:
+            observation = NormalizedObservation.model_validate_json(
+                str(normalized["observation_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid NormalizedObservation JSON") from exc
+        observed_at = cls._parse_audit_datetime(
+            normalized["observed_at"], "NormalizedObservation observed_at"
+        )
+        turn = int(normalized["turn"])
+        if (
+            observation.observation_id != str(normalized["observation_id"])
+            or observation.game_session_id != str(normalized["game_id"])
+            or observation.turn_number != turn
+            or observation.normalization_version
+            != str(normalized["normalization_version"])
+            or observation.source_version != str(normalized["source_version"])
+            or observation.projection_hash != str(normalized["projection_hash"])
+            or observation.observed_at != observed_at
+        ):
+            raise ValueError(
+                "NormalizedObservation relational columns disagree with JSON"
+            )
+        normalized["turn"] = turn
+        normalized["observed_at"] = observed_at.isoformat()
+        normalized["observation_json"] = cls._dump(observation.model_dump(mode="json"))
+        return normalized
+
+    @classmethod
+    def _normalize_baseline_acceptance_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "baseline_acceptance_id",
+            "game_id",
+            "sequence",
+            "observation_id",
+            "previous_observation_id",
+            "reason",
+            "accepted_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"Observation baseline row is missing columns: {sorted(missing)}"
+            )
+        sequence = int(normalized["sequence"])
+        if sequence < 1:
+            raise ValueError("Observation baseline sequence must be positive")
+        reason = str(normalized["reason"]).strip()
+        if not reason:
+            raise ValueError("Observation baseline reason must be non-empty")
+        accepted_at = cls._parse_audit_datetime(
+            normalized["accepted_at"], "Observation baseline accepted_at"
+        )
+        if accepted_at is None:
+            raise ValueError("Observation baseline accepted_at is required")
+        expected_id = cls._build_baseline_acceptance_id(
+            str(normalized["game_id"]),
+            str(normalized["observation_id"]),
+            (
+                None
+                if normalized["previous_observation_id"] is None
+                else str(normalized["previous_observation_id"])
+            ),
+        )
+        if normalized["baseline_acceptance_id"] != expected_id:
+            raise ValueError("Observation baseline acceptance identity is invalid")
+        normalized["sequence"] = sequence
+        normalized["reason"] = reason
+        normalized["accepted_at"] = accepted_at.isoformat()
+        return normalized
+
+    @classmethod
+    def _normalize_state_delta_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "state_delta_id",
+            "game_id",
+            "baseline_observation_id",
+            "current_observation_id",
+            "detected_at",
+            "delta_json",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(f"StateDelta row is missing columns: {sorted(missing)}")
+        try:
+            delta = StateDelta.model_validate_json(str(normalized["delta_json"]))
+        except Exception as exc:
+            raise ValueError("invalid StateDelta JSON") from exc
+        detected_at = cls._parse_audit_datetime(
+            normalized["detected_at"], "StateDelta detected_at"
+        )
+        if detected_at is None:
+            raise ValueError("StateDelta detected_at is required")
+        if (
+            delta.state_delta_id != str(normalized["state_delta_id"])
+            or delta.game_session_id != str(normalized["game_id"])
+            or delta.baseline_observation_id
+            != str(normalized["baseline_observation_id"])
+            or delta.current_observation_id != str(normalized["current_observation_id"])
+        ):
+            raise ValueError("StateDelta relational columns disagree with JSON")
+        normalized["detected_at"] = detected_at.isoformat()
+        normalized["delta_json"] = cls._dump(delta.model_dump(mode="json"))
+        return normalized
+
+    @classmethod
+    def _normalize_mission_graph_patch_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "patch_id",
+            "game_id",
+            "contract_id",
+            "expected_base_revision",
+            "state_delta_id",
+            "planner_request_id",
+            "provider_attempt_id",
+            "committed_revision",
+            "commit_id",
+            "patch_json",
+            "created_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"MissionGraphPatch row is missing columns: {sorted(missing)}"
+            )
+        try:
+            patch = MissionGraphPatch.model_validate_json(str(normalized["patch_json"]))
+        except Exception as exc:
+            raise ValueError("invalid MissionGraphPatch JSON") from exc
+        created_at = cls._parse_audit_datetime(
+            normalized["created_at"], "MissionGraphPatch created_at"
+        )
+        expected_base_revision = int(normalized["expected_base_revision"])
+        committed_revision = int(normalized["committed_revision"])
+        if (
+            patch.patch_id != str(normalized["patch_id"])
+            or patch.game_session_id != str(normalized["game_id"])
+            or patch.contract_id != str(normalized["contract_id"])
+            or patch.expected_base_revision != expected_base_revision
+            or patch.source_state_delta_id != str(normalized["state_delta_id"])
+            or patch.source_planner_request_id != str(normalized["planner_request_id"])
+            or patch.source_provider_attempt_id
+            != str(normalized["provider_attempt_id"])
+            or committed_revision != expected_base_revision + 1
+            or patch.created_at != created_at
+        ):
+            raise ValueError("MissionGraphPatch relational columns disagree with JSON")
+        normalized["expected_base_revision"] = expected_base_revision
+        normalized["committed_revision"] = committed_revision
+        normalized["patch_json"] = cls._dump(patch.model_dump(mode="json"))
+        normalized["created_at"] = created_at.isoformat()
+        return normalized
+
+    @classmethod
+    def _validate_phase2_observation_state(
+        cls,
+        observations: Sequence[Mapping[str, Any]],
+        baselines: Sequence[Mapping[str, Any]],
+        deltas: Sequence[Mapping[str, Any]],
+        patches: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        normalized_observations = [
+            cls._normalize_observation_row(row) for row in observations
+        ]
+        normalized_baselines = [
+            cls._normalize_baseline_acceptance_row(row) for row in baselines
+        ]
+        normalized_deltas = [cls._normalize_state_delta_row(row) for row in deltas]
+        normalized_patches = [
+            cls._normalize_mission_graph_patch_row(row) for row in patches
+        ]
+        if require_canonical:
+            for label, sources, normalized_rows in (
+                ("NormalizedObservation", observations, normalized_observations),
+                ("Observation baseline", baselines, normalized_baselines),
+                ("StateDelta", deltas, normalized_deltas),
+                ("MissionGraphPatch", patches, normalized_patches),
+            ):
+                for source, normalized in zip(sources, normalized_rows, strict=True):
+                    if dict(source) != normalized:
+                        raise ValueError(f"{label} row is not canonical")
+
+        observation_models = {
+            str(row["observation_id"]): NormalizedObservation.model_validate_json(
+                str(row["observation_json"])
+            )
+            for row in normalized_observations
+        }
+        if len(observation_models) != len(normalized_observations):
+            raise ValueError("duplicate NormalizedObservation identity")
+
+        baselines_by_game: dict[str, list[dict[str, Any]]] = {}
+        for row in normalized_baselines:
+            game_id = str(row["game_id"])
+            observation = observation_models.get(str(row["observation_id"]))
+            if observation is None or observation.game_session_id != game_id:
+                raise ValueError(
+                    "Observation baseline references another or missing Observation"
+                )
+            if not observation.completeness.supports_scope("research"):
+                raise ValueError(
+                    "accepted Observation baseline is incomplete for research"
+                )
+            accepted_at = cls._parse_audit_datetime(
+                row["accepted_at"], "Observation baseline accepted_at"
+            )
+            if accepted_at is None or accepted_at < observation.observed_at:
+                raise ValueError("Observation baseline cannot precede its Observation")
+            baselines_by_game.setdefault(game_id, []).append(row)
+
+        for rows in baselines_by_game.values():
+            rows.sort(key=lambda item: int(item["sequence"]))
+            previous_id = None
+            for expected_sequence, row in enumerate(rows, start=1):
+                if int(row["sequence"]) != expected_sequence:
+                    raise ValueError(
+                        "Observation baseline acceptance sequence is not contiguous"
+                    )
+                if row["previous_observation_id"] != previous_id:
+                    raise ValueError(
+                        "Observation baseline history is not causally contiguous"
+                    )
+                previous_id = str(row["observation_id"])
+
+        builder = StateDeltaBuilder()
+        delta_models: dict[str, StateDelta] = {}
+        for row in normalized_deltas:
+            baseline = observation_models.get(str(row["baseline_observation_id"]))
+            current = observation_models.get(str(row["current_observation_id"]))
+            if (
+                baseline is None
+                or current is None
+                or baseline.game_session_id != str(row["game_id"])
+                or current.game_session_id != str(row["game_id"])
+            ):
+                raise ValueError("StateDelta references another or missing Observation")
+            delta = StateDelta.model_validate_json(str(row["delta_json"]))
+            delta_models[delta.state_delta_id] = delta
+            comparison = builder.compare(baseline, current)
+            if comparison.state_delta != delta:
+                raise ValueError(
+                    "StateDelta does not match deterministic Observation comparison"
+                )
+            detected_at = cls._parse_audit_datetime(
+                row["detected_at"], "StateDelta detected_at"
+            )
+            if detected_at is None or detected_at < current.observed_at:
+                raise ValueError("StateDelta cannot precede its current Observation")
+
+        for row in normalized_patches:
+            patch = MissionGraphPatch.model_validate_json(str(row["patch_json"]))
+            delta = delta_models.get(patch.source_state_delta_id)
+            if (
+                delta is None
+                or delta.game_session_id != patch.game_session_id
+                or delta.current_observation_id != patch.created_from_observation_id
+            ):
+                raise ValueError(
+                    "MissionGraphPatch does not bind a matching StateDelta"
+                )
+            accepted = [
+                item
+                for item in normalized_baselines
+                if item["game_id"] == patch.game_session_id
+                and item["observation_id"] == patch.created_from_observation_id
+            ]
+            if (
+                len(accepted) != 1
+                or accepted[0]["previous_observation_id"]
+                != delta.baseline_observation_id
+            ):
+                raise ValueError(
+                    "MissionGraphPatch current Observation is not the direct "
+                    "accepted successor of its StateDelta baseline"
+                )
+
+    @classmethod
+    def _validate_phase2_patch_aggregate(
+        cls,
+        patches: Sequence[Mapping[str, Any]],
+        requests: Sequence[Mapping[str, Any]],
+        attempts: Sequence[Mapping[str, Any]],
+        revisions: Sequence[Mapping[str, Any]],
+        commits: Sequence[Mapping[str, Any]],
+        ticks: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        normalized_patches = [
+            cls._normalize_mission_graph_patch_row(row) for row in patches
+        ]
+        if require_canonical:
+            for source, normalized in zip(patches, normalized_patches, strict=True):
+                if dict(source) != normalized:
+                    raise ValueError("MissionGraphPatch row is not canonical")
+        request_models = {
+            request.planner_request_id: request
+            for request in (cls._planner_request_from_row(row) for row in requests)
+        }
+        attempt_models = {
+            attempt.provider_attempt_id: attempt
+            for attempt in (
+                ProviderAttempt.model_validate_json(
+                    str(cls._normalize_provider_attempt_row(row)["attempt_json"])
+                )
+                for row in attempts
+            )
+        }
+        contract_models = {
+            (contract.game_session_id, contract.revision): contract
+            for contract in (
+                StrategicContract.model_validate_json(
+                    str(cls._normalize_contract_revision_row(row)["contract_json"])
+                )
+                for row in revisions
+            )
+        }
+        commit_models = {
+            commit.commit_id: commit
+            for commit in (
+                StrategicContractCommit.model_validate_json(
+                    str(cls._normalize_contract_commit_row(row)["commit_json"])
+                )
+                for row in commits
+            )
+        }
+        patch_ticks: dict[str, list[MissionGraphPatchedTick]] = {}
+        for row in ticks:
+            tick = cls._workflow_tick_from_row(row)
+            if isinstance(tick, MissionGraphPatchedTick):
+                patch_ticks.setdefault(tick.patch_id, []).append(tick)
+
+        patch_ids = {str(row["patch_id"]) for row in normalized_patches}
+        patches_by_request: dict[str, list[str]] = {}
+        for row in normalized_patches:
+            patches_by_request.setdefault(str(row["planner_request_id"]), []).append(
+                str(row["patch_id"])
+            )
+        for request in request_models.values():
+            repair_context = request.input_projection.get("mission_repair_context")
+            if not (
+                request.target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+                and isinstance(repair_context, Mapping)
+            ):
+                continue
+            matching = patches_by_request.get(request.planner_request_id, [])
+            if request.status is PlannerRequestStatus.COMPLETED:
+                if len(matching) != 1:
+                    raise ValueError(
+                        "completed MissionGraph repair requires one MissionGraphPatch"
+                    )
+            elif matching:
+                raise ValueError(
+                    "non-completed MissionGraph repair cannot own a MissionGraphPatch"
+                )
+        for commit in commit_models.values():
+            if (
+                commit.source_patch_id is not None
+                and commit.source_patch_id not in patch_ids
+            ):
+                raise ValueError(
+                    "Patch-derived ContractCommit has no MissionGraphPatch"
+                )
+        for patch_id in patch_ticks:
+            if patch_id not in patch_ids:
+                raise ValueError(
+                    "MissionGraphPatch completion Tick has no MissionGraphPatch"
+                )
+
+        for row in normalized_patches:
+            patch = MissionGraphPatch.model_validate_json(str(row["patch_json"]))
+            request = request_models.get(patch.source_planner_request_id)
+            attempt = attempt_models.get(patch.source_provider_attempt_id)
+            contract = contract_models.get(
+                (patch.game_session_id, int(row["committed_revision"]))
+            )
+            base_contract = contract_models.get(
+                (patch.game_session_id, patch.expected_base_revision)
+            )
+            commit = commit_models.get(str(row["commit_id"]))
+            if (
+                request is None
+                or request.game_session_id != patch.game_session_id
+                or request.target.kind
+                is not PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+                or request.target.strategic_contract_id != patch.contract_id
+                or request.target.base_contract_revision != patch.expected_base_revision
+                or request.target.affected_mission_ids != patch.affected_mission_ids
+                or request.status is not PlannerRequestStatus.COMPLETED
+            ):
+                raise ValueError(
+                    "MissionGraphPatch has no matching completed PlannerRequest"
+                )
+            canonical_response = canonical_mission_graph_patch_response_payload(
+                request.response_payload
+            )
+            candidates = canonical_response["patch_candidates"]
+            if len(candidates) != 1:
+                raise ValueError(
+                    "MissionGraphPatch response requires exactly one candidate"
+                )
+            candidate = candidates[0]
+            if (
+                tuple(candidate["mission_updates"])
+                != tuple(
+                    mission.model_dump(mode="json") for mission in patch.mission_updates
+                )
+                or candidate["created_from_observation_id"]
+                != patch.created_from_observation_id
+            ):
+                raise ValueError(
+                    "MissionGraphPatch differs from canonical Planner response"
+                )
+            if (
+                attempt is None
+                or attempt.planner_request_id != request.planner_request_id
+                or attempt.attempt_number != patch.source_provider_attempt_number
+                or attempt.attempt_number != request.provider_attempt_count
+                or attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or attempt.completed_at is None
+                or request.completed_at != patch.created_at
+                or attempt.completed_at != patch.created_at
+            ):
+                raise ValueError(
+                    "MissionGraphPatch has no matching final ProviderAttempt"
+                )
+            if contract is None or base_contract is None or commit is None:
+                raise ValueError(
+                    "MissionGraphPatch has incomplete Contract revision evidence"
+                )
+            if (
+                commit.game_session_id != patch.game_session_id
+                or commit.contract_id != patch.contract_id
+                or commit.expected_base_revision != patch.expected_base_revision
+                or commit.contract != contract
+                or commit.source_patch_id != patch.patch_id
+                or commit.source_state_delta_id != patch.source_state_delta_id
+                or commit.source_patch_planner_request_id
+                != patch.source_planner_request_id
+                or commit.source_patch_provider_attempt_id
+                != patch.source_provider_attempt_id
+                or commit.committed_at != patch.created_at
+                or commit.source_patch_mission_id not in patch.affected_mission_ids
+            ):
+                raise ValueError(
+                    "MissionGraphPatch ContractCommit provenance disagrees"
+                )
+            base_by_id = {
+                mission.mission_id: mission
+                for mission in base_contract.mission_graph.missions
+            }
+            result_by_id = {
+                mission.mission_id: mission
+                for mission in contract.mission_graph.missions
+            }
+            updates = {mission.mission_id: mission for mission in patch.mission_updates}
+            source_mission = updates[str(commit.source_patch_mission_id)]
+            if commit.source_patch_mission_revision != source_mission.mission_revision:
+                raise ValueError(
+                    "MissionGraphPatch ContractCommit Mission provenance disagrees"
+                )
+            expected_result = dict(base_by_id)
+            expected_result.update(updates)
+            if (
+                result_by_id != expected_result
+                or contract.authority_scope_set != base_contract.authority_scope_set
+                or contract.strategic_objectives != base_contract.strategic_objectives
+                or contract.global_constraints != base_contract.global_constraints
+                or contract.policy_snapshot != base_contract.policy_snapshot
+                or contract.approval_status != base_contract.approval_status
+                or contract.created_from_observation_id
+                != patch.created_from_observation_id
+            ):
+                raise ValueError(
+                    "MissionGraphPatch changed state outside its affected closure"
+                )
+            for mission_id, mission in updates.items():
+                previous = base_by_id.get(mission_id)
+                if (
+                    previous is None
+                    or mission.mission_revision != previous.mission_revision + 1
+                ):
+                    raise ValueError(
+                        "MissionGraphPatch Mission revision is not contiguous"
+                    )
+            terminal_ticks = patch_ticks.get(patch.patch_id, [])
+            if len(terminal_ticks) != 1:
+                raise ValueError(
+                    "MissionGraphPatch requires one dedicated completion Tick"
+                )
+            tick = terminal_ticks[0]
+            repair_context = request.input_projection.get("mission_repair_context")
+            if not isinstance(repair_context, Mapping):
+                raise ValueError("MissionGraphPatch input context is missing")
+            if (
+                tick.game_session_id != patch.game_session_id
+                or tick.planner_request_id != patch.source_planner_request_id
+                or tick.provider_attempt_id != patch.source_provider_attempt_id
+                or tick.state_delta_id != patch.source_state_delta_id
+                or tick.contract_id != patch.contract_id
+                or tick.committed_revision != contract.revision
+                or tick.accepted_observation_id != patch.created_from_observation_id
+                or tick.previous_baseline_observation_id
+                != repair_context.get("baseline_observation_id")
+                or tick.completed_at < patch.created_at
+            ):
+                raise ValueError(
+                    "MissionGraphPatch completion Tick disagrees with aggregate"
+                )
 
     @classmethod
     def _validate_strategic_contract_state(
@@ -1742,7 +2454,16 @@ class WorkflowStore:
             if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
                 continue
             proposal = proposals_by_request.get(request.planner_request_id)
-            if request.status is PlannerRequestStatus.COMPLETED and proposal is None:
+            repair_context = request.input_projection.get("mission_repair_context")
+            is_phase2_patch_request = (
+                request.target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+                and isinstance(repair_context, Mapping)
+            )
+            if (
+                request.status is PlannerRequestStatus.COMPLETED
+                and proposal is None
+                and not is_phase2_patch_request
+            ):
                 raise ValueError(
                     "COMPLETED non-legacy PlannerRequest requires Proposal"
                 )
@@ -1751,6 +2472,10 @@ class WorkflowStore:
                 and proposal is not None
             ):
                 raise ValueError("non-COMPLETED PlannerRequest cannot own Proposal")
+            if is_phase2_patch_request and proposal is not None:
+                raise ValueError(
+                    "Phase 2 MissionGraph repair cannot persist a Proposal"
+                )
 
     @classmethod
     def _workflow_tick_from_row(cls, row: Mapping[str, Any]) -> WorkflowTick:
@@ -3098,13 +3823,13 @@ class WorkflowStore:
             commits_by_game_revision[
                 (commit.game_session_id, commit.contract.revision)
             ] = commit
-            if commit.source_proposal_id is None:
+            if commit.source_proposal_id is None and commit.source_patch_id is None:
                 cls._validate_phase1b_contract_foundation(commit.contract)
                 if commit.contract.approval_status is not ApprovalStatus.NOT_REQUIRED:
                     raise ValueError(
                         "foundation Contract revision requires NOT_REQUIRED approval"
                     )
-            else:
+            elif commit.source_proposal_id is not None:
                 commits_by_proposal.setdefault(commit.source_proposal_id, []).append(
                     commit
                 )
@@ -3116,10 +3841,14 @@ class WorkflowStore:
                     commit.game_session_id, set()
                 ).add(commit.contract.revision)
         for commit in commits:
-            if commit.source_proposal_id is None and any(
-                revision < commit.contract.revision
-                for revision in proposal_revisions_by_game.get(
-                    commit.game_session_id, set()
+            if (
+                commit.source_proposal_id is None
+                and commit.source_patch_id is None
+                and any(
+                    revision < commit.contract.revision
+                    for revision in proposal_revisions_by_game.get(
+                        commit.game_session_id, set()
+                    )
                 )
             ):
                 raise ValueError(
@@ -3566,13 +4295,35 @@ class WorkflowStore:
             if "research" not in active.authority_scope_set.mission_graph_scopes:
                 continue
             active_commit = commits.get((game_id, active_revision))
-            if active_commit is None or active_commit.source_proposal_id is None:
+            if active_commit is None or (
+                active_commit.source_proposal_id is None
+                and active_commit.source_patch_id is None
+            ):
                 raise ValueError(
-                    "research authority requires a Proposal-derived active revision"
+                    "research authority requires a Proposal or Patch-derived active revision"
                 )
-            applied = applied_by_proposal.get(active_commit.source_proposal_id, [])
+            proposal_commits = [
+                commit
+                for commit in commits.values()
+                if commit.game_session_id == game_id
+                and commit.source_proposal_id is not None
+                and commit.contract.revision <= active_revision
+            ]
+            if len(proposal_commits) != 1:
+                raise ValueError(
+                    "research authority requires one Proposal activation origin"
+                )
+            activation_commit = proposal_commits[0]
+            applied = applied_by_proposal.get(activation_commit.source_proposal_id, [])
             if len(applied) != 1:
                 raise ValueError("research authority requires one Applied Tick")
+            active_mission_id = (
+                active_commit.source_mission_id or active_commit.source_patch_mission_id
+            )
+            active_mission_revision = (
+                active_commit.source_mission_revision
+                or active_commit.source_patch_mission_revision
+            )
             legacy_research_tasks = {
                 task_id: task
                 for (task_game, task_id), task in tasks.items()
@@ -3617,12 +4368,8 @@ class WorkflowStore:
                 if (
                     task.source_contract_id != active.contract_id
                     or task.source_contract_revision != active.revision
-                    or task.source_mission_id != active_commit.source_mission_id
-                    or task.source_mission_revision
-                    != active_commit.source_mission_revision
-                    or task.source_mission_id != applied[0].source_mission_id
-                    or task.source_mission_revision
-                    != applied[0].source_mission_revision
+                    or task.source_mission_id != active_mission_id
+                    or task.source_mission_revision != active_mission_revision
                 ):
                     raise ValueError("stale Mission-derived task remains executable")
 
@@ -4380,9 +5127,240 @@ class WorkflowStore:
             value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
 
+    @classmethod
+    def _contract_commit_payload(
+        cls, commit: StrategicContractCommit
+    ) -> dict[str, Any]:
+        payload = commit.model_dump(mode="json")
+        if commit.source_patch_id is None:
+            for field_name in cls._PATCH_COMMIT_FIELDS:
+                payload.pop(field_name, None)
+        return payload
+
     @staticmethod
     def _load(value: str) -> Any:
         return json.loads(value)
+
+    @staticmethod
+    def _build_baseline_acceptance_id(
+        game_id: str,
+        observation_id: str,
+        previous_observation_id: str | None,
+    ) -> str:
+        payload = (
+            f"{game_id}\0{previous_observation_id or ''}\0{observation_id}"
+        ).encode("utf-8")
+        return f"baseline_acceptance_{hashlib.sha256(payload).hexdigest()[:24]}"
+
+    @classmethod
+    def _observation_from_row(cls, row: Mapping[str, Any]) -> NormalizedObservation:
+        normalized = cls._normalize_observation_row(row)
+        if dict(row) != normalized:
+            raise ValueError("NormalizedObservation row is not canonical")
+        return NormalizedObservation.model_validate_json(str(row["observation_json"]))
+
+    @classmethod
+    def _save_normalized_observation_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        observation: NormalizedObservation,
+    ) -> None:
+        candidate = {
+            "observation_id": observation.observation_id,
+            "game_id": observation.game_session_id,
+            "turn": observation.turn_number,
+            "normalization_version": observation.normalization_version,
+            "source_version": observation.source_version,
+            "projection_hash": observation.projection_hash,
+            "observed_at": observation.observed_at.isoformat(),
+            "observation_json": cls._dump(observation.model_dump(mode="json")),
+        }
+        existing = conn.execute(
+            "SELECT * FROM normalized_observations WHERE observation_id=?",
+            (observation.observation_id,),
+        ).fetchone()
+        if existing is not None:
+            if cls._normalize_observation_row(existing) != candidate:
+                raise ValueError(
+                    "NormalizedObservation identity was reused with new content"
+                )
+            return
+        conn.execute(
+            """
+            INSERT INTO normalized_observations(
+                observation_id, game_id, turn, normalization_version,
+                source_version, projection_hash, observed_at, observation_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(candidate.values()),
+        )
+
+    def save_normalized_observation(
+        self, observation: NormalizedObservation
+    ) -> NormalizedObservation:
+        with self._connect() as conn:
+            self._save_normalized_observation_in_connection(conn, observation)
+            self._validate_phase2_v12(conn)
+        return observation
+
+    def get_normalized_observation(
+        self, observation_id: str
+    ) -> NormalizedObservation | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM normalized_observations WHERE observation_id=?",
+                (observation_id,),
+            ).fetchone()
+        return None if row is None else self._observation_from_row(row)
+
+    @classmethod
+    def _accepted_observation_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+    ) -> NormalizedObservation | None:
+        row = conn.execute(
+            """
+            SELECT observation.*
+            FROM observation_baseline_acceptances AS baseline
+            JOIN normalized_observations AS observation
+              ON observation.observation_id=baseline.observation_id
+            WHERE baseline.game_id=?
+            ORDER BY baseline.sequence DESC
+            LIMIT 1
+            """,
+            (game_id,),
+        ).fetchone()
+        return None if row is None else cls._observation_from_row(row)
+
+    def get_accepted_observation_baseline(
+        self, game_id: str
+    ) -> NormalizedObservation | None:
+        with self._connect() as conn:
+            return self._accepted_observation_in_connection(conn, game_id)
+
+    def accept_observation_baseline(
+        self,
+        observation_id: str,
+        *,
+        expected_previous_observation_id: str | None,
+        reason: str,
+        accepted_at: datetime,
+    ) -> NormalizedObservation:
+        if accepted_at.tzinfo is None or accepted_at.utcoffset() is None:
+            raise ValueError("Observation baseline accepted_at must include a timezone")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM normalized_observations WHERE observation_id=?",
+                (observation_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("accepted Observation must be persisted first")
+            observation = self._observation_from_row(row)
+            if not observation.completeness.supports_scope("research"):
+                raise ValueError(
+                    "cannot accept an incomplete research Observation baseline"
+                )
+            current = conn.execute(
+                """
+                SELECT * FROM observation_baseline_acceptances
+                WHERE game_id=?
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (observation.game_session_id,),
+            ).fetchone()
+            current_id = None if current is None else str(current["observation_id"])
+            if current_id == observation_id:
+                return observation
+            if current_id != expected_previous_observation_id:
+                raise ValueError("stale accepted Observation baseline")
+            if accepted_at < observation.observed_at:
+                raise ValueError("Observation baseline cannot precede its Observation")
+            sequence = 1 if current is None else int(current["sequence"]) + 1
+            acceptance_id = self._build_baseline_acceptance_id(
+                observation.game_session_id,
+                observation.observation_id,
+                current_id,
+            )
+            conn.execute(
+                """
+                INSERT INTO observation_baseline_acceptances(
+                    baseline_acceptance_id, game_id, sequence, observation_id,
+                    previous_observation_id, reason, accepted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    acceptance_id,
+                    observation.game_session_id,
+                    sequence,
+                    observation.observation_id,
+                    current_id,
+                    reason.strip(),
+                    accepted_at.isoformat(),
+                ),
+            )
+            self._validate_phase2_v12(conn)
+        return observation
+
+    def record_observation_comparison(
+        self,
+        observation: NormalizedObservation,
+        *,
+        detected_at: datetime,
+    ) -> ObservationComparisonResult:
+        if detected_at.tzinfo is None or detected_at.utcoffset() is None:
+            raise ValueError("StateDelta detected_at must include a timezone")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._save_normalized_observation_in_connection(conn, observation)
+            baseline = self._accepted_observation_in_connection(
+                conn, observation.game_session_id
+            )
+            result = StateDeltaBuilder().compare(baseline, observation)
+            if result.state_delta is not None:
+                delta = result.state_delta
+                if detected_at < observation.observed_at:
+                    raise ValueError(
+                        "StateDelta cannot precede its current Observation"
+                    )
+                candidate = {
+                    "state_delta_id": delta.state_delta_id,
+                    "game_id": delta.game_session_id,
+                    "baseline_observation_id": delta.baseline_observation_id,
+                    "current_observation_id": delta.current_observation_id,
+                    "detected_at": detected_at.isoformat(),
+                    "delta_json": self._dump(delta.model_dump(mode="json")),
+                }
+                existing = conn.execute(
+                    "SELECT * FROM state_deltas WHERE state_delta_id=?",
+                    (delta.state_delta_id,),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO state_deltas(
+                            state_delta_id, game_id, baseline_observation_id,
+                            current_observation_id, detected_at, delta_json
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        tuple(candidate.values()),
+                    )
+                elif self._normalize_state_delta_row(existing) != candidate:
+                    raise ValueError(
+                        "StateDelta identity was reused with new audit content"
+                    )
+            self._validate_phase2_v12(conn)
+        return result
+
+    def list_state_deltas(self, game_id: str) -> list[StateDelta]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM state_deltas WHERE game_id=? ORDER BY detected_at",
+                (game_id,),
+            ).fetchall()
+        return [StateDelta.model_validate_json(str(row["delta_json"])) for row in rows]
 
     @classmethod
     def _contract_from_revision_row(cls, row: Mapping[str, Any]) -> StrategicContract:
@@ -4456,14 +5434,406 @@ class WorkflowStore:
             ).fetchall()
         return [self._contract_commit_from_row(row) for row in rows]
 
+    def get_mission_graph_patch(self, patch_id: str) -> MissionGraphPatch | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM mission_graph_patches WHERE patch_id=?",
+                (patch_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        normalized = self._normalize_mission_graph_patch_row(row)
+        if dict(row) != normalized:
+            raise ValueError("MissionGraphPatch row is not canonical")
+        return MissionGraphPatch.model_validate_json(str(row["patch_json"]))
+
+    def list_mission_graph_patches(self, game_id: str) -> list[MissionGraphPatch]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM mission_graph_patches "
+                "WHERE game_id=? ORDER BY created_at",
+                (game_id,),
+            ).fetchall()
+        return [
+            MissionGraphPatch.model_validate_json(str(row["patch_json"]))
+            for row in rows
+        ]
+
+    def apply_mission_graph_patch(
+        self,
+        *,
+        tick: MissionGraphPatchedTick,
+        planner_request: PlannerRequest,
+        provider_attempt: ProviderAttempt,
+        patch: MissionGraphPatch,
+        commit: StrategicContractCommit,
+        checkpoint: Callable[[str], None] | None = None,
+    ) -> StrategicContract:
+        tick = validate_workflow_tick(tick)
+        if not isinstance(tick, MissionGraphPatchedTick):
+            raise ValueError("MissionGraphPatch requires its dedicated Tick")
+        checkpoint = checkpoint or (lambda _point: None)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_patch_row = conn.execute(
+                "SELECT * FROM mission_graph_patches WHERE patch_id=?",
+                (patch.patch_id,),
+            ).fetchone()
+            if existing_patch_row is not None:
+                existing = MissionGraphPatch.model_validate_json(
+                    str(
+                        self._normalize_mission_graph_patch_row(existing_patch_row)[
+                            "patch_json"
+                        ]
+                    )
+                )
+                if existing != patch:
+                    raise ValueError(
+                        "MissionGraphPatch identity was reused with new content"
+                    )
+                stored_request_row = conn.execute(
+                    "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                    (patch.source_planner_request_id,),
+                ).fetchone()
+                stored_attempt_row = conn.execute(
+                    "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+                    (patch.source_provider_attempt_id,),
+                ).fetchone()
+                stored_commit_row = conn.execute(
+                    "SELECT * FROM strategic_contract_commits WHERE commit_id=?",
+                    (str(existing_patch_row["commit_id"]),),
+                ).fetchone()
+                stored_tick_row = conn.execute(
+                    "SELECT * FROM workflow_ticks WHERE tick_id=?",
+                    (tick.tick_id,),
+                ).fetchone()
+                if (
+                    stored_request_row is None
+                    or self._planner_request_from_row(stored_request_row)
+                    != planner_request
+                    or stored_attempt_row is None
+                    or self._provider_attempt_from_row(conn, stored_attempt_row)
+                    != provider_attempt
+                    or stored_commit_row is None
+                    or self._contract_commit_from_row(stored_commit_row) != commit
+                    or stored_tick_row is None
+                    or self._workflow_tick_from_row(dict(stored_tick_row)) != tick
+                ):
+                    raise ValueError("MissionGraphPatch idempotency evidence disagrees")
+                revision_row = conn.execute(
+                    "SELECT * FROM strategic_contract_revisions "
+                    "WHERE game_id=? AND revision=?",
+                    (
+                        patch.game_session_id,
+                        int(existing_patch_row["committed_revision"]),
+                    ),
+                ).fetchone()
+                if revision_row is None:
+                    raise ValueError(
+                        "MissionGraphPatch idempotency audit has no Contract revision"
+                    )
+                return self._contract_from_revision_row(revision_row)
+
+            if (
+                planner_request.game_session_id != patch.game_session_id
+                or planner_request.planner_request_id != patch.source_planner_request_id
+                or planner_request.target.kind
+                is not PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+                or planner_request.target.strategic_contract_id != patch.contract_id
+                or planner_request.target.base_contract_revision
+                != patch.expected_base_revision
+                or planner_request.target.affected_mission_ids
+                != patch.affected_mission_ids
+                or planner_request.status is not PlannerRequestStatus.COMPLETED
+                or planner_request.completed_at is None
+                or planner_request.completed_at != patch.created_at
+            ):
+                raise ValueError(
+                    "MissionGraphPatch completed PlannerRequest identity disagrees"
+                )
+            existing_request_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (planner_request.planner_request_id,),
+            ).fetchone()
+            if existing_request_row is None:
+                raise ValueError("MissionGraphPatch PlannerRequest does not exist")
+            existing_request = self._planner_request_from_row(existing_request_row)
+            if existing_request.status is not PlannerRequestStatus.IN_PROGRESS:
+                raise ValueError("MissionGraphPatch PlannerRequest is not in progress")
+            stored_attempt_row = conn.execute(
+                "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+                (provider_attempt.provider_attempt_id,),
+            ).fetchone()
+            if stored_attempt_row is None:
+                raise ValueError("MissionGraphPatch ProviderAttempt does not exist")
+            stored_attempt = self._provider_attempt_from_row(conn, stored_attempt_row)
+            if (
+                stored_attempt.status is not ProviderAttemptStatus.STARTED
+                or provider_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or provider_attempt.completed_at is None
+                or provider_attempt.completed_at != patch.created_at
+                or provider_attempt.planner_request_id
+                != planner_request.planner_request_id
+                or provider_attempt.provider_attempt_id
+                != patch.source_provider_attempt_id
+                or provider_attempt.attempt_number
+                != patch.source_provider_attempt_number
+                or provider_attempt.attempt_number
+                != planner_request.provider_attempt_count
+            ):
+                raise ValueError(
+                    "MissionGraphPatch final ProviderAttempt identity disagrees"
+                )
+            root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (patch.game_session_id,),
+            ).fetchone()
+            if (
+                root is None
+                or str(root["contract_id"]) != patch.contract_id
+                or int(root["active_revision"]) != patch.expected_base_revision
+            ):
+                raise ValueError("stale MissionGraphPatch Contract base")
+            base_row = conn.execute(
+                "SELECT * FROM strategic_contract_revisions "
+                "WHERE game_id=? AND revision=?",
+                (patch.game_session_id, patch.expected_base_revision),
+            ).fetchone()
+            if base_row is None:
+                raise ValueError("MissionGraphPatch Contract base is missing")
+            base_contract = self._contract_from_revision_row(base_row)
+            if "research" not in base_contract.authority_scope_set.mission_graph_scopes:
+                raise ValueError("MissionGraphPatch cannot write a legacy-owned scope")
+            base_by_id = {
+                mission.mission_id: mission
+                for mission in base_contract.mission_graph.missions
+            }
+            updates = {mission.mission_id: mission for mission in patch.mission_updates}
+            if set(updates) != set(patch.affected_mission_ids):
+                raise ValueError(
+                    "MissionGraphPatch update closure disagrees with target"
+                )
+            for mission_id, mission in updates.items():
+                previous = base_by_id.get(mission_id)
+                if (
+                    previous is None
+                    or previous.scope != "research"
+                    or mission.mission_revision != previous.mission_revision + 1
+                ):
+                    raise ValueError(
+                        "MissionGraphPatch Mission revision is stale or out of scope"
+                    )
+            expected_missions = dict(base_by_id)
+            expected_missions.update(updates)
+            expected_graph = MissionGraph(
+                missions=tuple(
+                    sorted(expected_missions.values(), key=lambda item: item.mission_id)
+                )
+            )
+            if (
+                commit.expected_base_revision != patch.expected_base_revision
+                or commit.contract.revision != patch.expected_base_revision + 1
+                or commit.contract.contract_id != patch.contract_id
+                or commit.contract.game_session_id != patch.game_session_id
+                or commit.contract.authority_scope_set
+                != base_contract.authority_scope_set
+                or commit.contract.mission_graph != expected_graph
+                or commit.contract.strategic_objectives
+                != base_contract.strategic_objectives
+                or commit.contract.global_constraints
+                != base_contract.global_constraints
+                or commit.contract.policy_snapshot != base_contract.policy_snapshot
+                or commit.contract.approval_status != base_contract.approval_status
+                or commit.contract.created_from_observation_id
+                != patch.created_from_observation_id
+                or commit.committed_at != patch.created_at
+                or commit.source_patch_id != patch.patch_id
+                or commit.source_state_delta_id != patch.source_state_delta_id
+                or commit.source_patch_planner_request_id
+                != patch.source_planner_request_id
+                or commit.source_patch_provider_attempt_id
+                != patch.source_provider_attempt_id
+                or commit.source_patch_mission_id not in patch.affected_mission_ids
+            ):
+                raise ValueError(
+                    "MissionGraphPatch ContractCommit does not preserve aggregate boundaries"
+                )
+            source_mission = updates[str(commit.source_patch_mission_id)]
+            if commit.source_patch_mission_revision != source_mission.mission_revision:
+                raise ValueError(
+                    "MissionGraphPatch ContractCommit Mission provenance differs"
+                )
+            delta_row = conn.execute(
+                "SELECT * FROM state_deltas WHERE state_delta_id=?",
+                (patch.source_state_delta_id,),
+            ).fetchone()
+            if delta_row is None:
+                raise ValueError("MissionGraphPatch StateDelta is missing")
+            delta = StateDelta.model_validate_json(str(delta_row["delta_json"]))
+            if (
+                delta.game_session_id != patch.game_session_id
+                or delta.current_observation_id != patch.created_from_observation_id
+            ):
+                raise ValueError("MissionGraphPatch StateDelta identity differs")
+            current_baseline = self._accepted_observation_in_connection(
+                conn, patch.game_session_id
+            )
+            if (
+                current_baseline is None
+                or current_baseline.observation_id != delta.baseline_observation_id
+                or tick.previous_baseline_observation_id
+                != delta.baseline_observation_id
+                or tick.accepted_observation_id != delta.current_observation_id
+            ):
+                raise ValueError("stale MissionGraphPatch Observation baseline")
+            current_observation_row = conn.execute(
+                "SELECT * FROM normalized_observations WHERE observation_id=?",
+                (delta.current_observation_id,),
+            ).fetchone()
+            if current_observation_row is None:
+                raise ValueError("MissionGraphPatch current Observation is missing")
+            current_observation = self._observation_from_row(current_observation_row)
+            if not current_observation.completeness.supports_scope("research"):
+                raise ValueError(
+                    "MissionGraphPatch cannot accept an incomplete Observation"
+                )
+            if (
+                tick.game_session_id != patch.game_session_id
+                or tick.planner_request_id != patch.source_planner_request_id
+                or tick.provider_attempt_id != patch.source_provider_attempt_id
+                or tick.patch_id != patch.patch_id
+                or tick.state_delta_id != patch.source_state_delta_id
+                or tick.contract_id != patch.contract_id
+                or tick.committed_revision != commit.contract.revision
+                or tick.completed_at < patch.created_at
+            ):
+                raise ValueError("MissionGraphPatch Tick identity disagrees")
+
+            self._save_provider_attempt_in_connection(
+                conn,
+                patch.game_session_id,
+                provider_attempt,
+                validate_aggregate=False,
+            )
+            self._save_planner_request_in_connection(conn, planner_request)
+            checkpoint("after_mission_patch_request_finalized")
+            conn.execute(
+                """
+                INSERT INTO strategic_contract_revisions(
+                    game_id, contract_id, revision, contract_json, committed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    commit.game_session_id,
+                    commit.contract_id,
+                    commit.contract.revision,
+                    self._dump(commit.contract.model_dump(mode="json")),
+                    commit.committed_at.isoformat(),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO strategic_contract_commits(
+                    commit_id, game_id, contract_id, expected_base_revision,
+                    committed_revision, commit_json, committed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    commit.commit_id,
+                    commit.game_session_id,
+                    commit.contract_id,
+                    commit.expected_base_revision,
+                    commit.contract.revision,
+                    self._dump(self._contract_commit_payload(commit)),
+                    commit.committed_at.isoformat(),
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE strategic_contract_roots SET active_revision=? "
+                "WHERE game_id=? AND contract_id=? AND active_revision=?",
+                (
+                    commit.contract.revision,
+                    commit.game_session_id,
+                    commit.contract_id,
+                    commit.expected_base_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("stale MissionGraphPatch Contract base")
+            checkpoint("after_mission_patch_contract_appended")
+            baseline_row = conn.execute(
+                "SELECT * FROM observation_baseline_acceptances "
+                "WHERE game_id=? ORDER BY sequence DESC LIMIT 1",
+                (patch.game_session_id,),
+            ).fetchone()
+            assert baseline_row is not None
+            sequence = int(baseline_row["sequence"]) + 1
+            conn.execute(
+                """
+                INSERT INTO observation_baseline_acceptances(
+                    baseline_acceptance_id, game_id, sequence, observation_id,
+                    previous_observation_id, reason, accepted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._build_baseline_acceptance_id(
+                        patch.game_session_id,
+                        current_observation.observation_id,
+                        current_baseline.observation_id,
+                    ),
+                    patch.game_session_id,
+                    sequence,
+                    current_observation.observation_id,
+                    current_baseline.observation_id,
+                    "MissionGraphPatch committed",
+                    tick.completed_at.isoformat(),
+                ),
+            )
+            checkpoint("after_mission_patch_baseline_accepted")
+            conn.execute(
+                """
+                INSERT INTO mission_graph_patches(
+                    patch_id, game_id, contract_id, expected_base_revision,
+                    state_delta_id, planner_request_id, provider_attempt_id,
+                    committed_revision, commit_id, patch_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    patch.patch_id,
+                    patch.game_session_id,
+                    patch.contract_id,
+                    patch.expected_base_revision,
+                    patch.source_state_delta_id,
+                    patch.source_planner_request_id,
+                    patch.source_provider_attempt_id,
+                    commit.contract.revision,
+                    commit.commit_id,
+                    self._dump(patch.model_dump(mode="json")),
+                    patch.created_at.isoformat(),
+                ),
+            )
+            self._save_runtime_state_in_connection(
+                conn, patch.game_session_id, tick.ending_runtime_state, None
+            )
+            self._persist_human_wait_context_in_connection(
+                conn, patch.game_session_id, tick.ending_runtime_state, None
+            )
+            checkpoint("before_mission_patch_tick")
+            self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1c_v11(conn)
+            self._validate_phase2_v12(conn)
+            return commit.contract
+
     def commit_strategic_contract_revision(
         self, commit: StrategicContractCommit
     ) -> StrategicContract:
         with self._connect() as conn:
-            if commit.source_proposal_id is not None:
+            if (
+                commit.source_proposal_id is not None
+                or commit.source_patch_id is not None
+            ):
                 raise ValueError(
-                    "Proposal-derived Contract commits require the Phase 1C "
-                    "aggregate decision transaction"
+                    "derived Contract commits require their aggregate transaction"
                 )
             self._validate_phase1b_contract_foundation(commit.contract)
             existing_row = conn.execute(
@@ -4535,7 +5905,7 @@ class WorkflowStore:
                     )
 
             contract_json = self._dump(commit.contract.model_dump(mode="json"))
-            commit_json = self._dump(commit.model_dump(mode="json"))
+            commit_json = self._dump(self._contract_commit_payload(commit))
             conn.execute(
                 """
                 INSERT INTO strategic_contract_revisions(
@@ -5129,7 +6499,7 @@ class WorkflowStore:
                 proposal.target_contract_id,
                 proposal.expected_base_revision,
                 contract.revision,
-                cls._dump(commit.model_dump(mode="json")),
+                cls._dump(cls._contract_commit_payload(commit)),
                 commit.committed_at.isoformat(),
             ),
         )
@@ -6232,11 +7602,19 @@ class WorkflowStore:
         if commit_row is None:
             raise ValueError("research authority Contract commit is missing")
         commit = cls._contract_commit_from_row(commit_row)
+        mission_id = commit.source_mission_id or commit.source_patch_mission_id
+        mission_revision = (
+            commit.source_mission_revision or commit.source_patch_mission_revision
+        )
+        if mission_id is None or mission_revision is None:
+            raise ValueError(
+                "research authority Contract commit has no Mission provenance"
+            )
         missions = tuple(
             mission
             for mission in contract.mission_graph.missions
-            if mission.mission_id == commit.source_mission_id
-            and mission.mission_revision == commit.source_mission_revision
+            if mission.mission_id == mission_id
+            and mission.mission_revision == mission_revision
         )
         if len(missions) != 1:
             raise ValueError("research authority resolves to no unique Mission")
@@ -8271,16 +9649,28 @@ class WorkflowStore:
                     request.response_payload
                 )
                 contract_name = "WorkflowPlanBundle"
-            case (
-                PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION
-                | PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
-            ):
+            case PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
                 canonical_payload = (
                     canonical_strategic_research_proposal_response_payload(
                         request.response_payload
                     )
                 )
                 contract_name = "StrategicResearchProposalResponse"
+            case PlannerRequestTargetKind.MISSION_GRAPH_REPAIR:
+                try:
+                    canonical_payload = canonical_mission_graph_patch_response_payload(
+                        request.response_payload
+                    )
+                    contract_name = "MissionGraphPatchResponse"
+                except ValueError:
+                    # Phase 1B persisted repair-target Proposal responses before the
+                    # local MissionGraphPatch protocol became authoritative.
+                    canonical_payload = (
+                        canonical_strategic_research_proposal_response_payload(
+                            request.response_payload
+                        )
+                    )
+                    contract_name = "StrategicResearchProposalResponse"
             case _:
                 raise ValueError("unsupported PlannerRequest response target")
         if canonical_json(request.response_payload) != canonical_json(
@@ -10080,6 +11470,14 @@ class WorkflowStore:
                     row = cls._normalize_contract_revision_row(row)
                 elif table == "strategic_contract_commits":
                     row = cls._normalize_contract_commit_row(row)
+                elif table == "normalized_observations":
+                    row = cls._normalize_observation_row(row)
+                elif table == "observation_baseline_acceptances":
+                    row = cls._normalize_baseline_acceptance_row(row)
+                elif table == "state_deltas":
+                    row = cls._normalize_state_delta_row(row)
+                elif table == "mission_graph_patches":
+                    row = cls._normalize_mission_graph_patch_row(row)
                 elif table == "strategic_research_proposals":
                     row = cls._normalize_strategic_research_proposal_row(row)
                 elif table == "strategic_proposal_wait_resume_requests":
@@ -10264,7 +11662,22 @@ class WorkflowStore:
             [*external_action_attempts, *prepared["action_attempts"]],
             require_canonical=True,
         )
-
+        cls._validate_phase2_observation_state(
+            prepared["normalized_observations"],
+            prepared["observation_baseline_acceptances"],
+            prepared["state_deltas"],
+            prepared["mission_graph_patches"],
+            require_canonical=True,
+        )
+        cls._validate_phase2_patch_aggregate(
+            prepared["mission_graph_patches"],
+            prepared["logical_planner_requests"],
+            prepared["provider_attempts"],
+            prepared["strategic_contract_revisions"],
+            prepared["strategic_contract_commits"],
+            prepared["workflow_ticks"],
+            require_canonical=True,
+        )
         for table in REPLAY_STATE_TABLES:
             for foreign_key in conn.execute(
                 f"PRAGMA foreign_key_list({table})"
