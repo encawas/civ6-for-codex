@@ -51,6 +51,7 @@ class TickOutcomeKind(StrEnum):
     STRATEGIC_PROPOSAL_REJECTED = "STRATEGIC_PROPOSAL_REJECTED"
     STRATEGIC_PROPOSAL_INVALIDATED = "STRATEGIC_PROPOSAL_INVALIDATED"
     MISSION_GRAPH_PATCHED = "MISSION_GRAPH_PATCHED"
+    SCOPE_AUTHORITY_ACTIVATED = "SCOPE_AUTHORITY_ACTIVATED"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
     INFORMATION_COLLECTED = "INFORMATION_COLLECTED"
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
@@ -196,6 +197,43 @@ class MissionGraphPatchedTick(TickRecord):
     committed_revision: int = Field(ge=2)
     previous_baseline_observation_id: str = Field(min_length=1)
     accepted_observation_id: str = Field(min_length=1)
+
+
+class LegacyScopeObjectDisposition(DomainModel):
+    object_kind: Literal["decision_gap", "plan_lease", "stored_task"]
+    object_id: str = Field(min_length=1)
+    previous_status: str = Field(min_length=1)
+    final_status: str = Field(min_length=1)
+
+
+class ScopeAuthorityActivatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.SCOPE_AUTHORITY_ACTIVATED] = (
+        TickOutcomeKind.SCOPE_AUTHORITY_ACTIVATED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    activation_id: str = Field(min_length=1)
+    scope: str = Field(min_length=1)
+    contract_id: str = Field(min_length=1)
+    expected_base_revision: int = Field(ge=1)
+    activated_revision: int = Field(ge=2)
+    contract_commit_id: str = Field(min_length=1)
+    mission_ids: tuple[str, ...] = Field(min_length=1)
+    legacy_dispositions: tuple[LegacyScopeObjectDisposition, ...] = ()
+
+    def model_post_init(self, __context: object) -> None:
+        super().model_post_init(__context)
+        if self.activated_revision != self.expected_base_revision + 1:
+            raise ValueError("scope activation revision must immediately follow base")
+        if self.mission_ids != tuple(sorted(set(self.mission_ids))):
+            raise ValueError("scope activation Mission IDs must be unique and sorted")
+        disposition_keys = tuple(
+            (item.object_kind, item.object_id) for item in self.legacy_dispositions
+        )
+        if disposition_keys != tuple(sorted(set(disposition_keys))):
+            raise ValueError(
+                "scope activation legacy dispositions must be unique and sorted"
+            )
 
 
 class StrategicProposalWaitResumedTick(TickRecord):
@@ -670,6 +708,7 @@ WorkflowTick: TypeAlias = Annotated[
     | PlannerAttemptCompletedTick
     | StrategicProposalReadyTick
     | MissionGraphPatchedTick
+    | ScopeAuthorityActivatedTick
     | StrategicRequestTerminatedTick
     | StrategicRequestWaitResumedTick
     | StrategicRequestWaitErrorTick

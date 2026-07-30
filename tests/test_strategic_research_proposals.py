@@ -70,6 +70,7 @@ from civ6_workflow.models import (
     StoredTask,
     TaskStatus,
 )
+from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.web_ui import ControlPanelState
 from civ6_workflow.workflow_protocol import (
@@ -105,6 +106,7 @@ class _Game:
     async def list_tools(self):
         return {
             "set_city_production",
+            "set_civic",
             "set_research",
             "unit_action",
             "end_turn",
@@ -5306,6 +5308,129 @@ def test_active_research_change_commits_local_mission_patch_and_replays(tmp_path
     asyncio.run(scenario())
 
 
+def test_active_civic_change_commits_local_mission_patch_and_replays(tmp_path):
+    async def scenario():
+        path = tmp_path / "phase5-civic-repair.sqlite3"
+        store = WorkflowStore(path)
+        base = _commit_contract(store, "game-1")
+        game = _Game()
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "tech_civics": {
+                    "current_research_type": "TECH_WRITING",
+                    "available_techs": [{"tech_type": "TECH_WRITING"}],
+                    "current_civic_type": "CIVIC_CODE_OF_LAWS",
+                    "available_civics": [
+                        {"civic_type": "CIVIC_CODE_OF_LAWS"},
+                        {"civic_type": "CIVIC_CRAFTSMANSHIP"},
+                    ],
+                }
+            }
+        )
+        activation_observation = normalize_runtime_snapshot(game.snapshot).canonical
+        store.save_normalized_observation(activation_observation)
+        civic_mission = Mission(
+            mission_id="mission-civic-opening",
+            game_session_id="game-1",
+            contract_id=base.contract_id,
+            mission_revision=1,
+            scope="civic",
+            subject=SubjectRef(subject_type="player", subject_id="player-1"),
+            slot="player:civic",
+            objective="Complete Code of Laws",
+            desired_outcome={"civic": "CIVIC_CODE_OF_LAWS"},
+            status=MissionStatus.ACTIVE,
+        )
+        activated, _activation_tick = store.activate_civic_authority(
+            game_session_id="game-1",
+            expected_base_revision=base.revision,
+            mission=civic_mission,
+            activation_id="activate-civic-repair-test",
+            observation_id=activation_observation.observation_id,
+            turn_number=game.snapshot.turn,
+            activated_at=activation_observation.observed_at + timedelta(seconds=1),
+        )
+        planner = _Planner()
+        engine = _engine(store, game, planner)
+        engine.config.execution_mode = ExecutionMode.READONLY
+        runtime_clock = [activation_observation.observed_at + timedelta(seconds=10)]
+
+        def next_runtime_time():
+            runtime_clock[0] += timedelta(milliseconds=1)
+            return runtime_clock[0]
+
+        engine._now = next_runtime_time
+        await engine.tick()
+        baseline = store.get_accepted_observation_baseline("game-1")
+        assert baseline is not None
+        assert planner.calls == 0
+
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 2,
+                "overview": {"turn": 2, "player_id": 1, "num_cities": 1},
+                "tech_civics": {
+                    "current_research_type": "TECH_WRITING",
+                    "available_techs": [{"tech_type": "TECH_WRITING"}],
+                    "current_civic_type": "CIVIC_CRAFTSMANSHIP",
+                    "available_civics": [
+                        {"civic_type": "CIVIC_CRAFTSMANSHIP"},
+                        {"civic_type": "CIVIC_FOREIGN_TRADE"},
+                    ],
+                },
+            }
+        )
+        request_tick = await engine.tick()
+        assert (
+            request_tick.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        ), request_tick.workflow_tick
+        request = store.active_planner_request("game-1")
+        assert request is not None
+        assert request.target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+        assert request.target.strategic_scope == "civic"
+        assert request.target.affected_mission_ids == (civic_mission.mission_id,)
+        assert planner.calls == 0
+        assert store.get_accepted_observation_baseline("game-1") == baseline
+
+        repaired_mission = civic_mission.model_copy(
+            update={
+                "mission_revision": 2,
+                "objective": "Continue Craftsmanship",
+                "desired_outcome": {"civic": "CIVIC_CRAFTSMANSHIP"},
+                "evidence_refs": (f"observation:{request.observation_id}",),
+            }
+        )
+        planner.responses.append(
+            MissionGraphPatchResponse(
+                schema_version="mission-graph-patch-response/v1",
+                patch_candidates=(
+                    MissionGraphPatchCandidate(
+                        mission_updates=(repaired_mission,),
+                        created_from_observation_id=request.observation_id,
+                    ),
+                ),
+            )
+        )
+        patch_tick = await engine.tick()
+
+        assert (
+            patch_tick.workflow_tick["outcome"] == TickOutcomeKind.MISSION_GRAPH_PATCHED
+        )
+        assert planner.calls == 1
+        updated = store.get_active_strategic_contract("game-1")
+        assert updated is not None
+        assert updated.revision == activated.revision + 1
+        assert updated.authority_scope_set.mission_graph_scopes == ("civic",)
+        assert updated.mission_graph.missions == (repaired_mission,)
+        replay = store.export_replay_state("game-1")
+        restored = WorkflowStore(tmp_path / "phase5-civic-repair-restored.sqlite3")
+        restored.import_replay_state(replay)
+        assert restored.export_replay_state("game-1") == replay
+
+    asyncio.run(scenario())
+
+
 def test_mission_graph_patch_transaction_rolls_back_before_completion_tick(tmp_path):
     async def scenario():
         path = tmp_path / "phase2-repair-crash.sqlite3"
@@ -6235,6 +6360,91 @@ def test_turn_action_graph_verification_commits_mission_completion_once(tmp_path
     with pytest.raises(ValueError, match="sources are stale"):
         restored.import_replay_state(tampered)
     assert restored.export_replay_state(proposal.game_session_id) == before_tamper
+
+
+def test_civic_turn_action_verification_commits_mission_completion_once(tmp_path):
+    path = tmp_path / "phase5-civic-turn-action.sqlite3"
+    store = WorkflowStore(path)
+    base = _commit_contract(store, "game-1")
+
+    class ExecutingCivicGame(_Game):
+        async def execute_task(self, task):
+            assert task.action_type == "set_civic"
+            assert task.arguments == {"tech_or_civic": "CIVIC_CODE_OF_LAWS"}
+            return ActionResult(
+                success=True,
+                delivery_status=MutationDeliveryStatus.ACKNOWLEDGED,
+            )
+
+    game = ExecutingCivicGame()
+    game.snapshot = game.snapshot.model_copy(
+        update={
+            "tech_civics": {
+                "current_research_type": "TECH_WRITING",
+                "available_techs": [{"tech_type": "TECH_WRITING"}],
+                "current_civic": None,
+                "available_civics": [{"civic_type": "CIVIC_CODE_OF_LAWS"}],
+            }
+        }
+    )
+    observation = normalize_runtime_snapshot(game.snapshot).canonical
+    store.save_normalized_observation(observation)
+    mission = Mission(
+        mission_id="mission-civic-code-of-laws",
+        game_session_id="game-1",
+        contract_id=base.contract_id,
+        mission_revision=1,
+        scope="civic",
+        subject=SubjectRef(subject_type="player", subject_id="player-1"),
+        slot="player:civic",
+        objective="Select Code of Laws",
+        desired_outcome={"civic": "CIVIC_CODE_OF_LAWS"},
+        status=MissionStatus.ACTIVE,
+    )
+    activated, _activation_tick = store.activate_civic_authority(
+        game_session_id="game-1",
+        expected_base_revision=base.revision,
+        mission=mission,
+        activation_id="activate-civic-execution-test",
+        observation_id=observation.observation_id,
+        turn_number=game.snapshot.turn,
+        activated_at=observation.observed_at + timedelta(seconds=1),
+    )
+    engine = _engine(store, game, _Planner())
+    engine._now = lambda: observation.observed_at + timedelta(seconds=10)
+
+    sent = asyncio.run(engine.tick())
+    assert sent.workflow_tick["outcome"] == TickOutcomeKind.MUTATION_SENT, (
+        sent.workflow_tick
+    )
+    graph_state = store.active_turn_action_graph("game-1")
+    assert graph_state is not None
+    graph, nodes = graph_state
+    assert [node.action_type for node in nodes] == ["set_civic"]
+
+    game.snapshot = game.snapshot.model_copy(
+        update={
+            "tech_civics": {
+                **game.snapshot.tech_civics,
+                "current_civic": "CIVIC_CODE_OF_LAWS",
+            }
+        }
+    )
+    verified = asyncio.run(engine.tick())
+    assert verified.workflow_tick["outcome"] == TickOutcomeKind.ATTEMPT_RECONCILED
+
+    completed = store.get_active_strategic_contract("game-1")
+    assert completed is not None
+    assert completed.revision == activated.revision + 1
+    completed_mission = completed.mission_graph.missions[0]
+    assert completed_mission.status is MissionStatus.COMPLETED
+    assert completed_mission.mission_revision == mission.mission_revision + 1
+    assert store.active_turn_action_graph("game-1") is None
+    replay = store.export_replay_state("game-1")
+    restored = WorkflowStore(tmp_path / "phase5-civic-turn-action-restored.sqlite3")
+    restored.import_replay_state(replay)
+    assert restored.export_replay_state("game-1") == replay
+    assert restored.get_active_strategic_contract("game-1") == completed
 
 
 def test_turn_action_graph_approval_survives_equivalent_observation(tmp_path):

@@ -33,6 +33,7 @@ class ProgressionRuleCompiler:
         observation: NormalizedRuntimeObservation,
         *,
         include_research: bool = True,
+        include_civic: bool = True,
     ) -> ProgressionCompilation:
         snapshot = observation.snapshot
         strategy = self.store.current_context(snapshot.game_id).get("strategy", {})
@@ -55,14 +56,18 @@ class ProgressionRuleCompiler:
         )
         if research is not None:
             tasks.append(research)
-        civic = self._compile_category(
-            observation,
-            strategy,
-            category="civic",
-            queue_keys=("civic_queue",),
-            action_type="set_civic",
-            target_keys=("civic_type", "item_name", "name"),
-            events=events,
+        civic = (
+            self._compile_category(
+                observation,
+                strategy,
+                category="civic",
+                queue_keys=("civic_queue",),
+                action_type="set_civic",
+                target_keys=("civic_type", "item_name", "name"),
+                events=events,
+            )
+            if include_civic
+            else None
         )
         if civic is not None:
             tasks.append(civic)

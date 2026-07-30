@@ -424,64 +424,79 @@ class WorkflowEngine:
         before = self.store.task_ids(snapshot.game_id)
         materialization_started = self._monotonic()
         rule_compilation = self.rules.compile(observation)
-        active_research = self.store.active_research_mission(snapshot.game_id)
+        active_execution = self.store.active_execution_missions(snapshot.game_id)
+        active_contract = None if active_execution is None else active_execution[0]
+        execution_missions = () if active_execution is None else active_execution[1]
+        owned_execution_scopes = (
+            set()
+            if active_contract is None
+            else set(active_contract.authority_scope_set.mission_graph_scopes)
+        )
         progression_compilation = self.progression.compile(
             observation,
-            include_research=active_research is None,
+            include_research="research" not in owned_execution_scopes,
+            include_civic="civic" not in owned_execution_scopes,
         )
-        authoritative_research_events: list[GameEvent] = []
-        if active_research is not None:
-            contract, mission = active_research
-            unavailable_target = self.turn_compiler.unavailable_target(
-                observation.canonical, mission
-            )
-            if unavailable_target is not None:
-                available = sorted(
-                    item.value
-                    for item in observation.canonical.progression.available_research_ids
+        authoritative_mission_events: list[GameEvent] = []
+        if active_contract is not None:
+            for mission in execution_missions:
+                scope = mission.scope
+                target_key = "technology" if scope == "research" else "civic"
+                available_ids = (
+                    observation.canonical.progression.available_research_ids
+                    if scope == "research"
+                    else observation.canonical.progression.available_civic_ids
                 )
-                authoritative_research_events.append(
+                unavailable_target = self.turn_compiler.unavailable_target(
+                    observation.canonical, mission
+                )
+                if unavailable_target is None:
+                    continue
+                available = sorted(item.value for item in available_ids)
+                authoritative_mission_events.append(
                     GameEvent(
-                        event_type="research_mission_target_unavailable",
+                        event_type=f"{scope}_mission_target_unavailable",
                         turn=snapshot.turn,
-                        entity_type="research",
+                        entity_type=scope,
                         entity_id=unavailable_target,
                         level=EventLevel.L3,
                         risk=RiskLevel.MEDIUM,
                         blocking=True,
                         payload={
-                            "contract_id": contract.contract_id,
-                            "contract_revision": contract.revision,
+                            "contract_id": active_contract.contract_id,
+                            "contract_revision": active_contract.revision,
                             "mission_id": mission.mission_id,
                             "mission_revision": mission.mission_revision,
-                            "technology": unavailable_target,
+                            target_key: unavailable_target,
                             "available": available,
                         },
                         dedupe_key=(
-                            "research_mission_target_unavailable:"
-                            f"{contract.revision}:{mission.mission_revision}:"
+                            f"{scope}_mission_target_unavailable:"
+                            f"{active_contract.revision}:{mission.mission_revision}:"
                             f"{unavailable_target}"
                         ),
                     )
                 )
         existing_graph_state = self.store.active_turn_action_graph(snapshot.game_id)
         reusable_graph = (
-            active_research is not None
+            active_contract is not None
+            and bool(execution_missions)
             and existing_graph_state is not None
             and existing_graph_state[0].turn_number == snapshot.turn
             and existing_graph_state[0].source_observation_projection_hash
             == observation.canonical.projection_hash
             and existing_graph_state[0].source_contract_id
-            == active_research[0].contract_id
+            == active_contract.contract_id
             and existing_graph_state[0].source_contract_revision
-            == active_research[0].revision
+            == active_contract.revision
         )
         turn_compilation = (
             None
-            if active_research is None or reusable_graph
-            else self.turn_compiler.compile(
+            if active_contract is None or not execution_missions or reusable_graph
+            else self.turn_compiler.compile_missions(
                 observation.canonical,
-                *active_research,
+                active_contract,
+                execution_missions,
                 mode=self.config.execution_mode,
                 auto_action_types=self.config.auto_action_types,
                 compiled_at=observation.canonical.observed_at,
@@ -490,7 +505,7 @@ class WorkflowEngine:
         current_events = [
             *rule_compilation.events,
             *progression_compilation.events,
-            *authoritative_research_events,
+            *authoritative_mission_events,
             *events_from_snapshot(snapshot),
         ]
         lease_tick = await self._pre_route_decision_runtime(
@@ -566,7 +581,7 @@ class WorkflowEngine:
         events = [] if rewind_event is None else [rewind_event]
         events.extend(rule_compilation.events)
         events.extend(progression_compilation.events)
-        events.extend(authoritative_research_events)
+        events.extend(authoritative_mission_events)
         events.extend(events_from_snapshot(snapshot))
         gate = self.gate.ingest(snapshot.game_id, events)
         compat = TickResult(
@@ -1356,22 +1371,30 @@ class WorkflowEngine:
         self, snapshot: RuntimeSnapshot, events: list[GameEvent]
     ) -> AgentRequest:
         context = self.store.current_context(snapshot.game_id)
-        research_authoritative = (
-            self.store.active_research_mission(snapshot.game_id) is not None
+        active_execution = self.store.active_execution_missions(snapshot.game_id)
+        owned_scopes = (
+            set()
+            if active_execution is None
+            else set(active_execution[0].authority_scope_set.mission_graph_scopes)
         )
-        if research_authoritative:
+        research_authoritative = "research" in owned_scopes
+        civic_authoritative = "civic" in owned_scopes
+        if research_authoritative or civic_authoritative:
             context = dict(context)
             strategy = context.get("strategy")
             if isinstance(strategy, dict):
                 strategy = dict(strategy)
-                for key in (
-                    "research",
-                    "research_queue",
-                    "tech",
-                    "tech_queue",
-                    "technology",
-                ):
-                    strategy.pop(key, None)
+                if research_authoritative:
+                    for key in (
+                        "research",
+                        "research_queue",
+                        "tech",
+                        "tech_queue",
+                        "technology",
+                    ):
+                        strategy.pop(key, None)
+                if civic_authoritative:
+                    strategy.pop("civic_queue", None)
                 context["strategy"] = strategy
         relevant_state, relevant_plans, max_tasks = project_agent_context(
             snapshot, events, context
@@ -1379,12 +1402,16 @@ class WorkflowEngine:
         allowed_action_types = set(self.config.allowed_action_types)
         if research_authoritative:
             allowed_action_types.discard("set_research")
+        if civic_authoritative:
+            allowed_action_types.discard("set_civic")
         argument_contracts = action_argument_contracts(allowed_action_types)
         entity_type_contracts = action_entity_type_contracts(allowed_action_types)
         entity_id_contracts = entity_id_argument_contracts(entity_type_contracts)
         required_condition_contracts = condition_contracts(allowed_action_types)
         information_contracts = information_tool_argument_contracts()
-        strategy_queue_fields = {"civic_queue": "ordered CIVIC_* type names"}
+        strategy_queue_fields = {}
+        if not civic_authoritative:
+            strategy_queue_fields["civic_queue"] = "ordered CIVIC_* type names"
         if not research_authoritative:
             strategy_queue_fields["research_queue"] = "ordered TECH_* type names"
         return AgentRequest(

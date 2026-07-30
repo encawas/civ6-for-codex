@@ -159,6 +159,9 @@ class StrategicContractCommit(DomainModel):
     source_turn_action_node_id: str | None = Field(default=None, min_length=1)
     source_execution_mission_id: str | None = Field(default=None, min_length=1)
     source_execution_mission_revision: int | None = Field(default=None, ge=1)
+    source_scope_activation_id: str | None = Field(default=None, min_length=1)
+    source_scope: str | None = Field(default=None, min_length=1)
+    source_scope_mission_ids: tuple[str, ...] = ()
 
     def model_post_init(self, __context: object) -> None:
         if self.committed_at.tzinfo is None or self.committed_at.utcoffset() is None:
@@ -210,12 +213,31 @@ class StrategicContractCommit(DomainModel):
             raise ValueError(
                 "Action-derived Contract provenance must be all present or all null"
             )
+        scope_activation_provenance = (
+            self.source_scope_activation_id,
+            self.source_scope,
+        )
+        if any(value is not None for value in scope_activation_provenance) and not all(
+            value is not None for value in scope_activation_provenance
+        ):
+            raise ValueError(
+                "Scope activation Contract provenance must be all present or all null"
+            )
+        if self.source_scope_mission_ids != tuple(
+            sorted(set(self.source_scope_mission_ids))
+        ):
+            raise ValueError("Scope activation Mission IDs must be unique and sorted")
+        if (self.source_scope_activation_id is None) != (
+            not self.source_scope_mission_ids
+        ):
+            raise ValueError("Scope activation provenance requires Mission identities")
         provenance_families = sum(
             value is not None
             for value in (
                 self.source_proposal_id,
                 self.source_patch_id,
                 self.source_action_attempt_id,
+                self.source_scope_activation_id,
             )
         )
         if provenance_families > 1:
@@ -249,7 +271,7 @@ class StrategicContractCommit(DomainModel):
                 raise ValueError(
                     "Patch-derived Contract provenance must identify one Mission"
                 )
-            research_mission_action(matching[0])
+            strategic_mission_action(matching[0])
         if self.source_action_attempt_id is not None:
             matching = tuple(
                 mission
@@ -270,9 +292,27 @@ class StrategicContractCommit(DomainModel):
                 raise ValueError(
                     "Action-derived Contract requires completed Mission evidence"
                 )
-            research_mission_action(
+            strategic_mission_action(
                 mission.model_copy(update={"status": MissionStatus.ACTIVE})
             )
+        if self.source_scope_activation_id is not None:
+            scope = str(self.source_scope)
+            if scope not in self.contract.authority_scope_set.mission_graph_scopes:
+                raise ValueError("activated scope is absent from authority scope set")
+            matching = tuple(
+                mission
+                for mission in self.contract.mission_graph.missions
+                if mission.mission_id in self.source_scope_mission_ids
+            )
+            if len(matching) != len(self.source_scope_mission_ids) or any(
+                mission.scope != scope or mission.status is not MissionStatus.ACTIVE
+                for mission in matching
+            ):
+                raise ValueError(
+                    "Scope activation provenance must identify ACTIVE scoped Missions"
+                )
+            for mission in matching:
+                strategic_mission_action(mission)
 
 
 def research_mission_action(mission: Mission) -> str:
@@ -300,6 +340,39 @@ def research_mission_action(mission: Mission) -> str:
             "research Mission desired_outcome requires a technology identity"
         )
     return "set_research"
+
+
+def civic_mission_action(mission: Mission) -> str:
+    """Resolve the closed civic execution mapping without free-form tool choice."""
+
+    if mission.scope != "civic":
+        raise ValueError("civic Mission scope must be civic")
+    if mission.status is not MissionStatus.ACTIVE:
+        raise ValueError("civic Mission must be ACTIVE")
+    desired_outcome = thaw_json(mission.desired_outcome)
+    forbidden_action_keys = {
+        "action",
+        "action_type",
+        "tool",
+        "tool_name",
+        "operation",
+    }
+    if forbidden_action_keys.intersection(desired_outcome):
+        raise ValueError("civic Mission desired_outcome cannot select an action")
+    civic = desired_outcome.get("civic")
+    if not isinstance(civic, str) or not civic.strip():
+        raise ValueError("civic Mission desired_outcome requires a civic identity")
+    return "set_civic"
+
+
+def strategic_mission_action(mission: Mission) -> str:
+    """Resolve one supported strategic execution action by authoritative scope."""
+
+    if mission.scope == "research":
+        return research_mission_action(mission)
+    if mission.scope == "civic":
+        return civic_mission_action(mission)
+    raise ValueError(f"scope has no Phase 5 execution contract: {mission.scope}")
 
 
 def build_strategic_contract_id(game_session_id: str) -> str:

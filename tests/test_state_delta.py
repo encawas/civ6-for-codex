@@ -208,10 +208,10 @@ def test_mission_graph_patch_is_closed_over_affected_research_missions():
     [
         (
             {
-                "scope": "civic",
-                "slot": "player:civic",
+                "scope": "production",
+                "slot": "city:production",
             },
-            "research",
+            "execution contract",
         ),
         (
             {"status": MissionStatus.BLOCKED},

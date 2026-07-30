@@ -123,59 +123,67 @@ class StateDeltaBuilder:
             )
 
         changes: list[StateDeltaChange] = []
-        before = baseline.progression.current_research
-        after = current.progression.current_research
-        if (
-            baseline.completeness.current_research
-            and current.completeness.current_research
-            and before.state is not SlotState.NOT_LOADED
-            and after.state is not SlotState.NOT_LOADED
-            and before != after
+        for scope, current_field, available_field, completeness_available in (
+            (
+                "research",
+                "current_research",
+                "available_research_ids",
+                "available_research",
+            ),
+            ("civic", "current_civic", "available_civic_ids", "available_civics"),
         ):
-            changes.append(
-                StateDeltaChange(
-                    change_kind=StateDeltaChangeKind.FIELD_CHANGED,
-                    scope="research",
-                    field_path="progression.current_research",
-                    before=before.model_dump(mode="json"),
-                    after=after.model_dump(mode="json"),
+            before = getattr(baseline.progression, current_field)
+            after = getattr(current.progression, current_field)
+            if (
+                getattr(baseline.completeness, current_field)
+                and getattr(current.completeness, current_field)
+                and before.state is not SlotState.NOT_LOADED
+                and after.state is not SlotState.NOT_LOADED
+                and before != after
+            ):
+                changes.append(
+                    StateDeltaChange(
+                        change_kind=StateDeltaChangeKind.FIELD_CHANGED,
+                        scope=scope,
+                        field_path=f"progression.{current_field}",
+                        before=before.model_dump(mode="json"),
+                        after=after.model_dump(mode="json"),
+                    )
                 )
+            if not (
+                getattr(baseline.completeness, completeness_available)
+                and getattr(current.completeness, completeness_available)
+            ):
+                continue
+            before_available = sorted(
+                item.value for item in getattr(baseline.progression, available_field)
             )
-
-        if (
-            baseline.completeness.available_research
-            and current.completeness.available_research
-        ):
-            before_available = tuple(
-                sorted(
-                    item.value for item in baseline.progression.available_research_ids
-                )
-            )
-            after_available = tuple(
-                sorted(
-                    item.value for item in current.progression.available_research_ids
-                )
+            after_available = sorted(
+                item.value for item in getattr(current.progression, available_field)
             )
             if before_available != after_available:
                 changes.append(
                     StateDeltaChange(
                         change_kind=StateDeltaChangeKind.FIELD_CHANGED,
-                        scope="research",
-                        field_path="progression.available_research_ids",
+                        scope=scope,
+                        field_path=f"progression.{available_field}",
                         before=before_available,
                         after=after_available,
                     )
                 )
 
         if not changes:
-            if not current.completeness.supports_scope("research"):
+            if not any(
+                current.completeness.supports_scope(scope)
+                for scope in ("research", "civic")
+            ):
                 return ObservationComparisonResult(
                     kind=ObservationComparisonKind.REBASELINE_REQUIRED,
-                    reason="current Observation is incomplete for research comparison",
+                    reason="current Observation has no complete strategic scope",
                 )
             return ObservationComparisonResult(
                 kind=ObservationComparisonKind.NO_CHANGE,
-                reason="no comparable research fact changed",
+                reason="no comparable strategic fact changed",
             )
 
         ordered = tuple(sorted(changes, key=lambda item: (item.scope, item.field_path)))
@@ -197,7 +205,7 @@ class StateDeltaBuilder:
         )
         return ObservationComparisonResult(
             kind=ObservationComparisonKind.STATE_DELTA,
-            reason="comparable research facts changed",
+            reason="comparable strategic facts changed",
             state_delta=delta,
         )
 

@@ -1,4 +1,4 @@
-"""Deterministically compile the current research execution projection."""
+"""Deterministically compile the current strategic execution projection."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from .domain import (
     TurnActionNode,
     build_turn_action_graph_id,
     build_turn_action_node_id,
-    research_mission_action,
+    strategic_mission_action,
     thaw_json,
 )
 from .models import ExecutionMode, RiskLevel, StoredTask, TaskStatus
@@ -25,10 +25,11 @@ class TurnCompilation:
     graph: TurnActionGraph
     nodes: tuple[TurnActionNode, ...]
     unavailable_target: str | None = None
+    unavailable_targets: tuple[tuple[str, str], ...] = ()
 
 
 class TurnCompiler:
-    """Compile one current-turn graph from authoritative research facts."""
+    """Compile one current-turn graph from authoritative Mission facts."""
 
     @staticmethod
     def unavailable_target(
@@ -37,14 +38,26 @@ class TurnCompiler:
     ) -> str | None:
         """Return the unavailable active target while research is unselected."""
 
-        research_mission_action(mission)
-        technology = str(thaw_json(mission.desired_outcome)["technology"])
-        if observation.progression.current_research.state is not SlotState.EMPTY:
+        strategic_mission_action(mission)
+        desired = thaw_json(mission.desired_outcome)
+        target_key = "technology" if mission.scope == "research" else "civic"
+        target = str(desired[target_key])
+        slot = (
+            observation.progression.current_research
+            if mission.scope == "research"
+            else observation.progression.current_civic
+        )
+        if slot.state is not SlotState.EMPTY:
             return None
         available = {
-            item.value for item in observation.progression.available_research_ids
+            item.value
+            for item in (
+                observation.progression.available_research_ids
+                if mission.scope == "research"
+                else observation.progression.available_civic_ids
+            )
         }
-        return None if technology in available else technology
+        return None if target in available else target
 
     def compile(
         self,
@@ -56,15 +69,105 @@ class TurnCompiler:
         auto_action_types: set[str],
         compiled_at: datetime,
     ) -> TurnCompilation:
-        action_type = research_mission_action(mission)
+        return self.compile_missions(
+            observation,
+            contract,
+            (mission,),
+            mode=mode,
+            auto_action_types=auto_action_types,
+            compiled_at=compiled_at,
+        )
+
+    def compile_missions(
+        self,
+        observation: NormalizedObservation,
+        contract: StrategicContract,
+        missions: tuple[Mission, ...],
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+        compiled_at: datetime,
+    ) -> TurnCompilation:
+        ordered_missions = tuple(sorted(missions, key=lambda item: item.mission_id))
+        if len({mission.scope for mission in ordered_missions}) != len(
+            ordered_missions
+        ):
+            raise ValueError("TurnActionGraph requires one active Mission per scope")
+        provisional_nodes: list[TurnActionNode] = []
+        unavailable_targets: list[tuple[str, str]] = []
+        for mission in ordered_missions:
+            node, unavailable = self._compile_mission_node(
+                observation,
+                contract,
+                mission,
+                mode=mode,
+                auto_action_types=auto_action_types,
+            )
+            if node is not None:
+                provisional_nodes.append(node)
+            if unavailable is not None:
+                unavailable_targets.append((mission.scope, unavailable))
+        provisional_nodes.sort(key=lambda item: item.node_id)
+        graph_identity = {
+            "game_session_id": observation.game_session_id,
+            "turn_number": observation.turn_number,
+            "source_observation_id": observation.observation_id,
+            "source_observation_projection_hash": observation.projection_hash,
+            "source_contract_id": contract.contract_id,
+            "source_contract_revision": contract.revision,
+            "node_ids": tuple(node.node_id for node in provisional_nodes),
+        }
+        graph_id = build_turn_action_graph_id(**graph_identity)
+        nodes = tuple(
+            node.model_copy(update={"graph_id": graph_id}) for node in provisional_nodes
+        )
+        graph = TurnActionGraph(
+            graph_id=graph_id,
+            compiled_at=compiled_at,
+            **graph_identity,
+        )
+        unavailable = tuple(unavailable_targets)
+        return TurnCompilation(
+            graph=graph,
+            nodes=nodes,
+            unavailable_target=(unavailable[0][1] if len(unavailable) == 1 else None),
+            unavailable_targets=unavailable,
+        )
+
+    def _compile_mission_node(
+        self,
+        observation: NormalizedObservation,
+        contract: StrategicContract,
+        mission: Mission,
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+    ) -> tuple[TurnActionNode | None, str | None]:
+        action_type = strategic_mission_action(mission)
         desired = thaw_json(mission.desired_outcome)
-        technology = str(desired["technology"])
-        nodes: tuple[TurnActionNode, ...] = ()
+        target_key = "technology" if mission.scope == "research" else "civic"
+        target = str(desired[target_key])
+        condition_prefix = "research" if mission.scope == "research" else "civic"
+        condition_target_key = (
+            "tech_type" if mission.scope == "research" else "civic_type"
+        )
         unavailable_target = self.unavailable_target(observation, mission)
         progression = observation.progression
-        if progression.current_research.state is SlotState.EMPTY:
-            available = {item.value for item in progression.available_research_ids}
-            if technology in available:
+        slot = (
+            progression.current_research
+            if mission.scope == "research"
+            else progression.current_civic
+        )
+        available = {
+            item.value
+            for item in (
+                progression.available_research_ids
+                if mission.scope == "research"
+                else progression.available_civic_ids
+            )
+        }
+        if slot.state is SlotState.EMPTY:
+            if target in available:
                 node_identity = {
                     "game_session_id": observation.game_session_id,
                     "turn_number": observation.turn_number,
@@ -74,8 +177,8 @@ class TurnCompiler:
                     "source_mission_id": mission.mission_id,
                     "source_mission_revision": mission.mission_revision,
                     "action_type": action_type,
-                    "entity_id": technology,
-                    "arguments": {"tech_or_civic": technology},
+                    "entity_id": target,
+                    "arguments": {"tech_or_civic": target},
                     "target_turn": observation.turn_number,
                 }
                 node_id = build_turn_action_node_id(**node_identity)
@@ -87,42 +190,30 @@ class TurnCompiler:
                     node_id=node_id,
                     graph_id="pending",
                     source_observation_projection_hash=observation.projection_hash,
-                    entity_type="research",
+                    entity_type=mission.scope,
                     preconditions=(
-                        {"type": "research_unselected"},
-                        {"type": "research_available", "tech_type": technology},
+                        {"type": f"{condition_prefix}_unselected"},
+                        {
+                            "type": f"{condition_prefix}_available",
+                            condition_target_key: target,
+                        },
                     ),
                     postconditions=(
-                        {"type": "research_equals", "tech_type": technology},
+                        {
+                            "type": f"{condition_prefix}_equals",
+                            condition_target_key: target,
+                        },
                     ),
                     risk=RiskLevel.LOW.value,
                     requires_confirmation=requires_confirmation,
-                    reason="Execute the active StrategicContract research Mission.",
+                    reason=(
+                        f"Execute the active StrategicContract {mission.scope} Mission."
+                    ),
                     idempotency_key=f"turn-action:{node_id}",
                     **node_identity,
                 )
-                nodes = (provisional,)
-        graph_identity = {
-            "game_session_id": observation.game_session_id,
-            "turn_number": observation.turn_number,
-            "source_observation_id": observation.observation_id,
-            "source_observation_projection_hash": observation.projection_hash,
-            "source_contract_id": contract.contract_id,
-            "source_contract_revision": contract.revision,
-            "node_ids": tuple(node.node_id for node in nodes),
-        }
-        graph_id = build_turn_action_graph_id(**graph_identity)
-        nodes = tuple(node.model_copy(update={"graph_id": graph_id}) for node in nodes)
-        graph = TurnActionGraph(
-            graph_id=graph_id,
-            compiled_at=compiled_at,
-            **graph_identity,
-        )
-        return TurnCompilation(
-            graph=graph,
-            nodes=nodes,
-            unavailable_target=unavailable_target,
-        )
+                return provisional, unavailable_target
+        return None, unavailable_target
 
 
 def turn_action_node_as_stored_task(

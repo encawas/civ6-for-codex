@@ -129,7 +129,7 @@ class PlannerLifecycleCoordinator:
         )
 
     async def advance_mission_repair(self, ctx, observation):
-        """Advance the active research repair before legacy task projection."""
+        """Advance active Mission repair before legacy task projection."""
 
         engine = self.engine
         snapshot = observation.snapshot
@@ -154,11 +154,12 @@ class PlannerLifecycleCoordinator:
             return None
 
         active_contract = engine.store.get_active_strategic_contract(snapshot.game_id)
-        if (
-            active_contract is None
-            or "research"
-            not in active_contract.authority_scope_set.mission_graph_scopes
-        ):
+        if active_contract is None:
+            return None
+        owned_scopes = set(
+            active_contract.authority_scope_set.mission_graph_scopes
+        ).intersection({"research", "civic"})
+        if not owned_scopes:
             return None
 
         current = observation.canonical
@@ -173,16 +174,27 @@ class PlannerLifecycleCoordinator:
                 comparison.state_delta,
                 active_contract.mission_graph,
             )
-            if affected_mission_ids and current.completeness.supports_scope("research"):
-                affected = tuple(
-                    mission
-                    for mission in active_contract.mission_graph.missions
-                    if mission.mission_id in affected_mission_ids
+            affected = tuple(
+                mission
+                for mission in active_contract.mission_graph.missions
+                if mission.mission_id in affected_mission_ids
+            )
+            affected_scopes = tuple(sorted({mission.scope for mission in affected}))
+            if len(affected_scopes) > 1:
+                raise RuntimeError(
+                    "MissionGraph repair cannot combine independently owned scopes"
                 )
+            repair_scope = None if not affected_scopes else affected_scopes[0]
+            if (
+                affected_mission_ids
+                and repair_scope is not None
+                and repair_scope in owned_scopes
+                and current.completeness.supports_scope(repair_scope)
+            ):
                 base_context = {
                     "target_contract_id": active_contract.contract_id,
                     "expected_base_revision": active_contract.revision,
-                    "strategic_scope": "research",
+                    "strategic_scope": repair_scope,
                 }
                 repair_context = {
                     "source_state_delta_id": comparison.state_delta.state_delta_id,
@@ -242,7 +254,7 @@ class PlannerLifecycleCoordinator:
                         kind=PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
                         strategic_contract_id=active_contract.contract_id,
                         base_contract_revision=active_contract.revision,
-                        strategic_scope="research",
+                        strategic_scope=repair_scope,
                         affected_mission_ids=affected_mission_ids,
                     ),
                     input_projection_hash=canonical_json_hash(projection),
@@ -253,7 +265,15 @@ class PlannerLifecycleCoordinator:
                     approval_contract_hash=canonical_json_hash(
                         {"approval": "not-required"}
                     ),
-                    allowed_actions_hash=canonical_json_hash(["set_research"]),
+                    allowed_actions_hash=canonical_json_hash(
+                        [
+                            (
+                                "set_research"
+                                if repair_scope == "research"
+                                else "set_civic"
+                            )
+                        ]
+                    ),
                     model_settings={"provider": type(engine.planner).__name__},
                     status=PlannerRequestStatus.PENDING,
                     created_at=engine._now(),
@@ -271,7 +291,7 @@ class PlannerLifecycleCoordinator:
                     decision_gap_ids=(),
                 )
 
-        if current.completeness.supports_scope("research"):
+        if all(current.completeness.supports_scope(scope) for scope in owned_scopes):
             expected_previous = None if baseline is None else baseline.observation_id
             engine.store.accept_observation_baseline(
                 current.observation_id,
@@ -1407,12 +1427,16 @@ class PlannerLifecycleCoordinator:
         self, logical_request: PlannerRequest, *, observation=None
     ) -> tuple[str, int]:
         target = logical_request.target
-        if target.strategic_scope != "research":
-            raise ValueError("strategic Proposal request scope must be research")
+        if target.strategic_scope not in {"research", "civic"}:
+            raise ValueError("strategic request scope is unsupported")
         active = self.engine.store.get_active_strategic_contract(
             logical_request.game_session_id
         )
         if target.kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            if target.strategic_scope != "research":
+                raise ValueError(
+                    "StrategicContract creation request scope must be research"
+                )
             if active is not None:
                 raise ValueError("StrategicContract creation base is stale")
             contract_id = target.strategic_contract_id or build_strategic_contract_id(
@@ -1426,6 +1450,15 @@ class PlannerLifecycleCoordinator:
                 raise ValueError("MissionGraph repair Contract identity is stale")
             if target.base_contract_revision != active.revision:
                 raise ValueError("MissionGraph repair Contract revision is stale")
+            repair_projection = thaw_json(logical_request.input_projection).get(
+                "mission_repair_context"
+            )
+            if (
+                isinstance(repair_projection, dict)
+                and target.strategic_scope
+                not in active.authority_scope_set.mission_graph_scopes
+            ):
+                raise ValueError("MissionGraph repair scope is not authoritative")
             contract_id = active.contract_id
             expected_base_revision = active.revision
         else:
@@ -1438,7 +1471,7 @@ class PlannerLifecycleCoordinator:
         expected_projection = {
             "target_contract_id": contract_id,
             "expected_base_revision": expected_base_revision,
-            "strategic_scope": "research",
+            "strategic_scope": target.strategic_scope,
         }
         if any(
             projection_context.get(key) != value
@@ -1560,7 +1593,7 @@ class PlannerLifecycleCoordinator:
                 "planner_request_target_kind": logical_request.target.kind.value,
                 "target_contract_id": target_contract_id,
                 "expected_base_revision": expected_base_revision,
-                "strategic_scope": "research",
+                "strategic_scope": logical_request.target.strategic_scope,
                 "response_schema_version": (
                     "mission-graph-patch-response/v1"
                     if mission_repair

@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import Field
 
 from .base import DomainModel
-from .contracts import Mission, MissionStatus, research_mission_action
+from .contracts import Mission, MissionStatus, strategic_mission_action
 
 
 class MissionGraphPatch(DomainModel):
@@ -38,17 +38,17 @@ class MissionGraphPatch(DomainModel):
             raise ValueError(
                 "MissionGraphPatch must replace exactly the affected Mission Set"
             )
+        if len({mission.scope for mission in self.mission_updates}) != 1:
+            raise ValueError("MissionGraphPatch cannot combine strategic scopes")
         for mission in self.mission_updates:
             if (
                 mission.game_session_id != self.game_session_id
                 or mission.contract_id != self.contract_id
             ):
                 raise ValueError("MissionGraphPatch Mission aggregate identity differs")
-            if mission.scope != "research":
-                raise ValueError("Phase 2 patch may update only research Missions")
             if mission.status is not MissionStatus.ACTIVE:
-                raise ValueError("Phase 2 repair Mission must remain ACTIVE")
-            research_mission_action(mission)
+                raise ValueError("MissionGraph repair Mission must remain ACTIVE")
+            strategic_mission_action(mission)
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("MissionGraphPatch created_at must include a timezone")
         if self.patch_id != build_mission_graph_patch_id(

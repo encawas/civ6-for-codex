@@ -66,8 +66,14 @@ class TurnActionNode(DomainModel):
             raise ValueError("TurnActionNode dependencies must be unique and sorted")
         if self.node_id in self.dependency_node_ids:
             raise ValueError("TurnActionNode cannot depend on itself")
-        if self.action_type != "set_research" or self.entity_type != "research":
-            raise ValueError("Phase 3 TurnActionNode supports only set_research")
+        expected_entity_type = {
+            "set_research": "research",
+            "set_civic": "civic",
+        }.get(self.action_type)
+        if expected_entity_type is None or self.entity_type != expected_entity_type:
+            raise ValueError(
+                "TurnActionNode action and entity type are outside migrated scopes"
+            )
         expected = build_turn_action_node_id(
             game_session_id=self.game_session_id,
             turn_number=self.turn_number,

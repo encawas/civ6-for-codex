@@ -9,6 +9,7 @@ from .domain import (
     Mission,
     MissionGraphPatch,
     MissionGraphPatchedTick,
+    ScopeAuthorityActivatedTick,
     NormalizedObservation,
     ObservationComparisonResult,
     PlannerRequest,
@@ -55,6 +56,18 @@ class WorkflowStorePort(Protocol):
     def list_strategic_contract_commits(
         self, game_session_id: str
     ) -> list[StrategicContractCommit]: ...
+
+    def activate_civic_authority(
+        self,
+        *,
+        game_session_id: str,
+        expected_base_revision: int,
+        mission: Mission,
+        activation_id: str,
+        observation_id: str,
+        turn_number: int,
+        activated_at: datetime,
+    ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]: ...
 
     def save_strategic_research_proposal(
         self, proposal: StrategicResearchProposal
@@ -123,6 +136,10 @@ class WorkflowStorePort(Protocol):
     def active_research_mission(
         self, game_id: str
     ) -> tuple[StrategicContract, Mission] | None: ...
+
+    def active_execution_missions(
+        self, game_id: str
+    ) -> tuple[StrategicContract, tuple[Mission, ...]] | None: ...
 
     def activate_turn_action_graph(
         self,
