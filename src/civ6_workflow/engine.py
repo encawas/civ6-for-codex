@@ -13,25 +13,15 @@ from uuid import uuid4
 
 from .actions import (
     ACTION_REGISTRY,
-    END_TURN_ACTION_SPEC,
-    ActionValidationError,
     action_argument_contracts,
-    resolve_action,
-    resolve_action_spec,
 )
 from .agent_projection import project_agent_context
+from .batch_executor import BatchExecutor, ExecutionTransition
 from .conditions import ConditionEvaluator, extract_known_entities
 from .domain import (
     ActionAttempt,
-    AttemptRecoveredTick,
-    AttemptReconciledTick,
     AttemptStatus,
-    AwaitingApprovalTick,
     AwaitingHumanTick,
-    AwaitingVerificationTick,
-    MutationRejectedTick,
-    MutationSentTick,
-    MutationUncertainTick,
     NoSafeActionTick,
     PlanRequestedTick,
     PlannerRequest,
@@ -45,18 +35,12 @@ from .domain import (
     StrategicRequestWaitResumedTick,
     SystemErrorTick,
     TaskCreatedTick,
-    TaskInvalidatedTick,
     TickOutcomeKind,
-    TurnTransitionConfirmedTick,
-    TurnTransitionStartedTick,
-    TurnTransitionWaitingTick,
-    VerificationStatus,
     validate_workflow_tick,
 )
 from .events import events_from_snapshot
 from .gate import EventGate, GateConfig
 from .ports import (
-    BoundedGamePort,
     GamePort,
     MutationBudget,
     Planner,
@@ -88,10 +72,6 @@ from .validation import (
     condition_contracts,
     entity_id_argument_contracts,
     validate_plan_bundle,
-)
-from .verification import (
-    VerificationEvidence,
-    evaluate_action_verification,
 )
 from .workflow_protocol import (
     LEASE_CONDITION_TYPES,
@@ -234,6 +214,15 @@ class WorkflowEngine:
             ),
         )
         self.conditions = ConditionEvaluator()
+        self.batch_executor = BatchExecutor(
+            store=self.store,
+            game=self.game,
+            conditions=self.conditions,
+            verification_attempts=self.config.verification_attempts,
+            now=self._now,
+            monotonic=self._monotonic,
+            checkpoint=self._checkpoint,
+        )
         self.rules = DeterministicRuleCompiler(store)
         self.progression = ProgressionRuleCompiler(store)
         self.turn_compiler = TurnCompiler()
@@ -331,7 +320,17 @@ class WorkflowEngine:
                 observation_id = self._observation_id(observation)
                 self._active_observation_id = observation_id
                 ctx.observation_ids.append(observation_id)
-            return self._reconcile_attempt(ctx, observation, unresolved)
+            transition = self.batch_executor.reconcile(
+                observation,
+                unresolved,
+                source_observation_id=observation_id,
+                metrics=ctx.metrics,
+            )
+            return self._finish_execution_transition(
+                ctx,
+                snapshot,
+                transition,
+            )
 
         if ctx.starting_state is RuntimeState.AWAITING_HUMAN:
             wait = self.store.human_wait_context(snapshot.game_id) or {}
@@ -531,18 +530,6 @@ class WorkflowEngine:
         if created:
             return self._finish(ctx, snapshot, TaskCreatedTick, task_id=created[0])
 
-        awaiting = self.store.list_tasks(
-            snapshot.game_id, statuses=[TaskStatus.AWAITING_CONFIRMATION]
-        )
-        if awaiting and awaiting[0].due_turn <= snapshot.turn:
-            return self._finish(
-                ctx,
-                snapshot,
-                AwaitingApprovalTick,
-                proposal_id=awaiting[0].task_id,
-                blocking_reason="task approval is required",
-            )
-
         due_tasks = [
             *self.store.due_turn_action_nodes(
                 snapshot.game_id,
@@ -564,29 +551,16 @@ class WorkflowEngine:
             self._active_observation_id = observation_id
             ctx.observation_ids.append(observation_id)
 
-        if self.config.execution_mode is not ExecutionMode.READONLY and due_tasks:
-            task = due_tasks[0]
-            if task.status is TaskStatus.AWAITING_CONFIRMATION:
-                return self._finish(
-                    ctx,
-                    snapshot,
-                    AwaitingApprovalTick,
-                    proposal_id=task.task_id,
-                    blocking_reason="task approval is required",
-                )
-            invalid = self._task_invalidation(task, observation)
-            if invalid is not None:
-                self.store.set_task_status(
-                    snapshot.game_id, task.task_id, TaskStatus.CANCELLED, error=invalid
-                )
-                return self._finish(
-                    ctx,
-                    snapshot,
-                    TaskInvalidatedTick,
-                    task_id=task.task_id,
-                    blocking_reason=invalid,
-                )
-            return await self._send_task(ctx, observation, task)
+        execution = await self.batch_executor.advance(
+            observation,
+            source_observation_id=observation_id,
+            mode=self.config.execution_mode,
+            available_tools=self._available_tools or set(),
+            metrics=ctx.metrics,
+            budget=ctx.budget,
+        )
+        if execution is not None:
+            return self._finish_execution_transition(ctx, snapshot, execution)
 
         rewind_event = recover_turn_rewind(self.store, snapshot)
         events = [] if rewind_event is None else [rewind_event]
@@ -660,7 +634,20 @@ class WorkflowEngine:
                     compatibility=compat,
                     blocking_reason=end_turn_suppression,
                 )
-            return await self._send_end_turn(ctx, observation)
+            transition = await self.batch_executor.send_end_turn(
+                observation,
+                source_observation_id=observation_id,
+                authorization_projection_version=(
+                    END_TURN_AUTHORIZATION_PROJECTION_VERSION
+                ),
+                authorization_projection_hash=self._end_turn_authorization_hash(
+                    observation
+                ),
+                reflections=self._end_turn_reflections(observation),
+                metrics=ctx.metrics,
+                budget=ctx.budget,
+            )
+            return self._finish_execution_transition(ctx, snapshot, transition)
         if any(event.blocking for event in compat.events):
             compat.paused = True
             compat.pause_reason = "a blocking decision has no safe automatic resolution"
@@ -677,497 +664,6 @@ class WorkflowEngine:
             NoSafeActionTick,
             compatibility=compat,
             blocking_reason="no safe action is available",
-        )
-
-    async def _send_task(
-        self,
-        ctx: _TickContext,
-        observation: NormalizedRuntimeObservation,
-        task: StoredTask,
-    ) -> TickResult:
-        snapshot = observation.snapshot
-        try:
-            spec = resolve_action_spec(task.action_type)
-            _, normalized_arguments = resolve_action(
-                task, self._available_tools or set()
-            )
-        except ActionValidationError as exc:
-            self.store.set_task_status(
-                snapshot.game_id, task.task_id, TaskStatus.CANCELLED, error=str(exc)
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                TaskInvalidatedTick,
-                task_id=task.task_id,
-                blocking_reason=str(exc),
-            )
-
-        parent = self.store.latest_attempt_for_task(snapshot.game_id, task.task_id)
-        now = self._now()
-        attempt = ActionAttempt(
-            action_attempt_id=f"attempt_{uuid4().hex}",
-            game_session_id=snapshot.game_id,
-            task_id=task.task_id,
-            action_type=task.action_type,
-            attempt_number=self.store.next_attempt_number(
-                snapshot.game_id, task.task_id
-            ),
-            request_id=f"request_{uuid4().hex}",
-            idempotency_key=self._idempotency_key(task, normalized_arguments),
-            prepared_from_observation_id=self._active_observation_id or "missing",
-            prepared_at=now,
-            status=AttemptStatus.PREPARED,
-            retry_classification=spec.retry_classification,
-            normalized_arguments=normalized_arguments,
-            postconditions=tuple(task.postconditions),
-            parent_attempt_id=None if parent is None else parent.action_attempt_id,
-        )
-        persistence_started = self._monotonic()
-        self.store.save_action_attempt(attempt)
-        self.store.set_task_status(snapshot.game_id, task.task_id, TaskStatus.RUNNING)
-        ctx.metrics.persistence_seconds += self._monotonic() - persistence_started
-        self._checkpoint("after_attempt_prepared")
-
-        delivery_started = self._replace_attempt(
-            attempt,
-            status=AttemptStatus.UNCERTAIN,
-            sent_at=self._now(),
-            transport_result={"phase": "delivery_started"},
-        )
-        self.store.update_action_attempt(delivery_started)
-        self.store.save_runtime_state(
-            snapshot.game_id,
-            RuntimeState.RECONCILING,
-            active_attempt_id=attempt.action_attempt_id,
-        )
-        self._checkpoint("after_delivery_started")
-
-        bounded = BoundedGamePort(self.game, ctx.budget)
-        delivery_started_at = self._monotonic()
-        try:
-            action_result = await bounded.execute_task(task)
-        except Exception as exc:
-            action_result = None
-            delivery_error = exc
-        else:
-            delivery_error = None
-        ctx.metrics.mutation_delivery_seconds += self._monotonic() - delivery_started_at
-        ctx.metrics.mutation_count = ctx.budget.used
-        self._checkpoint("after_port_call")
-
-        if action_result is None:
-            uncertain = self._replace_attempt(
-                delivery_started,
-                status=AttemptStatus.UNCERTAIN,
-                transport_result={
-                    "phase": "delivery_unknown",
-                    "error_type": type(delivery_error).__name__,
-                },
-            )
-
-            return self._finish(
-                ctx,
-                snapshot,
-                MutationUncertainTick,
-                action_attempt_id=attempt.action_attempt_id,
-                task_id=task.task_id,
-                selected_operation=task.action_type,
-                blocking_reason="mutation delivery outcome is unknown",
-                attempt_update=uncertain,
-                task_status=TaskStatus.UNCERTAIN,
-                task_error="mutation delivery outcome is unknown",
-            )
-
-        status = action_result.effective_delivery_status
-        response_at = self._now()
-        if status is MutationDeliveryStatus.ACKNOWLEDGED:
-            verifying = self._replace_attempt(
-                delivery_started,
-                status=AttemptStatus.VERIFYING,
-                response_received_at=response_at,
-                transport_result={"delivery_status": status.value},
-                tool_result=action_result.model_dump(mode="json"),
-                verification_status=VerificationStatus.PENDING,
-            )
-
-            return self._finish(
-                ctx,
-                snapshot,
-                MutationSentTick,
-                action_attempt_id=attempt.action_attempt_id,
-                task_id=task.task_id,
-                selected_operation=task.action_type,
-                attempt_update=verifying,
-                task_status=TaskStatus.VERIFYING,
-            )
-
-        if status is MutationDeliveryStatus.UNKNOWN:
-            uncertain = self._replace_attempt(
-                delivery_started,
-                status=AttemptStatus.UNCERTAIN,
-                response_received_at=response_at,
-                transport_result={"delivery_status": status.value},
-                tool_result=action_result.model_dump(mode="json"),
-            )
-
-            return self._finish(
-                ctx,
-                snapshot,
-                MutationUncertainTick,
-                action_attempt_id=attempt.action_attempt_id,
-                task_id=task.task_id,
-                selected_operation=task.action_type,
-                blocking_reason=action_result.message or "mutation outcome is unknown",
-                attempt_update=uncertain,
-                task_status=TaskStatus.UNCERTAIN,
-                task_error=action_result.message or "mutation outcome is unknown",
-            )
-
-        failed = self._replace_attempt(
-            delivery_started,
-            status=AttemptStatus.FAILED,
-            response_received_at=response_at,
-            transport_result={"delivery_status": status.value},
-            tool_result=action_result.model_dump(mode="json"),
-            verification_status=VerificationStatus.FAILED,
-        )
-        return self._finish(
-            ctx,
-            snapshot,
-            MutationRejectedTick,
-            action_attempt_id=attempt.action_attempt_id,
-            task_id=task.task_id,
-            selected_operation=task.action_type,
-            blocking_reason=action_result.message or "game rejected mutation",
-            failed_task_ids=[task.task_id],
-            attempt_update=failed,
-            task_error=action_result.message or "game rejected mutation",
-        )
-
-    def _reconcile_attempt(
-        self,
-        ctx: _TickContext,
-        observation: NormalizedRuntimeObservation,
-        attempt: ActionAttempt,
-    ) -> TickResult:
-        snapshot = observation.snapshot
-        if attempt.status is AttemptStatus.PREPARED:
-            rejected = self._replace_attempt(
-                attempt,
-                status=AttemptStatus.REJECTED_BEFORE_SEND,
-                transport_result={"recovery": "prepared commit proves no send began"},
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                AttemptRecoveredTick,
-                action_attempt_id=attempt.action_attempt_id,
-                task_id=attempt.task_id,
-                attempt_update=rejected,
-            )
-
-        if attempt.action_type == "end_turn":
-            return self._reconcile_end_turn(ctx, observation, attempt)
-
-        task = self.store.get_task(snapshot.game_id, attempt.task_id)
-        if task is None:
-            return self._finish(
-                ctx,
-                snapshot,
-                AwaitingHumanTick,
-                action_attempt_id=attempt.action_attempt_id,
-                blocking_reason="attempt task is missing",
-                attempt_update=attempt,
-            )
-
-        verification_started = self._monotonic()
-        decision = evaluate_action_verification(
-            attempt, task, observation, self.conditions
-        )
-        ctx.metrics.verification_seconds += self._monotonic() - verification_started
-        observation_id = self._active_observation_id or "missing"
-
-        if decision.evidence is VerificationEvidence.POSITIVE_COMMIT_EVIDENCE:
-            succeeded = self._replace_attempt(
-                attempt,
-                status=AttemptStatus.SUCCEEDED,
-                verification_status=VerificationStatus.PASSED,
-                last_verification_observation_id=observation_id,
-                verification_count=attempt.verification_count + 1,
-                transport_result={
-                    **dict(attempt.transport_result or {}),
-                    "verification_evidence": decision.evidence.value,
-                },
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                AttemptReconciledTick,
-                action_attempt_id=attempt.action_attempt_id,
-                task_id=task.task_id,
-                attempt_status=AttemptStatus.SUCCEEDED,
-                executed_task_ids=[task.task_id],
-                attempt_update=succeeded,
-            )
-
-        if decision.evidence in {
-            VerificationEvidence.EXPLICIT_NON_COMMIT_EVIDENCE,
-            VerificationEvidence.CONFLICTING_STATE,
-            VerificationEvidence.IMPOSSIBLE_POSTCONDITION,
-        }:
-            failed = self._replace_attempt(
-                attempt,
-                status=AttemptStatus.FAILED,
-                transport_result={
-                    **dict(attempt.transport_result or {}),
-                    "verification_evidence": decision.evidence.value,
-                },
-                verification_status=VerificationStatus.FAILED,
-                last_verification_observation_id=observation_id,
-                verification_count=attempt.verification_count + 1,
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                AttemptReconciledTick,
-                action_attempt_id=attempt.action_attempt_id,
-                task_id=task.task_id,
-                attempt_status=AttemptStatus.FAILED,
-                failed_task_ids=[task.task_id],
-                attempt_update=failed,
-                task_error=decision.reason,
-            )
-
-        count = attempt.verification_count + 1
-        if count < max(1, self.config.verification_attempts):
-            verifying = self._replace_attempt(
-                attempt,
-                status=AttemptStatus.VERIFYING,
-                verification_status=VerificationStatus.INCONCLUSIVE,
-                last_verification_observation_id=observation_id,
-                verification_count=count,
-                transport_result={
-                    **dict(attempt.transport_result or {}),
-                    "verification_evidence": decision.evidence.value,
-                },
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                AwaitingVerificationTick,
-                action_attempt_id=attempt.action_attempt_id,
-                task_id=task.task_id,
-                attempt_update=verifying,
-                task_status=TaskStatus.VERIFYING,
-                task_error=decision.reason,
-            )
-
-        uncertain = self._replace_attempt(
-            attempt,
-            status=AttemptStatus.UNCERTAIN,
-            verification_status=VerificationStatus.INCONCLUSIVE,
-            last_verification_observation_id=observation_id,
-            verification_count=count,
-            transport_result={
-                **dict(attempt.transport_result or {}),
-                "verification_evidence": decision.evidence.value,
-            },
-        )
-        return self._finish(
-            ctx,
-            snapshot,
-            AwaitingHumanTick,
-            action_attempt_id=attempt.action_attempt_id,
-            blocking_reason=decision.reason or "verification remained inconclusive",
-            attempt_update=uncertain,
-            task_status=TaskStatus.UNCERTAIN,
-            task_error=decision.reason,
-        )
-
-    async def _send_end_turn(
-        self, ctx: _TickContext, observation: NormalizedRuntimeObservation
-    ) -> TickResult:
-        snapshot = observation.snapshot
-        authorization_hash = self._end_turn_authorization_hash(observation)
-        reflections = self._end_turn_reflections(observation)
-        task_id = f"end_turn:{snapshot.turn}"
-        parent = self.store.latest_attempt_for_task(snapshot.game_id, task_id)
-        attempt = ActionAttempt(
-            action_attempt_id=f"attempt_{uuid4().hex}",
-            game_session_id=snapshot.game_id,
-            task_id=task_id,
-            action_type="end_turn",
-            attempt_number=self.store.next_attempt_number(snapshot.game_id, task_id),
-            request_id=f"request_{uuid4().hex}",
-            idempotency_key=f"{snapshot.game_id}:end_turn:{snapshot.turn}",
-            prepared_from_observation_id=self._active_observation_id or "missing",
-            prepared_at=self._now(),
-            status=AttemptStatus.PREPARED,
-            retry_classification=END_TURN_ACTION_SPEC.retry_classification,
-            normalized_arguments={
-                "authorization_projection_version": (
-                    END_TURN_AUTHORIZATION_PROJECTION_VERSION
-                ),
-                "authorization_projection_hash": authorization_hash,
-                **reflections,
-            },
-            postconditions=(),
-            parent_attempt_id=(None if parent is None else parent.action_attempt_id),
-            pre_send_turn=snapshot.turn,
-        )
-        self.store.save_action_attempt(attempt)
-        self._checkpoint("after_attempt_prepared")
-        delivery_started = self._replace_attempt(
-            attempt,
-            status=AttemptStatus.UNCERTAIN,
-            sent_at=self._now(),
-            transport_result={"phase": "delivery_started"},
-        )
-        self.store.update_action_attempt(delivery_started)
-        self.store.save_runtime_state(
-            snapshot.game_id,
-            RuntimeState.TURN_TRANSITIONING,
-            active_attempt_id=attempt.action_attempt_id,
-        )
-        self._checkpoint("after_delivery_started")
-        bounded = BoundedGamePort(self.game, ctx.budget)
-        started = self._monotonic()
-        try:
-            action_result = await bounded.end_turn(reflections)
-        except Exception as exc:
-            action_result = None
-            error = exc
-        else:
-            error = None
-        ctx.metrics.mutation_delivery_seconds += self._monotonic() - started
-        ctx.metrics.mutation_count = ctx.budget.used
-        self._checkpoint("after_port_call")
-
-        if action_result is not None and (
-            action_result.effective_delivery_status
-            is MutationDeliveryStatus.ACKNOWLEDGED
-        ):
-            verifying = self._replace_attempt(
-                delivery_started,
-                status=AttemptStatus.VERIFYING,
-                response_received_at=self._now(),
-                transport_result={"delivery_status": "acknowledged"},
-                tool_result=action_result.model_dump(mode="json"),
-                verification_status=VerificationStatus.PENDING,
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                TurnTransitionStartedTick,
-                action_attempt_id=attempt.action_attempt_id,
-                attempt_update=verifying,
-            )
-
-        if action_result is None or (
-            action_result.effective_delivery_status is MutationDeliveryStatus.UNKNOWN
-        ):
-            uncertain = self._replace_attempt(
-                delivery_started,
-                status=AttemptStatus.UNCERTAIN,
-                response_received_at=(None if action_result is None else self._now()),
-                transport_result={
-                    "delivery_status": "unknown",
-                    "error_type": None if error is None else type(error).__name__,
-                },
-                tool_result=(
-                    None
-                    if action_result is None
-                    else action_result.model_dump(mode="json")
-                ),
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                MutationUncertainTick,
-                action_attempt_id=attempt.action_attempt_id,
-                task_id=task_id,
-                selected_operation="end_turn",
-                blocking_reason="end-turn delivery outcome is unknown",
-                attempt_update=uncertain,
-            )
-
-        failed = self._replace_attempt(
-            delivery_started,
-            status=AttemptStatus.FAILED,
-            response_received_at=self._now(),
-            transport_result={
-                "delivery_status": action_result.effective_delivery_status.value
-            },
-            tool_result=action_result.model_dump(mode="json"),
-            verification_status=VerificationStatus.FAILED,
-        )
-        return self._finish(
-            ctx,
-            snapshot,
-            MutationRejectedTick,
-            action_attempt_id=attempt.action_attempt_id,
-            task_id=task_id,
-            selected_operation="end_turn",
-            blocking_reason=action_result.message or "end turn was rejected",
-            attempt_update=failed,
-        )
-
-    def _reconcile_end_turn(
-        self,
-        ctx: _TickContext,
-        observation: NormalizedRuntimeObservation,
-        attempt: ActionAttempt,
-    ) -> TickResult:
-        snapshot = observation.snapshot
-        if snapshot.turn > int(attempt.pre_send_turn or 0):
-            succeeded = self._replace_attempt(
-                attempt,
-                status=AttemptStatus.SUCCEEDED,
-                verification_status=VerificationStatus.PASSED,
-                last_verification_observation_id=self._active_observation_id,
-                verification_count=attempt.verification_count + 1,
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                TurnTransitionConfirmedTick,
-                action_attempt_id=attempt.action_attempt_id,
-                turn_ended=True,
-                attempt_update=succeeded,
-            )
-
-        count = attempt.verification_count + 1
-        if count < max(1, self.config.verification_attempts):
-            waiting = self._replace_attempt(
-                attempt,
-                status=AttemptStatus.VERIFYING,
-                verification_status=VerificationStatus.INCONCLUSIVE,
-                last_verification_observation_id=self._active_observation_id,
-                verification_count=count,
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                TurnTransitionWaitingTick,
-                action_attempt_id=attempt.action_attempt_id,
-                attempt_update=waiting,
-            )
-
-        uncertain = self._replace_attempt(
-            attempt,
-            status=AttemptStatus.UNCERTAIN,
-            verification_status=VerificationStatus.INCONCLUSIVE,
-            last_verification_observation_id=self._active_observation_id,
-            verification_count=count,
-        )
-        return self._finish(
-            ctx,
-            snapshot,
-            AwaitingHumanTick,
-            action_attempt_id=attempt.action_attempt_id,
-            blocking_reason="turn number did not increase within verification policy",
-            attempt_update=uncertain,
         )
 
     def _finish(
@@ -1304,39 +800,29 @@ class WorkflowEngine:
             result.pause_reason = tick.blocking_reason
         return result
 
-    @staticmethod
-    def _replace_attempt(attempt: ActionAttempt, **updates: Any) -> ActionAttempt:
-        payload = attempt.model_dump(mode="python")
-        payload.update(updates)
-        return ActionAttempt.model_validate(payload)
-
-    @staticmethod
-    def _idempotency_key(task: StoredTask, normalized_arguments: dict[str, Any]) -> str:
-        semantic = {
-            "task_id": task.task_id,
-            "action_type": task.action_type,
-            "entity_type": task.entity_type,
-            "entity_id": task.entity_id,
-            "arguments": normalized_arguments,
-            "preconditions": task.preconditions,
-            "postconditions": task.postconditions,
-        }
-        digest = hashlib.sha256(
-            json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        return f"task:{task.task_id}:{digest}"
+    def _finish_execution_transition(
+        self,
+        ctx: _TickContext,
+        snapshot: RuntimeSnapshot,
+        transition: ExecutionTransition,
+    ) -> TickResult:
+        return self._finish(
+            ctx,
+            snapshot,
+            transition.tick_type,
+            executed_task_ids=list(transition.executed_task_ids),
+            failed_task_ids=list(transition.failed_task_ids),
+            blocked_task_ids=list(transition.blocked_task_ids),
+            turn_ended=transition.turn_ended,
+            attempt_update=transition.attempt_update,
+            task_status=transition.task_status,
+            task_error=transition.task_error,
+            **transition.fields,
+        )
 
     @staticmethod
     def _observation_id(observation: NormalizedRuntimeObservation) -> str:
         return observation.canonical.observation_id
-
-    def _task_invalidation(
-        self, task: StoredTask, observation: NormalizedRuntimeObservation
-    ) -> str | None:
-        preconditions = self.conditions.evaluate_all(task.preconditions, observation)
-        if not preconditions.valid:
-            return preconditions.reason
-        return self._first_active_invalidator(task.invalidators, observation)
 
     def _system_error(
         self,
@@ -1799,19 +1285,6 @@ class WorkflowEngine:
         missing = (self.config.allowed_tools | fallback_queries) - self._available_tools
         if missing:
             raise RuntimeError(f"civ6-mcp is missing required tools: {sorted(missing)}")
-
-    def _first_active_invalidator(
-        self,
-        invalidators: list[dict[str, Any]],
-        observation: NormalizedRuntimeObservation,
-    ) -> str | None:
-        for invalidator in invalidators:
-            evaluation = self.conditions.evaluate(invalidator, observation)
-            if evaluation.valid:
-                return str(invalidator)
-            if evaluation.reason.startswith("unsupported condition type"):
-                return evaluation.reason
-        return None
 
     def _suppress_recoverable_blockers(
         self, events: list[GameEvent], retrying_tasks: list[StoredTask]
