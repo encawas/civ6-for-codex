@@ -370,11 +370,16 @@ Other Strategic Scopes remain legacy-owned.
 - Define Invalidated, Applied, and Rejected Tick contracts and terminal
   uniqueness.
 - Add structured ContractCommit source binding.
-- Add data contracts, Schema, canonical serialization, typed reads, replay
-  import/export, ordinary-save checks, and shared startup/replay aggregate
-  validators. Do not add a public operation that independently saves an
-  ApprovalRecord or terminal Tick or performs a terminal decision.
-- Add protocol and forged-state tests.
+- Add optional grouped StoredTask/workflow_tasks source fields:
+  source_contract_id, source_contract_revision, source_mission_id, and
+  source_mission_revision. Existing rows migrate with all four NULL.
+- Add canonical serialization, typed reads, replay import/export, ordinary-save
+  checks, and shared startup/replay validation for complete-or-null provenance.
+- Add Proposal decision contracts and validation without a public operation
+  that independently saves ApprovalRecord or terminal Tick or performs a
+  terminal decision.
+- Add protocol, migration, round-trip, and forged-state tests while preserving
+  current routing and task lifecycle behavior.
 - Do not connect Engine, user actions, authority activation, or legacy write
   closure.
 
@@ -387,18 +392,25 @@ Other Strategic Scopes remain legacy-owned.
   revision, ContractCommit, transition Tick, research Mission,
   AuthorityScopeSet, Runtime transition, and wait clearance as applicable.
 - Close legacy research writes after ownership changes.
-- Add active Contract/Mission routing projection and stale-revision guards.
+- Add active Contract/Mission routing projection that writes the PR 1C-1 task
+  provenance group, plus transaction-local claim, retry, confirmation-release,
+  and recovery guards for legacy or stale research work.
 - Add crash, restart, replay, concurrency, and idempotency coverage.
 - Keep every new production path behind a dormant gate with no user or Engine
   caller.
 
 ### PR 1C-3: Runtime Entry and Enablement
 
-- Add explicit user approve/reject actions.
+- Before enablement, atomically migrate Phase 1B OPEN Proposals with historical
+  WaitResumedTick evidence to system invalidation. Preserve valid unresolved
+  Proposal waits and use existing stale reasons when the target or base changed.
+- Add explicit user APPROVE/REJECT actions.
+- Reject request_human_resume for strategic_contract_proposal_ready after
+  enablement while preserving supported non-Proposal resume behavior.
 - Integrate the existing Engine/Runtime lineage with the dedicated decision
   transition and post-activation routing.
-- Remove dormancy only after Windows, Ubuntu, replay, concurrency, and
-  end-to-end gates pass.
+- Remove dormancy only after Windows, Ubuntu, replay, migration, concurrency,
+  and end-to-end gates pass.
 - Finalize documents and perform OpenSpec verify, sync, and archive after
   primary and secondary review.
 
@@ -414,6 +426,25 @@ Other Strategic Scopes remain legacy-owned.
   and expected base structurally.
 - Replay validates complete decision, activation, authority, Runtime/wait, and
   Tick evidence before deleting target-game data.
+- Existing workflow_tasks rows receive NULL for all four Contract/Mission
+  provenance columns. No legacy task receives inferred provenance.
+- Partial provenance is invalid. Mission-derived research work uses all four
+  fields and binds to the same-game active Contract and Mission revisions.
+
+Phase 1B Proposal wait migration runs only at PR 1C-3 enablement:
+
+| Historical state | Migration result |
+| --- | --- |
+| OPEN plus valid unresolved Proposal-ready wait | Preserve OPEN for APPROVE or REJECT |
+| OPEN plus WaitResumedTick and no terminal fact | INVALIDATED with PRE_PHASE1C_WAIT_RELEASED |
+| OPEN plus stale target or base | INVALIDATED with the existing stale reason |
+| No Proposal | No operation |
+
+The migration handles multiple Proposals independently and is idempotent. It
+writes no ApprovalRecord, Contract revision, ContractCommit, MissionGraph
+authority, StoredTask, or Provider call. Pre-enable startup/replay treats
+OPEN plus WaitResumedTick only as migration input; after migration, that shape
+is invalid.
 
 ### Active object handling
 
@@ -449,8 +480,15 @@ Other Strategic Scopes remain legacy-owned.
 - After activation and the Decision/Activation Tick complete, later Routing
   reads the active Contract/Mission revision, performs a separate deterministic
   projection, and enters the normal Planner lifecycle before a replacement
-  StoredTask may be created. Old provenance is not rewritten, audit association
-  is retained, and at most one equivalent action is claimable.
+  StoredTask may be created.
+- Before first cutover, set_research with all four provenance fields NULL is
+  legacy. After cutover, a valid Mission-derived set_research task has all four
+  fields and matches the active Contract/Mission identity and revision.
+- Claim, retry, confirmation release, and recovery re-read those active
+  revisions in their own write transactions. NULL, partial, stale, or
+  cross-game provenance cannot become claimable.
+- Old provenance is not rewritten, audit association is retained, and at most
+  one equivalent action is claimable.
 
 ### Tests
 
@@ -463,7 +501,12 @@ Other Strategic Scopes remain legacy-owned.
   transition Tick leave no partial state.
 - Startup and replay reject forged Approval, forged Contract, missing
   ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal
-  facts, duplicate Invalidated Ticks, and partial authority state.
+  facts, duplicate Invalidated Ticks, partial authority state, partial task
+  provenance, and stale claimable Mission-derived research work.
+- PR 1C-1 migration/replay preserves all-null legacy task provenance and rejects
+  partial or cross-game groups without changing legacy claim behavior.
+- Post-cutover claim/retry/confirm/recovery reject provenance-free legacy tasks
+  and complete but stale Mission-derived tasks.
 - Replay failure occurs before target-game deletion.
 - Startup and replay reject MissionGraph research authority with claimable,
   in-flight, verifying, uncertain, or revivable legacy research execution.
@@ -480,6 +523,12 @@ Other Strategic Scopes remain legacy-owned.
   cannot create claimable work.
 - Proposal application creates no StoredTask and non-research scopes remain
   unchanged.
+- An unresolved Phase 1B Proposal wait remains OPEN and decidable after upgrade.
+- One or multiple historical resumed OPEN Proposals migrate idempotently to
+  PRE_PHASE1C_WAIT_RELEASED invalidation unless a stale reason takes precedence.
+- Generic Proposal resume fails after enablement, supported terminal Request
+  resume remains unchanged, and migration writes no approval or activation.
+- Enabled startup/replay contains no OPEN Proposal with WaitResumedTick.
 - The feature remains dormant until PR 1C-3.
 
 ### Rollback
@@ -496,11 +545,15 @@ revision.
 
 - Each Proposal has exactly one derived OPEN, APPROVED, REJECTED, or
   INVALIDATED disposition from canonical durable facts.
+- Every Phase 1B released OPEN Proposal is invalidated before enablement, and
+  Proposal-ready waits can then leave only through APPROVE or REJECT.
 - Approved content, Contract revision, ContractCommit, Applied Tick, research
   Mission, and AuthorityScopeSet are one atomic aggregate.
 - Research strategy is MissionGraph-owned only after legacy execution is
   quiescent and legacy research writes are closed by the successful activation.
-- Research execution remains solely StoredTask-owned until Phase 3.
+- Research execution remains solely StoredTask-owned until Phase 3, with
+  complete current Contract/Mission provenance required for post-cutover
+  research task mutation.
 - Startup, replay, concurrency, crash recovery, and protected Tick
   ordering pass.
 - Non-research scopes are unchanged and no second Engine or Store exists.

@@ -297,6 +297,28 @@ before lock acquisition is not authority. Switched authority with claimable,
 in-flight, verifying, uncertain, or revivable legacy execution is invalid at
 ordinary save, startup, and replay.
 
+Phase 1B StrategicProposalWaitResumedTick is interaction evidence only. Before
+PR 1C-3 enables Proposal decisions, a writer-locked migration classifies each
+historical OPEN Proposal:
+
+| Historical Proposal state | Enablement treatment |
+| --- | --- |
+| Valid unresolved Proposal-ready wait | Preserve OPEN for APPROVE or REJECT |
+| WaitResumedTick and no terminal fact | INVALIDATED with PRE_PHASE1C_WAIT_RELEASED |
+| Stale target or expected base | INVALIDATED with the existing stale reason |
+| No Proposal | No operation |
+
+The migration is deterministic and idempotent across multiple Proposals. It
+writes no ApprovalRecord, Contract revision, ContractCommit, MissionGraph
+authority, StoredTask, or Provider call. Startup and replay recognize the
+pre-enable shape as migration input, but enabled ordinary work requires that no
+OPEN Proposal already has a WaitResumedTick.
+
+After enablement, a strategic_contract_proposal_ready wait can leave only
+through the dedicated APPROVE or REJECT aggregate transition.
+request_human_resume fails closed for that wait and remains available for
+supported non-Proposal waits such as strategic_request_terminated.
+
 RuntimeState, Human Wait context, Applied, Rejected, Resume, and Error Ticks
 are transition or interaction evidence. None substitutes for ApprovalRecord.
 Ordinary work begins only after the dedicated decision or activation Tick
@@ -516,10 +538,28 @@ MissionGraph                 = research strategic authority
 workflow_tasks / StoredTask  = temporary research execution authority
 ```
 
-StoredTask is deterministically projected from a current Mission revision and
-references its Mission and Contract revision. Planner cannot create an
-independently strategic StoredTask. A stale Contract makes old StoredTask
-unclaimable, and an action cannot have two execution authorities.
+StoredTask is deterministically projected from a current Mission revision.
+PR 1C-1 adds this optional, all-or-none provenance group to the existing
+StoredTask model and workflow_tasks table:
+
+```text
+source_contract_id
+source_contract_revision
+source_mission_id
+source_mission_revision
+```
+
+Legacy rows migrate with all four columns NULL. Partial groups, cross-game
+references, and a Mission that does not belong to the Contract fail ordinary
+save, startup, and replay validation. This PR 1C-1 foundation does not alter
+routing or task lifecycle behavior and creates no second task model or table.
+
+Before first research cutover, action_type=set_research with null provenance is
+a legacy research StoredTask. After cutover, Mission-derived set_research has
+all four fields and matches the same-game active Contract and research Mission
+revisions. Planner cannot create an independently strategic StoredTask, a
+stale Contract or Mission makes old work unclaimable, and an action cannot
+have two execution authorities.
 
 The approval transaction freezes legacy research execution under the same
 writer lock as the Contract and AuthorityScopeSet commit:
@@ -548,9 +588,13 @@ Decision/Activation Tick complete, a later Routing step reads the active
 Contract and Mission, performs a separate deterministic revision-bound
 projection, and enters the normal Planner lifecycle before a replacement
 StoredTask may be created. Old execution provenance remains auditable and at
-most one equivalent action may be claimable. After cutover, every legacy task
-creation, retry, release, and confirmation path reads AuthorityScopeSet and
-fails closed.
+most one equivalent action may be claimable.
+
+After cutover, every research claim, retry, confirmation release, and recovery
+operation re-reads AuthorityScopeSet and the active Contract/Mission revision
+inside its own write transaction. Provenance-free legacy work and complete but
+stale provenance cannot become claimable. Every legacy task creation and
+equivalent mutation path fails closed.
 
 Phase 3 makes `domain.Task` and TurnActionGraph the research execution
 authority. `workflow_tasks` and `models.StoredTask` stop deciding research

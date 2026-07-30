@@ -104,11 +104,37 @@ Proposal explicit-only wait
 
 Ordinary Routing, Observing, planning, or execution Ticks neither precede nor overlap the dedicated transition. Startup and replay validate the protected interval rather than trusting a Tick's claimed starting Runtime state.
 
+### Phase 1B released waits migrate before enablement
+
+StrategicProposalWaitResumedTick is historical interaction evidence, not approval. Before PR 1C-3 enables decisions, one writer-locked migration classifies each historical OPEN Proposal:
+
+| Phase 1B history | Required result |
+| --- | --- |
+| Valid unresolved Proposal-ready wait | Remains OPEN and decidable through APPROVE or REJECT |
+| WaitResumedTick with no terminal fact | INVALIDATED with PRE_PHASE1C_WAIT_RELEASED |
+| Stale target or expected base | INVALIDATED with the existing deterministic stale reason |
+| No Proposal | No operation |
+
+The migration is idempotent for one or multiple Proposals and writes no ApprovalRecord, Contract revision, ContractCommit, MissionGraph authority, StoredTask, or Provider call. After enablement, request_human_resume rejects strategic_contract_proposal_ready; that wait can leave only through APPROVE or REJECT. Supported non-Proposal waits keep their existing resume behavior.
+
+Startup and replay can read the pre-enable history only as migration input. Enabled ordinary work cannot begin while an OPEN Proposal already has a WaitResumedTick.
+
 ### Proposal application creates no StoredTask
 
 The approval transaction establishes effective strategy and research write authority only. It does not create StoredTask.
 
 Later Routing reads the active approved Contract and authoritative research Mission, performs a separate deterministic revision-bound projection, and enters the normal PlannerRequest lifecycle before executable work can exist. Proposal or Applied Tick identity alone cannot produce claimable work.
+
+PR 1C-1 adds one optional all-or-none provenance group to the existing StoredTask and workflow_tasks representation:
+
+```text
+source_contract_id
+source_contract_revision
+source_mission_id
+source_mission_revision
+```
+
+Legacy rows migrate with all four fields null. Before first cutover, provenance-free set_research is explicitly legacy. Mission-derived set_research has all four fields and matches the active same-game Contract and research Mission revisions. PR 1C-2 makes claim, retry, confirmation release, and recovery revalidate those facts in each write transaction. Partial, stale, cross-game, or post-cutover null provenance cannot become claimable. No second task model or table is created.
 
 ### Startup and replay fail closed
 
@@ -126,9 +152,9 @@ INVALIDATED
 = Proposal + StrategicProposalInvalidatedTick
 ```
 
-Replay validates incoming evidence together with retained state before deleting target-game data. A forged Approval, missing ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal state, partial authority switch, or impossible Tick interval fails before replacement.
+Replay validates incoming evidence together with retained state before deleting target-game data. A forged Approval, missing ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal state, partial authority switch, impossible Tick interval, partial task provenance, stale claimable research task, or enabled OPEN Proposal with a historical WaitResumedTick fails before replacement.
 
-PR 1C-1 defines the data contracts, Schema, canonical serialization, reads, import/export, and ordinary-save, startup, and replay validation for these evidence shapes. It does not perform a terminal decision and exposes no standalone public ApprovalRecord or terminal Tick save method. PR 1C-2 adds dedicated full-aggregate approved, rejected, and invalidated entry points. Only those transactions implement identical-decision idempotency, conflicting-decision failure, stale invalidation, and concurrent decision serialization.
+PR 1C-1 defines decision evidence and grouped StoredTask provenance data contracts, Schema, canonical serialization, reads, import/export, and ordinary-save/startup/replay validation. It changes no routing or task lifecycle behavior, performs no terminal decision, and exposes no standalone public ApprovalRecord or terminal Tick save method. PR 1C-2 adds dedicated full-aggregate decision entry points plus dormant provenance-emitting routing and task mutation guards. PR 1C-3 migrates Phase 1B released waits before enabling APPROVE/REJECT and disabling generic Proposal resume.
 
 ## Consequences
 
@@ -139,6 +165,8 @@ PR 1C-1 defines the data contracts, Schema, canonical serialization, reads, impo
 - Restart and replay can prove one complete activation instead of inferring it from mutable status.
 - Stale Proposals are classified honestly as system-invalidated rather than human-rejected.
 - Existing Phase 1A/1B Request, Attempt, InformationRound, Proposal, and wait evidence remains useful.
+- Historical Resume remains auditable without being reinterpreted as human intent.
+- Persisted task provenance lets restart and replay distinguish legacy, current, and stale research execution.
 - Non-research scopes remain unchanged.
 
 ### Negative
@@ -147,6 +175,8 @@ PR 1C-1 defines the data contracts, Schema, canonical serialization, reads, impo
 - Proposal-specific constraints must narrow the shared ApprovalRecord decision set without breaking unrelated approval workflows.
 - The current foundation guard against non-empty scope/Mission state cannot be relaxed until dormant atomic activation and validators land together.
 - Legacy research write entry points must all consult persisted AuthorityScopeSet before enablement.
+- StoredTask persistence gains four nullable grouped fields before dormant routing can consume them.
+- PR 1C-3 requires an idempotent compatibility migration before decisions can be enabled.
 - Three PRs carry one active specification and require disciplined dormancy until the final integration.
 
 ## Rejected Alternatives
@@ -175,15 +205,23 @@ Free-form text is not typed, canonical, or reliably validated during replay.
 
 This conflates candidate handling, effective strategy, routing projection, and execution authority.
 
+### Infer task provenance from action type or caller path
+
+action_type identifies research intent but cannot prove a Contract or Mission revision after restart or replay. plan_id and call path are not durable authority.
+
+### Interpret a Phase 1B Resume Tick as approval
+
+Resume only released a wait. Treating it as approval would fabricate human intent; leaving the Proposal OPEN after the wait is gone would bypass the decision protocol.
+
 ### Add another approval model or state store
 
 WorkflowStateStore and the existing approval lineage remain the only persistence boundary. Proposal-specific constraints extend them instead of creating parallel authority.
 
 ## Dormant Rollout
 
-- **PR 1C-1:** protocol and persistence foundation. Add Proposal-specific terminal data contracts, Schema, serialization, reads, import/export, and fail-closed ordinary-save, startup, and replay validators. Do not add public terminal transitions or connect Engine or user entry.
-- **PR 1C-2:** dormant atomic services and authority projection. Add dedicated approved, rejected, and invalidated full-aggregate transactions, research authority cutover, legacy write closure, routing projection, and recovery tests behind a dormant gate. No standalone ApprovalRecord or terminal Tick public save method may bypass them.
-- **PR 1C-3:** runtime entry and enablement. Install the official generated OpenSpec verify Skill, add user actions and Engine integration, remove dormancy after end-to-end validation, finalize documents, then verify, sync, and archive the OpenSpec Change.
+- **PR 1C-1:** protocol and persistence foundation. Add Proposal terminal contracts and grouped StoredTask Contract/Mission provenance Domain/Schema/serialization/replay support. Keep routing, task mutations, Engine, and user behavior unchanged.
+- **PR 1C-2:** dormant atomic services and authority projection. Add full-aggregate decisions, research cutover, legacy closure, provenance-emitting routing, and transaction-local task guards behind a dormant gate. No standalone ApprovalRecord or terminal Tick save method may bypass them.
+- **PR 1C-3:** runtime entry and enablement. Install the official Verify Skill, migrate released Phase 1B Proposal waits, reject generic Proposal resume, add APPROVE/REJECT and Engine integration, then verify, sync, and archive after end-to-end validation.
 
 The OpenSpec Change remains active through PR 1C-1 and PR 1C-2. No Phase 1C production behavior is enabled before PR 1C-3.
 

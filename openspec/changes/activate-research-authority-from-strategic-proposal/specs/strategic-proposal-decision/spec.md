@@ -61,6 +61,54 @@ The system SHALL derive INVALIDATED only from one immutable StrategicProposalInv
 - **WHEN** the identical invalidation is retried for an already INVALIDATED Proposal
 - **THEN** the system returns the existing invalidation fact without adding another Tick
 
+### Requirement: Phase 1B released waits migrate before decision enablement
+
+A StrategicProposalWaitResumedTick created by the Phase 1B generic resume path SHALL remain interaction evidence only and SHALL NOT be interpreted as approval, rejection, or application. Before PR 1C-3 enables the Proposal decision protocol, the system SHALL atomically classify every historical OPEN Proposal while holding the WorkflowStateStore writer boundary.
+
+An OPEN Proposal with its unresolved strategic_contract_proposal_ready wait SHALL remain OPEN and eligible for APPROVE or REJECT. An OPEN Proposal with a historical StrategicProposalWaitResumedTick and no terminal decision SHALL receive exactly one StrategicProposalInvalidatedTick with reason PRE_PHASE1C_WAIT_RELEASED. If its Contract target or base is already stale, the existing deterministic stale invalidation reason takes precedence. The migration SHALL write no ApprovalRecord, Contract revision, ContractCommit, MissionGraph authority, StoredTask, or Provider call.
+
+After PR 1C-3 enables the decision protocol, a strategic_contract_proposal_ready wait SHALL leave AWAITING_HUMAN only through the dedicated APPROVE or REJECT aggregate transition. The generic request_human_resume operation SHALL reject that wait while remaining available to non-Proposal waits such as strategic_request_terminated.
+
+#### Scenario: Unresolved Phase 1B wait remains decidable
+
+- **WHEN** enablement migration finds an OPEN Proposal with a valid unresolved Proposal-ready wait and no Resume Tick
+- **THEN** the Proposal remains OPEN and the wait remains available to APPROVE or REJECT
+
+#### Scenario: Released Phase 1B wait is invalidated
+
+- **WHEN** enablement migration finds an OPEN Proposal with a StrategicProposalWaitResumedTick and no human or system terminal fact
+- **THEN** it atomically records one StrategicProposalInvalidatedTick with reason PRE_PHASE1C_WAIT_RELEASED without creating approval or activation evidence
+
+#### Scenario: Stale reason takes precedence
+
+- **WHEN** a historical resumed OPEN Proposal also has a stale Contract target or expected base revision
+- **THEN** the existing target-stale or base-stale invalidation reason is recorded instead of PRE_PHASE1C_WAIT_RELEASED
+
+#### Scenario: Multiple released Proposals migrate independently
+
+- **WHEN** one game contains multiple historical OPEN Proposals whose waits were resumed before Phase 1C
+- **THEN** each Proposal receives its own deterministic idempotent invalidation and no Proposal is treated as approved
+
+#### Scenario: Generic resume cannot release a Proposal wait after enablement
+
+- **WHEN** request_human_resume targets a strategic_contract_proposal_ready wait after the decision protocol is enabled
+- **THEN** it fails closed and leaves the Proposal, Runtime, and Human Wait unchanged
+
+#### Scenario: Non-Proposal resume remains available
+
+- **WHEN** request_human_resume targets a supported non-Proposal wait after enablement
+- **THEN** the existing non-Proposal resume policy remains unchanged
+
+#### Scenario: Pre-enable replay remains readable
+
+- **WHEN** startup or replay receives a valid Phase 1B OPEN Proposal plus WaitResumedTick before enablement migration completes
+- **THEN** it recognizes the state as migration input rather than approval and runs the deterministic migration before enabled ordinary work
+
+#### Scenario: Migrated store has no released OPEN Proposal
+
+- **WHEN** PR 1C-3 enablement migration commits
+- **THEN** startup and replay validation reject any remaining OPEN Proposal that already has a StrategicProposalWaitResumedTick
+
 ### Requirement: Human and system terminal dispositions are mutually exclusive
 
 Each Proposal SHALL have at most one human terminal ApprovalRecord or one system invalidation fact, never both. APPROVED and REJECTED SHALL also be mutually exclusive.

@@ -138,6 +138,49 @@ After cutover, research routing SHALL read the active StrategicContract revision
 - **WHEN** the process restarts after research activation
 - **THEN** routing derives research ownership and content from the persisted active Contract and AuthorityScopeSet
 
+### Requirement: StoredTask projection has durable Mission provenance
+
+The existing StoredTask and workflow_tasks representation SHALL gain the following optional, grouped source fields without introducing a second task model or table:
+
+```text
+source_contract_id
+source_contract_revision
+source_mission_id
+source_mission_revision
+```
+
+The four fields SHALL be either all null or all present. PR 1C-1 SHALL add the domain contract, nullable SQLite columns, all-null legacy migration, canonical serialization, replay import/export, and ordinary-save/startup/replay validation. It SHALL NOT change current research routing. A Mission-derived research StoredTask SHALL carry all four fields and they SHALL identify the active Contract revision and active research Mission revision for the same game.
+
+#### Scenario: Existing task remains explicitly legacy
+
+- **WHEN** an existing or migrated StoredTask has action_type set_research and all four source fields are null before the first research authority cutover
+- **THEN** it is classified as a legacy research StoredTask rather than being assigned inferred provenance
+
+#### Scenario: Mission-derived research task has complete provenance
+
+- **WHEN** post-activation Routing projects a set_research task from the active research Mission
+- **THEN** all four source fields are present and match the active Contract and Mission identities and revisions
+
+#### Scenario: Partial provenance is rejected
+
+- **WHEN** ordinary persistence, startup, or replay observes only part of the four-field provenance group
+- **THEN** validation fails closed and replay rejects before deleting target data
+
+#### Scenario: Legacy task cannot become claimable after cutover
+
+- **WHEN** research is MissionGraph-owned and a set_research task has null provenance
+- **THEN** claim, retry, confirmation release, and recovery reject it as legacy execution
+
+#### Scenario: Stale projected task cannot become claimable
+
+- **WHEN** claim, retry, confirmation release, or recovery sees a Mission-derived research task whose source Contract or Mission identity or revision differs from the active aggregate
+- **THEN** that write transaction fails closed or makes the task permanently unclaimable before execution
+
+#### Scenario: Current projected task is eligible
+
+- **WHEN** a Mission-derived set_research task has complete provenance matching the active Contract and Mission revision
+- **THEN** the normal task lifecycle may evaluate it without reopening a legacy research write path
+
 ### Requirement: Proposal application does not create StoredTask
 
 The decision and activation transaction SHALL NOT directly create a StoredTask. Executable work SHALL be produced only by a later deterministic projection from the active Contract and authoritative MissionGraph through the normal Planner and execution lifecycle.
