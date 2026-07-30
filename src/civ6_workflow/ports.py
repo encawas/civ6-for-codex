@@ -7,11 +7,14 @@ from typing import Any, Protocol
 from .domain import (
     StrategicContract,
     StrategicContractCommit,
+    StrategicProposalAppliedTick,
     StrategicProposalApprovalRecord,
+    StrategicProposalInvalidatedTick,
+    StrategicProposalRejectedTick,
     StrategicProposalWaitResumeRequest,
     StrategicResearchProposal,
 )
-from .models import ActionResult, RuntimeSnapshot, StoredTask
+from .models import ActionResult, ExecutionMode, PlanBundle, RuntimeSnapshot, StoredTask
 
 
 class WorkflowStorePort(Protocol):
@@ -70,6 +73,38 @@ class WorkflowStorePort(Protocol):
     def strategic_proposal_approval_record(
         self, game_session_id: str, proposal_id: str
     ) -> StrategicProposalApprovalRecord | None: ...
+
+    def approve_strategic_research_proposal(
+        self,
+        game_session_id: str,
+        approval: StrategicProposalApprovalRecord,
+        **kwargs: Any,
+    ) -> StrategicProposalAppliedTick | StrategicProposalInvalidatedTick: ...
+
+    def reject_strategic_research_proposal(
+        self,
+        game_session_id: str,
+        approval: StrategicProposalApprovalRecord,
+        **kwargs: Any,
+    ) -> StrategicProposalRejectedTick | StrategicProposalInvalidatedTick: ...
+
+    def invalidate_stale_strategic_research_proposal(
+        self,
+        game_session_id: str,
+        proposal_id: str,
+        **kwargs: Any,
+    ) -> StrategicProposalInvalidatedTick: ...
+
+    def save_authoritative_research_plan_bundle(
+        self,
+        game_id: str,
+        turn: int,
+        bundle: PlanBundle,
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+        observation_id: str,
+    ) -> None: ...
 
     def __getattr__(self, name: str) -> Any: ...
 

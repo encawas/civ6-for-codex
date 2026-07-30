@@ -70,6 +70,14 @@ non-empty Authority Scope Set or MissionGraph, switch research authority, or
 project Mission-derived StoredTask. Legacy research planning and execution
 remain authoritative until Phase 1C atomically changes that ownership.
 
+PR 1C-1 now supplies the version 11 terminal-evidence and grouped StoredTask
+provenance foundation. PR 1C-2 supplies dormant atomic approve, reject, and
+invalidate transactions, research authority activation, legacy research write
+closure, and a revision-bound set_research projection. These capabilities have
+no Engine, bootstrap, or user caller. Therefore the deployed behavior remains
+Phase 1B until PR 1C-3 performs compatibility migration and deliberately
+enables the existing Runtime lineage.
+
 ## 3. System Invariants
 
 1. A game session has exactly one active StrategicContract revision.

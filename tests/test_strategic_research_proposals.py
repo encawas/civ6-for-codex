@@ -10,11 +10,13 @@ import pytest
 from civ6_workflow.domain import (
     AuthorityScopeSet,
     ApprovalDecision,
+    ApprovalRecord,
     ApprovalStatus,
     AwaitingHumanTick,
     InformationRequestedTick,
     InformationRound,
     InformationRoundStatus,
+    LeaseValidationResult,
     Mission,
     MissionGraph,
     MissionStatus,
@@ -26,6 +28,9 @@ from civ6_workflow.domain import (
     PlannerRequestStatus,
     PlannerRequestTarget,
     PlannerRequestTargetKind,
+    ContinuationPolicy,
+    PlanLease,
+    PlanLeaseStatus,
     RuntimeState,
     StrategicContract,
     StrategicContractCommit,
@@ -53,6 +58,8 @@ from civ6_workflow.domain import (
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
 from civ6_workflow.models import (
     ExecutionMode,
+    PlanBundle,
+    ProposedTask,
     RiskLevel,
     RuntimeSnapshot,
     StoredTask,
@@ -4223,7 +4230,7 @@ def _research_task_replay_row(
         "entity_id": "player-1",
         "due_turn": 1,
         "expires_turn": None,
-        "arguments_json": json.dumps({"technology": "TECH_WRITING"}),
+        "arguments_json": json.dumps({"tech_or_civic": "TECH_WRITING"}),
         "preconditions_json": "[]",
         "postconditions_json": "[]",
         "invalidators_json": "[]",
@@ -5029,3 +5036,589 @@ def test_replay_rejects_migration_invalidation_missing_source_before_delete(
         target.import_replay_state(invalid)
 
     assert target.export_replay_state(proposal.game_session_id) == before
+
+
+def _proposal_decision(
+    store, proposal, decision, *, suffix="primary", actor="phase1c-test"
+):
+    ready = _proposal_ready_tick(store, proposal.proposal_id)
+    return StrategicProposalApprovalRecord(
+        approval_id=f"approval-{proposal.proposal_id}-{suffix}",
+        proposal_id=proposal.proposal_id,
+        decision=decision,
+        actor=actor,
+        created_at=ready.completed_at + timedelta(seconds=1),
+        reason=f"{decision.value.lower()} research Proposal",
+    )
+
+
+def _dormant_store(store):
+    store._phase1c_dormant_activation_enabled = True
+    return store
+
+
+def test_phase1c_atomic_decisions_are_dormant_by_default(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "dormant-gate.sqlite3")
+    )
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+
+    with pytest.raises(ValueError, match="remain dormant"):
+        store.approve_strategic_research_proposal(proposal.game_session_id, approval)
+
+    assert (
+        store.strategic_proposal_approval_record(
+            proposal.game_session_id, proposal.proposal_id
+        )
+        is None
+    )
+    assert store.get_active_strategic_contract(proposal.game_session_id) is None
+
+
+def test_dormant_approval_atomically_activates_research_and_is_idempotent(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "atomic-approval.sqlite3")
+    )
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    store = _dormant_store(store)
+
+    applied = store.approve_strategic_research_proposal(
+        proposal.game_session_id, approval
+    )
+    repeated = store.approve_strategic_research_proposal(
+        proposal.game_session_id, approval
+    )
+
+    assert repeated == applied
+    assert isinstance(applied, StrategicProposalAppliedTick)
+    assert (
+        store.strategic_proposal_approval_record(
+            proposal.game_session_id, proposal.proposal_id
+        )
+        == approval
+    )
+    active = store.get_active_strategic_contract(proposal.game_session_id)
+    assert active is not None
+    assert active.revision == proposal.expected_base_revision + 1
+    assert active.authority_scope_set.mission_graph_scopes == ("research",)
+    assert active.mission_graph.missions == (proposal.proposed_research_mission,)
+    assert store.list_tasks(proposal.game_session_id) == []
+    assert store.load_runtime_state(proposal.game_session_id) is RuntimeState.ROUTING
+    assert store.human_wait_context(proposal.game_session_id) is None
+    assert len(store.list_strategic_contract_revisions(proposal.game_session_id)) == 1
+    assert len(store.list_strategic_contract_commits(proposal.game_session_id)) == 1
+
+    WorkflowStore(store.path)
+    replay = store.export_replay_state(proposal.game_session_id)
+    restored = WorkflowStore(tmp_path / "atomic-approval-restored.sqlite3")
+    restored.import_replay_state(replay)
+    assert restored.export_replay_state(proposal.game_session_id) == replay
+
+
+def test_dormant_rejection_is_atomic_idempotent_and_conflicts_with_approval(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "atomic-rejection.sqlite3")
+    )
+    rejection = _proposal_decision(store, proposal, ApprovalDecision.REJECTED)
+    approval = rejection.model_copy(
+        update={
+            "approval_id": f"approval-{proposal.proposal_id}-conflict",
+            "decision": ApprovalDecision.APPROVED,
+        }
+    )
+    store = _dormant_store(store)
+
+    rejected = store.reject_strategic_research_proposal(
+        proposal.game_session_id, rejection
+    )
+    assert (
+        store.reject_strategic_research_proposal(proposal.game_session_id, rejection)
+        == rejected
+    )
+    with pytest.raises(ValueError, match="conflicts"):
+        store.approve_strategic_research_proposal(proposal.game_session_id, approval)
+
+    assert isinstance(rejected, StrategicProposalRejectedTick)
+    assert store.get_active_strategic_contract(proposal.game_session_id) is None
+    assert store.load_runtime_state(proposal.game_session_id) is RuntimeState.ROUTING
+    assert store.human_wait_context(proposal.game_session_id) is None
+
+
+def test_stale_approval_becomes_system_invalidation_without_human_decision(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "stale-approval.sqlite3")
+    )
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    _commit_contract(store, proposal.game_session_id)
+    store = _dormant_store(store)
+
+    invalidated = store.approve_strategic_research_proposal(
+        proposal.game_session_id, approval
+    )
+    repeated = store.invalidate_stale_strategic_research_proposal(
+        proposal.game_session_id, proposal.proposal_id
+    )
+    repeated_approval = store.approve_strategic_research_proposal(
+        proposal.game_session_id, approval
+    )
+
+    assert repeated == invalidated
+    assert repeated_approval == invalidated
+    assert isinstance(invalidated, StrategicProposalInvalidatedTick)
+    assert invalidated.invalidation_reason is (
+        StrategicProposalInvalidationReason.TARGET_CONTRACT_CREATED
+    )
+    assert (
+        store.strategic_proposal_approval_record(
+            proposal.game_session_id, proposal.proposal_id
+        )
+        is None
+    )
+    assert store.get_active_strategic_contract(proposal.game_session_id).revision == 1
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "after_legacy_research_disposition",
+        "after_strategic_approval",
+        "after_strategic_contract_activation",
+        "before_strategic_applied_tick",
+    ],
+)
+def test_dormant_approval_crash_points_roll_back_complete_aggregate(
+    tmp_path, checkpoint
+):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / f"approval-crash-{checkpoint}.sqlite3")
+    )
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    store = _dormant_store(store)
+    before = store.export_replay_state(proposal.game_session_id)
+
+    def crash(point):
+        if point == checkpoint:
+            raise RuntimeError(point)
+
+    with pytest.raises(RuntimeError, match=checkpoint):
+        store.approve_strategic_research_proposal(
+            proposal.game_session_id, approval, checkpoint=crash
+        )
+
+    assert store.export_replay_state(proposal.game_session_id) == before
+    WorkflowStore(store.path)
+
+
+def _legacy_research_bundle(status=TaskStatus.READY):
+    task = ProposedTask(
+        task_id="legacy-research-task",
+        action_type="set_research",
+        entity_type="player",
+        entity_id="player-1",
+        due_turn=1,
+        arguments={"tech_or_civic": "TECH_MINING"},
+        preconditions=[],
+        postconditions=[],
+        invalidators=[],
+        risk=RiskLevel.LOW,
+        requires_confirmation=(status is TaskStatus.AWAITING_CONFIRMATION),
+        reason="legacy research task",
+    )
+    return PlanBundle(
+        plan_id="legacy-research-plan",
+        summary="legacy research",
+        strategy_updates={"research_queue": ["TECH_MINING"]},
+        tasks=[task],
+    )
+
+
+def test_approval_cancels_disposable_legacy_research_without_replacement(tmp_path):
+    path = tmp_path / "legacy-disposition.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    store.save_plan_bundle(
+        "game-1",
+        1,
+        _legacy_research_bundle(),
+        mode=ExecutionMode.AUTO,
+        auto_action_types={"set_research"},
+        observation_id="obs-legacy",
+    )
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    store = _dormant_store(store)
+
+    applied = store.approve_strategic_research_proposal(
+        proposal.game_session_id, approval
+    )
+
+    task = store.get_task(proposal.game_session_id, "legacy-research-task")
+    assert task is not None and task.status is TaskStatus.CANCELLED
+    assert applied.legacy_task_dispositions[0].prior_status == TaskStatus.READY.value
+    assert applied.legacy_task_dispositions[0].final_status == (
+        TaskStatus.CANCELLED.value
+    )
+    assert len(store.list_tasks(proposal.game_session_id)) == 1
+
+
+def test_inflight_legacy_research_blocks_approval_and_rolls_back(tmp_path):
+    path = tmp_path / "legacy-inflight.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    store.save_plan_bundle(
+        "game-1",
+        1,
+        _legacy_research_bundle(),
+        mode=ExecutionMode.AUTO,
+        auto_action_types={"set_research"},
+        observation_id="obs-legacy",
+    )
+    store.set_task_status("game-1", "legacy-research-task", TaskStatus.RUNNING)
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    store = _dormant_store(store)
+    before = store.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="not quiescent"):
+        store.approve_strategic_research_proposal(proposal.game_session_id, approval)
+
+    assert store.export_replay_state(proposal.game_session_id) == before
+
+
+def _authoritative_research_bundle(
+    *,
+    task_id: str = "mission-research-task",
+    technology: str = "TECH_WRITING",
+) -> PlanBundle:
+    return PlanBundle(
+        plan_id=f"mission-plan-{task_id}",
+        summary="Mission-derived research projection",
+        tasks=[
+            ProposedTask(
+                task_id=task_id,
+                action_type="set_research",
+                entity_type="player",
+                entity_id="player-1",
+                due_turn=1,
+                arguments={"tech_or_civic": technology},
+                preconditions=[],
+                postconditions=[],
+                invalidators=[],
+                risk=RiskLevel.LOW,
+                requires_confirmation=False,
+                reason="active research Mission projection",
+            )
+        ],
+    )
+
+
+def test_dormant_authoritative_projection_emits_current_mission_provenance(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "authoritative-projection.sqlite3")
+    )
+    store = _dormant_store(store)
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    applied = store.approve_strategic_research_proposal(
+        proposal.game_session_id, approval
+    )
+
+    store.save_authoritative_research_plan_bundle(
+        proposal.game_session_id,
+        1,
+        _authoritative_research_bundle(),
+        mode=ExecutionMode.AUTO,
+        auto_action_types={"set_research"},
+        observation_id=proposal.created_from_observation_id,
+    )
+
+    tasks = store.due_tasks(proposal.game_session_id, 1)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.source_contract_id == proposal.target_contract_id
+    assert task.source_contract_revision == applied.activated_contract_revision
+    assert task.source_mission_id == applied.source_mission_id
+    assert task.source_mission_revision == applied.source_mission_revision
+    restored = WorkflowStore(store.path)
+    assert restored.get_task(proposal.game_session_id, task.task_id) == task
+
+
+def test_dormant_authoritative_projection_wrong_target_rolls_back(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "wrong-projection.sqlite3")
+    )
+    store = _dormant_store(store)
+    store.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
+    )
+    before = store.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="must match"):
+        store.save_authoritative_research_plan_bundle(
+            proposal.game_session_id,
+            1,
+            _authoritative_research_bundle(technology="TECH_POTTERY"),
+            mode=ExecutionMode.AUTO,
+            auto_action_types={"set_research"},
+            observation_id=proposal.created_from_observation_id,
+        )
+
+    assert store.export_replay_state(proposal.game_session_id) == before
+
+
+def test_cutover_closes_legacy_research_writes_and_claim_release(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "legacy-closed.sqlite3")
+    )
+    store.save_plan_bundle(
+        proposal.game_session_id,
+        1,
+        _legacy_research_bundle(),
+        mode=ExecutionMode.AUTO,
+        auto_action_types={"set_research"},
+        observation_id="obs-legacy",
+    )
+    store = _dormant_store(store)
+    store.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
+    )
+    before = store.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="legacy research plan writes"):
+        store.save_plan_bundle(
+            proposal.game_session_id,
+            1,
+            _legacy_research_bundle(),
+            mode=ExecutionMode.AUTO,
+            auto_action_types={"set_research"},
+            observation_id="obs-late-legacy",
+        )
+    with pytest.raises(ValueError, match="legacy provenance-free"):
+        store.set_task_status(
+            proposal.game_session_id,
+            "legacy-research-task",
+            TaskStatus.READY,
+        )
+
+    assert store.export_replay_state(proposal.game_session_id) == before
+
+
+def test_cutover_closes_legacy_research_lease_approval(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "legacy-lease-approval-closed.sqlite3")
+    )
+    lease = PlanLease(
+        plan_lease_id="legacy-research-lease",
+        plan_id="legacy-research-plan",
+        game_session_id=proposal.game_session_id,
+        decision_gap_ids=("legacy-research-gap",),
+        scope="research",
+        covered_slots=("research",),
+        plan_revision=1,
+        created_from_observation_id="obs-legacy-research-lease",
+        status=PlanLeaseStatus.AWAITING_APPROVAL,
+        approval_status=ApprovalStatus.REQUIRED,
+        valid_from_turn=1,
+        valid_until_turn=2,
+        continuation_policy=ContinuationPolicy.REQUIRE_REVIEW,
+        relevant_input_hash="legacy-research-input",
+        last_validated_observation_id="obs-legacy-research-lease",
+        last_validation_result=LeaseValidationResult.UNKNOWN,
+    )
+    store.save_plan_lease(lease)
+    store = _dormant_store(store)
+    store.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
+    )
+    before = store.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="legacy research PlanLease writes"):
+        store.record_lease_approval(
+            proposal.game_session_id,
+            lease.plan_lease_id,
+            approved=True,
+        )
+
+    with pytest.raises(ValueError, match="legacy research approval writes"):
+        store.save_approval_record(
+            proposal.game_session_id,
+            ApprovalRecord(
+                approval_id="late-legacy-research-approval",
+                proposal_type="decision_gap",
+                proposal_id=lease.decision_gap_ids[0],
+                proposal_revision=lease.plan_revision,
+                decision=ApprovalDecision.APPROVED,
+                actor="test",
+                created_at=NOW,
+            ),
+        )
+
+    assert store.export_replay_state(proposal.game_session_id) == before
+
+
+def test_cutover_leaves_non_research_plan_and_task_behavior_unchanged(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "non-research-isolation.sqlite3")
+    )
+    store = _dormant_store(store)
+    store.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
+    )
+    civic_task = ProposedTask(
+        task_id="legacy-civic-task",
+        action_type="set_civic",
+        entity_type="player",
+        entity_id="player-1",
+        due_turn=1,
+        arguments={"tech_or_civic": "CIVIC_CODE_OF_LAWS"},
+        preconditions=[],
+        postconditions=[],
+        invalidators=[],
+        risk=RiskLevel.LOW,
+        requires_confirmation=False,
+        reason="legacy civic remains unchanged",
+    )
+
+    store.save_plan_bundle(
+        proposal.game_session_id,
+        1,
+        PlanBundle(
+            plan_id="legacy-civic-plan",
+            summary="legacy civic",
+            strategy_updates={"civic_queue": ["CIVIC_CODE_OF_LAWS"]},
+            tasks=[civic_task],
+        ),
+        mode=ExecutionMode.AUTO,
+        auto_action_types={"set_civic"},
+        observation_id="obs-civic",
+    )
+
+    assert store.due_tasks(proposal.game_session_id, 1)[0].task_id == civic_task.task_id
+
+
+def test_two_concurrent_identical_approvals_commit_one_revision(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "concurrent-approval.sqlite3")
+    )
+    store = _dormant_store(store)
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    barrier = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def decide():
+        barrier.wait()
+        try:
+            results.append(
+                store.approve_strategic_research_proposal(
+                    proposal.game_session_id, approval
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=decide) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(results) == 2 and results[0] == results[1]
+    assert len(store.list_strategic_contract_revisions(proposal.game_session_id)) == 1
+    assert len(store.list_strategic_contract_commits(proposal.game_session_id)) == 1
+
+
+def test_approval_rereads_ready_legacy_research_after_prelock_hook(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "prelock-research.sqlite3")
+    )
+    store = _dormant_store(store)
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    inserted = False
+
+    def checkpoint(name):
+        nonlocal inserted
+        if name != "before_strategic_decision_lock" or inserted:
+            return
+        inserted = True
+        store.save_plan_bundle(
+            proposal.game_session_id,
+            1,
+            _legacy_research_bundle(),
+            mode=ExecutionMode.AUTO,
+            auto_action_types={"set_research"},
+            observation_id="obs-prelock",
+        )
+
+    applied = store.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        approval,
+        checkpoint=checkpoint,
+    )
+
+    task = store.get_task(proposal.game_session_id, "legacy-research-task")
+    assert inserted is True
+    assert task is not None and task.status is TaskStatus.CANCELLED
+    assert tuple(item.task_id for item in applied.legacy_task_dispositions) == (
+        "legacy-research-task",
+    )
+
+
+def test_concurrent_approve_reject_race_persists_one_terminal_authority(tmp_path):
+    store, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "approve-reject-race.sqlite3")
+    )
+    store = _dormant_store(store)
+    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
+    rejection = approval.model_copy(
+        update={
+            "approval_id": f"approval-{proposal.proposal_id}-reject-race",
+            "decision": ApprovalDecision.REJECTED,
+        }
+    )
+    barrier = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def decide(record):
+        barrier.wait()
+        try:
+            operation = (
+                store.approve_strategic_research_proposal
+                if record.decision is ApprovalDecision.APPROVED
+                else store.reject_strategic_research_proposal
+            )
+            results.append(operation(proposal.game_session_id, record))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=decide, args=(approval,)),
+        threading.Thread(target=decide, args=(rejection,)),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    terminal = [
+        tick
+        for tick in store.list_workflow_ticks(proposal.game_session_id)
+        if isinstance(
+            tick,
+            (
+                StrategicProposalAppliedTick,
+                StrategicProposalRejectedTick,
+                StrategicProposalInvalidatedTick,
+            ),
+        )
+    ]
+    assert terminal == results
+    assert len(
+        store.list_strategic_contract_revisions(proposal.game_session_id)
+    ) == int(isinstance(results[0], StrategicProposalAppliedTick))

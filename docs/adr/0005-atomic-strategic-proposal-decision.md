@@ -204,6 +204,23 @@ choice is to extend the existing authority tables and canonical JSON rather
 than introduce dedicated terminal tables; this is consistent with the ADR and
 creates no protocol deviation.
 
+### PR 1C-2 implementation record
+
+The Store now contains dormant, typed full-aggregate operations for approval,
+rejection, and stale invalidation. Approval uses BEGIN IMMEDIATE, re-reads
+Proposal and legacy research execution under the lock, disposes only safe work,
+and atomically commits Approval, the next Contract revision, the Proposal-bound
+ACTIVE research Mission, AuthorityScopeSet, ContractCommit, Applied Tick,
+Runtime ROUTING, and wait clearance. Rejection and invalidation write their
+smaller complete aggregates without a Contract revision.
+
+The same persisted AuthorityScopeSet closes legacy research planning and task
+mutation paths after cutover. A separate dormant routing projection can create
+only set_research StoredTask rows carrying the complete active
+Contract/Mission provenance group. Activation itself creates no StoredTask.
+The gate has no Engine, bootstrap, or user caller; production behavior remains
+Phase 1B until PR 1C-3 performs migration and enablement.
+
 ## Consequences
 
 ### Positive
