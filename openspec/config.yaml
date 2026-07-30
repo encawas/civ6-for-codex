@@ -1,0 +1,54 @@
+schema: spec-driven
+
+context: |
+  Canonical architecture documents:
+  - docs/architecture/mission-graph-sdd.md
+  - docs/adr/0001-explicit-runtime-composition.md
+  - docs/adr/0002-strategic-contract-mission-graph.md
+  - docs/adr/0003-state-authority-module-boundaries.md
+  - docs/adr/0004-turn-action-graph-execution.md
+  - docs/adr/0005-atomic-strategic-proposal-decision.md
+  - docs/plans/2026-07-23-mission-graph-migration.md
+
+  Current implementation baseline:
+  - Phase 1A generalized PlannerRequest targets and preserved ProviderAttempt and InformationRound audit.
+  - Phase 1B created the single StrategicContract persistence foundation, but persisted MissionGraph scopes and Missions remain empty.
+  - Phase 1B persists immutable StrategicResearchProposal candidates and explicit-only durable human wait evidence.
+  - No proposal decision, Contract activation, research authority switch, or Mission-derived StoredTask exists yet.
+
+  Core invariants:
+  - Each game session has exactly one active StrategicContract revision.
+  - MissionGraph is internal Contract structure, not a second authority.
+  - Each Strategic Scope has exactly one write authority at a time.
+  - WorkflowStateStore is the sole database authority for workflow state.
+  - StrategicResearchProposal content is immutable.
+  - ApprovalRecord is the sole authority for an APPROVED or REJECTED human disposition.
+  - StrategicProposalInvalidatedTick is the sole authority for a system invalidation.
+  - Human and system terminal dispositions are mutually exclusive.
+  - StrategicContract.approval_status is an immutable redundant snapshot of ApprovalRecord, not approval authority.
+  - StrategicContract revision is the authority for effective strategic content.
+  - AuthorityScopeSet is the authority for current scope write ownership.
+  - One active Change spans PR 1C-1, PR 1C-2, and PR 1C-3 and remains active until PR 1C-3 is verified.
+  - OpenSpec is a development specification, never runtime state authority.
+
+rules:
+  proposal:
+    - State current authority, target authority, affected research scope, non-goals, rollback, and the three-PR rollout.
+    - Prohibit a second approval system, a mutable Proposal status, or any second runtime state source.
+  specs:
+    - Cover success, rejection, invalidation, duplicate, conflict, stale base, crash, restart, replay, concurrency, idempotency, ordinary Tick ordering, and negative behavior.
+    - Write every MODIFIED Requirement as a complete Requirement block.
+  design:
+    - Identify the sole authority for every lifecycle fact and the complete evidence for APPROVED, REJECTED, and INVALIDATED.
+    - Specify BEGIN IMMEDIATE transaction boundaries, startup and replay fail-closed validation, dormant rollout, legacy research cutover, and the prohibition on direct StoredTask creation from a Proposal.
+  tasks:
+    - Group work under PR 1C-1, PR 1C-2, and PR 1C-3.
+    - Map requirements and scenarios to implementation and tests; leave all unimplemented work unchecked.
+
+operations:
+  apply:
+    guidance:
+      - Preserve the PR boundary named by each task and do not implement work from a later PR.
+  archive:
+    guidance:
+      - Do not sync or archive this Change before PR 1C-3 passes primary and secondary review.

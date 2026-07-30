@@ -10,6 +10,7 @@ Architecture references:
 - [ADR 0002: One StrategicContract Aggregate per Game Session](../adr/0002-strategic-contract-mission-graph.md)
 - [ADR 0003: State Authority, Observation Completeness, and Module Boundaries](../adr/0003-state-authority-module-boundaries.md)
 - [ADR 0004: TurnActionGraph and Wave/Barrier Execution](../adr/0004-turn-action-graph-execution.md)
+- [ADR 0005: Atomic Strategic Proposal Decision and Research Authority Activation](../adr/0005-atomic-strategic-proposal-decision.md)
 
 ## 1. Migration Rules
 
@@ -184,107 +185,439 @@ removed only after every scope exits legacy planning authority.
 No scope switch, MissionGraph execution, second request system, Provider retry
 redesign, or Agent hierarchy.
 
-## 4. Phase 1B: Research Strategic Vertical Slice
+## 4. Phase 1B: Strategic Proposal Generation and Durable Human Wait
+
+This section records the implementation delivered after Phase 1A and
+supersedes PR 0's original assumption that Phase 1B would already switch
+research authority.
 
 ```text
-research_direction_required
--> StrategicContract research Mission
--> set_research
+generalized PlannerRequest
+-> ProviderAttempt / InformationRound
+-> StrategicResearchProposal
+-> StrategicProposalReadyTick
+-> explicit-only AWAITING_HUMAN
 ```
 
 ### Goal
 
-Prove one scope can use MissionGraph strategic authority within the single
-game-session Contract while preserving current execution safety.
+Persist a minimum single-Contract foundation and a validated, immutable
+research Proposal with complete model-call audit and durable explicit-only
+Human Wait, without making that Proposal effective.
 
 ### Current authority
 
-DecisionGap and PlanLease decide research strategy. StoredTask is execution
-authority.
+At Phase 1B entry, DecisionGap and PlanLease decide research strategy and
+StoredTask decides research execution. Phase 1A already allows PlannerRequest
+to target StrategicContract creation or MissionGraph repair without a
+synthetic DecisionGap.
+
+### Target authority
+
+Phase 1B adds durable candidate and audit state only:
+
+```text
+StrategicContract root/revision history = durable empty foundation
+StrategicResearchProposal               = immutable candidate
+explicit-only Human Wait                = interaction boundary
+legacy DecisionGap / PlanLease           = research strategic authority
+StoredTask                               = research execution authority
+```
+
+AuthorityScopeSet and MissionGraph remain empty. A Proposal does not activate
+strategy.
+
+### Allowed scope
+
+- Add the minimum Contract, Mission, MissionGraph, AuthorityScopeSet, and
+  ContractCommit domain shapes needed by the research slice.
+- Persist one stable Contract root per game with immutable, atomically appended
+  revisions and idempotent commit recovery.
+- Keep non-empty AuthorityScopeSet and MissionGraph persistence disabled.
+- Use Phase 1A PlannerRequest targets, ProviderAttempt, and InformationRound
+  for strategic creation and repair requests.
+- Validate and persist one immutable StrategicResearchProposal bound to its
+  source Request, final successful Attempt, target Contract, expected base,
+  source Observation, and canonical hash.
+- Persist Proposal Ready, explicit resume request, resume/error, terminal
+  request wait, RuntimeState, and Human Wait evidence with startup/replay
+  aggregate validation.
+- Preserve one WorkflowStateStore, one bootstrap, and one Engine lineage.
+
+### Data migration
+
+- Migrate existing databases to the Contract and Proposal schema without
+  rewriting PlannerRequest, ProviderAttempt, InformationRound, DecisionGap,
+  PlanLease, StoredTask, or execution authority.
+- Export and import Contract roots, complete revision history, commits,
+  Proposals, resume requests, RuntimeState, Human Wait context, and Tick audit.
+- Reject non-empty MissionGraph or AuthorityScopeSet state at ordinary save,
+  startup, and replay.
+- Validate replay before deleting target-game data.
+
+### Active object handling
+
+- Legacy research DecisionGap, PlanLease, and StoredTask remain active under
+  their existing rules.
+- A Proposal Ready wait remains explicit-only across observation changes,
+  execution-mode changes, repeated waiting Ticks, restart, and replay.
+- Only an immutable explicit resume request can release the wait.
+- Releasing the wait does not approve, reject, invalidate, apply, edit, or
+  rebase the Proposal and does not call Provider again.
+- Strategic Request failure terminal waits preserve dedicated termination,
+  resume, error, and protected Tick-interval evidence.
+- Public Store methods cannot advance strategic Request or InformationRound
+  lifecycle outside the complete Runtime transaction.
+
+### Tests
+
+- One stable Contract root exists per game and revisions append idempotently.
+- Stale bases, identity conflicts, partial commits, startup corruption, and
+  replay corruption fail closed.
+- AuthorityScopeSet and MissionGraph remain empty on every persisted revision.
+- Strategic Request, Attempt, InformationRound, Proposal, Ready Tick, Runtime,
+  Human Wait, and resume evidence round-trip stably.
+- Proposal content and source evidence are immutable.
+- Generic and terminal explicit-only waits survive repeated Ticks, restart,
+  replay, concurrency, and impossible Tick-history attacks.
+- Legacy research behavior and all existing tests remain unchanged.
+
+### Rollback
+
+Disable strategic Proposal request entry while retaining compatible reads and
+audit. Existing Proposals remain inert. Contract foundation rows remain
+historical data; legacy research authority continues without reconstruction.
+
+### Exit criteria
+
+- Phase 1A strategic Request targets are durable and replay-safe.
+- Each game has at most one Contract root with immutable revision history.
+- Persisted AuthorityScopeSet and MissionGraph remain empty.
+- Valid strategic model responses can produce one immutable research Proposal.
+- Proposal and strategic terminal waits are explicit-only, auditable, and
+  restart/replay safe.
+- No Proposal decision, Contract activation, authority switch, or
+  Mission-derived StoredTask exists.
+
+### Deletion criteria
+
+Nothing is deleted. Contract and Proposal records are new durable audit;
+legacy research types and tables remain authoritative and readable.
+
+### Explicitly not done
+
+No Proposal approval or rejection, system invalidation terminal, effective
+Contract revision from Proposal, research authority switch, legacy research
+write closure, Mission routing, Mission-derived StoredTask, StateDelta repair,
+TurnActionGraph authority, BatchExecutor extraction, or other scope migration.
+
+## 5. Phase 1C: Human Decision and Atomic Research Authority Activation
+
+```text
+StrategicResearchProposal
+-> APPROVED / REJECTED / INVALIDATED
+-> APPROVED: Contract revision and research authority commit atomically
+-> dedicated Decision/Activation Tick completes
+-> authoritative research routing continues
+```
+
+### Goal
+
+Turn the Phase 1B immutable candidate into an auditable human decision and,
+only for APPROVED, atomically make its research content effective while
+transferring research write authority to MissionGraph.
+
+### Current authority
+
+StrategicResearchProposal and explicit-only wait are durable, but they are
+inert. No ApprovalRecord decides the Proposal, no system invalidation fact
+closes a stale Proposal, Contract revisions contain no Mission or owned scope,
+and legacy research remains authoritative.
 
 ### Target authority
 
 ```text
-MissionGraph = research strategic authority
-StoredTask   = temporary research execution authority
+StrategicResearchProposal          = immutable AI candidate
+ApprovalRecord                     = sole human APPROVED/REJECTED authority
+StrategicProposalInvalidatedTick   = sole system invalidation authority
+StrategicContract revision         = effective research strategy
+AuthorityScopeSet                  = current research write authority
+StoredTask                         = temporary research execution authority
 ```
 
-The Contract root covers the game session. Other scopes remain legacy-owned.
+Other Strategic Scopes remain legacy-owned.
 
 ### Allowed scope
 
-- Add minimum Contract/Mission domain and typed Store Port operations.
-- Create or repair research through generalized PlannerRequest.
-- Deterministically project `set_research` StoredTask from current Mission.
-- Route through existing bootstrap and Engine lineage.
+- Add Proposal-specific terminal decision contracts and complete evidence
+  closure without adding mutable Proposal status.
+- Extend ContractCommit with structured Proposal, hash, Approval, Request, and
+  base-revision binding.
+- Add atomic approve, reject, and invalidate transitions.
+- Switch research AuthorityScopeSet ownership only with the approved Contract
+  revision, research Mission, and locked disposition of all legacy research
+  execution.
+- Stop legacy research writes after switch and route from the active
+  Contract/Mission revision.
+- Preserve StoredTask temporarily as execution authority, but never create it
+  directly in the Proposal application transaction.
+- Add user entry and Engine enablement only in the final rollout PR.
+
+### PR 1C-1: Protocol and Persistence Foundation
+
+- Constrain StrategicResearchProposal human decisions to APPROVED or REJECTED
+  without narrowing unrelated approval workflows.
+- Define Invalidated, Applied, and Rejected Tick contracts and terminal
+  uniqueness. Migration-origin InvalidatedTick includes typed origin, structured
+  Ready/Resume source bindings, and canonical causal time.
+- Add structured ContractCommit and AppliedTick source Mission identity/revision
+  binding.
+- Add optional grouped StoredTask/workflow_tasks source fields:
+  source_contract_id, source_contract_revision, source_mission_id, and
+  source_mission_revision. Existing rows migrate with all four NULL.
+- Add canonical serialization, typed reads, replay import/export, ordinary-save
+  checks, and shared startup/replay validation for complete-or-null provenance.
+- Add Proposal decision contracts and validation without a public operation
+  that independently saves ApprovalRecord or terminal Tick or performs a
+  terminal decision.
+- Validate that the Proposal-derived Mission has scope research and status
+  ACTIVE, and that its action semantic comes only from the closed
+  research-to-set_research mapping.
+- Add protocol, migration, round-trip, and forged-state tests while preserving
+  current routing and task lifecycle behavior.
+- Do not connect Engine, user actions, authority activation, or legacy write
+  closure.
+
+### PR 1C-2: Dormant Atomic Activation and Authority Projection
+
+- Implement dedicated BEGIN IMMEDIATE approved, rejected, and invalidated
+  full-aggregate services. No standalone ApprovalRecord or terminal Tick public
+  save method may bypass them.
+- Atomically persist legacy research execution disposition, Approval, Contract
+  revision, ContractCommit, transition Tick, the Proposal-derived ACTIVE
+  research Mission, AuthorityScopeSet, Runtime transition, and wait clearance
+  as applicable. ContractCommit and AppliedTick bind the same Mission identity and
+  revision.
+- Close legacy research writes after ownership changes.
+- Add active Contract/Mission routing projection that writes the PR 1C-1 task
+  provenance group, plus transaction-local claim, retry, confirmation-release,
+  and recovery guards for legacy or stale research work.
+- Add crash, restart, replay, concurrency, and idempotency coverage.
+- Keep every new production path behind a dormant gate with no user or Engine
+  caller.
+
+### PR 1C-3: Runtime Entry and Enablement
+
+- Before enablement, atomically migrate Phase 1B OPEN Proposals with historical
+  WaitResumedTick evidence to system invalidation. Preserve valid unresolved
+  Proposal waits, use existing stale reasons when the target or base changed,
+  and derive migration-origin Tick time from the canonical persisted causal
+  frontier rather than current wall clock or invented user time.
+- Add explicit user APPROVE/REJECT actions.
+- Reject request_human_resume for strategic_contract_proposal_ready after
+  enablement while preserving supported non-Proposal resume behavior.
+- Integrate the existing Engine/Runtime lineage with the dedicated decision
+  transition and post-activation routing.
+- Remove dormancy only after Windows, Ubuntu, replay, migration, concurrency,
+  and end-to-end gates pass.
+- Finalize documents and perform OpenSpec verify, sync, and archive after
+  primary and secondary review.
 
 ### Data migration
 
-- Create the game-session Contract and Authority Scope Set.
-- Switch only research through an atomic authority-switch transaction that
-  updates the Authority Scope Set, initializes research Missions, records
-  migration audit, stops the legacy research write path, and commits one new
-  StrategicContract revision.
-- Persist source Contract/Mission revision on projected execution work.
-- Stop new research DecisionGap and PlanLease writes in the same switch.
+- Add immutable Proposal decision and transition audit without rewriting
+  Proposal content or existing Phase 1A Request evidence.
+- Proposal-derived Contract revisions append to the one existing root and use
+  revision = expected base + 1.
+- The approved revision copies canonical Proposal objectives, constraints,
+  source Observation, and the Proposal-derived Mission with scope research and
+  status ACTIVE. Non-research or non-ACTIVE Mission content is never activated.
+- ContractCommit and AppliedTick bind the same source Mission ID/revision in
+  addition to Proposal ID/hash, Approval ID, PlannerRequest ID, and expected
+  base. The action semantic is the closed mapping research -> set_research;
+  desired_outcome, tool-name strings, and free JSON cannot select an action.
+- Replay validates complete decision, activation, authority, Runtime/wait, and
+  Tick evidence before deleting target-game data.
+- Existing workflow_tasks rows receive NULL for all four Contract/Mission
+  provenance columns. No legacy task receives inferred provenance.
+- Partial provenance is invalid. Mission-derived research work uses all four
+  fields and binds to the same-game active Contract and Mission revisions.
+
+Phase 1B Proposal wait migration runs only at PR 1C-3 enablement:
+
+| Historical state | Migration result |
+| --- | --- |
+| OPEN plus valid unresolved Proposal-ready wait | Preserve OPEN for APPROVE or REJECT |
+| OPEN plus WaitResumedTick and no terminal fact | INVALIDATED with PRE_PHASE1C_WAIT_RELEASED |
+| OPEN plus stale target or base | INVALIDATED with the existing stale reason |
+| No Proposal | No operation |
+
+The migration handles multiple Proposals independently and is idempotent. It
+writes no ApprovalRecord, Contract revision, ContractCommit, MissionGraph
+authority, StoredTask, or Provider call. Each migration InvalidatedTick records
+origin PHASE1C_ENABLEMENT_MIGRATION and binds ProposalReadyTick, ResumeRequest,
+and StrategicProposalWaitResumedTick. Define:
+
+```text
+causal_frontier = max(
+  Proposal.created_at,
+  source PlannerRequest.completed_at,
+  final ProviderAttempt.completed_at,
+  ProposalReadyTick.completed_at,
+  ResumeRequest.requested_at,
+  StrategicProposalWaitResumedTick.completed_at,
+)
+started_at = completed_at = causal_frontier + 1 microsecond
+```
+
+Ordinary save, startup, and replay resolve those same bindings and require the
+exact value. Missing/mismatched sources, earlier or different time, or an
+unrepresentable successor rejects before mutation or target-data deletion.
+The formula uses only durable Phase 1B evidence, so no unavailable historical
+user time is required. Successful migration reopens normally and replay
+preserves the Tick rather than regenerating it. Pre-enable startup/replay treats
+OPEN plus WaitResumedTick only as migration input; after migration, that shape
+is invalid.
 
 ### Active object handling
 
-- OPEN/REQUESTED research DecisionGap completes or supersedes.
-- Active PlannerRequest completes, supersedes, or explicitly migrates.
+- OPEN/REQUESTED legacy research DecisionGap completes or supersedes before
+  authority switch.
+- Active legacy PlannerRequest completes, supersedes, or follows an explicit
+  migration path.
 - Research PlanLease completes, invalidates, or blocks switch.
-- Every legacy-authority READY StoredTask is cancelled or superseded before
-  switch, or converted by creating a new deterministic StoredTask projection
-  from the current Contract and Mission revision in the switch transaction or
-  an explicit migration step.
-- Converted tasks retain old-to-new audit linkage; the old task is unclaimable,
-  its provenance is not rewritten in place, and at most one equivalent action
-  is claimable.
-- VERIFYING StoredTask completes fresh verification first.
-- UNCERTAIN ActionAttempt blocks equivalent replacement and authority switch
-  until human or observed reconciliation.
-- Pending approval completes, invalidates, or resubmits on the new revision.
+- Approval holds BEGIN IMMEDIATE before the authoritative execution check.
+  Preflight cleanup is advisory and cannot authorize activation.
+
+| Existing legacy research state | Locked activation treatment |
+| --- | --- |
+| PENDING, READY, BLOCKED, FAILED, ESCALATED | Move to CANCELLED and record previous state plus authority-switch reason |
+| AWAITING_CONFIRMATION | Cancel the task and close its legacy confirmation without treating it as Contract approval |
+| RUNNING | Block activation until mutation-boundary recovery completes |
+| VERIFYING | Block activation until fresh verification completes |
+| UNCERTAIN | Block activation until fact-based or human reconciliation completes |
+| DONE, CANCELLED, EXPIRED | Preserve as inert history when no unresolved Attempt exists |
+
+- Any ActionAttempt in PREPARED, VERIFYING, or UNCERTAIN blocks activation
+  regardless of the StoredTask state.
+- The locked transaction re-reads all legacy research tasks, all Attempts,
+  and pending confirmations; applies safe cancellations; and proves no
+  claimable, in-flight, verifying, uncertain, or revivable work remains.
+- A READY task created after preflight but before lock acquisition is observed
+  and cancelled in the activation transaction or causes the transaction to
+  roll back.
+- CANCELLED is permanently non-revivable for this cutover. After authority
+  transfer, legacy task creation, retry, release, and confirmation paths fail
+  closed from the persisted AuthorityScopeSet.
+- Proposal decision and activation do not directly create StoredTask.
+- After activation and the Decision/Activation Tick complete, later Routing
+  reads the active Contract/Mission revision, performs a separate deterministic
+  projection, and enters the normal Planner lifecycle before a replacement
+  StoredTask may be created.
+- Before first cutover, set_research with all four provenance fields NULL is
+  legacy. After cutover, a valid Mission-derived set_research task has all four
+  fields and matches the active Contract plus the same ACTIVE research Mission
+  bound by Proposal, ContractCommit, and AppliedTick. The action type must be
+  exactly set_research and cannot be selected from desired_outcome or free JSON.
+- Claim, retry, confirmation release, and recovery re-read those active
+  revisions in their own write transactions. NULL, partial, stale, or
+  cross-game provenance cannot become claimable.
+- Old provenance is not rewritten, audit association is retained, and at most
+  one equivalent action is claimable.
 
 ### Tests
 
-- New and existing games have one Contract root.
-- Only research enters MissionGraph authority.
-- With research MissionGraph-owned and civic legacy-owned, a research Patch is
-  accepted and a civic Patch is rejected deterministically.
-- Research creates no DecisionGap or PlanLease after switch.
-- StoredTask projection is deterministic and revision-bound.
-- Stale Mission revisions cannot produce claimable tasks.
-- A legacy READY research task is cancelled or superseded at switch, and at
-  most one Mission-derived replacement is claimable.
-- Verified action evidence that completes a Mission increments the Contract
-  revision exactly once; duplicate recovery does not increment it again.
-- Other scopes remain legacy and unchanged.
-- Replay and crash recovery cover the slice.
+- Approve, reject, and stale invalidation produce their complete, mutually
+  exclusive evidence sets.
+- Identical decisions are idempotent; conflicting decisions fail.
+- Two approvals produce one Approval, revision, and Applied Tick.
+- Concurrent approve/reject is decided by the first committed transaction.
+- Faults after Approval preparation, Contract preparation, or before the
+  transition Tick leave no partial state.
+- Startup and replay reject forged Approval, forged Contract, missing
+  ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal
+  facts, duplicate Invalidated Ticks, migration-origin Ticks with missing source
+  bindings or non-canonical causal time, partial authority state, partial task
+  provenance, non-research/non-ACTIVE Mission bindings, non-set_research action
+  semantics, and stale claimable Mission-derived research work.
+- PR 1C-1 migration/replay preserves all-null legacy task provenance and rejects
+  partial or cross-game groups without changing legacy claim behavior.
+- Post-cutover claim/retry/confirm/recovery reject provenance-free legacy tasks
+  and complete but stale Mission-derived tasks.
+- Replay failure occurs before target-game deletion.
+- Startup and replay reject MissionGraph research authority with claimable,
+  in-flight, verifying, uncertain, or revivable legacy research execution.
+- A READY task created after preflight but before BEGIN IMMEDIATE is acquired is
+  observed by the locked re-read and cannot survive activation.
+- Research, Contract, and legacy execution disposition commit atomically; no
+  old research work remains claimable or revivable and legacy writes fail
+  afterward.
+- With research MissionGraph-owned and civic legacy-owned, MissionGraph-owned
+  research strategic writes may pass scope validation, while writes targeting
+  legacy-owned non-research scopes are rejected.
+- Ordinary Ticks neither precede nor overlap the Decision/Activation Tick.
+- Routing consumes only the active Contract/Mission revision; stale revisions
+  cannot create claimable work.
+- Proposal application creates no StoredTask and non-research scopes remain
+  unchanged.
+- An unresolved Phase 1B Proposal wait remains OPEN and decidable after upgrade.
+- One or multiple historical resumed OPEN Proposals migrate idempotently to
+  PRE_PHASE1C_WAIT_RELEASED invalidation unless a stale reason takes precedence;
+  their source-bound canonical times are stable across startup and replay.
+- Migration rejects a forged timestamp before or unequal to its causal frontier
+  and leaves the existing target database untouched, while valid Phase 1B data
+  migrates, reopens, exports, imports into an empty store, and re-exports
+  semantically unchanged.
+- Generic Proposal resume fails after enablement, supported terminal Request
+  resume remains unchanged, and migration writes no approval or activation.
+- Enabled startup/replay contains no OPEN Proposal with WaitResumedTick.
+- The feature remains dormant until PR 1C-3.
 
 ### Rollback
 
-Drain or reconcile research ActionAttempts and approvals, then atomically
-switch research back to a compatible legacy baseline. Never dual-write.
+Before PR 1C-3 enablement, disable the dormant gate or roll back code; no
+persisted authority switch has occurred. After a game completes research
+activation, Phase 1C provides no automatic reverse switch or revision
+revocation. Pause new research work and require human handling. Any future
+reverse migration requires a separate ADR and OpenSpec Change and must append a
+new forward revision without deleting, modifying, or revoking an effective
+revision.
 
 ### Exit criteria
 
-- Research strategy is only MissionGraph-owned.
-- Research execution is only StoredTask-owned.
-- No second Engine exists.
-- Provider, approval, attempt, and fresh-verification tests pass.
-- Other scopes are unchanged.
+- Each Proposal has exactly one derived OPEN, APPROVED, REJECTED, or
+  INVALIDATED disposition from canonical durable facts.
+- Every Phase 1B released OPEN Proposal is invalidated before enablement, and
+  Proposal-ready waits can then leave only through APPROVE or REJECT.
+- Approved content, Contract revision, ContractCommit, Applied Tick, the
+  Proposal-derived ACTIVE research Mission, and AuthorityScopeSet are one atomic
+  aggregate; all
+  Mission identities/revisions agree and routing can emit only set_research.
+- Research strategy is MissionGraph-owned only after legacy execution is
+  quiescent and legacy research writes are closed by the successful activation.
+- Research execution remains solely StoredTask-owned until Phase 3, with
+  complete current Contract/Mission provenance required for post-cutover
+  research task mutation.
+- Startup, replay, concurrency, crash recovery, and protected Tick
+  ordering pass.
+- Non-research scopes are unchanged and no second Engine or Store exists.
 
 ### Deletion criteria
 
-Delete research legacy writes only after rollback and historical reads are
-proven. Shared types remain while other scopes use them.
+Delete no shared legacy type or table in Phase 1C. Research-specific legacy
+writes may be removed only after rollback, historical reads, replay, and
+control surfaces are proven. Shared structures remain while other scopes use
+them.
 
 ### Explicitly not done
 
-No other scope migration, StateDelta repair, TurnActionGraph authority,
-BatchExecutor extraction, or speculative full Contract Schema.
+No Proposal editing, automatic approval, automatic rebase, revision revocation,
+multi-approver or approval-permission system, non-research authority switch,
+general MissionGraph editor, direct StoredTask creation from Proposal,
+TurnActionGraph authority, BatchExecutor extraction, or general task
+orchestration rewrite.
 
-## 5. Phase 2: StateDelta and Local Mission Repair
+## 6. Phase 2: StateDelta and Local Mission Repair
 
 ### Goal
 
@@ -368,7 +701,7 @@ be removed only after replay proves parity.
 No graph database, event-sourcing framework, generic Patch engine, automatic
 full rewrite, or expansion to unmigrated scopes.
 
-## 6. Phase 3: TurnActionGraph
+## 7. Phase 3: TurnActionGraph
 
 ### Goal
 
@@ -447,7 +780,7 @@ validated. Shared `workflow_tasks` remains for unmigrated scopes.
 No BatchExecutor extraction, parallel mutation, generic DAG platform, or
 other scope migration.
 
-## 7. Phase 4: BatchExecutor
+## 8. Phase 4: BatchExecutor
 
 ### Goal
 
@@ -524,13 +857,12 @@ BatchExecutor and replay parity passes.
 No multi-mutation Tick, parallel game writes, distributed queue, generic
 workflow language, Barrier plugins, or Planner fallback in Executor.
 
-## 8. Phase 5: Migrate Remaining Strategic Scopes
+## 9. Phase 5: Migrate Remaining Strategic Scopes
 
 Suggested order:
 
 ```text
-research
--> civic
+civic
 -> opening strategy
 -> settler
 -> city roles
@@ -538,7 +870,8 @@ research
 -> tactical/emergency
 ```
 
-Each scope repeats the Phase 1B authority protocol and uses the StateDelta,
+Research has already exercised the Phase 1C decision and activation protocol.
+Each remaining scope repeats that authority protocol and uses the StateDelta,
 MissionGraphPatch, TurnActionGraph, and BatchExecutor capabilities already
 proven. Order changes require an explicit reviewed plan.
 
@@ -577,29 +910,40 @@ migration audit, replay fixtures, and control-surface reads.
 | OPEN/REQUESTED DecisionGap | Complete or supersede before switch |
 | Active PlannerRequest | Complete, supersede, or explicitly migrate |
 | PlanLease | Invalidate, complete, or block switch |
-| READY StoredTask | Cancel or supersede the old task, or create a deterministic Mission-derived replacement in the controlled switch transaction or explicit migration step |
-| VERIFYING StoredTask | Finish fresh verification before switch |
-| UNCERTAIN ActionAttempt | Reconcile manually or from facts; never generate equivalent replacement mutation |
+| PENDING, READY, BLOCKED, FAILED, ESCALATED StoredTask | Move to CANCELLED under the authority-switch lock and audit previous state plus reason |
+| AWAITING_CONFIRMATION StoredTask | Cancel task and close legacy confirmation under the same lock |
+| RUNNING StoredTask | Block switch until mutation-boundary recovery completes |
+| VERIFYING StoredTask | Block switch until fresh verification completes |
+| UNCERTAIN StoredTask | Block switch until fact-based or human reconciliation completes |
+| PREPARED, VERIFYING, UNCERTAIN ActionAttempt | Block switch regardless of StoredTask state |
+| DONE, CANCELLED, EXPIRED StoredTask | Preserve as inert history when no unresolved Attempt exists |
 | Pending approval | Complete, invalidate, or resubmit on new revision |
 | Provider BACKOFF | Preserve ordinary budget semantics; migration cannot bypass it |
 
-An UNCERTAIN ActionAttempt blocks any switch that could generate the same
-semantic mutation.
+The authority-switch transaction re-reads every affected task, all Attempts,
+and pending confirmations while holding its writer lock. Preflight cleanup is
+not authoritative. A task created after preflight is cancelled under the lock
+or blocks the switch, and no unresolved mutation may survive.
 
-Any READY StoredTask conversion creates a new task referencing the current
-Contract and Mission revision, records old-to-new audit linkage, leaves the old
-task unclaimable, and does not rewrite old provenance in place. The migration
-must leave at most one equivalent action claimable.
+The authority-switch transaction does not create a Mission-derived StoredTask.
+After activation and its dedicated Tick complete, later Routing may create a
+replacement only through deterministic projection from the current Contract
+and Mission revision and the normal Planner lifecycle. It records old-to-new
+audit association, leaves the old task unclaimable, does not rewrite old
+provenance, and leaves at most one equivalent action claimable.
 
 ### Tests
 
 - Scope-specific safety and behavior characterization.
 - Authority Scope Set has one writer per scope.
-- With research MissionGraph-owned and civic legacy-owned, a research Patch is
-  accepted and a civic Patch is rejected deterministically.
+- With research MissionGraph-owned and civic legacy-owned, MissionGraph-owned
+  research strategic writes may pass scope validation, while writes targeting
+  legacy-owned non-research scopes are rejected.
 - No equivalent legacy/new action is claimable.
-- A legacy READY research task is cancelled or superseded during authority
-  switch, with at most one Mission-derived replacement claimable.
+- All safely disposable legacy execution is cancelled under the switch lock;
+  in-flight, verifying, or uncertain work blocks activation, and startup/replay
+  reject a switched scope with claimable or revivable legacy execution.
+- A READY task created after preflight cannot survive the locked re-read.
 - Active-object migration and rollback fixtures.
 - Multi-game isolation, replay, approvals, crash injection, and rebaseline.
 - Unmigrated scopes remain unchanged.
@@ -626,7 +970,7 @@ and tables remain until no scope uses them.
 No bulk all-scope switch, production dual write, shadow Planner call, inferred
 authority from deployment, or unrelated semantics redesign.
 
-## 9. Phase 6: Delete Legacy Authorities
+## 10. Phase 6: Delete Legacy Authorities
 
 ### Goal
 
@@ -697,7 +1041,7 @@ and types no longer depend on them.
 No deletion merely because a replacement exists, no table-first cleanup, and
 no loss of audit records required for recovery.
 
-## 10. Phase 7: Shrink WorkflowRuntime
+## 11. Phase 7: Shrink WorkflowRuntime
 
 ### Goal
 
@@ -764,7 +1108,7 @@ replay use the converged Runtime and characterization tests pass.
 No second runtime, service mesh, deployment redesign, UI redesign, or generic
 agent platform.
 
-## 11. Program Completion
+## 12. Program Completion
 
 Migration completes only when one StrategicContract root governs each game
 session, every Strategic Scope has MissionGraph authority, every action has
