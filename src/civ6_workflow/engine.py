@@ -1371,14 +1371,15 @@ class WorkflowEngine:
         self, snapshot: RuntimeSnapshot, events: list[GameEvent]
     ) -> AgentRequest:
         context = self.store.current_context(snapshot.game_id)
-        active_execution = self.store.active_execution_missions(snapshot.game_id)
+        active_contract = self.store.get_active_strategic_contract(snapshot.game_id)
         owned_scopes = (
             set()
-            if active_execution is None
-            else set(active_execution[0].authority_scope_set.mission_graph_scopes)
+            if active_contract is None
+            else set(active_contract.authority_scope_set.mission_graph_scopes)
         )
         research_authoritative = "research" in owned_scopes
         civic_authoritative = "civic" in owned_scopes
+        opening_authoritative = "opening_strategy" in owned_scopes
         if research_authoritative or civic_authoritative:
             context = dict(context)
             strategy = context.get("strategy")
@@ -1451,6 +1452,7 @@ class WorkflowEngine:
                 ],
                 "supported_lease_condition_types": sorted(LEASE_CONDITION_TYPES),
                 "strategy_queue_fields": strategy_queue_fields,
+                "strategy_updates_allowed": not opening_authoritative,
                 "task_postconditions_required": True,
                 "max_tasks": max_tasks,
                 "max_agent_calls_this_turn": self.config.max_agent_calls_per_turn,

@@ -420,15 +420,26 @@ class PlannerLifecycleCoordinator:
         decision_events = list(
             current_events if current_events is not None else agent_events
         )
-        research_authoritative = (
-            engine.store.active_research_mission(game_id) is not None
+        active_contract = engine.store.get_active_strategic_contract(game_id)
+        owned_scopes = (
+            set()
+            if active_contract is None
+            else set(active_contract.authority_scope_set.mission_graph_scopes)
         )
-        if research_authoritative:
+        closed_event_types = set()
+        if "research" in owned_scopes:
+            closed_event_types.update(
+                {"research_direction_required", "research_unavailable"}
+            )
+        if "civic" in owned_scopes:
+            closed_event_types.update({"civic_direction_required", "civic_unavailable"})
+        if "opening_strategy" in owned_scopes:
+            closed_event_types.add("opening_strategy_required")
+        if closed_event_types:
             decision_events = [
                 event
                 for event in decision_events
-                if event.event_type
-                not in {"research_direction_required", "research_unavailable"}
+                if event.event_type not in closed_event_types
             ]
         if engine.config.max_agent_calls_per_turn > 0 and not any(
             event.event_type in STRATEGIC_GAP_TYPES for event in decision_events
@@ -437,7 +448,7 @@ class PlannerLifecycleCoordinator:
                 observation,
                 existing_events=decision_events,
             )
-            if research_authoritative:
+            if "research" in owned_scopes:
                 opening_events = [
                     event
                     for event in opening_events

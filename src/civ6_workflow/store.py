@@ -73,8 +73,10 @@ from .domain import (
     build_strategic_proposal_wait_resume_request,
     build_strategic_contract_id,
     StrategicContractCommit,
+    opening_strategy_mission_policy,
     research_mission_action,
     strategic_mission_action,
+    validate_scope_activation_mission,
     RuntimeState,
     ScopeAuthorityActivatedTick,
     TickOutcomeKind,
@@ -4620,7 +4622,7 @@ class WorkflowStore:
             }
             added_ids = set(result_missions) - set(base_missions)
             if (
-                scope != "civic"
+                scope not in {"civic", "opening_strategy"}
                 or scope in base.authority_scope_set.mission_graph_scopes
                 or commit.contract.authority_scope_set.mission_graph_scopes
                 != expected_scopes
@@ -4644,7 +4646,7 @@ class WorkflowStore:
             ):
                 raise ValueError("scope activation aggregate evidence disagrees")
             for mission_id in commit.source_scope_mission_ids:
-                strategic_mission_action(result_missions[mission_id])
+                validate_scope_activation_mission(result_missions[mission_id], scope)
             for disposition in tick.legacy_dispositions:
                 identity = (tick.game_session_id, disposition.object_id)
                 if disposition.object_kind == "decision_gap":
@@ -4705,33 +4707,57 @@ class WorkflowStore:
             PlanLeaseStatus.INVALIDATED,
         }
         for game_id, contract in active_contracts.items():
-            if "civic" not in contract.authority_scope_set.mission_graph_scopes:
-                continue
-            for (gap_game_id, _gap_id), gap in gaps.items():
-                if (
-                    gap_game_id == game_id
-                    and cls._decision_gap_targets_scope(gap, "civic")
-                    and gap.status not in terminal_gap_statuses
-                ):
-                    raise ValueError(
-                        "active civic authority retains a nonterminal legacy DecisionGap"
+            owned_migration_scopes = set(
+                contract.authority_scope_set.mission_graph_scopes
+            ).intersection({"civic", "opening_strategy"})
+            for scope in owned_migration_scopes:
+                for (gap_game_id, _gap_id), gap in gaps.items():
+                    if (
+                        gap_game_id == game_id
+                        and cls._decision_gap_targets_scope(gap, scope)
+                        and gap.status not in terminal_gap_statuses
+                    ):
+                        raise ValueError(
+                            f"active {scope} authority retains a nonterminal "
+                            "legacy DecisionGap"
+                        )
+                targeted_leases = []
+                for (lease_game_id, _lease_id), lease in leases.items():
+                    if lease_game_id != game_id:
+                        continue
+                    direct_tokens = {
+                        str(lease.scope).strip().lower(),
+                        *(str(slot).strip().lower() for slot in lease.covered_slots),
+                    }
+                    aliases = cls._scope_aliases(scope)
+                    targets_scope = any(
+                        alias in token for alias in aliases for token in direct_tokens
+                    ) or any(
+                        cls._decision_gap_targets_scope(gaps[(game_id, gap_id)], scope)
+                        for gap_id in lease.decision_gap_ids
+                        if (game_id, gap_id) in gaps
                     )
-            for (lease_game_id, _lease_id), lease in leases.items():
-                if lease_game_id != game_id or lease.status in terminal_lease_statuses:
-                    continue
-                direct_tokens = {
-                    str(lease.scope).strip().lower(),
-                    *(str(slot).strip().lower() for slot in lease.covered_slots),
-                }
-                targets_civic = any("civic" in token for token in direct_tokens) or any(
-                    cls._decision_gap_targets_scope(gaps[(game_id, gap_id)], "civic")
-                    for gap_id in lease.decision_gap_ids
-                    if (game_id, gap_id) in gaps
-                )
-                if targets_civic:
-                    raise ValueError(
-                        "active civic authority retains a nonterminal legacy PlanLease"
-                    )
+                    if not targets_scope:
+                        continue
+                    targeted_leases.append(lease)
+                    if lease.status not in terminal_lease_statuses:
+                        raise ValueError(
+                            f"active {scope} authority retains a nonterminal "
+                            "legacy PlanLease"
+                        )
+                if scope == "opening_strategy":
+                    for lease in targeted_leases:
+                        for task_id in lease.task_ids:
+                            task = stored_tasks.get((game_id, task_id))
+                            if task is not None and task.status not in {
+                                TaskStatus.DONE,
+                                TaskStatus.CANCELLED,
+                                TaskStatus.EXPIRED,
+                            }:
+                                raise ValueError(
+                                    "active opening_strategy authority retains "
+                                    "child-scope legacy execution"
+                                )
 
         proposal_revisions_by_game: dict[str, set[int]] = {}
         for commit in commits:
@@ -5185,12 +5211,12 @@ class WorkflowStore:
             active = contracts[(game_id, active_revision)]
             unsupported_scopes = set(
                 active.authority_scope_set.mission_graph_scopes
-            ) - {"research", "civic"}
+            ) - {"research", "civic", "opening_strategy"}
             if unsupported_scopes:
                 raise ValueError("active Contract contains an unsupported scope")
             owned_scopes = set(
                 active.authority_scope_set.mission_graph_scopes
-            ).intersection({"research", "civic"})
+            ).intersection({"research", "civic", "opening_strategy"})
             if not owned_scopes:
                 continue
             active_commit = commits.get((game_id, active_revision))
@@ -5236,8 +5262,19 @@ class WorkflowStore:
                 mission.mission_id: mission for mission in active_missions
             }
             for mission in active_missions:
-                strategic_mission_action(mission)
+                validate_scope_activation_mission(mission, mission.scope)
             for scope in owned_scopes:
+                if scope == "opening_strategy":
+                    activation_ticks = [
+                        tick
+                        for tick in scope_ticks.values()
+                        if tick.game_session_id == game_id and tick.scope == scope
+                    ]
+                    if len(activation_ticks) != 1:
+                        raise ValueError(
+                            "opening_strategy authority requires one activation Tick"
+                        )
+                    continue
                 action_type = "set_research" if scope == "research" else "set_civic"
                 legacy_tasks = {
                     task_id: task
@@ -5288,7 +5325,9 @@ class WorkflowStore:
                         if tick.game_session_id == game_id and tick.scope == scope
                     ]
                     if len(activation_ticks) != 1:
-                        raise ValueError("civic authority requires one activation Tick")
+                        raise ValueError(
+                            f"{scope} authority requires one activation Tick"
+                        )
             for (task_game, _task_id), task in tasks.items():
                 if task_game != game_id or task.source_contract_id is None:
                     continue
@@ -6382,15 +6421,58 @@ class WorkflowStore:
         turn_number: int,
         activated_at: datetime,
     ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]:
+        return self._activate_scope_authority(
+            scope="civic",
+            game_session_id=game_session_id,
+            expected_base_revision=expected_base_revision,
+            mission=mission,
+            activation_id=activation_id,
+            observation_id=observation_id,
+            turn_number=turn_number,
+            activated_at=activated_at,
+        )
+
+    def activate_opening_strategy_authority(
+        self,
+        *,
+        game_session_id: str,
+        expected_base_revision: int,
+        mission: Mission,
+        activation_id: str,
+        observation_id: str,
+        turn_number: int,
+        activated_at: datetime,
+    ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]:
+        return self._activate_scope_authority(
+            scope="opening_strategy",
+            game_session_id=game_session_id,
+            expected_base_revision=expected_base_revision,
+            mission=mission,
+            activation_id=activation_id,
+            observation_id=observation_id,
+            turn_number=turn_number,
+            activated_at=activated_at,
+        )
+
+    def _activate_scope_authority(
+        self,
+        *,
+        scope: str,
+        game_session_id: str,
+        expected_base_revision: int,
+        mission: Mission,
+        activation_id: str,
+        observation_id: str,
+        turn_number: int,
+        activated_at: datetime,
+    ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]:
         if activated_at.tzinfo is None or activated_at.utcoffset() is None:
             raise ValueError("scope activation time must include a timezone")
-        if mission.scope != "civic" or mission.status is not MissionStatus.ACTIVE:
-            raise ValueError(
-                "civic authority activation requires one ACTIVE civic Mission"
-            )
-        strategic_mission_action(mission)
+        if scope not in {"civic", "opening_strategy"}:
+            raise ValueError(f"scope authority activation is unsupported: {scope}")
+        validate_scope_activation_mission(mission, scope)
         digest = hashlib.sha256(
-            f"{game_session_id}\0civic\0{activation_id}".encode("utf-8")
+            f"{game_session_id}\0{scope}\0{activation_id}".encode("utf-8")
         ).hexdigest()[:24]
         commit_id = f"scope_commit_{digest}"
         tick_id = f"scope_activation_{digest}"
@@ -6411,10 +6493,20 @@ class WorkflowStore:
                 existing_tick = self._workflow_tick_from_row(dict(tick_row))
                 if (
                     existing_commit.source_scope_activation_id != activation_id
-                    or existing_commit.source_scope != "civic"
+                    or existing_commit.source_scope != scope
                     or existing_commit.expected_base_revision != expected_base_revision
                     or existing_commit.source_scope_mission_ids != (mission.mission_id,)
+                    or next(
+                        (
+                            item
+                            for item in existing_commit.contract.mission_graph.missions
+                            if item.mission_id == mission.mission_id
+                        ),
+                        None,
+                    )
+                    != mission
                     or not isinstance(existing_tick, ScopeAuthorityActivatedTick)
+                    or existing_tick.scope != scope
                     or existing_tick.observation_ids != (observation_id,)
                     or existing_tick.turn_number != turn_number
                     or existing_tick.completed_at != activated_at
@@ -6434,7 +6526,7 @@ class WorkflowStore:
                 or str(root["contract_id"]) != mission.contract_id
             ):
                 raise StaleStrategicContractBaseError(
-                    "stale civic authority activation Contract base"
+                    f"stale {scope} authority activation Contract base"
                 )
             base_row = conn.execute(
                 "SELECT * FROM strategic_contract_revisions "
@@ -6442,10 +6534,10 @@ class WorkflowStore:
                 (game_session_id, expected_base_revision),
             ).fetchone()
             if base_row is None:
-                raise ValueError("civic authority activation base is missing")
+                raise ValueError(f"{scope} authority activation base is missing")
             base = self._contract_from_revision_row(base_row)
-            if "civic" in base.authority_scope_set.mission_graph_scopes:
-                raise ValueError("civic authority is already active")
+            if scope in base.authority_scope_set.mission_graph_scopes:
+                raise ValueError(f"{scope} authority is already active")
             if (
                 mission.game_session_id != game_session_id
                 or mission.contract_id != base.contract_id
@@ -6455,21 +6547,21 @@ class WorkflowStore:
                     for item in base.mission_graph.missions
                 )
             ):
-                raise ValueError("civic activation Mission identity is invalid")
+                raise ValueError(f"{scope} activation Mission identity is invalid")
             observation_row = conn.execute(
                 "SELECT * FROM normalized_observations WHERE observation_id=?",
                 (observation_id,),
             ).fetchone()
             if observation_row is None:
-                raise ValueError("civic activation Observation is missing")
+                raise ValueError(f"{scope} activation Observation is missing")
             observation = self._observation_from_row(observation_row)
             if (
                 observation.game_session_id != game_session_id
                 or observation.turn_number != turn_number
-                or not observation.completeness.supports_scope("civic")
+                or not observation.completeness.supports_scope(scope)
             ):
                 raise ValueError(
-                    "civic activation requires a complete same-turn Observation"
+                    f"{scope} activation requires a complete same-turn Observation"
                 )
 
             active_request_statuses = {
@@ -6486,7 +6578,7 @@ class WorkflowStore:
             ).fetchall()
             for row in gap_rows:
                 gap = DecisionGap.model_validate_json(str(row["gap_json"]))
-                if not self._decision_gap_targets_scope(gap, "civic"):
+                if not self._decision_gap_targets_scope(gap, scope):
                     continue
                 if gap.logical_request_id is not None:
                     request_row = conn.execute(
@@ -6499,7 +6591,7 @@ class WorkflowStore:
                         and str(request_row["status"]) in active_request_statuses
                     ):
                         raise ValueError(
-                            "civic activation is blocked by an active PlannerRequest"
+                            f"{scope} activation is blocked by an active PlannerRequest"
                         )
                 if gap.status not in {
                     DecisionGapStatus.RULE_RESOLVED,
@@ -6514,7 +6606,7 @@ class WorkflowStore:
                         update={
                             "status": DecisionGapStatus.SUPERSEDED,
                             "resolution_reason": (
-                                "superseded by civic MissionGraph authority activation"
+                                f"superseded by {scope} MissionGraph authority activation"
                             ),
                             "updated_at": activated_at,
                         }
@@ -6529,16 +6621,16 @@ class WorkflowStore:
                         )
                     )
 
+            scope_lease_task_ids: set[str] = set()
             lease_rows = conn.execute(
                 "SELECT * FROM plan_leases WHERE game_id=?",
                 (game_session_id,),
             ).fetchall()
             for row in lease_rows:
                 lease = PlanLease.model_validate_json(str(row["lease_json"]))
-                if not self._plan_lease_targets_scope_in_connection(
-                    conn, lease, "civic"
-                ):
+                if not self._plan_lease_targets_scope_in_connection(conn, lease, scope):
                     continue
+                scope_lease_task_ids.update(lease.task_ids)
                 if lease.status not in {
                     PlanLeaseStatus.COMPLETED,
                     PlanLeaseStatus.EXPIRED,
@@ -6549,7 +6641,7 @@ class WorkflowStore:
                         update={
                             "status": PlanLeaseStatus.INVALIDATED,
                             "invalidation_reason": (
-                                "invalidated by civic MissionGraph authority activation"
+                                f"invalidated by {scope} MissionGraph authority activation"
                             ),
                         }
                     )
@@ -6564,10 +6656,20 @@ class WorkflowStore:
                         )
                     )
 
-            task_rows = conn.execute(
-                "SELECT * FROM workflow_tasks WHERE game_id=? AND action_type=?",
-                (game_session_id, "set_civic"),
-            ).fetchall()
+            if scope == "civic":
+                task_rows = conn.execute(
+                    "SELECT * FROM workflow_tasks WHERE game_id=? AND action_type=?",
+                    (game_session_id, "set_civic"),
+                ).fetchall()
+            elif scope_lease_task_ids:
+                placeholders = ",".join("?" for _ in scope_lease_task_ids)
+                task_rows = conn.execute(
+                    "SELECT * FROM workflow_tasks WHERE game_id=? "
+                    f"AND task_id IN ({placeholders})",
+                    (game_session_id, *sorted(scope_lease_task_ids)),
+                ).fetchall()
+            else:
+                task_rows = ()
             unresolved_statuses = {
                 AttemptStatus.PREPARED,
                 AttemptStatus.VERIFYING,
@@ -6601,7 +6703,15 @@ class WorkflowStore:
                     attempt.status in unresolved_statuses for attempt in attempts
                 ):
                     raise ValueError(
-                        "civic activation is blocked by unresolved legacy execution"
+                        f"{scope} activation is blocked by unresolved legacy execution"
+                    )
+                if scope == "opening_strategy" and task.status not in {
+                    TaskStatus.DONE,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.EXPIRED,
+                }:
+                    raise ValueError(
+                        "opening_strategy activation cannot dispose child-scope tasks"
                     )
                 if task.status in disposable_task_statuses:
                     self._set_execution_task_status_in_connection(
@@ -6609,7 +6719,7 @@ class WorkflowStore:
                         game_session_id,
                         task.task_id,
                         TaskStatus.CANCELLED,
-                        error="cancelled by civic authority activation",
+                        error=f"cancelled by {scope} authority activation",
                         increment_retry=False,
                         approved_by=task.approved_by,
                     )
@@ -6636,7 +6746,7 @@ class WorkflowStore:
                             sorted(
                                 {
                                     *base.authority_scope_set.mission_graph_scopes,
-                                    "civic",
+                                    scope,
                                 }
                             )
                         )
@@ -6659,9 +6769,9 @@ class WorkflowStore:
                 expected_base_revision=expected_base_revision,
                 contract=contract,
                 committed_at=activated_at,
-                reason="deterministic civic authority migration",
+                reason=f"deterministic {scope} authority migration",
                 source_scope_activation_id=activation_id,
-                source_scope="civic",
+                source_scope=scope,
                 source_scope_mission_ids=(mission.mission_id,),
             )
             dispositions_tuple = tuple(
@@ -6689,7 +6799,7 @@ class WorkflowStore:
                     started_at=activated_at,
                     completed_at=activated_at,
                     activation_id=activation_id,
-                    scope="civic",
+                    scope=scope,
                     contract_id=base.contract_id,
                     expected_base_revision=expected_base_revision,
                     activated_revision=contract.revision,
@@ -6737,7 +6847,7 @@ class WorkflowStore:
             )
             if updated.rowcount != 1:
                 raise StaleStrategicContractBaseError(
-                    "stale civic authority activation Contract base"
+                    f"stale {scope} authority activation Contract base"
                 )
             self._save_runtime_state_in_connection(
                 conn,
@@ -8681,13 +8791,15 @@ class WorkflowStore:
             if row is None:
                 return False, "plan lease was not found for this game"
             lease = PlanLease.model_validate_json(row["lease_json"])
-            active = self._active_execution_missions_in_connection(conn, game_id)
+            active = self._active_scope_missions_in_connection(conn, game_id)
             owned_scopes = (
                 set()
                 if active is None
                 else set(active[0].authority_scope_set.mission_graph_scopes)
             )
-            for scope in owned_scopes.intersection({"research", "civic"}):
+            for scope in owned_scopes.intersection(
+                {"research", "civic", "opening_strategy"}
+            ):
                 if self._plan_lease_targets_scope_in_connection(conn, lease, scope):
                     raise ValueError(f"legacy {scope} PlanLease writes are closed")
             if lease.status is not PlanLeaseStatus.AWAITING_APPROVAL:
@@ -8937,7 +9049,7 @@ class WorkflowStore:
             )
 
     @classmethod
-    def _active_execution_missions_in_connection(
+    def _active_scope_missions_in_connection(
         cls,
         conn: sqlite3.Connection,
         game_id: str,
@@ -8956,8 +9068,7 @@ class WorkflowStore:
             raise ValueError("active StrategicContract revision is missing")
         contract = cls._contract_from_revision_row(revision_row)
         owned_scopes = set(contract.authority_scope_set.mission_graph_scopes)
-        supported_scopes = owned_scopes.intersection({"research", "civic"})
-        if not supported_scopes:
+        if not owned_scopes:
             return None
         commit_row = conn.execute(
             "SELECT * FROM strategic_contract_commits "
@@ -8979,7 +9090,7 @@ class WorkflowStore:
                 (
                     mission
                     for mission in contract.mission_graph.missions
-                    if mission.scope in supported_scopes
+                    if mission.scope in owned_scopes
                     and mission.status is MissionStatus.ACTIVE
                 ),
                 key=lambda item: item.mission_id,
@@ -8989,9 +9100,26 @@ class WorkflowStore:
             raise ValueError(
                 "strategic authority resolves to multiple Missions per scope"
             )
-        for mission in missions:
-            strategic_mission_action(mission)
         return contract, missions
+
+    @classmethod
+    def _active_execution_missions_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+    ) -> tuple[StrategicContract, tuple[Mission, ...]] | None:
+        active = cls._active_scope_missions_in_connection(conn, game_id)
+        if active is None:
+            return None
+        contract, missions = active
+        executable = tuple(
+            mission for mission in missions if mission.scope in {"research", "civic"}
+        )
+        if not executable:
+            return None
+        for mission in executable:
+            strategic_mission_action(mission)
+        return contract, executable
 
     @classmethod
     def _active_research_mission_in_connection(
@@ -9504,6 +9632,20 @@ class WorkflowStore:
             for key in bundle.strategy_updates
         )
 
+    @staticmethod
+    def _bundle_contains_opening_strategy_write(bundle: PlanBundle) -> bool:
+        opening_keys = {
+            "opening",
+            "opening_strategy",
+            "victory_focus",
+            "stage",
+            "expansion_target",
+            "military_posture",
+        }
+        return any(
+            str(key).strip().lower() in opening_keys for key in bundle.strategy_updates
+        )
+
     @classmethod
     def _validate_research_task_authority_in_connection(
         cls,
@@ -9797,7 +9939,7 @@ class WorkflowStore:
             value is not None for value in provenance
         ):
             raise ValueError("task Contract/Mission provenance must be complete")
-        active = self._active_execution_missions_in_connection(conn, game_id)
+        active = self._active_scope_missions_in_connection(conn, game_id)
         if active is not None and source_contract_id is None:
             owned_scopes = set(active[0].authority_scope_set.mission_graph_scopes)
             if "research" in owned_scopes and self._bundle_contains_research_write(
@@ -9810,6 +9952,34 @@ class WorkflowStore:
                 raise ValueError(
                     "legacy civic plan writes are closed after authority cutover"
                 )
+            if (
+                "opening_strategy" in owned_scopes
+                and self._bundle_contains_opening_strategy_write(bundle)
+            ):
+                raise ValueError(
+                    "legacy opening strategy writes are closed after authority cutover"
+                )
+            if "opening_strategy" in owned_scopes and bundle.tasks:
+                incoming_task_ids = {task.task_id for task in bundle.tasks}
+                lease_rows = conn.execute(
+                    "SELECT lease_json FROM plan_leases WHERE game_id=?",
+                    (game_id,),
+                ).fetchall()
+                protected_task_ids = {
+                    task_id
+                    for row in lease_rows
+                    for lease in (
+                        PlanLease.model_validate_json(str(row["lease_json"])),
+                    )
+                    if self._plan_lease_targets_scope_in_connection(
+                        conn, lease, "opening_strategy"
+                    )
+                    for task_id in lease.task_ids
+                }
+                if incoming_task_ids.intersection(protected_task_ids):
+                    raise ValueError(
+                        "legacy opening strategy task identities cannot be revived"
+                    )
         created_from_observation_id = (
             observation_id or f"legacy:{game_id}:{turn}:{bundle.plan_id}"
         )
@@ -10436,8 +10606,20 @@ class WorkflowStore:
                 """,
                 (game_id,),
             ).fetchall()
+            active = self._active_scope_missions_in_connection(conn, game_id)
+        strategy_value = {} if strategy is None else self._load(strategy["state_json"])
+        if active is not None:
+            opening_missions = tuple(
+                mission for mission in active[1] if mission.scope == "opening_strategy"
+            )
+            if len(opening_missions) > 1:
+                raise ValueError(
+                    "opening strategy authority resolves to multiple Missions"
+                )
+            if opening_missions:
+                strategy_value = opening_strategy_mission_policy(opening_missions[0])
         return {
-            "strategy": {} if strategy is None else self._load(strategy["state_json"]),
+            "strategy": strategy_value,
             "cities": {
                 row["city_id"]: {
                     **self._load(row["plan_json"]),
@@ -11709,13 +11891,15 @@ class WorkflowStore:
         gap: DecisionGap,
         turn: int,
     ) -> None:
-        active = cls._active_execution_missions_in_connection(conn, gap.game_session_id)
+        active = cls._active_scope_missions_in_connection(conn, gap.game_session_id)
         owned_scopes = (
             set()
             if active is None
             else set(active[0].authority_scope_set.mission_graph_scopes)
         )
-        for scope in owned_scopes.intersection({"research", "civic"}):
+        for scope in owned_scopes.intersection(
+            {"research", "civic", "opening_strategy"}
+        ):
             if cls._decision_gap_targets_scope(gap, scope):
                 raise ValueError(f"legacy {scope} DecisionGap writes are closed")
         now = datetime.now(UTC).isoformat()
@@ -11805,8 +11989,19 @@ class WorkflowStore:
         return [DecisionGap.model_validate_json(row["gap_json"]) for row in rows]
 
     @staticmethod
-    def _decision_gap_targets_scope(gap: DecisionGap, scope: str) -> bool:
-        aliases = {scope, *(("tech", "technology") if scope == "research" else ())}
+    def _scope_aliases(scope: str) -> set[str]:
+        return {
+            scope,
+            *(
+                ("tech", "technology")
+                if scope == "research"
+                else (("opening",) if scope == "opening_strategy" else ())
+            ),
+        }
+
+    @classmethod
+    def _decision_gap_targets_scope(cls, gap: DecisionGap, scope: str) -> bool:
+        aliases = cls._scope_aliases(scope)
         tokens = {
             str(gap.scope).strip().lower(),
             str(gap.gap_type).strip().lower(),
@@ -11844,7 +12039,7 @@ class WorkflowStore:
     def _plan_lease_targets_scope_in_connection(
         conn: sqlite3.Connection, lease: PlanLease, scope: str
     ) -> bool:
-        aliases = {scope, *(("tech", "technology") if scope == "research" else ())}
+        aliases = WorkflowStore._scope_aliases(scope)
         direct_tokens = {
             str(lease.scope).strip().lower(),
             *(str(slot).strip().lower() for slot in lease.covered_slots),
@@ -11884,7 +12079,7 @@ class WorkflowStore:
             "WHERE game_id=? AND decision_gap_id=?",
             (game_id, record.proposal_id),
         ).fetchone()
-        aliases = {scope, *(("tech", "technology") if scope == "research" else ())}
+        aliases = cls._scope_aliases(scope)
         if gap is not None and any(
             alias in token
             for alias in aliases
@@ -11910,15 +12105,15 @@ class WorkflowStore:
     def _save_plan_lease_in_connection(
         cls, conn: sqlite3.Connection, lease: PlanLease
     ) -> None:
-        active = cls._active_execution_missions_in_connection(
-            conn, lease.game_session_id
-        )
+        active = cls._active_scope_missions_in_connection(conn, lease.game_session_id)
         owned_scopes = (
             set()
             if active is None
             else set(active[0].authority_scope_set.mission_graph_scopes)
         )
-        for scope in owned_scopes.intersection({"research", "civic"}):
+        for scope in owned_scopes.intersection(
+            {"research", "civic", "opening_strategy"}
+        ):
             if cls._plan_lease_targets_scope_in_connection(conn, lease, scope):
                 raise ValueError(f"legacy {scope} PlanLease writes are closed")
         conn.execute(
@@ -11959,13 +12154,15 @@ class WorkflowStore:
                 "decision transaction"
             )
         with self._connect() as conn:
-            active = self._active_execution_missions_in_connection(conn, game_id)
+            active = self._active_scope_missions_in_connection(conn, game_id)
             owned_scopes = (
                 set()
                 if active is None
                 else set(active[0].authority_scope_set.mission_graph_scopes)
             )
-            for scope in owned_scopes.intersection({"research", "civic"}):
+            for scope in owned_scopes.intersection(
+                {"research", "civic", "opening_strategy"}
+            ):
                 if self._legacy_approval_targets_scope_in_connection(
                     conn, game_id, record, scope
                 ):

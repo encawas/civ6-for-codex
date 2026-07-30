@@ -46,8 +46,10 @@ from .contracts import (
     build_mission_id,
     build_strategic_contract_id,
     civic_mission_action,
+    opening_strategy_mission_policy,
     research_mission_action,
     strategic_mission_action,
+    validate_scope_activation_mission,
 )
 from .decisions import (
     DECISION_INPUT_PROJECTION_VERSION,
@@ -208,7 +210,9 @@ __all__ = [
     "build_strategic_contract_id",
     "research_mission_action",
     "civic_mission_action",
+    "opening_strategy_mission_policy",
     "strategic_mission_action",
+    "validate_scope_activation_mission",
     "ACTIVE_TASK_STATUSES",
     "ProviderAttemptStatus",
     "ProviderAttempt",

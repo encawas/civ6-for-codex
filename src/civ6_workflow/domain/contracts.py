@@ -312,7 +312,7 @@ class StrategicContractCommit(DomainModel):
                     "Scope activation provenance must identify ACTIVE scoped Missions"
                 )
             for mission in matching:
-                strategic_mission_action(mission)
+                validate_scope_activation_mission(mission, scope)
 
 
 def research_mission_action(mission: Mission) -> str:
@@ -363,6 +363,50 @@ def civic_mission_action(mission: Mission) -> str:
     if not isinstance(civic, str) or not civic.strip():
         raise ValueError("civic Mission desired_outcome requires a civic identity")
     return "set_civic"
+
+
+def opening_strategy_mission_policy(mission: Mission) -> dict[str, object]:
+    """Validate the non-executable opening policy held by one Mission."""
+
+    if mission.scope != "opening_strategy":
+        raise ValueError("opening strategy Mission scope must be opening_strategy")
+    if mission.status is not MissionStatus.ACTIVE:
+        raise ValueError("opening strategy Mission must be ACTIVE")
+    desired_outcome = thaw_json(mission.desired_outcome)
+    if set(desired_outcome) != {"opening_strategy"}:
+        raise ValueError(
+            "opening strategy Mission desired_outcome must contain only "
+            "opening_strategy"
+        )
+    policy = desired_outcome["opening_strategy"]
+    if not isinstance(policy, dict) or not policy:
+        raise ValueError("opening strategy Mission requires a non-empty policy")
+
+    forbidden = {"action", "action_type", "tool", "tool_name", "operation"}
+
+    def contains_action_selector(value: object) -> bool:
+        if isinstance(value, dict):
+            return bool(forbidden.intersection(value)) or any(
+                contains_action_selector(item) for item in value.values()
+            )
+        if isinstance(value, list):
+            return any(contains_action_selector(item) for item in value)
+        return False
+
+    if contains_action_selector(policy):
+        raise ValueError("opening strategy policy cannot select an execution action")
+    return policy
+
+
+def validate_scope_activation_mission(mission: Mission, scope: str) -> None:
+    """Validate one Mission introduced by a reviewed authority switch."""
+
+    if mission.scope != scope:
+        raise ValueError("scope activation Mission belongs to another scope")
+    if scope == "opening_strategy":
+        opening_strategy_mission_policy(mission)
+        return
+    strategic_mission_action(mission)
 
 
 def strategic_mission_action(mission: Mission) -> str:

@@ -132,6 +132,14 @@ class ObservationCompleteness(DomainModel):
             return self.current_research and self.available_research
         if scope == "civic":
             return self.current_civic and self.available_civics
+        if scope == "opening_strategy":
+            return (
+                self.cities
+                and self.current_research
+                and self.available_research
+                and self.current_civic
+                and self.available_civics
+            )
         return False
 
 
