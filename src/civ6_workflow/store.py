@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .action_retry import FailedAttemptResolution, resolve_failed_attempt
 from .domain import (
+    ACTIVE_TURN_ACTION_NODE_STATUSES,
     ActionAttempt,
     ApprovalDecision,
     ApprovalRecord,
@@ -35,6 +36,7 @@ from .domain import (
     LogicalPlannerRequestCreatedTick,
     Mission,
     MissionGraph,
+    MissionStatus,
     MissionGraphPatch,
     MissionGraphPatchedTick,
     NormalizedObservation,
@@ -73,6 +75,9 @@ from .domain import (
     research_mission_action,
     RuntimeState,
     TickOutcomeKind,
+    TurnActionGraph,
+    TurnActionNode,
+    TurnActionNodeStatus,
     TurnTransitionConfirmedTick,
     WorkflowTick,
     validate_workflow_tick,
@@ -82,6 +87,7 @@ from .domain import (
     canonical_json_hash,
     thaw_json,
 )
+from .turn_compiler import turn_action_node_as_stored_task
 from .domain.planner import TERMINAL_PLANNER_STATUSES
 from .models import (
     AgentRequest,
@@ -600,11 +606,71 @@ CREATE TABLE IF NOT EXISTS strategic_proposal_wait_resume_requests (
 );
 """
 
+SCHEMA += """
+
+CREATE TABLE IF NOT EXISTS turn_action_graphs (
+    graph_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    turn INTEGER NOT NULL CHECK (turn >= 0),
+    source_observation_id TEXT NOT NULL,
+    source_contract_id TEXT NOT NULL,
+    source_contract_revision INTEGER NOT NULL CHECK (source_contract_revision >= 1),
+    graph_json TEXT NOT NULL,
+    compiled_at TEXT NOT NULL,
+    UNIQUE (game_id, turn, source_observation_id, source_contract_revision),
+    FOREIGN KEY (source_observation_id)
+        REFERENCES normalized_observations(observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS active_turn_action_graphs (
+    game_id TEXT PRIMARY KEY,
+    graph_id TEXT NOT NULL UNIQUE,
+    activated_at TEXT NOT NULL,
+    FOREIGN KEY (graph_id) REFERENCES turn_action_graphs(graph_id)
+);
+
+CREATE TABLE IF NOT EXISTS turn_action_nodes (
+    node_id TEXT PRIMARY KEY,
+    graph_id TEXT NOT NULL,
+    game_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 2,
+    last_error TEXT,
+    approved_by TEXT,
+    node_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (graph_id) REFERENCES turn_action_graphs(graph_id),
+    UNIQUE (graph_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_action_nodes_graph_status
+ON turn_action_nodes (graph_id, status, node_id);
+
+CREATE TABLE IF NOT EXISTS turn_action_legacy_dispositions (
+    disposition_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    graph_id TEXT NOT NULL,
+    node_id TEXT,
+    previous_status TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE (game_id, task_id),
+    FOREIGN KEY (graph_id) REFERENCES turn_action_graphs(graph_id),
+    FOREIGN KEY (node_id) REFERENCES turn_action_nodes(node_id)
+);
+"""
+
 REPLAY_STATE_TABLES = (
     "strategic_contract_roots",
     "strategic_contract_revisions",
     "strategic_contract_commits",
     "normalized_observations",
+    "turn_action_graphs",
+    "turn_action_nodes",
+    "active_turn_action_graphs",
+    "turn_action_legacy_dispositions",
     "observation_baseline_acceptances",
     "state_deltas",
     "strategy_state",
@@ -643,6 +709,13 @@ class WorkflowStore:
         "source_patch_mission_id",
         "source_patch_mission_revision",
     )
+    _ACTION_COMMIT_FIELDS = (
+        "source_action_attempt_id",
+        "source_turn_action_graph_id",
+        "source_turn_action_node_id",
+        "source_execution_mission_id",
+        "source_execution_mission_revision",
+    )
 
     def __init__(
         self,
@@ -656,10 +729,10 @@ class WorkflowStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > 12:
+            if version > 13:
                 raise ValueError(
                     f"unsupported workflow database version {version}; "
-                    "maximum supported version is 12"
+                    "maximum supported version is 13"
                 )
             conn.executescript(SCHEMA)
             self._migrate(conn)
@@ -867,10 +940,10 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > 12:
+        if version > 13:
             raise ValueError(
                 f"unsupported workflow database version {version}; "
-                "maximum supported version is 12"
+                "maximum supported version is 13"
             )
         upgraded_from_pre_v7 = version < 7
         if upgraded_from_pre_v7:
@@ -924,6 +997,13 @@ class WorkflowStore:
         else:
             WorkflowStore._validate_phase2_v12(conn)
 
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < 13:
+            WorkflowStore._migrate_phase3_v13(conn)
+            conn.execute("PRAGMA user_version=13")
+        else:
+            WorkflowStore._validate_phase3_v13(conn)
+
     @classmethod
     def _migrate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
         """Add the empty Contract aggregate tables without changing legacy authority."""
@@ -935,6 +1015,42 @@ class WorkflowStore:
         """Add empty accepted-Observation and StateDelta history."""
 
         cls._validate_phase2_v12(conn)
+
+    @classmethod
+    def _migrate_phase3_v13(cls, conn: sqlite3.Connection) -> None:
+        """Add empty TurnActionGraph execution authority tables."""
+
+        cls._validate_phase3_v13(conn)
+
+    @classmethod
+    def _validate_phase3_v13(cls, conn: sqlite3.Connection) -> None:
+        cls._validate_turn_action_state(
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM turn_action_graphs ORDER BY game_id, compiled_at"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM active_turn_action_graphs ORDER BY game_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM turn_action_nodes ORDER BY graph_id, node_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM turn_action_legacy_dispositions ORDER BY game_id, task_id"
+                ).fetchall()
+            ],
+            require_canonical=True,
+        )
 
     @classmethod
     def _validate_phase2_v12(cls, conn: sqlite3.Connection) -> None:
@@ -966,6 +1082,149 @@ class WorkflowStore:
             ],
             require_canonical=True,
         )
+        cls._validate_turn_action_authority_state(
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM turn_action_graphs ORDER BY game_id, compiled_at"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM active_turn_action_graphs ORDER BY game_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM turn_action_nodes ORDER BY graph_id, node_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM turn_action_legacy_dispositions "
+                    "ORDER BY game_id, task_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM normalized_observations ORDER BY game_id, observed_at"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_roots ORDER BY game_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_revisions "
+                    "ORDER BY game_id, revision"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_commits "
+                    "ORDER BY game_id, committed_revision"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM action_attempts "
+                    "ORDER BY game_id, task_id, attempt_number"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_tasks ORDER BY game_id, task_id"
+                ).fetchall()
+            ],
+            require_canonical=True,
+        )
+        active_rows = conn.execute(
+            """
+            SELECT graph.*
+            FROM active_turn_action_graphs AS active
+            JOIN turn_action_graphs AS graph ON graph.graph_id=active.graph_id
+            ORDER BY active.game_id
+            """
+        ).fetchall()
+        for graph_row in active_rows:
+            graph = cls._turn_action_graph_from_row(graph_row)
+            observation_row = conn.execute(
+                "SELECT * FROM normalized_observations WHERE observation_id=?",
+                (graph.source_observation_id,),
+            ).fetchone()
+            if observation_row is None:
+                raise ValueError("active TurnActionGraph source Observation is missing")
+            observation = cls._observation_from_row(observation_row)
+            if (
+                observation.game_session_id != graph.game_session_id
+                or observation.turn_number != graph.turn_number
+                or observation.projection_hash
+                != graph.source_observation_projection_hash
+            ):
+                raise ValueError(
+                    "active TurnActionGraph source Observation is inconsistent"
+                )
+            active = cls._active_research_mission_in_connection(
+                conn, graph.game_session_id
+            )
+            if active is None:
+                raise ValueError(
+                    "active TurnActionGraph has no active research authority"
+                )
+            contract, mission = active
+            if (
+                contract.contract_id != graph.source_contract_id
+                or contract.revision != graph.source_contract_revision
+            ):
+                raise ValueError("active TurnActionGraph Contract source is stale")
+            desired = thaw_json(mission.desired_outcome)
+            node_rows = conn.execute(
+                "SELECT * FROM turn_action_nodes WHERE graph_id=?",
+                (graph.graph_id,),
+            ).fetchall()
+            for node_row in node_rows:
+                node = TurnActionNode.model_validate_json(str(node_row["node_json"]))
+                if (
+                    node.source_mission_id != mission.mission_id
+                    or node.source_mission_revision != mission.mission_revision
+                    or node.action_type != research_mission_action(mission)
+                    or node.arguments.get("tech_or_civic") != desired["technology"]
+                ):
+                    raise ValueError(
+                        "active TurnActionNode Mission provenance is stale"
+                    )
+            duplicate = conn.execute(
+                """
+                SELECT task_id FROM workflow_tasks
+                WHERE game_id=? AND action_type='set_research'
+                  AND status IN (?, ?, ?, ?, ?, ?)
+                LIMIT 1
+                """,
+                (
+                    graph.game_session_id,
+                    TaskStatus.PENDING.value,
+                    TaskStatus.AWAITING_CONFIRMATION.value,
+                    TaskStatus.READY.value,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.VERIFYING.value,
+                    TaskStatus.UNCERTAIN.value,
+                ),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError(
+                    "StoredTask and TurnActionGraph expose duplicate research authority"
+                )
         cls._validate_phase2_patch_aggregate(
             [
                 dict(row)
@@ -1300,6 +1559,423 @@ class WorkflowStore:
         )
 
     @classmethod
+    def _validate_turn_action_state(
+        cls,
+        graphs: Sequence[Mapping[str, Any]],
+        active_graphs: Sequence[Mapping[str, Any]],
+        nodes: Sequence[Mapping[str, Any]],
+        dispositions: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        normalized_graphs = [
+            cls._normalize_turn_action_graph_row(row) for row in graphs
+        ]
+        normalized_nodes = [cls._normalize_turn_action_node_row(row) for row in nodes]
+        if require_canonical:
+            for label, source, normalized in (
+                ("TurnActionGraph", graphs, normalized_graphs),
+                ("TurnActionNode", nodes, normalized_nodes),
+            ):
+                for before, after in zip(source, normalized, strict=True):
+                    if dict(before) != after:
+                        raise ValueError(f"{label} row is not canonical")
+        graph_models = {
+            str(row["graph_id"]): TurnActionGraph.model_validate_json(
+                str(row["graph_json"])
+            )
+            for row in normalized_graphs
+        }
+        if len(graph_models) != len(normalized_graphs):
+            raise ValueError("duplicate TurnActionGraph identity")
+        node_models = {
+            str(row["node_id"]): TurnActionNode.model_validate_json(
+                str(row["node_json"])
+            )
+            for row in normalized_nodes
+        }
+        if len(node_models) != len(normalized_nodes):
+            raise ValueError("duplicate TurnActionNode identity")
+
+        nodes_by_graph: dict[str, list[TurnActionNode]] = {}
+        for node in node_models.values():
+            graph = graph_models.get(node.graph_id)
+            if (
+                graph is None
+                or node.game_session_id != graph.game_session_id
+                or node.turn_number != graph.turn_number
+                or node.source_observation_id != graph.source_observation_id
+                or node.source_observation_projection_hash
+                != graph.source_observation_projection_hash
+                or node.source_contract_id != graph.source_contract_id
+                or node.source_contract_revision != graph.source_contract_revision
+            ):
+                raise ValueError("TurnActionNode does not belong to its graph sources")
+            nodes_by_graph.setdefault(node.graph_id, []).append(node)
+        for graph in graph_models.values():
+            actual = tuple(
+                sorted(node.node_id for node in nodes_by_graph.get(graph.graph_id, []))
+            )
+            if actual != graph.node_ids:
+                raise ValueError("TurnActionGraph node set disagrees with node rows")
+
+        active_by_game: dict[str, str] = {}
+        for row in active_graphs:
+            game_id = str(row.get("game_id", ""))
+            graph_id = str(row.get("graph_id", ""))
+            activated_at = cls._parse_audit_datetime(
+                row.get("activated_at"), "active TurnActionGraph activated_at"
+            )
+            graph = graph_models.get(graph_id)
+            if (
+                not game_id
+                or graph is None
+                or graph.game_session_id != game_id
+                or game_id in active_by_game
+                or activated_at is None
+                or activated_at < graph.compiled_at
+            ):
+                raise ValueError("active TurnActionGraph row is invalid")
+            active_by_game[game_id] = graph_id
+            normalized_active = {
+                "game_id": game_id,
+                "graph_id": graph_id,
+                "activated_at": activated_at.isoformat(),
+            }
+            if require_canonical and dict(row) != normalized_active:
+                raise ValueError("active TurnActionGraph row is not canonical")
+
+        for row in normalized_nodes:
+            status = TurnActionNodeStatus(str(row["status"]))
+            if status in ACTIVE_TURN_ACTION_NODE_STATUSES and active_by_game.get(
+                str(row["game_id"])
+            ) != str(row["graph_id"]):
+                raise ValueError("inactive TurnActionGraph has an active node")
+
+        seen_dispositions: set[tuple[str, str]] = set()
+        for row in dispositions:
+            required = {
+                "disposition_id",
+                "game_id",
+                "task_id",
+                "graph_id",
+                "node_id",
+                "previous_status",
+                "disposition",
+                "occurred_at",
+            }
+            if required - row.keys():
+                raise ValueError("TurnActionGraph legacy disposition is incomplete")
+            game_id = str(row["game_id"])
+            task_id = str(row["task_id"])
+            graph = graph_models.get(str(row["graph_id"]))
+            node_id = None if row["node_id"] is None else str(row["node_id"])
+            occurred_at = cls._parse_audit_datetime(
+                row["occurred_at"], "legacy task disposition occurred_at"
+            )
+            if (
+                not game_id
+                or not task_id
+                or graph is None
+                or graph.game_session_id != game_id
+                or (node_id is not None and node_id not in graph.node_ids)
+                or occurred_at is None
+                or occurred_at < graph.compiled_at
+                or (game_id, task_id) in seen_dispositions
+            ):
+                raise ValueError("TurnActionGraph legacy disposition is invalid")
+            seen_dispositions.add((game_id, task_id))
+
+    @classmethod
+    def _validate_turn_action_authority_state(
+        cls,
+        graphs: Sequence[Mapping[str, Any]],
+        active_graphs: Sequence[Mapping[str, Any]],
+        nodes: Sequence[Mapping[str, Any]],
+        dispositions: Sequence[Mapping[str, Any]],
+        observations: Sequence[Mapping[str, Any]],
+        roots: Sequence[Mapping[str, Any]],
+        revisions: Sequence[Mapping[str, Any]],
+        commits: Sequence[Mapping[str, Any]],
+        action_attempts: Sequence[Mapping[str, Any]],
+        tasks: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        cls._validate_turn_action_state(
+            graphs,
+            active_graphs,
+            nodes,
+            dispositions,
+            require_canonical=require_canonical,
+        )
+        graph_models = {
+            str(row["graph_id"]): TurnActionGraph.model_validate_json(
+                str(cls._normalize_turn_action_graph_row(row)["graph_json"])
+            )
+            for row in graphs
+        }
+        node_models = {
+            str(row["node_id"]): TurnActionNode.model_validate_json(
+                str(cls._normalize_turn_action_node_row(row)["node_json"])
+            )
+            for row in nodes
+        }
+        observation_models = {
+            str(row["observation_id"]): NormalizedObservation.model_validate_json(
+                str(cls._normalize_observation_row(row)["observation_json"])
+            )
+            for row in observations
+        }
+        root_rows = {
+            str(row["game_id"]): cls._normalize_contract_root_row(row) for row in roots
+        }
+        revision_models = {
+            (
+                str(row["game_id"]),
+                int(row["revision"]),
+            ): StrategicContract.model_validate_json(
+                str(cls._normalize_contract_revision_row(row)["contract_json"])
+            )
+            for row in revisions
+        }
+        commit_models = {
+            (str(row["game_id"]), int(row["committed_revision"])): (
+                StrategicContractCommit.model_validate_json(
+                    str(cls._normalize_contract_commit_row(row)["commit_json"])
+                )
+            )
+            for row in commits
+        }
+        attempt_models = {
+            str(row["action_attempt_id"]): ActionAttempt.model_validate_json(
+                str(row["attempt_json"])
+            )
+            for row in action_attempts
+        }
+        action_commit_attempt_ids: set[str] = set()
+        for commit in commit_models.values():
+            if commit.source_action_attempt_id is None:
+                continue
+            attempt = attempt_models.get(commit.source_action_attempt_id)
+            graph = graph_models.get(str(commit.source_turn_action_graph_id))
+            node = node_models.get(str(commit.source_turn_action_node_id))
+            base = revision_models.get(
+                (commit.game_session_id, commit.expected_base_revision)
+            )
+            if (
+                attempt is None
+                or attempt.status is not AttemptStatus.SUCCEEDED
+                or graph is None
+                or node is None
+                or node.graph_id != graph.graph_id
+                or attempt.game_session_id != commit.game_session_id
+                or attempt.task_id != node.node_id
+                or attempt.action_type != node.action_type
+                or node.source_contract_id != commit.contract_id
+                or node.source_contract_revision != commit.expected_base_revision
+                or node.source_mission_id != commit.source_execution_mission_id
+                or node.source_mission_revision
+                != commit.source_execution_mission_revision
+                or base is None
+                or commit.source_action_attempt_id in action_commit_attempt_ids
+            ):
+                raise ValueError(
+                    "Action-derived Contract commit evidence is inconsistent"
+                )
+            action_commit_attempt_ids.add(commit.source_action_attempt_id)
+            base_missions = {
+                mission.mission_id: mission for mission in base.mission_graph.missions
+            }
+            result_missions = {
+                mission.mission_id: mission
+                for mission in commit.contract.mission_graph.missions
+            }
+            source = base_missions.get(node.source_mission_id)
+            result = result_missions.get(node.source_mission_id)
+            unchanged_ids = set(base_missions) - {node.source_mission_id}
+            if (
+                source is None
+                or result is None
+                or source.status is not MissionStatus.ACTIVE
+                or result.status is not MissionStatus.COMPLETED
+                or result.mission_revision != source.mission_revision + 1
+                or attempt.action_attempt_id not in result.evidence_refs
+                or any(
+                    result_missions.get(mission_id) != base_missions[mission_id]
+                    for mission_id in unchanged_ids
+                )
+                or set(result_missions) != set(base_missions)
+                or commit.contract.authority_scope_set != base.authority_scope_set
+                or commit.contract.strategic_objectives != base.strategic_objectives
+                or commit.contract.global_constraints != base.global_constraints
+                or commit.contract.policy_snapshot != base.policy_snapshot
+                or commit.contract.approval_status != base.approval_status
+            ):
+                raise ValueError(
+                    "Action-derived Contract commit changes unrelated strategy facts"
+                )
+        active_ids = {
+            str(row["game_id"]): str(row["graph_id"]) for row in active_graphs
+        }
+        for game_id, graph_id in active_ids.items():
+            graph = graph_models[graph_id]
+            observation = observation_models.get(graph.source_observation_id)
+            root = root_rows.get(game_id)
+            if (
+                observation is None
+                or observation.game_session_id != game_id
+                or observation.turn_number != graph.turn_number
+                or observation.projection_hash
+                != graph.source_observation_projection_hash
+                or root is None
+                or str(root["contract_id"]) != graph.source_contract_id
+                or int(root["active_revision"]) != graph.source_contract_revision
+            ):
+                raise ValueError("active TurnActionGraph sources are stale")
+            contract = revision_models.get((game_id, graph.source_contract_revision))
+            commit = commit_models.get((game_id, graph.source_contract_revision))
+            if contract is None or commit is None:
+                raise ValueError("active TurnActionGraph Contract audit is missing")
+            mission_id = commit.source_mission_id or commit.source_patch_mission_id
+            mission_revision = (
+                commit.source_mission_revision or commit.source_patch_mission_revision
+            )
+            missions = tuple(
+                mission
+                for mission in contract.mission_graph.missions
+                if mission.mission_id == mission_id
+                and mission.mission_revision == mission_revision
+            )
+            if (
+                "research" not in contract.authority_scope_set.mission_graph_scopes
+                or len(missions) != 1
+            ):
+                raise ValueError(
+                    "active TurnActionGraph has no unique research Mission"
+                )
+            mission = missions[0]
+            action_type = research_mission_action(mission)
+            desired = thaw_json(mission.desired_outcome)
+            for node_id in graph.node_ids:
+                node = node_models[node_id]
+                if (
+                    node.source_mission_id != mission.mission_id
+                    or node.source_mission_revision != mission.mission_revision
+                    or node.action_type != action_type
+                    or node.arguments.get("tech_or_civic") != desired["technology"]
+                ):
+                    raise ValueError(
+                        "active TurnActionNode Mission provenance is stale"
+                    )
+            for row in tasks:
+                if (
+                    str(row.get("game_id", "")) == game_id
+                    and str(row.get("action_type", "")) == "set_research"
+                    and TaskStatus(str(row.get("status")))
+                    in {
+                        TaskStatus.PENDING,
+                        TaskStatus.AWAITING_CONFIRMATION,
+                        TaskStatus.READY,
+                        TaskStatus.RUNNING,
+                        TaskStatus.VERIFYING,
+                        TaskStatus.UNCERTAIN,
+                    }
+                ):
+                    raise ValueError(
+                        "StoredTask and TurnActionGraph expose duplicate research authority"
+                    )
+
+    @classmethod
+    def _normalize_turn_action_node_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "node_id",
+            "graph_id",
+            "game_id",
+            "status",
+            "retry_count",
+            "max_retries",
+            "last_error",
+            "approved_by",
+            "node_json",
+            "updated_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"TurnActionNode row is missing columns: {sorted(missing)}"
+            )
+        try:
+            node = TurnActionNode.model_validate_json(str(normalized["node_json"]))
+            status = TurnActionNodeStatus(str(normalized["status"]))
+        except Exception as exc:
+            raise ValueError("invalid TurnActionNode row") from exc
+        updated_at = cls._parse_audit_datetime(
+            normalized["updated_at"], "TurnActionNode updated_at"
+        )
+        retry_count = int(normalized["retry_count"])
+        max_retries = int(normalized["max_retries"])
+        if (
+            node.node_id != str(normalized["node_id"])
+            or node.graph_id != str(normalized["graph_id"])
+            or node.game_session_id != str(normalized["game_id"])
+            or retry_count < 0
+            or max_retries < 0
+            or updated_at is None
+        ):
+            raise ValueError("TurnActionNode relational columns disagree with JSON")
+        normalized["status"] = status.value
+        normalized["retry_count"] = retry_count
+        normalized["max_retries"] = max_retries
+        normalized["updated_at"] = updated_at.isoformat()
+        normalized["node_json"] = cls._dump(node.model_dump(mode="json"))
+        return normalized
+
+    @classmethod
+    def _normalize_turn_action_graph_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "graph_id",
+            "game_id",
+            "turn",
+            "source_observation_id",
+            "source_contract_id",
+            "source_contract_revision",
+            "graph_json",
+            "compiled_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"TurnActionGraph row is missing columns: {sorted(missing)}"
+            )
+        try:
+            graph = TurnActionGraph.model_validate_json(str(normalized["graph_json"]))
+        except Exception as exc:
+            raise ValueError("invalid TurnActionGraph JSON") from exc
+        compiled_at = cls._parse_audit_datetime(
+            normalized["compiled_at"], "TurnActionGraph compiled_at"
+        )
+        turn = int(normalized["turn"])
+        revision = int(normalized["source_contract_revision"])
+        if (
+            graph.graph_id != str(normalized["graph_id"])
+            or graph.game_session_id != str(normalized["game_id"])
+            or graph.turn_number != turn
+            or graph.source_observation_id != str(normalized["source_observation_id"])
+            or graph.source_contract_id != str(normalized["source_contract_id"])
+            or graph.source_contract_revision != revision
+            or graph.compiled_at != compiled_at
+        ):
+            raise ValueError("TurnActionGraph relational columns disagree with JSON")
+        normalized["turn"] = turn
+        normalized["source_contract_revision"] = revision
+        normalized["compiled_at"] = compiled_at.isoformat()
+        normalized["graph_json"] = cls._dump(graph.model_dump(mode="json"))
+        return normalized
+
+    @classmethod
     def _normalize_contract_root_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
         normalized = dict(row)
         required = {"game_id", "contract_id", "active_revision", "created_at"}
@@ -1412,11 +2088,14 @@ class WorkflowStore:
         normalized["expected_base_revision"] = expected_base
         normalized["committed_revision"] = committed_revision
         source_payload = cls._load(str(normalized["commit_json"]))
-        commit_payload = (
-            commit.model_dump(mode="json")
-            if any(field in source_payload for field in cls._PATCH_COMMIT_FIELDS)
-            else cls._contract_commit_payload(commit)
-        )
+        commit_payload = cls._contract_commit_payload(commit)
+        complete_payload = commit.model_dump(mode="json")
+        for field_name in (
+            *cls._PATCH_COMMIT_FIELDS,
+            *cls._ACTION_COMMIT_FIELDS,
+        ):
+            if field_name in source_payload:
+                commit_payload[field_name] = complete_payload[field_name]
         normalized["commit_json"] = cls._dump(commit_payload)
         normalized["committed_at"] = committed_at.isoformat()
         return normalized
@@ -3823,7 +4502,11 @@ class WorkflowStore:
             commits_by_game_revision[
                 (commit.game_session_id, commit.contract.revision)
             ] = commit
-            if commit.source_proposal_id is None and commit.source_patch_id is None:
+            if (
+                commit.source_proposal_id is None
+                and commit.source_patch_id is None
+                and commit.source_action_attempt_id is None
+            ):
                 cls._validate_phase1b_contract_foundation(commit.contract)
                 if commit.contract.approval_status is not ApprovalStatus.NOT_REQUIRED:
                     raise ValueError(
@@ -3844,6 +4527,7 @@ class WorkflowStore:
             if (
                 commit.source_proposal_id is None
                 and commit.source_patch_id is None
+                and commit.source_action_attempt_id is None
                 and any(
                     revision < commit.contract.revision
                     for revision in proposal_revisions_by_game.get(
@@ -4298,9 +4982,10 @@ class WorkflowStore:
             if active_commit is None or (
                 active_commit.source_proposal_id is None
                 and active_commit.source_patch_id is None
+                and active_commit.source_action_attempt_id is None
             ):
                 raise ValueError(
-                    "research authority requires a Proposal or Patch-derived active revision"
+                    "research authority requires a derived active revision"
                 )
             proposal_commits = [
                 commit
@@ -4318,11 +5003,18 @@ class WorkflowStore:
             if len(applied) != 1:
                 raise ValueError("research authority requires one Applied Tick")
             active_mission_id = (
-                active_commit.source_mission_id or active_commit.source_patch_mission_id
+                active_commit.source_mission_id
+                or active_commit.source_patch_mission_id
+                or active_commit.source_execution_mission_id
             )
             active_mission_revision = (
                 active_commit.source_mission_revision
                 or active_commit.source_patch_mission_revision
+                or (
+                    None
+                    if active_commit.source_execution_mission_revision is None
+                    else active_commit.source_execution_mission_revision + 1
+                )
             )
             legacy_research_tasks = {
                 task_id: task
@@ -5135,6 +5827,9 @@ class WorkflowStore:
         if commit.source_patch_id is None:
             for field_name in cls._PATCH_COMMIT_FIELDS:
                 payload.pop(field_name, None)
+        if commit.source_action_attempt_id is None:
+            for field_name in cls._ACTION_COMMIT_FIELDS:
+                payload.pop(field_name, None)
         return payload
 
     @staticmethod
@@ -5709,6 +6404,12 @@ class WorkflowStore:
             ):
                 raise ValueError("MissionGraphPatch Tick identity disagrees")
 
+            self._invalidate_active_turn_action_graph_in_connection(
+                conn,
+                patch.game_session_id,
+                expected_contract_revision=patch.expected_base_revision,
+                invalidated_at=tick.completed_at,
+            )
             self._save_provider_attempt_in_connection(
                 conn,
                 patch.game_session_id,
@@ -5831,6 +6532,7 @@ class WorkflowStore:
             if (
                 commit.source_proposal_id is not None
                 or commit.source_patch_id is not None
+                or commit.source_action_attempt_id is not None
             ):
                 raise ValueError(
                     "derived Contract commits require their aggregate transaction"
@@ -7273,6 +7975,19 @@ class WorkflowStore:
                     TaskStatus.READY.value,
                 ),
             )
+            conn.execute(
+                """
+                UPDATE turn_action_nodes
+                SET status=?, updated_at=?
+                WHERE status=? AND approved_by IS NULL
+                """,
+                (
+                    TurnActionNodeStatus.AWAITING_APPROVAL.value,
+                    datetime.now(UTC).isoformat(),
+                    TurnActionNodeStatus.READY.value,
+                ),
+            )
+            self._validate_phase3_v13(conn)
 
     def reject_task_confirmation(
         self,
@@ -7285,6 +8000,24 @@ class WorkflowStore:
 
         with self._connect() as conn:
             self._validate_research_task_authority_in_connection(conn, game_id, task_id)
+            node = conn.execute(
+                "SELECT status FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+                (game_id, task_id),
+            ).fetchone()
+            if node is not None:
+                if str(node["status"]) != TurnActionNodeStatus.AWAITING_APPROVAL.value:
+                    return False
+                changed = self._set_execution_task_status_in_connection(
+                    conn,
+                    game_id,
+                    task_id,
+                    TaskStatus.CANCELLED,
+                    error="confirmation rejected by user",
+                    increment_retry=False,
+                    approved_by=rejected_by,
+                )
+                self._validate_phase3_v13(conn)
+                return changed
             cursor = conn.execute(
                 """
                 UPDATE workflow_tasks SET
@@ -7602,20 +8335,19 @@ class WorkflowStore:
         if commit_row is None:
             raise ValueError("research authority Contract commit is missing")
         commit = cls._contract_commit_from_row(commit_row)
-        mission_id = commit.source_mission_id or commit.source_patch_mission_id
-        mission_revision = (
-            commit.source_mission_revision or commit.source_patch_mission_revision
-        )
-        if mission_id is None or mission_revision is None:
-            raise ValueError(
-                "research authority Contract commit has no Mission provenance"
-            )
+        if (
+            commit.source_proposal_id is None
+            and commit.source_patch_id is None
+            and commit.source_action_attempt_id is None
+        ):
+            raise ValueError("research authority Contract commit has no provenance")
         missions = tuple(
             mission
             for mission in contract.mission_graph.missions
-            if mission.mission_id == mission_id
-            and mission.mission_revision == mission_revision
+            if mission.scope == "research" and mission.status is MissionStatus.ACTIVE
         )
+        if not missions:
+            return None
         if len(missions) != 1:
             raise ValueError("research authority resolves to no unique Mission")
         research_mission_action(missions[0])
@@ -7626,6 +8358,448 @@ class WorkflowStore:
     ) -> tuple[StrategicContract, Mission] | None:
         with self._connect() as conn:
             return self._active_research_mission_in_connection(conn, game_id)
+
+    @classmethod
+    def _turn_action_task_from_row(cls, row: Mapping[str, Any]) -> StoredTask:
+        normalized = cls._normalize_turn_action_node_row(row)
+        node = TurnActionNode.model_validate_json(str(normalized["node_json"]))
+        return turn_action_node_as_stored_task(
+            node,
+            status=TaskStatus(str(normalized["status"])),
+            retry_count=int(normalized["retry_count"]),
+            max_retries=int(normalized["max_retries"]),
+            last_error=normalized["last_error"],
+            approved_by=normalized["approved_by"],
+        )
+
+    @classmethod
+    def _turn_action_graph_from_row(cls, row: Mapping[str, Any]) -> TurnActionGraph:
+        normalized = cls._normalize_turn_action_graph_row(row)
+        if dict(row) != normalized:
+            raise ValueError("TurnActionGraph row is not canonical")
+        return TurnActionGraph.model_validate_json(str(normalized["graph_json"]))
+
+    @classmethod
+    def _turn_action_task_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+        task_id: str,
+    ) -> StoredTask | None:
+        row = conn.execute(
+            "SELECT * FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+            (game_id, task_id),
+        ).fetchone()
+        return None if row is None else cls._turn_action_task_from_row(row)
+
+    def active_turn_action_graph(
+        self, game_id: str
+    ) -> tuple[TurnActionGraph, tuple[StoredTask, ...]] | None:
+        with self._connect() as conn:
+            graph_row = conn.execute(
+                """
+                SELECT graph.*
+                FROM active_turn_action_graphs AS active
+                JOIN turn_action_graphs AS graph ON graph.graph_id=active.graph_id
+                WHERE active.game_id=?
+                """,
+                (game_id,),
+            ).fetchone()
+            if graph_row is None:
+                return None
+            graph = self._turn_action_graph_from_row(graph_row)
+            rows = conn.execute(
+                "SELECT * FROM turn_action_nodes WHERE graph_id=? ORDER BY node_id",
+                (graph.graph_id,),
+            ).fetchall()
+        return graph, tuple(self._turn_action_task_from_row(row) for row in rows)
+
+    def list_turn_action_graphs(self, game_id: str) -> list[TurnActionGraph]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM turn_action_graphs "
+                "WHERE game_id=? ORDER BY compiled_at, graph_id",
+                (game_id,),
+            ).fetchall()
+        return [self._turn_action_graph_from_row(row) for row in rows]
+
+    @staticmethod
+    def _legacy_research_task_can_be_retired(
+        status: TaskStatus,
+    ) -> bool:
+        return status in {
+            TaskStatus.PENDING,
+            TaskStatus.AWAITING_CONFIRMATION,
+            TaskStatus.READY,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
+            TaskStatus.ESCALATED,
+            TaskStatus.CANCELLED,
+            TaskStatus.EXPIRED,
+            TaskStatus.DONE,
+        }
+
+    @classmethod
+    def _invalidate_active_turn_action_graph_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+        *,
+        expected_contract_revision: int,
+        invalidated_at: datetime,
+    ) -> None:
+        active = conn.execute(
+            """
+            SELECT graph.*
+            FROM active_turn_action_graphs AS active
+            JOIN turn_action_graphs AS graph ON graph.graph_id=active.graph_id
+            WHERE active.game_id=?
+            """,
+            (game_id,),
+        ).fetchone()
+        if active is None:
+            return
+        graph = cls._turn_action_graph_from_row(active)
+        if graph.source_contract_revision != expected_contract_revision:
+            raise ValueError("active TurnActionGraph Contract source is already stale")
+        unresolved = conn.execute(
+            """
+            SELECT attempt.action_attempt_id
+            FROM action_attempts AS attempt
+            JOIN turn_action_nodes AS node ON node.node_id=attempt.task_id
+            WHERE attempt.game_id=? AND node.graph_id=?
+              AND attempt.status IN (?, ?, ?)
+            LIMIT 1
+            """,
+            (
+                game_id,
+                graph.graph_id,
+                AttemptStatus.PREPARED.value,
+                AttemptStatus.VERIFYING.value,
+                AttemptStatus.UNCERTAIN.value,
+            ),
+        ).fetchone()
+        active_execution = conn.execute(
+            "SELECT node_id FROM turn_action_nodes WHERE graph_id=? "
+            "AND status IN (?, ?, ?) LIMIT 1",
+            (
+                graph.graph_id,
+                TurnActionNodeStatus.EXECUTING.value,
+                TurnActionNodeStatus.VERIFYING.value,
+                TurnActionNodeStatus.UNCERTAIN.value,
+            ),
+        ).fetchone()
+        if unresolved is not None or active_execution is not None:
+            raise ValueError(
+                "unresolved TurnActionGraph execution blocks Contract revision"
+            )
+        conn.execute(
+            "UPDATE turn_action_nodes SET status=?, updated_at=? "
+            "WHERE graph_id=? AND status IN (?, ?, ?)",
+            (
+                TurnActionNodeStatus.EXPIRED.value,
+                invalidated_at.isoformat(),
+                graph.graph_id,
+                TurnActionNodeStatus.AWAITING_APPROVAL.value,
+                TurnActionNodeStatus.READY.value,
+                TurnActionNodeStatus.FAILED.value,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM active_turn_action_graphs WHERE game_id=?",
+            (game_id,),
+        )
+
+    def activate_turn_action_graph(
+        self,
+        graph: TurnActionGraph,
+        nodes: Sequence[TurnActionNode],
+        *,
+        activated_at: datetime,
+    ) -> tuple[TurnActionGraph, tuple[StoredTask, ...]]:
+        if activated_at.tzinfo is None or activated_at.utcoffset() is None:
+            raise ValueError("TurnActionGraph activated_at must include a timezone")
+        if activated_at < graph.compiled_at:
+            raise ValueError("TurnActionGraph cannot be activated before compilation")
+        ordered_nodes = tuple(sorted(nodes, key=lambda item: item.node_id))
+        if tuple(node.node_id for node in ordered_nodes) != graph.node_ids:
+            raise ValueError("TurnActionGraph node set is incomplete")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            observation_row = conn.execute(
+                "SELECT * FROM normalized_observations WHERE observation_id=?",
+                (graph.source_observation_id,),
+            ).fetchone()
+            if observation_row is None:
+                raise ValueError("TurnActionGraph source Observation is not persisted")
+            observation = self._observation_from_row(observation_row)
+            if (
+                observation.game_session_id != graph.game_session_id
+                or observation.turn_number != graph.turn_number
+                or observation.projection_hash
+                != graph.source_observation_projection_hash
+            ):
+                raise ValueError("TurnActionGraph source Observation is stale")
+            active = self._active_research_mission_in_connection(
+                conn, graph.game_session_id
+            )
+            if active is None:
+                raise ValueError("TurnActionGraph requires active research authority")
+            contract, mission = active
+            if (
+                contract.contract_id != graph.source_contract_id
+                or contract.revision != graph.source_contract_revision
+            ):
+                raise ValueError("TurnActionGraph source Contract is stale")
+            desired = thaw_json(mission.desired_outcome)
+            for node in ordered_nodes:
+                if (
+                    node.graph_id != graph.graph_id
+                    or node.game_session_id != graph.game_session_id
+                    or node.turn_number != graph.turn_number
+                    or node.source_observation_id != graph.source_observation_id
+                    or node.source_observation_projection_hash
+                    != graph.source_observation_projection_hash
+                    or node.source_contract_id != contract.contract_id
+                    or node.source_contract_revision != contract.revision
+                    or node.source_mission_id != mission.mission_id
+                    or node.source_mission_revision != mission.mission_revision
+                    or node.action_type != research_mission_action(mission)
+                    or node.arguments.get("tech_or_civic") != desired["technology"]
+                ):
+                    raise ValueError(
+                        "TurnActionNode does not match active research authority"
+                    )
+
+            previous = conn.execute(
+                "SELECT graph_id FROM active_turn_action_graphs WHERE game_id=?",
+                (graph.game_session_id,),
+            ).fetchone()
+            previous_graph_id = None if previous is None else str(previous["graph_id"])
+            if previous_graph_id == graph.graph_id:
+                stored_graph = conn.execute(
+                    "SELECT * FROM turn_action_graphs WHERE graph_id=?",
+                    (graph.graph_id,),
+                ).fetchone()
+                stored_nodes = conn.execute(
+                    "SELECT * FROM turn_action_nodes WHERE graph_id=? ORDER BY node_id",
+                    (graph.graph_id,),
+                ).fetchall()
+                if (
+                    stored_graph is None
+                    or self._turn_action_graph_from_row(stored_graph) != graph
+                    or tuple(
+                        TurnActionNode.model_validate_json(str(row["node_json"]))
+                        for row in stored_nodes
+                    )
+                    != ordered_nodes
+                ):
+                    raise ValueError(
+                        "active TurnActionGraph identity disagrees with candidate"
+                    )
+                self._validate_phase3_v13(conn)
+                return graph, tuple(
+                    self._turn_action_task_from_row(row) for row in stored_nodes
+                )
+            if previous_graph_id != graph.graph_id:
+                unresolved = conn.execute(
+                    """
+                    SELECT attempt.action_attempt_id
+                    FROM action_attempts AS attempt
+                    JOIN turn_action_nodes AS node ON node.node_id=attempt.task_id
+                    WHERE attempt.game_id=? AND node.graph_id=?
+                      AND attempt.status IN (?, ?, ?)
+                    LIMIT 1
+                    """,
+                    (
+                        graph.game_session_id,
+                        previous_graph_id or "",
+                        AttemptStatus.PREPARED.value,
+                        AttemptStatus.VERIFYING.value,
+                        AttemptStatus.UNCERTAIN.value,
+                    ),
+                ).fetchone()
+                if unresolved is not None:
+                    raise ValueError(
+                        "unresolved ActionAttempt blocks TurnActionGraph replacement"
+                    )
+
+            legacy_rows = conn.execute(
+                "SELECT * FROM workflow_tasks "
+                "WHERE game_id=? AND action_type='set_research'",
+                (graph.game_session_id,),
+            ).fetchall()
+            for row in legacy_rows:
+                task = self._row_to_task(row)
+                unresolved = conn.execute(
+                    "SELECT 1 FROM action_attempts WHERE game_id=? AND task_id=? "
+                    "AND status IN (?, ?, ?) LIMIT 1",
+                    (
+                        graph.game_session_id,
+                        task.task_id,
+                        AttemptStatus.PREPARED.value,
+                        AttemptStatus.VERIFYING.value,
+                        AttemptStatus.UNCERTAIN.value,
+                    ),
+                ).fetchone()
+                if (
+                    unresolved is not None
+                    or not self._legacy_research_task_can_be_retired(task.status)
+                ):
+                    raise ValueError(
+                        "legacy research execution must quiesce before graph activation"
+                    )
+
+            graph_row = {
+                "graph_id": graph.graph_id,
+                "game_id": graph.game_session_id,
+                "turn": graph.turn_number,
+                "source_observation_id": graph.source_observation_id,
+                "source_contract_id": graph.source_contract_id,
+                "source_contract_revision": graph.source_contract_revision,
+                "graph_json": self._dump(graph.model_dump(mode="json")),
+                "compiled_at": graph.compiled_at.isoformat(),
+            }
+            existing_graph = conn.execute(
+                "SELECT * FROM turn_action_graphs WHERE graph_id=?",
+                (graph.graph_id,),
+            ).fetchone()
+            if existing_graph is None:
+                conn.execute(
+                    "INSERT INTO turn_action_graphs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    tuple(graph_row.values()),
+                )
+            elif self._normalize_turn_action_graph_row(existing_graph) != graph_row:
+                raise ValueError("TurnActionGraph identity was reused")
+
+            for node in ordered_nodes:
+                status = (
+                    TurnActionNodeStatus.AWAITING_APPROVAL
+                    if node.requires_confirmation
+                    else TurnActionNodeStatus.READY
+                )
+                node_row = {
+                    "node_id": node.node_id,
+                    "graph_id": node.graph_id,
+                    "game_id": node.game_session_id,
+                    "status": status.value,
+                    "retry_count": 0,
+                    "max_retries": 2,
+                    "last_error": None,
+                    "approved_by": None,
+                    "node_json": self._dump(node.model_dump(mode="json")),
+                    "updated_at": activated_at.isoformat(),
+                }
+                existing_node = conn.execute(
+                    "SELECT * FROM turn_action_nodes WHERE node_id=?",
+                    (node.node_id,),
+                ).fetchone()
+                if existing_node is None:
+                    conn.execute(
+                        "INSERT INTO turn_action_nodes VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        tuple(node_row.values()),
+                    )
+                elif self._normalize_turn_action_node_row(existing_node) != node_row:
+                    raise ValueError("TurnActionNode identity was reused")
+
+            if previous_graph_id not in {None, graph.graph_id}:
+                conn.execute(
+                    "UPDATE turn_action_nodes SET status=?, updated_at=? "
+                    "WHERE graph_id=? AND status IN (?, ?, ?)",
+                    (
+                        TurnActionNodeStatus.EXPIRED.value,
+                        activated_at.isoformat(),
+                        previous_graph_id,
+                        TurnActionNodeStatus.AWAITING_APPROVAL.value,
+                        TurnActionNodeStatus.READY.value,
+                        TurnActionNodeStatus.FAILED.value,
+                    ),
+                )
+
+            for row in legacy_rows:
+                task = self._row_to_task(row)
+                if task.status in {
+                    TaskStatus.RUNNING,
+                    TaskStatus.VERIFYING,
+                    TaskStatus.UNCERTAIN,
+                }:
+                    raise ValueError(
+                        "active legacy research task blocks graph activation"
+                    )
+                matching = next(
+                    (
+                        node
+                        for node in ordered_nodes
+                        if node.arguments.get("tech_or_civic")
+                        == task.arguments.get("tech_or_civic")
+                    ),
+                    None,
+                )
+                conn.execute(
+                    "UPDATE workflow_tasks SET status=?, updated_at=? "
+                    "WHERE game_id=? AND task_id=? AND status NOT IN (?, ?, ?)",
+                    (
+                        TaskStatus.CANCELLED.value,
+                        activated_at.isoformat(),
+                        graph.game_session_id,
+                        task.task_id,
+                        TaskStatus.DONE.value,
+                        TaskStatus.CANCELLED.value,
+                        TaskStatus.EXPIRED.value,
+                    ),
+                )
+                disposition_id = (
+                    "turn_action_disposition_"
+                    + hashlib.sha256(
+                        f"{graph.game_session_id}\0{task.task_id}".encode("utf-8")
+                    ).hexdigest()[:24]
+                )
+                disposition = {
+                    "disposition_id": disposition_id,
+                    "game_id": graph.game_session_id,
+                    "task_id": task.task_id,
+                    "graph_id": graph.graph_id,
+                    "node_id": None if matching is None else matching.node_id,
+                    "previous_status": task.status.value,
+                    "disposition": (
+                        "mapped_and_superseded" if matching is not None else "cancelled"
+                    ),
+                    "occurred_at": activated_at.isoformat(),
+                }
+                existing = conn.execute(
+                    "SELECT * FROM turn_action_legacy_dispositions "
+                    "WHERE game_id=? AND task_id=?",
+                    (graph.game_session_id, task.task_id),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO turn_action_legacy_dispositions VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?)",
+                        tuple(disposition.values()),
+                    )
+                elif dict(existing) != disposition:
+                    raise ValueError("legacy research task disposition is immutable")
+
+            conn.execute(
+                "INSERT INTO active_turn_action_graphs(game_id, graph_id, activated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(game_id) DO UPDATE SET "
+                "graph_id=excluded.graph_id, activated_at=excluded.activated_at",
+                (
+                    graph.game_session_id,
+                    graph.graph_id,
+                    activated_at.isoformat(),
+                ),
+            )
+            self._validate_phase3_v13(conn)
+            tasks = tuple(
+                self._turn_action_task_from_row(row)
+                for row in conn.execute(
+                    "SELECT * FROM turn_action_nodes WHERE graph_id=? ORDER BY node_id",
+                    (graph.graph_id,),
+                ).fetchall()
+            )
+        return graph, tasks
 
     @staticmethod
     def _bundle_contains_research_write(bundle: PlanBundle) -> bool:
@@ -7652,6 +8826,41 @@ class WorkflowStore:
         allow_legacy_inert: bool = False,
         action_type: str | None = None,
     ) -> StoredTask | None:
+        graph_task = cls._turn_action_task_in_connection(conn, game_id, task_id)
+        if graph_task is not None:
+            active_graph = conn.execute(
+                "SELECT graph_id FROM active_turn_action_graphs WHERE game_id=?",
+                (game_id,),
+            ).fetchone()
+            if (
+                active_graph is None
+                or str(active_graph["graph_id"]) != graph_task.plan_id
+            ):
+                if allow_legacy_inert and graph_task.status in {
+                    TaskStatus.DONE,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.EXPIRED,
+                }:
+                    return graph_task
+                raise ValueError("TurnActionNode is not part of the active graph")
+            active = cls._active_research_mission_in_connection(conn, game_id)
+            if active is None:
+                raise ValueError("TurnActionNode is not backed by research authority")
+            contract, mission = active
+            desired = thaw_json(mission.desired_outcome)
+            if (
+                graph_task.action_type != "set_research"
+                or graph_task.source_contract_id != contract.contract_id
+                or graph_task.source_contract_revision != contract.revision
+                or graph_task.source_mission_id != mission.mission_id
+                or graph_task.source_mission_revision != mission.mission_revision
+                or graph_task.arguments.get("tech_or_civic") != desired["technology"]
+                or (action_type is not None and graph_task.action_type != action_type)
+            ):
+                raise ValueError(
+                    "TurnActionNode provenance does not match active Contract/Mission"
+                )
+            return graph_task
         row = conn.execute(
             "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
             (game_id, task_id),
@@ -7673,6 +8882,22 @@ class WorkflowStore:
                     "Mission-derived research task is not backed by active authority"
                 )
             return task
+        active_graph = conn.execute(
+            "SELECT graph_id FROM active_turn_action_graphs WHERE game_id=?",
+            (game_id,),
+        ).fetchone()
+        if (
+            task.action_type == "set_research"
+            and active_graph is not None
+            and not (
+                allow_legacy_inert
+                and task.status
+                in {TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.EXPIRED}
+            )
+        ):
+            raise ValueError(
+                "StoredTask research execution is closed while a graph is active"
+            )
         contract, mission = active
         if task.source_contract_id is None:
             if allow_legacy_inert and task.status in {
@@ -7715,6 +8940,16 @@ class WorkflowStore:
         self._reject_task_id_reuse(game_id, bundle)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM active_turn_action_graphs WHERE game_id=?",
+                    (game_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError(
+                    "StoredTask research projection is closed after graph activation"
+                )
             active = self._active_research_mission_in_connection(conn, game_id)
             if active is None:
                 raise ValueError("research authority is not active")
@@ -7770,6 +9005,7 @@ class WorkflowStore:
                 source_mission_revision=mission.mission_revision,
             )
             self._validate_phase1b_proposals_v10(conn)
+            self._validate_phase3_v13(conn)
 
     def save_plan_bundle(
         self,
@@ -8194,6 +9430,135 @@ class WorkflowStore:
                 )
             return [self._row_to_task(row) for row in rows]
 
+    def due_turn_action_nodes(
+        self,
+        game_id: str,
+        turn: int,
+        *,
+        source_observation_id: str,
+    ) -> list[StoredTask]:
+        with self._connect() as conn:
+            graph_row = conn.execute(
+                """
+                SELECT graph.*
+                FROM active_turn_action_graphs AS active
+                JOIN turn_action_graphs AS graph ON graph.graph_id=active.graph_id
+                WHERE active.game_id=?
+                """,
+                (game_id,),
+            ).fetchone()
+            if graph_row is None:
+                return []
+            graph = self._turn_action_graph_from_row(graph_row)
+            active = self._active_research_mission_in_connection(conn, game_id)
+            current_observation_row = conn.execute(
+                "SELECT * FROM normalized_observations WHERE observation_id=?",
+                (source_observation_id,),
+            ).fetchone()
+            current_observation = (
+                None
+                if current_observation_row is None
+                else self._observation_from_row(current_observation_row)
+            )
+            if (
+                active is None
+                or graph.turn_number != turn
+                or current_observation is None
+                or current_observation.game_session_id != game_id
+                or current_observation.turn_number != turn
+                or current_observation.projection_hash
+                != graph.source_observation_projection_hash
+                or graph.source_contract_id != active[0].contract_id
+                or graph.source_contract_revision != active[0].revision
+            ):
+                return []
+            rows = conn.execute(
+                "SELECT * FROM turn_action_nodes "
+                "WHERE graph_id=? AND status=? ORDER BY node_id",
+                (graph.graph_id, TurnActionNodeStatus.READY.value),
+            ).fetchall()
+            tasks = [self._turn_action_task_from_row(row) for row in rows]
+            return [
+                task
+                for task in tasks
+                if task.due_turn <= turn
+                and all(
+                    conn.execute(
+                        "SELECT status FROM turn_action_nodes WHERE node_id=?",
+                        (dependency,),
+                    ).fetchone()["status"]
+                    == TurnActionNodeStatus.SUCCEEDED.value
+                    for dependency in TurnActionNode.model_validate_json(
+                        str(
+                            conn.execute(
+                                "SELECT node_json FROM turn_action_nodes "
+                                "WHERE node_id=?",
+                                (task.task_id,),
+                            ).fetchone()["node_json"]
+                        )
+                    ).dependency_node_ids
+                )
+            ]
+
+    @classmethod
+    def _set_execution_task_status_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        error: str | None,
+        increment_retry: bool,
+        approved_by: str | None = None,
+    ) -> bool:
+        node = conn.execute(
+            "SELECT * FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+            (game_id, task_id),
+        ).fetchone()
+        if node is not None:
+            try:
+                node_status = TurnActionNodeStatus(status.value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"unsupported TurnActionNode status transition target: {status}"
+                ) from exc
+            cursor = conn.execute(
+                """
+                UPDATE turn_action_nodes
+                SET status=?, last_error=?, retry_count=retry_count+?,
+                    approved_by=COALESCE(?, approved_by), updated_at=?
+                WHERE game_id=? AND node_id=?
+                """,
+                (
+                    node_status.value,
+                    error,
+                    int(increment_retry),
+                    approved_by,
+                    datetime.now(UTC).isoformat(),
+                    game_id,
+                    task_id,
+                ),
+            )
+            return cursor.rowcount == 1
+        cursor = conn.execute(
+            """
+            UPDATE workflow_tasks SET
+                status=?, last_error=?, retry_count=retry_count+?,
+                approved_by=COALESCE(?, approved_by), updated_at=CURRENT_TIMESTAMP
+            WHERE game_id=? AND task_id=?
+            """,
+            (
+                status.value,
+                error,
+                int(increment_retry),
+                approved_by,
+                game_id,
+                task_id,
+            ),
+        )
+        return cursor.rowcount == 1
+
     @classmethod
     def _row_to_task(cls, row: Mapping[str, Any]) -> StoredTask:
         row = dict(row)
@@ -8259,27 +9624,43 @@ class WorkflowStore:
                 allow_legacy_inert=status
                 in {TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.EXPIRED},
             )
-            conn.execute(
-                """
-                UPDATE workflow_tasks SET
-                    status=?, last_error=?, retry_count=retry_count+?,
-                    updated_at=CURRENT_TIMESTAMP
-                WHERE game_id=? AND task_id=?
-                """,
-                (status.value, error, int(increment_retry), game_id, task_id),
+            self._set_execution_task_status_in_connection(
+                conn,
+                game_id,
+                task_id,
+                status,
+                error=error,
+                increment_retry=increment_retry,
             )
+            self._validate_phase3_v13(conn)
 
     def approve_task(
         self, game_id: str, task_id: str, approved_by: str = "user"
     ) -> bool:
         with self._connect() as conn:
             self._validate_research_task_authority_in_connection(conn, game_id, task_id)
+            node = conn.execute(
+                "SELECT status FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+                (game_id, task_id),
+            ).fetchone()
+            if node is not None:
+                if str(node["status"]) != TurnActionNodeStatus.AWAITING_APPROVAL.value:
+                    return False
+                changed = self._set_execution_task_status_in_connection(
+                    conn,
+                    game_id,
+                    task_id,
+                    TaskStatus.READY,
+                    error=None,
+                    increment_retry=False,
+                    approved_by=approved_by,
+                )
+                self._validate_phase3_v13(conn)
+                return changed
             cursor = conn.execute(
-                """
-                UPDATE workflow_tasks SET
-                    status=?, approved_by=?, updated_at=CURRENT_TIMESTAMP
-                WHERE game_id=? AND task_id=? AND status=?
-                """,
+                "UPDATE workflow_tasks SET status=?, approved_by=?, "
+                "updated_at=CURRENT_TIMESTAMP "
+                "WHERE game_id=? AND task_id=? AND status=?",
                 (
                     TaskStatus.READY.value,
                     approved_by,
@@ -8309,10 +9690,25 @@ class WorkflowStore:
                     "SELECT * FROM workflow_tasks WHERE game_id=? ORDER BY due_turn, task_id",
                     (game_id,),
                 ).fetchall()
-        return [self._row_to_task(row) for row in rows]
+            graph_rows = conn.execute(
+                "SELECT * FROM turn_action_nodes WHERE game_id=? ORDER BY node_id",
+                (game_id,),
+            ).fetchall()
+        tasks = [self._row_to_task(row) for row in rows]
+        graph_tasks = [self._turn_action_task_from_row(row) for row in graph_rows]
+        if statuses:
+            allowed = set(statuses)
+            graph_tasks = [task for task in graph_tasks if task.status in allowed]
+        return [*tasks, *graph_tasks]
 
     def task_status(self, game_id: str, task_id: str) -> TaskStatus | None:
         with self._connect() as conn:
+            node = conn.execute(
+                "SELECT status FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+                (game_id, task_id),
+            ).fetchone()
+            if node is not None:
+                return TaskStatus(str(node["status"]))
             row = conn.execute(
                 "SELECT status FROM workflow_tasks WHERE game_id=? AND task_id=?",
                 (game_id, task_id),
@@ -8371,10 +9767,20 @@ class WorkflowStore:
                 "SELECT task_id FROM workflow_tasks WHERE game_id=?",
                 (game_id,),
             ).fetchall()
-        return {str(row["task_id"]) for row in rows}
+            node_rows = conn.execute(
+                "SELECT node_id FROM turn_action_nodes WHERE game_id=?",
+                (game_id,),
+            ).fetchall()
+        return {
+            *(str(row["task_id"]) for row in rows),
+            *(str(row["node_id"]) for row in node_rows),
+        }
 
     def get_task(self, game_id: str, task_id: str) -> StoredTask | None:
         with self._connect() as conn:
+            node = self._turn_action_task_in_connection(conn, game_id, task_id)
+            if node is not None:
+                return node
             row = conn.execute(
                 "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
                 (game_id, task_id),
@@ -8426,12 +9832,57 @@ class WorkflowStore:
         if attempt.action_type is None:
             raise ValueError("persisted attempts require action_type")
         with self._connect() as conn:
-            self._validate_research_task_authority_in_connection(
+            task = self._validate_research_task_authority_in_connection(
                 conn,
                 attempt.game_session_id,
                 attempt.task_id,
                 action_type=attempt.action_type,
             )
+            if (
+                task is not None
+                and task.plan_id.startswith("turn_action_graph_")
+                and attempt.prepared_from_observation_id
+                != task.created_from_observation_id
+            ):
+                current_row = conn.execute(
+                    "SELECT * FROM normalized_observations WHERE observation_id=?",
+                    (attempt.prepared_from_observation_id,),
+                ).fetchone()
+                graph_row = conn.execute(
+                    "SELECT * FROM turn_action_graphs WHERE graph_id=?",
+                    (task.plan_id,),
+                ).fetchone()
+                current = (
+                    None
+                    if current_row is None
+                    else self._observation_from_row(current_row)
+                )
+                graph = (
+                    None
+                    if graph_row is None
+                    else self._turn_action_graph_from_row(graph_row)
+                )
+                if (
+                    current is None
+                    or graph is None
+                    or current.game_session_id != graph.game_session_id
+                    or current.turn_number != graph.turn_number
+                    or current.projection_hash
+                    != graph.source_observation_projection_hash
+                ):
+                    raise ValueError(
+                        "ActionAttempt source Observation does not match TurnActionGraph"
+                    )
+            if task is not None and task.plan_id.startswith("turn_action_graph_"):
+                if (
+                    task.status is not TaskStatus.READY
+                    or (task.requires_confirmation and task.approved_by is None)
+                    or dict(attempt.normalized_arguments)
+                    != {**task.arguments, "category": "tech"}
+                ):
+                    raise ValueError(
+                        "TurnActionNode is not approved and ready for this Attempt"
+                    )
             conn.execute(
                 """
                 INSERT INTO action_attempts(
@@ -9123,6 +10574,14 @@ class WorkflowStore:
                     (tick.game_session_id, attempt.task_id),
                 ).fetchone()
                 if task_row is None:
+                    task_row = conn.execute(
+                        """
+                        SELECT retry_count, max_retries FROM turn_action_nodes
+                        WHERE game_id=? AND node_id=?
+                        """,
+                        (tick.game_session_id, attempt.task_id),
+                    ).fetchone()
+                if task_row is None:
                     raise KeyError(f"unknown attempt task: {attempt.task_id}")
                 failure_resolution = resolve_failed_attempt(
                     attempt,
@@ -9134,22 +10593,46 @@ class WorkflowStore:
                 task_error = failure_resolution.reason
                 task_retry_count = failure_resolution.retry_count
             if task_status is not None and attempt is not None:
-                cursor = conn.execute(
-                    """
-                    UPDATE workflow_tasks SET
-                        status=?, last_error=?,
-                        retry_count=COALESCE(?, retry_count),
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE game_id=? AND task_id=?
-                    """,
-                    (
-                        task_status.value,
-                        task_error,
-                        task_retry_count,
-                        tick.game_session_id,
-                        attempt.task_id,
-                    ),
-                )
+                node_row = conn.execute(
+                    "SELECT 1 FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+                    (tick.game_session_id, attempt.task_id),
+                ).fetchone()
+                if node_row is not None:
+                    node_status = TurnActionNodeStatus(task_status.value)
+                    cursor = conn.execute(
+                        """
+                        UPDATE turn_action_nodes SET
+                            status=?, last_error=?,
+                            retry_count=COALESCE(?, retry_count),
+                            updated_at=?
+                        WHERE game_id=? AND node_id=?
+                        """,
+                        (
+                            node_status.value,
+                            task_error,
+                            task_retry_count,
+                            datetime.now(UTC).isoformat(),
+                            tick.game_session_id,
+                            attempt.task_id,
+                        ),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE workflow_tasks SET
+                            status=?, last_error=?,
+                            retry_count=COALESCE(?, retry_count),
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE game_id=? AND task_id=?
+                        """,
+                        (
+                            task_status.value,
+                            task_error,
+                            task_retry_count,
+                            tick.game_session_id,
+                            attempt.task_id,
+                        ),
+                    )
                 if cursor.rowcount != 1:
                     raise KeyError(f"unknown attempt task: {attempt.task_id}")
             self._save_runtime_state_in_connection(
@@ -9168,6 +10651,7 @@ class WorkflowStore:
                 checkpoint("after_runtime_state_update")
             self._insert_workflow_tick_in_connection(conn, tick)
             self._validate_phase1b_proposals_v10(conn)
+            self._validate_phase3_v13(conn)
         return failure_resolution
 
     def finalize_attempt_success(
@@ -9179,6 +10663,18 @@ class WorkflowStore:
     ) -> None:
         if attempt.status is not AttemptStatus.SUCCEEDED:
             raise ValueError("success finalization requires SUCCEEDED attempt")
+        with self._connect() as conn:
+            node_row = conn.execute(
+                "SELECT 1 FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+                (attempt.game_session_id, attempt.task_id),
+            ).fetchone()
+        if node_row is not None:
+            self._finalize_turn_action_success(
+                attempt,
+                tick,
+                checkpoint=checkpoint,
+            )
+            return
         self.persist_tick_and_runtime_state(
             tick,
             attempt=attempt,
@@ -9187,6 +10683,241 @@ class WorkflowStore:
             checkpoint=checkpoint,
             attempt_checkpoint="after_attempt_succeeded_update",
         )
+
+    def _finalize_turn_action_success(
+        self,
+        attempt: ActionAttempt,
+        tick: WorkflowTick,
+        *,
+        checkpoint: Callable[[str], None] | None,
+    ) -> None:
+        tick = validate_workflow_tick(tick)
+        checkpoint = checkpoint or (lambda _point: None)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            node_row = conn.execute(
+                "SELECT * FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+                (attempt.game_session_id, attempt.task_id),
+            ).fetchone()
+            if node_row is None:
+                raise KeyError(f"unknown TurnActionNode: {attempt.task_id}")
+            node = TurnActionNode.model_validate_json(str(node_row["node_json"]))
+            commit_id = (
+                "turn_action_commit_"
+                + hashlib.sha256(attempt.action_attempt_id.encode("utf-8")).hexdigest()[
+                    :24
+                ]
+            )
+            existing_commit_row = conn.execute(
+                "SELECT * FROM strategic_contract_commits WHERE commit_id=?",
+                (commit_id,),
+            ).fetchone()
+            if existing_commit_row is not None:
+                stored_attempt = conn.execute(
+                    "SELECT attempt_json FROM action_attempts "
+                    "WHERE action_attempt_id=?",
+                    (attempt.action_attempt_id,),
+                ).fetchone()
+                stored_tick = conn.execute(
+                    "SELECT * FROM workflow_ticks WHERE tick_id=?",
+                    (tick.tick_id,),
+                ).fetchone()
+                if (
+                    stored_attempt is None
+                    or ActionAttempt.model_validate_json(
+                        str(stored_attempt["attempt_json"])
+                    )
+                    != attempt
+                    or stored_tick is None
+                    or self._workflow_tick_from_row(dict(stored_tick)) != tick
+                ):
+                    raise ValueError(
+                        "TurnActionNode success idempotency evidence disagrees"
+                    )
+                return
+            graph_row = conn.execute(
+                "SELECT * FROM turn_action_graphs WHERE graph_id=?",
+                (node.graph_id,),
+            ).fetchone()
+            active_row = conn.execute(
+                "SELECT graph_id FROM active_turn_action_graphs WHERE game_id=?",
+                (attempt.game_session_id,),
+            ).fetchone()
+            if (
+                graph_row is None
+                or active_row is None
+                or str(active_row["graph_id"]) != node.graph_id
+            ):
+                raise ValueError(
+                    "TurnActionNode success requires the current active graph"
+                )
+            graph = self._turn_action_graph_from_row(graph_row)
+            self._validate_research_task_authority_in_connection(
+                conn,
+                attempt.game_session_id,
+                attempt.task_id,
+                action_type=attempt.action_type,
+            )
+            if (
+                attempt.task_id != node.node_id
+                or attempt.action_type != node.action_type
+                or attempt.status is not AttemptStatus.SUCCEEDED
+                or attempt.last_verification_observation_id is None
+                or tick.game_session_id != attempt.game_session_id
+                or tick.completed_at < attempt.prepared_at
+            ):
+                raise ValueError("TurnActionNode success evidence is incomplete")
+            self._update_action_attempt_in_connection(conn, attempt)
+            checkpoint("after_attempt_succeeded_update")
+
+            root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (attempt.game_session_id,),
+            ).fetchone()
+            if (
+                root is None
+                or str(root["contract_id"]) != graph.source_contract_id
+                or int(root["active_revision"]) != graph.source_contract_revision
+            ):
+                raise ValueError("stale TurnActionGraph Contract base")
+            base_row = conn.execute(
+                "SELECT * FROM strategic_contract_revisions "
+                "WHERE game_id=? AND revision=?",
+                (attempt.game_session_id, graph.source_contract_revision),
+            ).fetchone()
+            if base_row is None:
+                raise ValueError("TurnActionGraph Contract base is missing")
+            base = self._contract_from_revision_row(base_row)
+            missions = {
+                mission.mission_id: mission for mission in base.mission_graph.missions
+            }
+            source_mission = missions.get(node.source_mission_id)
+            if (
+                source_mission is None
+                or source_mission.mission_revision != node.source_mission_revision
+                or source_mission.status is not MissionStatus.ACTIVE
+            ):
+                raise ValueError("TurnActionNode source Mission is stale")
+            completed_mission = source_mission.model_copy(
+                update={
+                    "mission_revision": source_mission.mission_revision + 1,
+                    "status": MissionStatus.COMPLETED,
+                    "evidence_refs": tuple(
+                        sorted(
+                            {
+                                *source_mission.evidence_refs,
+                                attempt.action_attempt_id,
+                            }
+                        )
+                    ),
+                }
+            )
+            missions[completed_mission.mission_id] = completed_mission
+            contract = base.model_copy(
+                update={
+                    "revision": base.revision + 1,
+                    "mission_graph": MissionGraph(
+                        missions=tuple(
+                            sorted(
+                                missions.values(),
+                                key=lambda item: item.mission_id,
+                            )
+                        )
+                    ),
+                }
+            )
+            commit = StrategicContractCommit(
+                commit_id=commit_id,
+                game_session_id=attempt.game_session_id,
+                contract_id=base.contract_id,
+                expected_base_revision=base.revision,
+                contract=contract,
+                committed_at=tick.completed_at,
+                reason="verified TurnActionNode completed its research Mission",
+                source_action_attempt_id=attempt.action_attempt_id,
+                source_turn_action_graph_id=graph.graph_id,
+                source_turn_action_node_id=node.node_id,
+                source_execution_mission_id=source_mission.mission_id,
+                source_execution_mission_revision=source_mission.mission_revision,
+            )
+            conn.execute(
+                """
+                INSERT INTO strategic_contract_revisions(
+                    game_id, contract_id, revision, contract_json, committed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    commit.game_session_id,
+                    commit.contract_id,
+                    commit.contract.revision,
+                    self._dump(commit.contract.model_dump(mode="json")),
+                    commit.committed_at.isoformat(),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO strategic_contract_commits(
+                    commit_id, game_id, contract_id, expected_base_revision,
+                    committed_revision, commit_json, committed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    commit.commit_id,
+                    commit.game_session_id,
+                    commit.contract_id,
+                    commit.expected_base_revision,
+                    commit.contract.revision,
+                    self._dump(self._contract_commit_payload(commit)),
+                    commit.committed_at.isoformat(),
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE strategic_contract_roots SET active_revision=? "
+                "WHERE game_id=? AND contract_id=? AND active_revision=?",
+                (
+                    commit.contract.revision,
+                    commit.game_session_id,
+                    commit.contract_id,
+                    commit.expected_base_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("stale TurnActionGraph Contract base")
+            conn.execute(
+                "UPDATE turn_action_nodes SET status=?, updated_at=? "
+                "WHERE graph_id=? AND status IN (?, ?, ?, ?)",
+                (
+                    TurnActionNodeStatus.EXPIRED.value,
+                    tick.completed_at.isoformat(),
+                    graph.graph_id,
+                    TurnActionNodeStatus.AWAITING_APPROVAL.value,
+                    TurnActionNodeStatus.READY.value,
+                    TurnActionNodeStatus.EXECUTING.value,
+                    TurnActionNodeStatus.FAILED.value,
+                ),
+            )
+            conn.execute(
+                "UPDATE turn_action_nodes SET status=?, last_error=NULL, updated_at=? "
+                "WHERE node_id=?",
+                (
+                    TurnActionNodeStatus.SUCCEEDED.value,
+                    tick.completed_at.isoformat(),
+                    node.node_id,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM active_turn_action_graphs WHERE game_id=?",
+                (attempt.game_session_id,),
+            )
+            self._save_runtime_state_in_connection(
+                conn, attempt.game_session_id, tick.ending_runtime_state, None
+            )
+            self._persist_human_wait_context_in_connection(
+                conn, attempt.game_session_id, tick.ending_runtime_state, None
+            )
+            self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1c_v11(conn)
+            self._validate_phase3_v13(conn)
 
     def finalize_attempt_failure(
         self,
@@ -11476,6 +13207,10 @@ class WorkflowStore:
                     row = cls._normalize_baseline_acceptance_row(row)
                 elif table == "state_deltas":
                     row = cls._normalize_state_delta_row(row)
+                elif table == "turn_action_graphs":
+                    row = cls._normalize_turn_action_graph_row(row)
+                elif table == "turn_action_nodes":
+                    row = cls._normalize_turn_action_node_row(row)
                 elif table == "mission_graph_patches":
                     row = cls._normalize_mission_graph_patch_row(row)
                 elif table == "strategic_research_proposals":
@@ -11642,6 +13377,41 @@ class WorkflowStore:
                 (game_id,),
             ).fetchall()
         ]
+        external_turn_action_graphs = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM turn_action_graphs WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_active_turn_action_graphs = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM active_turn_action_graphs WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_turn_action_nodes = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM turn_action_nodes WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_turn_action_dispositions = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM turn_action_legacy_dispositions WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_observations = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM normalized_observations WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
         cls._validate_phase1c_state_v11(
             [*external_proposals, *prepared["strategic_research_proposals"]],
             [
@@ -11676,6 +13446,31 @@ class WorkflowStore:
             prepared["strategic_contract_revisions"],
             prepared["strategic_contract_commits"],
             prepared["workflow_ticks"],
+            require_canonical=True,
+        )
+        cls._validate_turn_action_authority_state(
+            [
+                *external_turn_action_graphs,
+                *prepared["turn_action_graphs"],
+            ],
+            [
+                *external_active_turn_action_graphs,
+                *prepared["active_turn_action_graphs"],
+            ],
+            [
+                *external_turn_action_nodes,
+                *prepared["turn_action_nodes"],
+            ],
+            [
+                *external_turn_action_dispositions,
+                *prepared["turn_action_legacy_dispositions"],
+            ],
+            [*external_observations, *prepared["normalized_observations"]],
+            [*external_roots, *prepared["strategic_contract_roots"]],
+            [*external_revisions, *prepared["strategic_contract_revisions"]],
+            [*external_commits, *prepared["strategic_contract_commits"]],
+            [*external_action_attempts, *prepared["action_attempts"]],
+            [*external_tasks, *prepared["workflow_tasks"]],
             require_canonical=True,
         )
         for table in REPLAY_STATE_TABLES:

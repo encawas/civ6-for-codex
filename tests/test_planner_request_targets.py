@@ -1137,7 +1137,7 @@ def test_v7_to_v8_migration_preserves_status_attempt_round_and_canonical_json(
     assert store.list_information_rounds("awaiting") == [round_record]
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
         rows = conn.execute(
             "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
         ).fetchall()
@@ -1245,7 +1245,7 @@ def test_v8_migration_recovers_one_column_interruption(tmp_path, partial_column)
             for row in conn.execute("PRAGMA table_info(logical_planner_requests)")
         }
         assert {"request_target_kind", "request_target_key"} <= columns
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
 
 
 def test_v8_migration_rolls_back_canonical_duplicates(tmp_path):
@@ -1376,13 +1376,13 @@ def test_future_database_version_fails_before_content_changes(tmp_path):
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE sentinel(value TEXT NOT NULL)")
         conn.execute("INSERT INTO sentinel VALUES ('unchanged')")
-        conn.execute("PRAGMA user_version=13")
+        conn.execute("PRAGMA user_version=14")
 
-    with pytest.raises(ValueError, match="unsupported workflow database version 13"):
+    with pytest.raises(ValueError, match="unsupported workflow database version 14"):
         WorkflowStore(path)
 
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 14
         assert conn.execute("SELECT value FROM sentinel").fetchone()[0] == "unchanged"
         assert (
             conn.execute(
@@ -2609,7 +2609,7 @@ def test_v7_migration_preserves_real_foreign_key_children(tmp_path):
     )
 
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert store.get_planner_request(request.planner_request_id) == migrated_request
     assert store.list_provider_attempts(request.planner_request_id) == [attempt]

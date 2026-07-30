@@ -67,6 +67,7 @@ from .models import (
     ExecutionMode,
     GameEvent,
     MutationDeliveryStatus,
+    RiskLevel,
     RuntimeSnapshot,
     StoredTask,
     TaskStatus,
@@ -80,6 +81,7 @@ from .planner_lifecycle import PlannerLifecycleCoordinator
 from .progression import ProgressionRuleCompiler
 from .recovery import recover_turn_rewind
 from .rules import DeterministicRuleCompiler
+from .turn_compiler import TurnCompiler
 from .validation import (
     PlanValidationContext,
     action_entity_type_contracts,
@@ -234,6 +236,7 @@ class WorkflowEngine:
         self.conditions = ConditionEvaluator()
         self.rules = DeterministicRuleCompiler(store)
         self.progression = ProgressionRuleCompiler(store)
+        self.turn_compiler = TurnCompiler()
         self.information_queries = InformationQueryRouter(self.game)
         self.planner_lifecycle = PlannerLifecycleCoordinator(self)
         self._available_tools: set[str] | None = None
@@ -427,17 +430,68 @@ class WorkflowEngine:
             observation,
             include_research=active_research is None,
         )
-        authoritative_research = (
+        authoritative_research_events: list[GameEvent] = []
+        if active_research is not None:
+            contract, mission = active_research
+            unavailable_target = self.turn_compiler.unavailable_target(
+                observation.canonical, mission
+            )
+            if unavailable_target is not None:
+                available = sorted(
+                    item.value
+                    for item in observation.canonical.progression.available_research_ids
+                )
+                authoritative_research_events.append(
+                    GameEvent(
+                        event_type="research_mission_target_unavailable",
+                        turn=snapshot.turn,
+                        entity_type="research",
+                        entity_id=unavailable_target,
+                        level=EventLevel.L3,
+                        risk=RiskLevel.MEDIUM,
+                        blocking=True,
+                        payload={
+                            "contract_id": contract.contract_id,
+                            "contract_revision": contract.revision,
+                            "mission_id": mission.mission_id,
+                            "mission_revision": mission.mission_revision,
+                            "technology": unavailable_target,
+                            "available": available,
+                        },
+                        dedupe_key=(
+                            "research_mission_target_unavailable:"
+                            f"{contract.revision}:{mission.mission_revision}:"
+                            f"{unavailable_target}"
+                        ),
+                    )
+                )
+        existing_graph_state = self.store.active_turn_action_graph(snapshot.game_id)
+        reusable_graph = (
+            active_research is not None
+            and existing_graph_state is not None
+            and existing_graph_state[0].turn_number == snapshot.turn
+            and existing_graph_state[0].source_observation_projection_hash
+            == observation.canonical.projection_hash
+            and existing_graph_state[0].source_contract_id
+            == active_research[0].contract_id
+            and existing_graph_state[0].source_contract_revision
+            == active_research[0].revision
+        )
+        turn_compilation = (
             None
-            if active_research is None
-            else self.progression.compile_authoritative_research(
-                observation, *active_research
+            if active_research is None or reusable_graph
+            else self.turn_compiler.compile(
+                observation.canonical,
+                *active_research,
+                mode=self.config.execution_mode,
+                auto_action_types=self.config.auto_action_types,
+                compiled_at=observation.canonical.observed_at,
             )
         )
         current_events = [
             *rule_compilation.events,
             *progression_compilation.events,
-            *(authoritative_research.events if authoritative_research else []),
+            *authoritative_research_events,
             *events_from_snapshot(snapshot),
         ]
         lease_tick = await self._pre_route_decision_runtime(
@@ -456,22 +510,24 @@ class WorkflowEngine:
                     auto_action_types=self.config.auto_action_types,
                     observation_id=observation_id,
                 )
-        if (
-            authoritative_research is not None
-            and authoritative_research.bundle is not None
-        ):
-            self.store.save_authoritative_research_plan_bundle(
-                snapshot.game_id,
-                snapshot.turn,
-                authoritative_research.bundle,
-                mode=self.config.execution_mode,
-                auto_action_types=self.config.auto_action_types,
-                observation_id=observation_id,
+        if turn_compilation is not None:
+            self.store.activate_turn_action_graph(
+                turn_compilation.graph,
+                turn_compilation.nodes,
+                activated_at=observation.canonical.observed_at,
             )
         ctx.metrics.task_materialization_seconds += (
             self._monotonic() - materialization_started
         )
         created = sorted(self.store.task_ids(snapshot.game_id) - before)
+        created = [
+            task_id
+            for task_id in created
+            if not (
+                (task := self.store.get_task(snapshot.game_id, task_id)) is not None
+                and task.plan_id.startswith("turn_action_graph_")
+            )
+        ]
         if created:
             return self._finish(ctx, snapshot, TaskCreatedTick, task_id=created[0])
 
@@ -487,7 +543,15 @@ class WorkflowEngine:
                 blocking_reason="task approval is required",
             )
 
-        due_tasks = self.store.due_tasks(snapshot.game_id, snapshot.turn)
+        due_tasks = [
+            *self.store.due_turn_action_nodes(
+                snapshot.game_id,
+                snapshot.turn,
+                source_observation_id=observation_id,
+            ),
+            *self.store.due_tasks(snapshot.game_id, snapshot.turn),
+        ]
+        due_tasks.sort(key=lambda task: (task.due_turn, task.task_id))
         if (
             due_tasks
             and snapshot.units is None
@@ -528,8 +592,7 @@ class WorkflowEngine:
         events = [] if rewind_event is None else [rewind_event]
         events.extend(rule_compilation.events)
         events.extend(progression_compilation.events)
-        if authoritative_research is not None:
-            events.extend(authoritative_research.events)
+        events.extend(authoritative_research_events)
         events.extend(events_from_snapshot(snapshot))
         gate = self.gate.ingest(snapshot.game_id, events)
         compat = TickResult(

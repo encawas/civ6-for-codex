@@ -154,6 +154,11 @@ class StrategicContractCommit(DomainModel):
     source_patch_provider_attempt_id: str | None = Field(default=None, min_length=1)
     source_patch_mission_id: str | None = Field(default=None, min_length=1)
     source_patch_mission_revision: int | None = Field(default=None, ge=1)
+    source_action_attempt_id: str | None = Field(default=None, min_length=1)
+    source_turn_action_graph_id: str | None = Field(default=None, min_length=1)
+    source_turn_action_node_id: str | None = Field(default=None, min_length=1)
+    source_execution_mission_id: str | None = Field(default=None, min_length=1)
+    source_execution_mission_revision: int | None = Field(default=None, ge=1)
 
     def model_post_init(self, __context: object) -> None:
         if self.committed_at.tzinfo is None or self.committed_at.utcoffset() is None:
@@ -192,9 +197,30 @@ class StrategicContractCommit(DomainModel):
             raise ValueError(
                 "Patch-derived Contract provenance must be all present or all null"
             )
-        if self.source_proposal_id is not None and self.source_patch_id is not None:
+        action_provenance = (
+            self.source_action_attempt_id,
+            self.source_turn_action_graph_id,
+            self.source_turn_action_node_id,
+            self.source_execution_mission_id,
+            self.source_execution_mission_revision,
+        )
+        if any(value is not None for value in action_provenance) and not all(
+            value is not None for value in action_provenance
+        ):
             raise ValueError(
-                "Contract commit cannot be both Proposal-derived and Patch-derived"
+                "Action-derived Contract provenance must be all present or all null"
+            )
+        provenance_families = sum(
+            value is not None
+            for value in (
+                self.source_proposal_id,
+                self.source_patch_id,
+                self.source_action_attempt_id,
+            )
+        )
+        if provenance_families > 1:
+            raise ValueError(
+                "Contract commit cannot combine derived provenance families"
             )
         if self.source_proposal_id is not None:
             if self.contract.approval_status is not ApprovalStatus.APPROVED:
@@ -224,6 +250,29 @@ class StrategicContractCommit(DomainModel):
                     "Patch-derived Contract provenance must identify one Mission"
                 )
             research_mission_action(matching[0])
+        if self.source_action_attempt_id is not None:
+            matching = tuple(
+                mission
+                for mission in self.contract.mission_graph.missions
+                if mission.mission_id == self.source_execution_mission_id
+                and mission.mission_revision
+                == int(self.source_execution_mission_revision) + 1
+            )
+            if len(matching) != 1:
+                raise ValueError(
+                    "Action-derived Contract must advance one source Mission"
+                )
+            mission = matching[0]
+            if (
+                mission.status is not MissionStatus.COMPLETED
+                or self.source_action_attempt_id not in mission.evidence_refs
+            ):
+                raise ValueError(
+                    "Action-derived Contract requires completed Mission evidence"
+                )
+            research_mission_action(
+                mission.model_copy(update={"status": MissionStatus.ACTIVE})
+            )
 
 
 def research_mission_action(mission: Mission) -> str:

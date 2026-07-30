@@ -60,7 +60,9 @@ from civ6_workflow.domain import (
 )
 from civ6_workflow.engine import EngineConfig, InjectedCrashBoundary, WorkflowEngine
 from civ6_workflow.models import (
+    ActionResult,
     ExecutionMode,
+    MutationDeliveryStatus,
     PlanBundle,
     ProposedTask,
     RiskLevel,
@@ -1118,7 +1120,7 @@ def test_v9_upgrade_creates_empty_proposal_table_without_changing_state(tmp_path
     )
     assert upgraded.list_strategic_research_proposals("game-1") == []
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
 
 
 @pytest.mark.parametrize("kind", ["creation", "repair"])
@@ -6131,6 +6133,241 @@ def test_phase1c_approval_routes_research_from_mission_and_preserves_civic(
     assert civic.source_mission_id is None
     assert planner.calls == 0
     assert len(enabled.list_provider_attempts(request.planner_request_id)) == 1
+
+
+def test_turn_action_graph_verification_commits_mission_completion_once(tmp_path):
+    path = tmp_path / "phase3-turn-action-graph.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+    ready = _proposal_ready_tick(enabled, proposal.proposal_id)
+    approval = _proposal_decision(
+        enabled, proposal, ApprovalDecision.APPROVED
+    ).model_copy(update={"created_at": max(datetime.now(UTC), ready.completed_at)})
+    applied = enabled.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        approval,
+    )
+
+    class ExecutingResearchGame(_Game):
+        async def execute_task(self, task):
+            assert task.action_type == "set_research"
+            assert task.arguments == {"tech_or_civic": "TECH_WRITING"}
+            return ActionResult(
+                success=True,
+                delivery_status=MutationDeliveryStatus.ACKNOWLEDGED,
+            )
+
+    game = ExecutingResearchGame(proposal.game_session_id)
+    game.snapshot = _research_ready_game(proposal.game_session_id).snapshot
+    engine = _engine(enabled, game, _Planner())
+
+    sent = asyncio.run(engine.tick())
+    assert sent.workflow_tick["outcome"] == TickOutcomeKind.MUTATION_SENT
+    graph_state = enabled.active_turn_action_graph(proposal.game_session_id)
+    assert graph_state is not None
+    graph, nodes = graph_state
+    assert len(nodes) == 1
+    assert nodes[0].action_type == "set_research"
+    assert (
+        enabled.due_turn_action_nodes(
+            proposal.game_session_id,
+            1,
+            source_observation_id=graph.source_observation_id,
+        )
+        == []
+    )
+
+    game.snapshot = game.snapshot.model_copy(
+        update={
+            "tech_civics": {
+                **game.snapshot.tech_civics,
+                "current_research": "TECH_WRITING",
+            }
+        }
+    )
+    verified = asyncio.run(engine.tick())
+    assert verified.workflow_tick["outcome"] == TickOutcomeKind.ATTEMPT_RECONCILED
+
+    contract = enabled.get_active_strategic_contract(proposal.game_session_id)
+    assert contract is not None
+    assert contract.revision == applied.activated_contract_revision + 1
+    mission = contract.mission_graph.missions[0]
+    assert mission.status is MissionStatus.COMPLETED
+    assert mission.mission_revision == applied.source_mission_revision + 1
+    assert len(mission.evidence_refs) == 1
+    assert enabled.active_turn_action_graph(proposal.game_session_id) is None
+    assert (
+        enabled.due_turn_action_nodes(
+            proposal.game_session_id,
+            1,
+            source_observation_id=graph.source_observation_id,
+        )
+        == []
+    )
+    final_attempt = enabled.latest_attempt_for_task(
+        proposal.game_session_id, nodes[0].task_id
+    )
+    assert final_attempt is not None
+    final_tick = enabled.list_workflow_ticks(proposal.game_session_id)[-1]
+    enabled.finalize_attempt_success(final_attempt, final_tick)
+    assert (
+        enabled.get_active_strategic_contract(proposal.game_session_id).revision
+        == contract.revision
+    )
+
+    replay = enabled.export_replay_state(proposal.game_session_id)
+    restored = WorkflowStore(
+        tmp_path / "phase3-turn-action-graph-restored.sqlite3",
+        enable_phase1c_decisions=True,
+    )
+    restored.import_replay_state(replay)
+    assert restored.export_replay_state(proposal.game_session_id) == replay
+    assert restored.get_active_strategic_contract(proposal.game_session_id) == contract
+    before_tamper = restored.export_replay_state(proposal.game_session_id)
+    tampered = copy.deepcopy(replay)
+    tampered["tables"]["active_turn_action_graphs"] = [
+        {
+            "game_id": proposal.game_session_id,
+            "graph_id": graph.graph_id,
+            "activated_at": graph.compiled_at.isoformat(),
+        }
+    ]
+    with pytest.raises(ValueError, match="sources are stale"):
+        restored.import_replay_state(tampered)
+    assert restored.export_replay_state(proposal.game_session_id) == before_tamper
+
+
+def test_turn_action_graph_approval_survives_equivalent_observation(tmp_path):
+    path = tmp_path / "phase3-turn-action-approval.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+    ready = _proposal_ready_tick(enabled, proposal.proposal_id)
+    approval = _proposal_decision(
+        enabled, proposal, ApprovalDecision.APPROVED
+    ).model_copy(update={"created_at": max(datetime.now(UTC), ready.completed_at)})
+    enabled.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        approval,
+    )
+
+    class ConfirmedResearchGame(_Game):
+        calls = 0
+
+        async def execute_task(self, task):
+            self.calls += 1
+            return ActionResult(
+                success=True,
+                delivery_status=MutationDeliveryStatus.ACKNOWLEDGED,
+            )
+
+    game = ConfirmedResearchGame(proposal.game_session_id)
+    game.snapshot = _research_ready_game(proposal.game_session_id).snapshot
+    engine = WorkflowEngine(
+        store=enabled,
+        game=game,
+        planner=_Planner(),
+        config=EngineConfig(
+            execution_mode=ExecutionMode.CONFIRM,
+            auto_end_turn=False,
+            max_agent_calls_per_turn=0,
+        ),
+    )
+
+    waiting = asyncio.run(engine.tick())
+    assert waiting.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_APPROVAL
+    graph_state = enabled.active_turn_action_graph(proposal.game_session_id)
+    assert graph_state is not None
+    graph, nodes = graph_state
+    assert len(nodes) == 1
+    assert game.calls == 0
+    with pytest.raises(
+        ValueError,
+        match="StoredTask research projection is closed",
+    ):
+        enabled.save_authoritative_research_plan_bundle(
+            proposal.game_session_id,
+            1,
+            PlanBundle(
+                plan_id="forged-second-research-authority",
+                summary="Must not coexist with the active graph.",
+                tasks=[
+                    ProposedTask(
+                        task_id="forged-research-task",
+                        action_type="set_research",
+                        entity_type="research",
+                        entity_id="TECH_WRITING",
+                        due_turn=1,
+                        arguments={"tech_or_civic": "TECH_WRITING"},
+                        reason="forged duplicate authority",
+                    )
+                ],
+            ),
+            mode=ExecutionMode.CONFIRM,
+            auto_action_types={"set_research"},
+            observation_id=graph.source_observation_id,
+        )
+    assert enabled.approve_task(
+        proposal.game_session_id, nodes[0].task_id, approved_by="operator"
+    )
+
+    sent = asyncio.run(engine.tick())
+    assert sent.workflow_tick["outcome"] == TickOutcomeKind.MUTATION_SENT
+    assert game.calls == 1
+    current_graph = enabled.active_turn_action_graph(proposal.game_session_id)
+    assert current_graph is not None
+    assert current_graph[0].graph_id == graph.graph_id
+
+
+def test_turn_change_expires_old_graph_before_any_node_can_be_claimed(tmp_path):
+    path = tmp_path / "phase3-turn-barrier.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+    ready = _proposal_ready_tick(enabled, proposal.proposal_id)
+    approval = _proposal_decision(
+        enabled, proposal, ApprovalDecision.APPROVED
+    ).model_copy(update={"created_at": max(datetime.now(UTC), ready.completed_at)})
+    enabled.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        approval,
+    )
+    game = _research_ready_game(proposal.game_session_id)
+    engine = WorkflowEngine(
+        store=enabled,
+        game=game,
+        planner=_Planner(),
+        config=EngineConfig(
+            execution_mode=ExecutionMode.CONFIRM,
+            auto_end_turn=False,
+            max_agent_calls_per_turn=0,
+        ),
+    )
+
+    first = asyncio.run(engine.tick())
+    assert first.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_APPROVAL
+    old_graph, old_nodes = enabled.active_turn_action_graph(proposal.game_session_id)
+    game.snapshot = game.snapshot.model_copy(
+        update={
+            "turn": 2,
+            "overview": {**game.snapshot.overview, "turn": 2},
+        }
+    )
+
+    second = asyncio.run(engine.tick())
+    assert second.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_APPROVAL
+    new_graph, new_nodes = enabled.active_turn_action_graph(proposal.game_session_id)
+    assert new_graph.turn_number == 2
+    assert new_graph.graph_id != old_graph.graph_id
+    assert old_nodes[0].task_id != new_nodes[0].task_id
+    assert (
+        enabled.task_status(proposal.game_session_id, old_nodes[0].task_id)
+        is TaskStatus.EXPIRED
+    )
+    with pytest.raises(ValueError, match="not part of the active graph"):
+        enabled.approve_task(
+            proposal.game_session_id,
+            old_nodes[0].task_id,
+            approved_by="operator",
+        )
 
 
 @pytest.mark.parametrize("decision", [ApprovalDecision.REJECTED, "stale"])

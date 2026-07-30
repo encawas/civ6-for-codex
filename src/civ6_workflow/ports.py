@@ -22,6 +22,8 @@ from .domain import (
     StrategicProposalRejectedTick,
     StrategicProposalWaitResumeRequest,
     StrategicResearchProposal,
+    TurnActionGraph,
+    TurnActionNode,
 )
 from .models import ActionResult, ExecutionMode, PlanBundle, RuntimeSnapshot, StoredTask
 
@@ -121,6 +123,26 @@ class WorkflowStorePort(Protocol):
     def active_research_mission(
         self, game_id: str
     ) -> tuple[StrategicContract, Mission] | None: ...
+
+    def activate_turn_action_graph(
+        self,
+        graph: TurnActionGraph,
+        nodes: tuple[TurnActionNode, ...],
+        *,
+        activated_at: datetime,
+    ) -> tuple[TurnActionGraph, tuple[StoredTask, ...]]: ...
+
+    def active_turn_action_graph(
+        self, game_id: str
+    ) -> tuple[TurnActionGraph, tuple[StoredTask, ...]] | None: ...
+
+    def due_turn_action_nodes(
+        self,
+        game_id: str,
+        turn: int,
+        *,
+        source_observation_id: str,
+    ) -> list[StoredTask]: ...
 
     def save_normalized_observation(
         self, observation: NormalizedObservation
