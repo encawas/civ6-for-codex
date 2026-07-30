@@ -77,8 +77,29 @@ civ6-control --config config.toml --port 8877
 - display planner backend, HTTP status, response-header time, first-byte time, completion time and request ID;
 - display the most recent tick timing metrics;
 - run one explicitly requested workflow tick.
+- show an OPEN strategic research Proposal when the persisted wait is ready;
+- explicitly approve or reject that Proposal through its atomic decision
+  transition.
 
 The control panel does not bypass workflow safety. Approval still uses the SQLite task transition, and a tick still passes through the user-global execution lock, action registry, preconditions and postconditions.
+
+## Strategic research proposals
+
+When the current Human Wait is strategic_contract_proposal_ready, the panel
+shows the Proposal identity and explicit **Approve** and **Reject** actions.
+The ordinary Human Wait resume action is not available for this wait.
+
+**Approve** atomically records the decision, appends the next Contract
+revision, activates the Proposal-derived ACTIVE research Mission, transfers
+only research authority, and clears the wait. It does not create a StoredTask.
+Run a later workflow Tick to project the revision-bound set_research task from
+the active Mission. **Reject** records the terminal decision and clears the
+wait without changing Contract or authority.
+
+Repeated submission of the same decision is idempotent. A conflicting decision
+is rejected. Stale Proposal content is system-invalidated rather than treated
+as a human rejection. Existing non-Proposal Human Wait resume behavior is
+unchanged.
 
 ## Reapply the upstream overlay
 

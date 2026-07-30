@@ -450,6 +450,16 @@ user entry invokes them before PR 1C-3.
 - Finalize documents and perform OpenSpec verify, sync, and archive after
   primary and secondary review.
 
+Implementation status: enabled in the existing production composition root.
+Store startup and replay perform the released-wait migration before enabled
+validation; the control panel supplies explicit APPROVE/REJECT operations;
+generic Proposal resume is closed; and the existing Runtime projects
+set_research only after atomic activation has committed. Approval itself still
+creates no StoredTask. Rejection and stale invalidation leave Contract and
+authority unchanged. Generic non-Proposal Human Wait recovery and all
+non-research scope behavior remain unchanged. No second Runtime, Engine, Store,
+or task model was added.
+
 ### Data migration
 
 - Add immutable Proposal decision and transition audit without rewriting
@@ -539,8 +549,9 @@ is invalid.
 - Proposal decision and activation do not directly create StoredTask.
 - After activation and the Decision/Activation Tick complete, later Routing
   reads the active Contract/Mission revision, performs a separate deterministic
-  projection, and enters the normal Planner lifecycle before a replacement
-  StoredTask may be created.
+  projection, and enters the existing PlanBundle/StoredTask persistence and
+  execution lifecycle before a replacement StoredTask may be created. It does
+  not create another PlannerRequest or recall the Provider.
 - Before first cutover, set_research with all four provenance fields NULL is
   legacy. After cutover, a valid Mission-derived set_research task has all four
   fields and matches the active Contract plus the same ACTIVE research Mission
@@ -955,7 +966,8 @@ or blocks the switch, and no unresolved mutation may survive.
 The authority-switch transaction does not create a Mission-derived StoredTask.
 After activation and its dedicated Tick complete, later Routing may create a
 replacement only through deterministic projection from the current Contract
-and Mission revision and the normal Planner lifecycle. It records old-to-new
+and Mission revision and the normal task persistence/execution lifecycle. It
+records old-to-new
 audit association, leaves the old task unclaimable, does not rewrite old
 provenance, and leaves at most one equivalent action claimable.
 

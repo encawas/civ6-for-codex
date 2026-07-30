@@ -191,7 +191,7 @@ Alternative rejected: treating an old Resume Tick as approval would fabricate hu
 
 The approval transaction changes only research ownership. Legacy research DecisionGap, PlanLease, strategy-state, and equivalent write paths become fail-closed or read-only once the active AuthorityScopeSet includes research. Non-research scope ownership and state remain unchanged.
 
-Proposal application does not create StoredTask. A later Routing step reads the active Contract and authoritative research Mission, performs a separate deterministic revision-bound projection, and enters the normal PlannerRequest lifecycle.
+Proposal application does not create StoredTask. A later Routing step reads the active Contract and authoritative research Mission, performs a separate deterministic revision-bound projection, and enters the existing PlanBundle/StoredTask persistence and execution lifecycle without creating another PlannerRequest or recalling the Provider.
 
 Mission-derived research StoredTask uses the four-field provenance group added in PR 1C-1. Before first cutover, set_research with all four fields null is explicitly legacy. After cutover, a set_research task is eligible only when all four fields are present and match the same-game active Contract and an `ACTIVE` Mission whose scope is exactly `research`. ContractCommit and Applied Tick bind that same Mission identity/revision. Routing obtains the action only from the closed `research -> set_research` mapping; neither Mission desired_outcome nor arbitrary strings/JSON can choose an operation. Each claim, retry, confirmation release, and recovery operation re-reads and validates the active aggregate in its own write transaction; null, partial, stale, cross-game, non-research, non-ACTIVE, or non-`set_research` provenance cannot become claimable.
 
@@ -213,6 +213,16 @@ checks, revision-bound research projection, task mutation guards, and shared
 startup/replay validation implement this design without enabling production
 decisions. PR 1C-3 remains responsible for compatibility migration, user entry,
 Runtime integration, and removal of dormancy.
+
+PR 1C-3 enables that same Store capability in the existing production
+composition root. Startup and replay migrate released Phase 1B waits before
+enabled validation, the control panel supplies explicit APPROVE/REJECT
+operations, generic Proposal resume is rejected, and the existing Runtime
+performs the later revision-bound set_research projection. Approval itself
+creates no StoredTask; rejection and stale invalidation do not change Contract
+or authority; non-research scopes and generic non-Proposal resume are
+unchanged. No second Store, Runtime, Engine, Repository, or task model is
+introduced.
 
 ## Risks / Trade-offs
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .domain import (
+    Mission,
     StrategicContract,
     StrategicContractCommit,
     StrategicProposalAppliedTick,
@@ -21,6 +22,9 @@ class WorkflowStorePort(Protocol):
     """Application-facing persistence boundary implemented by WorkflowStore."""
 
     path: Path
+
+    @property
+    def phase1c_decisions_enabled(self) -> bool: ...
 
     def commit_strategic_contract_revision(
         self, commit: StrategicContractCommit
@@ -105,6 +109,10 @@ class WorkflowStorePort(Protocol):
         auto_action_types: set[str],
         observation_id: str,
     ) -> None: ...
+
+    def active_research_mission(
+        self, game_id: str
+    ) -> tuple[StrategicContract, Mission] | None: ...
 
     def __getattr__(self, name: str) -> Any: ...
 

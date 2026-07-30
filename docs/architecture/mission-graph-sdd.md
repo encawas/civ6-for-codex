@@ -346,6 +346,17 @@ through the dedicated APPROVE or REJECT aggregate transition.
 request_human_resume fails closed for that wait and remains available for
 supported non-Proposal waits such as strategic_request_terminated.
 
+Phase 1C-3 enables this boundary in the production composition root. Store
+startup migrates every released Phase 1B Proposal wait under the existing
+writer lock before ordinary work can run. The control panel exposes explicit
+APPROVE and REJECT commands bound to the persisted Proposal-ready context.
+Approval performs the existing atomic activation transaction; only a later
+Runtime routing Tick reads the active Contract/Mission revision and projects a
+revision-bound set_research StoredTask. Rejection and stale invalidation append
+their dedicated terminal evidence without changing Contract or authority.
+Generic non-Proposal Human Wait recovery and every non-research scope retain
+their previous behavior.
+
 RuntimeState, Human Wait context, Applied, Rejected, Resume, and Error Ticks
 are transition or interaction evidence. None substitutes for ApprovalRecord.
 Ordinary work begins only after the dedicated decision or activation Tick
@@ -353,7 +364,8 @@ completes.
 
 Proposal application does not directly create StoredTask. Later routing reads
 the active Contract and authoritative MissionGraph revision, performs a
-separate deterministic projection, and enters the normal Planner lifecycle.
+separate deterministic projection, and enters the normal PlanBundle/StoredTask
+persistence and execution lifecycle without another Provider call.
 Proposal or transition-Tick identity alone cannot create claimable work.
 
 ## 7. Planner Boundary
@@ -635,8 +647,8 @@ The authority-switch or Proposal-application transaction never creates a
 Mission-derived StoredTask. After activation and the dedicated
 Decision/Activation Tick complete, a later Routing step reads the active
 Contract and Mission, performs a separate deterministic revision-bound
-projection, and enters the normal Planner lifecycle before a replacement
-StoredTask may be created. Old execution provenance remains auditable and at
+projection, and enters the normal PlanBundle/StoredTask persistence and
+execution lifecycle before a replacement StoredTask may be created. Old execution provenance remains auditable and at
 most one equivalent action may be claimable.
 
 After cutover, every research claim, retry, confirmation release, and recovery

@@ -51,7 +51,10 @@ def resolve_database_path(config: AppConfig, config_path: str | Path) -> Path:
 
 
 def build_store(config: AppConfig, config_path: str | Path) -> WorkflowStore:
-    return WorkflowStore(resolve_database_path(config, config_path))
+    return WorkflowStore(
+        resolve_database_path(config, config_path),
+        enable_phase1c_decisions=True,
+    )
 
 
 def compose_runtime(
@@ -184,7 +187,7 @@ def compose_replay_runtime(
 ) -> RuntimeComposition:
     if not recording.frames:
         raise ValueError("recording contains no snapshot frames")
-    store = WorkflowStore(database)
+    store = WorkflowStore(database, enable_phase1c_decisions=True)
     if recording.store_state is not None:
         store.import_replay_state(recording.store_state)
     config = replay_engine_config(recording, auto_end_turn=auto_end_turn)

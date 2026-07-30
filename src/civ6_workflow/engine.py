@@ -335,20 +335,30 @@ class WorkflowEngine:
             if (
                 wait.get("wait_kind") == "strategic_contract_proposal_ready"
                 and wait.get("resume_policy") == "explicit_only"
-                and wait.get("resume_requested") is True
             ):
-                return self._finish(
-                    ctx,
-                    snapshot,
-                    StrategicProposalWaitResumedTick,
-                    resume_request_id=wait.get("resume_request_id"),
-                    proposal_ready_tick_id=wait.get("proposal_ready_tick_id"),
-                    planner_request_id=wait.get("planner_request_id"),
-                    proposal_id=wait.get("proposal_id"),
-                    target_kind=wait.get("target_kind"),
-                    expected_base_revision=wait.get("expected_base_revision"),
-                    resume_reason="explicit_user_resume",
-                )
+                if self.store.phase1c_decisions_enabled:
+                    return self._finish(
+                        ctx,
+                        snapshot,
+                        AwaitingHumanTick,
+                        blocking_reason=str(
+                            wait.get("blocking_reason")
+                            or "research Proposal requires APPROVE or REJECT"
+                        ),
+                    )
+                if wait.get("resume_requested") is True:
+                    return self._finish(
+                        ctx,
+                        snapshot,
+                        StrategicProposalWaitResumedTick,
+                        resume_request_id=wait.get("resume_request_id"),
+                        proposal_ready_tick_id=wait.get("proposal_ready_tick_id"),
+                        planner_request_id=wait.get("planner_request_id"),
+                        proposal_id=wait.get("proposal_id"),
+                        target_kind=wait.get("target_kind"),
+                        expected_base_revision=wait.get("expected_base_revision"),
+                        resume_reason="explicit_user_resume",
+                    )
             if wait.get("wait_kind") == "strategic_request_terminated":
                 if wait.get("resume_requested") is True:
                     return self._finish(
@@ -406,10 +416,22 @@ class WorkflowEngine:
         before = self.store.task_ids(snapshot.game_id)
         materialization_started = self._monotonic()
         rule_compilation = self.rules.compile(observation)
-        progression_compilation = self.progression.compile(observation)
+        active_research = self.store.active_research_mission(snapshot.game_id)
+        progression_compilation = self.progression.compile(
+            observation,
+            include_research=active_research is None,
+        )
+        authoritative_research = (
+            None
+            if active_research is None
+            else self.progression.compile_authoritative_research(
+                observation, *active_research
+            )
+        )
         current_events = [
             *rule_compilation.events,
             *progression_compilation.events,
+            *(authoritative_research.events if authoritative_research else []),
             *events_from_snapshot(snapshot),
         ]
         lease_tick = await self._pre_route_decision_runtime(
@@ -428,6 +450,18 @@ class WorkflowEngine:
                     auto_action_types=self.config.auto_action_types,
                     observation_id=observation_id,
                 )
+        if (
+            authoritative_research is not None
+            and authoritative_research.bundle is not None
+        ):
+            self.store.save_authoritative_research_plan_bundle(
+                snapshot.game_id,
+                snapshot.turn,
+                authoritative_research.bundle,
+                mode=self.config.execution_mode,
+                auto_action_types=self.config.auto_action_types,
+                observation_id=observation_id,
+            )
         ctx.metrics.task_materialization_seconds += (
             self._monotonic() - materialization_started
         )
@@ -488,6 +522,8 @@ class WorkflowEngine:
         events = [] if rewind_event is None else [rewind_event]
         events.extend(rule_compilation.events)
         events.extend(progression_compilation.events)
+        if authoritative_research is not None:
+            events.extend(authoritative_research.events)
         events.extend(events_from_snapshot(snapshot))
         gate = self.gate.ingest(snapshot.game_id, events)
         compat = TickResult(
@@ -1556,7 +1592,11 @@ class WorkflowEngine:
             bundle,
             PlanValidationContext(
                 current_turn=snapshot.turn,
-                allowed_action_types=self.config.allowed_action_types,
+                allowed_action_types=set(
+                    request.constraints.get(
+                        "allowed_action_types", self.config.allowed_action_types
+                    )
+                ),
                 known_entities=extract_known_entities(snapshot),
                 max_tasks=max_tasks,
             ),
@@ -1776,15 +1816,37 @@ class WorkflowEngine:
         self, snapshot: RuntimeSnapshot, events: list[GameEvent]
     ) -> AgentRequest:
         context = self.store.current_context(snapshot.game_id)
+        research_authoritative = (
+            self.store.active_research_mission(snapshot.game_id) is not None
+        )
+        if research_authoritative:
+            context = dict(context)
+            strategy = context.get("strategy")
+            if isinstance(strategy, dict):
+                strategy = dict(strategy)
+                for key in (
+                    "research",
+                    "research_queue",
+                    "tech",
+                    "tech_queue",
+                    "technology",
+                ):
+                    strategy.pop(key, None)
+                context["strategy"] = strategy
         relevant_state, relevant_plans, max_tasks = project_agent_context(
             snapshot, events, context
         )
         allowed_action_types = set(self.config.allowed_action_types)
+        if research_authoritative:
+            allowed_action_types.discard("set_research")
         argument_contracts = action_argument_contracts(allowed_action_types)
         entity_type_contracts = action_entity_type_contracts(allowed_action_types)
         entity_id_contracts = entity_id_argument_contracts(entity_type_contracts)
         required_condition_contracts = condition_contracts(allowed_action_types)
         information_contracts = information_tool_argument_contracts()
+        strategy_queue_fields = {"civic_queue": "ordered CIVIC_* type names"}
+        if not research_authoritative:
+            strategy_queue_fields["research_queue"] = "ordered TECH_* type names"
         return AgentRequest(
             turn=snapshot.turn,
             execution_mode=self.config.execution_mode,
@@ -1821,10 +1883,7 @@ class WorkflowEngine:
                     "unit_can_improve",
                 ],
                 "supported_lease_condition_types": sorted(LEASE_CONDITION_TYPES),
-                "strategy_queue_fields": {
-                    "research_queue": "ordered TECH_* type names",
-                    "civic_queue": "ordered CIVIC_* type names",
-                },
+                "strategy_queue_fields": strategy_queue_fields,
                 "task_postconditions_required": True,
                 "max_tasks": max_tasks,
                 "max_agent_calls_this_turn": self.config.max_agent_calls_per_turn,

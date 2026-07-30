@@ -8,11 +8,18 @@ import threading
 import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
+from uuid import uuid4
 
 from .config import AppConfig
+from .domain import (
+    ApprovalDecision,
+    StrategicProposalApprovalRecord,
+    StrategicProposalReadyTick,
+)
 from .models import TaskStatus
 from .planner_connection import planner_connection_status, probe_planner_connection
 from .store import WorkflowStore
@@ -190,6 +197,7 @@ class ControlPanelState:
         human_actions = {
             "runtime_state": None,
             "human_wait": None,
+            "strategic_proposal": None,
             "lease_approvals": [],
             "retryable_attempts": [],
         }
@@ -197,6 +205,26 @@ class ControlPanelState:
             runtime_state = self.store.load_runtime_state(game_id)
             human_actions["runtime_state"] = runtime_state.value
             human_actions["human_wait"] = self.store.human_wait_context(game_id)
+            wait = human_actions["human_wait"]
+            if (
+                isinstance(wait, dict)
+                and wait.get("wait_kind") == "strategic_contract_proposal_ready"
+            ):
+                proposal = self.store.get_strategic_research_proposal(
+                    str(wait.get("proposal_id"))
+                )
+                if proposal is not None:
+                    human_actions["strategic_proposal"] = {
+                        "proposal_id": proposal.proposal_id,
+                        "proposal_hash": proposal.proposal_hash,
+                        "target_kind": proposal.target_kind.value,
+                        "expected_base_revision": proposal.expected_base_revision,
+                        "strategic_objectives": list(proposal.strategic_objectives),
+                        "global_constraints": list(proposal.global_constraints),
+                        "research_mission": (
+                            proposal.proposed_research_mission.model_dump(mode="json")
+                        ),
+                    }
             human_actions["lease_approvals"] = [
                 {
                     "plan_lease_id": lease.plan_lease_id,
@@ -235,6 +263,54 @@ class ControlPanelState:
 
     def retry_attempt(self, game_id: str, action_attempt_id: str) -> tuple[bool, str]:
         return self.store.retry_failed_attempt_if_safe(game_id, action_attempt_id)
+
+    def decide_strategic_proposal(
+        self,
+        game_id: str,
+        proposal_id: str,
+        *,
+        approved: bool,
+    ) -> tuple[bool, str]:
+        proposal = self.store.get_strategic_research_proposal(proposal_id)
+        if proposal is None or proposal.game_session_id != game_id:
+            return False, "strategic Proposal is not available for this game"
+        decision = ApprovalDecision.APPROVED if approved else ApprovalDecision.REJECTED
+        existing = self.store.strategic_proposal_approval_record(game_id, proposal_id)
+        if existing is not None:
+            if existing.decision is not decision:
+                return False, "strategic Proposal already has a conflicting decision"
+            record = existing
+        else:
+            ready_ticks = [
+                tick
+                for tick in self.store.list_workflow_ticks(game_id)
+                if isinstance(tick, StrategicProposalReadyTick)
+                and tick.proposal_id == proposal_id
+            ]
+            if len(ready_ticks) != 1:
+                return False, "strategic Proposal has no unique Ready Tick"
+            decided_at = max(datetime.now(UTC), ready_ticks[0].completed_at)
+            record = StrategicProposalApprovalRecord(
+                approval_id=f"strategic_approval_{uuid4().hex}",
+                proposal_id=proposal_id,
+                decision=decision,
+                actor="control-panel-user",
+                created_at=decided_at,
+                reason=(
+                    "approved from the local control panel"
+                    if approved
+                    else "rejected from the local control panel"
+                ),
+            )
+        try:
+            if approved:
+                tick = self.store.approve_strategic_research_proposal(game_id, record)
+            else:
+                tick = self.store.reject_strategic_research_proposal(game_id, record)
+        except (KeyError, ValueError) as exc:
+            return False, str(exc)
+        disposition = tick.outcome.value
+        return True, f"strategic Proposal recorded as {disposition}"
 
     def request_resume(self, game_id: str) -> tuple[bool, str]:
         if self.store.request_human_resume(game_id):
@@ -352,6 +428,31 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 return
             ok, reason = self.server.control.request_resume(parts[2])
             self._send_human_action(ok, reason, game_id=parts[2])
+            return
+        if (
+            len(parts) == 6
+            and parts[:2] == ["api", "games"]
+            and parts[3] == "proposals"
+        ):
+            if not self._authorized(parsed):
+                return
+            game_id, proposal_id, decision = parts[2], parts[4], parts[5]
+            if decision not in {"approve", "reject"}:
+                self._send_json(
+                    {"error": "unknown Proposal decision"}, HTTPStatus.NOT_FOUND
+                )
+                return
+            ok, reason = self.server.control.decide_strategic_proposal(
+                game_id,
+                proposal_id,
+                approved=decision == "approve",
+            )
+            self._send_human_action(
+                ok,
+                reason,
+                game_id=game_id,
+                proposal_id=proposal_id,
+            )
             return
         if len(parts) == 6 and parts[:2] == ["api", "games"] and parts[3] == "tasks":
             if not self._authorized(parsed):
@@ -558,8 +659,8 @@ _HUMAN_ACTIONS_SCRIPT = """
 let humanActionStatus='';
 function humanButton(label,action,game,target){return `<button class="btn" data-human-action="${esc(action)}" data-game-id="${esc(game)}" data-target-id="${esc(target)}">${esc(label)}</button>`}
 function humanActionRow(title,detail,buttons){return `<div class="task"><div><div class="task-title">${esc(title)}</div><div class="reason">${esc(detail)}</div></div><div class="actions">${buttons}</div></div>`}
-function renderHumanActions(d){const h=d.human_actions||{};const game=d.game?.game_id||'';const rows=[];if(h.runtime_state==='AWAITING_HUMAN'){rows.push(humanActionRow('Workflow requires review',h.human_wait?.blocking_reason||'A fresh observation will be evaluated after resume.',humanButton('Resume','resume',game,game)))}for(const task of d.waiting_tasks||[]){rows.push(humanActionRow(`Task: ${task.action_type}`,task.reason||task.task_id,humanButton('Confirm','confirm-task',game,task.task_id)+humanButton('Reject','reject-task',game,task.task_id)))}for(const lease of h.lease_approvals||[]){rows.push(humanActionRow(`Plan approval: ${lease.scope}`,lease.plan_id,humanButton('Approve','approve-lease',game,lease.plan_lease_id)+humanButton('Reject','reject-lease',game,lease.plan_lease_id)))}for(const attempt of h.retryable_attempts||[]){rows.push(humanActionRow(`Retry: ${attempt.action_type}`,attempt.reason,humanButton('Retry','retry-attempt',game,attempt.action_attempt_id)))}$('humanActionCount').textContent=rows.length;$('humanActions').innerHTML=(humanActionStatus?`<div class="reason" style="margin-bottom:10px">${esc(humanActionStatus)}</div>`:'')+(rows.length?rows.join(''):'<div class="empty">No manual action is currently available.</div>')}
-async function performHumanAction(button){const action=button.dataset.humanAction;const game=button.dataset.gameId;const target=button.dataset.targetId;const path={resume:`/api/games/${encodeURIComponent(game)}/workflow/resume`,'confirm-task':`/api/games/${encodeURIComponent(game)}/tasks/${encodeURIComponent(target)}/confirm`,'reject-task':`/api/games/${encodeURIComponent(game)}/tasks/${encodeURIComponent(target)}/reject`,'approve-lease':`/api/games/${encodeURIComponent(game)}/leases/${encodeURIComponent(target)}/approve`,'reject-lease':`/api/games/${encodeURIComponent(game)}/leases/${encodeURIComponent(target)}/reject`,'retry-attempt':`/api/games/${encodeURIComponent(game)}/attempts/${encodeURIComponent(target)}/retry`}[action];button.disabled=true;try{const result=await api(path,{method:'POST',body:'{}'});humanActionStatus=result.reason||'Action recorded.';if(action==='resume'){const tickResult=await api('/api/tick',{method:'POST',body:'{}'});humanActionStatus=`${humanActionStatus} ${tickResult.result?.outcome||'Re-evaluation completed.'}`}}catch(error){humanActionStatus=error.message}finally{await refresh()}}
+function renderHumanActions(d){const h=d.human_actions||{};const game=d.game?.game_id||'';const rows=[];const proposal=h.strategic_proposal;if(h.runtime_state==='AWAITING_HUMAN'){if(proposal){const detail=(proposal.strategic_objectives||[]).join('; ')||h.human_wait?.blocking_reason||'Research strategy requires a decision.';rows.push(humanActionRow('Research strategy proposal',detail,humanButton('Approve','approve-proposal',game,proposal.proposal_id)+humanButton('Reject','reject-proposal',game,proposal.proposal_id)))}else{rows.push(humanActionRow('Workflow requires review',h.human_wait?.blocking_reason||'A fresh observation will be evaluated after resume.',humanButton('Resume','resume',game,game)))}}for(const task of d.waiting_tasks||[]){rows.push(humanActionRow(`Task: ${task.action_type}`,task.reason||task.task_id,humanButton('Confirm','confirm-task',game,task.task_id)+humanButton('Reject','reject-task',game,task.task_id)))}for(const lease of h.lease_approvals||[]){rows.push(humanActionRow(`Plan approval: ${lease.scope}`,lease.plan_id,humanButton('Approve','approve-lease',game,lease.plan_lease_id)+humanButton('Reject','reject-lease',game,lease.plan_lease_id)))}for(const attempt of h.retryable_attempts||[]){rows.push(humanActionRow(`Retry: ${attempt.action_type}`,attempt.reason,humanButton('Retry','retry-attempt',game,attempt.action_attempt_id)))}$('humanActionCount').textContent=rows.length;$('humanActions').innerHTML=(humanActionStatus?`<div class="reason" style="margin-bottom:10px">${esc(humanActionStatus)}</div>`:'')+(rows.length?rows.join(''):'<div class="empty">No manual action is currently available.</div>')}
+async function performHumanAction(button){const action=button.dataset.humanAction;const game=button.dataset.gameId;const target=button.dataset.targetId;const path={resume:`/api/games/${encodeURIComponent(game)}/workflow/resume`,'approve-proposal':`/api/games/${encodeURIComponent(game)}/proposals/${encodeURIComponent(target)}/approve`,'reject-proposal':`/api/games/${encodeURIComponent(game)}/proposals/${encodeURIComponent(target)}/reject`,'confirm-task':`/api/games/${encodeURIComponent(game)}/tasks/${encodeURIComponent(target)}/confirm`,'reject-task':`/api/games/${encodeURIComponent(game)}/tasks/${encodeURIComponent(target)}/reject`,'approve-lease':`/api/games/${encodeURIComponent(game)}/leases/${encodeURIComponent(target)}/approve`,'reject-lease':`/api/games/${encodeURIComponent(game)}/leases/${encodeURIComponent(target)}/reject`,'retry-attempt':`/api/games/${encodeURIComponent(game)}/attempts/${encodeURIComponent(target)}/retry`}[action];button.disabled=true;try{const result=await api(path,{method:'POST',body:'{}'});humanActionStatus=result.reason||'Action recorded.';if(action==='resume'){const tickResult=await api('/api/tick',{method:'POST',body:'{}'});humanActionStatus=`${humanActionStatus} ${tickResult.result?.outcome||'Re-evaluation completed.'}`}}catch(error){humanActionStatus=error.message}finally{await refresh()}}
 document.addEventListener('click',event=>{const button=event.target.closest('[data-human-action]');if(button){performHumanAction(button)}});
 """
 

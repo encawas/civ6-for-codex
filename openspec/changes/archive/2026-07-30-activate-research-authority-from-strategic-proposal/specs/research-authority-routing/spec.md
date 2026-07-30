@@ -193,7 +193,7 @@ The four fields SHALL be either all null or all present. PR 1C-1 SHALL add the d
 
 ### Requirement: Proposal application does not create StoredTask
 
-The decision and activation transaction SHALL NOT directly create a StoredTask. Executable work SHALL be produced only by a later deterministic projection from the active Contract and authoritative MissionGraph through the normal Planner and execution lifecycle.
+The decision and activation transaction SHALL NOT directly create a StoredTask. Executable work SHALL be produced only by a later deterministic projection from the active Contract and authoritative MissionGraph through the existing PlanBundle/StoredTask persistence and execution lifecycle. This projection SHALL NOT create another PlannerRequest or recall the Provider.
 
 #### Scenario: Approval commits no StoredTask
 
@@ -203,7 +203,7 @@ The decision and activation transaction SHALL NOT directly create a StoredTask. 
 #### Scenario: Routing projects later work
 
 - **WHEN** a later routing step consumes the active research Mission
-- **THEN** any planner work is revision-bound and enters the normal PlannerRequest lifecycle before a StoredTask can exist
+- **THEN** the revision-bound deterministic projection enters the existing PlanBundle/StoredTask persistence and execution lifecycle before a StoredTask can exist, without creating another PlannerRequest or recalling the Provider
 
 #### Scenario: Proposal identity alone cannot create work
 

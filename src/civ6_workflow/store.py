@@ -562,12 +562,11 @@ class WorkflowStore:
         self,
         path: str | Path,
         *,
-        enable_phase1c_dormant_activation: bool = False,
+        enable_phase1c_decisions: bool = False,
     ):
         self.path = Path(path)
-        self._phase1c_dormant_activation_enabled = bool(
-            enable_phase1c_dormant_activation
-        )
+        self._phase1c_decisions_enabled = bool(enable_phase1c_decisions)
+        self._phase1c_dormant_activation_enabled = self._phase1c_decisions_enabled
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -578,6 +577,10 @@ class WorkflowStore:
                 )
             conn.executescript(SCHEMA)
             self._migrate(conn)
+            if self._phase1c_decisions_enabled:
+                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                self._migrate_phase1c_enablement_in_connection(conn)
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -881,6 +884,154 @@ class WorkflowStore:
                 StrategicContract.model_validate_json(str(row["contract_json"]))
             )
         cls._validate_phase1c_v11(conn)
+
+    @classmethod
+    def _migrate_phase1c_enablement_in_connection(
+        cls, conn: sqlite3.Connection
+    ) -> None:
+        """Classify Phase 1B released Proposal waits before decisions go live."""
+
+        cls._validate_phase1c_v11(conn)
+        proposal_rows = conn.execute(
+            "SELECT * FROM strategic_research_proposals ORDER BY proposal_id"
+        ).fetchall()
+        for proposal_row in proposal_rows:
+            proposal = cls._strategic_research_proposal_from_row(proposal_row)
+            if cls._strategic_proposal_terminal_tick_in_connection(conn, proposal):
+                continue
+            resumed_rows = conn.execute(
+                "SELECT * FROM workflow_ticks WHERE game_id=? AND outcome=?",
+                (
+                    proposal.game_session_id,
+                    TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED.value,
+                ),
+            ).fetchall()
+            resumed = tuple(
+                tick
+                for tick in (
+                    cls._workflow_tick_from_row(dict(row)) for row in resumed_rows
+                )
+                if isinstance(tick, StrategicProposalWaitResumedTick)
+                and tick.proposal_id == proposal.proposal_id
+            )
+            if not resumed:
+                continue
+            if len(resumed) != 1:
+                raise ValueError(
+                    "Phase 1C enablement requires one historical Resume Tick"
+                )
+            ready = cls._proposal_ready_tick_in_connection(conn, proposal)
+            resume_request_row = conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE proposal_id=?",
+                (proposal.proposal_id,),
+            ).fetchone()
+            request_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (proposal.source_planner_request_id,),
+            ).fetchone()
+            attempt_row = conn.execute(
+                "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+                (proposal.source_provider_attempt_id,),
+            ).fetchone()
+            if resume_request_row is None or request_row is None or attempt_row is None:
+                raise ValueError(
+                    "Phase 1C enablement migration is missing causal evidence"
+                )
+            resume_request = cls._strategic_proposal_wait_resume_request_from_row(
+                resume_request_row
+            )
+            request = cls._planner_request_from_row(request_row)
+            attempt = cls._provider_attempt_from_row(conn, attempt_row)
+            if request.completed_at is None or attempt.completed_at is None:
+                raise ValueError(
+                    "Phase 1C enablement migration requires completed sources"
+                )
+            frontier = max(
+                proposal.created_at,
+                request.completed_at,
+                attempt.completed_at,
+                ready.completed_at,
+                resume_request.requested_at,
+                resumed[0].completed_at,
+            )
+            try:
+                occurred_at = frontier + timedelta(microseconds=1)
+            except OverflowError as exc:
+                raise ValueError(
+                    "Phase 1C enablement migration time is not representable"
+                ) from exc
+            root_row = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (proposal.game_session_id,),
+            ).fetchone()
+            stale_reason = cls._strategic_proposal_stale_reason_v11(
+                proposal, None if root_row is None else dict(root_row)
+            )
+            tick = StrategicProposalInvalidatedTick(
+                tick_id=build_strategic_proposal_terminal_tick_id(
+                    proposal.proposal_id,
+                    TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED,
+                ),
+                game_session_id=proposal.game_session_id,
+                turn_number=resumed[0].turn_number,
+                starting_runtime_state=resumed[0].ending_runtime_state,
+                observation_ids=ready.observation_ids,
+                started_at=occurred_at,
+                completed_at=occurred_at,
+                planner_request_id=proposal.source_planner_request_id,
+                proposal_id=proposal.proposal_id,
+                proposal_hash=proposal.proposal_hash,
+                proposal_ready_tick_id=ready.tick_id,
+                target_contract_id=proposal.target_contract_id,
+                expected_base_revision=proposal.expected_base_revision,
+                invalidation_origin=(
+                    StrategicProposalInvalidationOrigin.PHASE1C_ENABLEMENT_MIGRATION
+                ),
+                invalidation_reason=(
+                    StrategicProposalInvalidationReason.PRE_PHASE1C_WAIT_RELEASED
+                    if stale_reason is None
+                    else stale_reason
+                ),
+                source_resume_request_id=resume_request.resume_request_id,
+                source_wait_resumed_tick_id=resumed[0].tick_id,
+            )
+            cls._insert_workflow_tick_in_connection(conn, tick)
+
+        cls._validate_phase1c_v11(conn)
+        cls._validate_phase1c_enabled_state_in_connection(conn)
+
+    @classmethod
+    def _validate_phase1c_enabled_state_in_connection(
+        cls, conn: sqlite3.Connection
+    ) -> None:
+        terminal_proposal_ids = {
+            str(row["proposal_id"])
+            for row in conn.execute(
+                "SELECT proposal_id FROM approval_records WHERE proposal_type=?",
+                (STRATEGIC_RESEARCH_PROPOSAL_TYPE,),
+            ).fetchall()
+        }
+        for row in conn.execute(
+            "SELECT tick_json FROM workflow_ticks WHERE outcome=?",
+            (TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED.value,),
+        ).fetchall():
+            terminal_proposal_ids.add(
+                StrategicProposalInvalidatedTick.model_validate_json(
+                    str(row["tick_json"])
+                ).proposal_id
+            )
+        for row in conn.execute(
+            "SELECT tick_json FROM workflow_ticks WHERE outcome=?",
+            (TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED.value,),
+        ).fetchall():
+            resumed = StrategicProposalWaitResumedTick.model_validate_json(
+                str(row["tick_json"])
+            )
+            if resumed.proposal_id not in terminal_proposal_ids:
+                raise ValueError(
+                    "enabled Phase 1C cannot retain a released OPEN Proposal"
+                )
 
     @classmethod
     def _validate_phase1c_v11(cls, conn: sqlite3.Connection) -> None:
@@ -4590,8 +4741,14 @@ class WorkflowStore:
             ).fetchall()
         return [self._strategic_research_proposal_from_row(row) for row in rows]
 
+    @property
+    def phase1c_decisions_enabled(self) -> bool:
+        return self._phase1c_decisions_enabled
+
     def _require_phase1c_dormant_activation(self) -> None:
-        if not self._phase1c_dormant_activation_enabled:
+        if not (
+            self._phase1c_decisions_enabled or self._phase1c_dormant_activation_enabled
+        ):
             raise ValueError(
                 "Phase 1C atomic Proposal decisions remain dormant until enablement"
             )
@@ -4690,14 +4847,10 @@ class WorkflowStore:
             raise ValueError("Strategic Proposal already has a terminal disposition")
         if cls._strategic_proposal_approval_in_connection(conn, proposal) is not None:
             raise ValueError("Strategic Proposal already has a human decision")
-        resume = conn.execute(
-            "SELECT 1 FROM strategic_proposal_wait_resume_requests WHERE proposal_id=?",
+        resume_row = conn.execute(
+            "SELECT * FROM strategic_proposal_wait_resume_requests WHERE proposal_id=?",
             (proposal.proposal_id,),
         ).fetchone()
-        if resume is not None:
-            raise ValueError(
-                "dormant Proposal decision cannot consume a Phase 1B Resume Request"
-            )
         runtime = conn.execute(
             "SELECT state FROM runtime_state WHERE game_id=?",
             (proposal.game_session_id,),
@@ -4719,7 +4872,6 @@ class WorkflowStore:
             "proposal_id": proposal.proposal_id,
             "target_kind": proposal.target_kind.value,
             "expected_base_revision": proposal.expected_base_revision,
-            "resume_requested": False,
         }
         if not isinstance(context, dict) or any(
             context.get(key) != value for key, value in expected.items()
@@ -4727,6 +4879,56 @@ class WorkflowStore:
             raise ValueError(
                 "Strategic Proposal decision requires its explicit-only wait"
             )
+        resumed_rows = conn.execute(
+            "SELECT * FROM workflow_ticks WHERE game_id=? AND outcome=?",
+            (
+                proposal.game_session_id,
+                TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED.value,
+            ),
+        ).fetchall()
+        if any(
+            isinstance(
+                resumed := cls._workflow_tick_from_row(dict(tick_row)),
+                StrategicProposalWaitResumedTick,
+            )
+            and resumed.proposal_id == proposal.proposal_id
+            for tick_row in resumed_rows
+        ):
+            raise ValueError("released Proposal wait cannot receive a decision")
+        if resume_row is None:
+            if (
+                context.get("resume_requested") is not False
+                or "resume_request_id" in context
+                or "resume_requested_at" in context
+            ):
+                raise ValueError(
+                    "Strategic Proposal decision wait has invalid resume state"
+                )
+        else:
+            resume_request = cls._strategic_proposal_wait_resume_request_from_row(
+                resume_row
+            )
+            requested_at = cls._parse_audit_datetime(
+                context.get("resume_requested_at"),
+                "Proposal Human Wait resume_requested_at",
+            )
+            if (
+                resume_request.game_session_id != proposal.game_session_id
+                or resume_request.proposal_id != proposal.proposal_id
+                or resume_request.planner_request_id
+                != proposal.source_planner_request_id
+                or resume_request.proposal_ready_tick_id != ready.tick_id
+                or resume_request.target_kind is not proposal.target_kind
+                or resume_request.expected_base_revision
+                != proposal.expected_base_revision
+                or context.get("resume_requested") is not True
+                or context.get("resume_request_id") != resume_request.resume_request_id
+                or context.get("proposal_ready_tick_id") != ready.tick_id
+                or requested_at != resume_request.requested_at
+            ):
+                raise ValueError(
+                    "Phase 1B pending Resume Request disagrees with Proposal wait"
+                )
         return proposal, ready
 
     @classmethod
@@ -5483,6 +5685,10 @@ class WorkflowStore:
                 context.get("wait_kind") == "strategic_contract_proposal_ready"
                 and context.get("resume_policy") == "explicit_only"
             ):
+                if self._phase1c_decisions_enabled:
+                    raise ValueError(
+                        "strategic Proposal waits require APPROVE or REJECT"
+                    )
                 if type(context.get("resume_requested")) is not bool:
                     raise ValueError(
                         "Proposal Human Wait resume_requested must be a bool"
@@ -6036,6 +6242,12 @@ class WorkflowStore:
             raise ValueError("research authority resolves to no unique Mission")
         research_mission_action(missions[0])
         return contract, missions[0]
+
+    def active_research_mission(
+        self, game_id: str
+    ) -> tuple[StrategicContract, Mission] | None:
+        with self._connect() as conn:
+            return self._active_research_mission_in_connection(conn, game_id)
 
     @staticmethod
     def _bundle_contains_research_write(bundle: PlanBundle) -> bool:
@@ -7173,15 +7385,19 @@ class WorkflowStore:
                 "decision transaction"
             )
 
-    @classmethod
     def _validate_strategic_resume_transition_in_connection(
-        cls,
+        self,
         conn: sqlite3.Connection,
         tick: WorkflowTick,
         human_wait_context: dict[str, Any] | None,
     ) -> None:
         if not isinstance(tick, StrategicProposalWaitResumedTick):
             return
+        if self._phase1c_decisions_enabled:
+            raise ValueError(
+                "generic Proposal wait resume is disabled after Phase 1C enablement"
+            )
+        cls = type(self)
         if human_wait_context is not None:
             raise ValueError("Proposal wait resume must clear Human Wait context")
         cls._validate_phase1b_proposals_v10(conn)
@@ -10106,3 +10322,5 @@ class WorkflowStore:
                         f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})",
                         tuple(row[column] for column in columns),
                     )
+            if self._phase1c_decisions_enabled:
+                self._migrate_phase1c_enablement_in_connection(conn)

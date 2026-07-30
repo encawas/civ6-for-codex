@@ -429,3 +429,41 @@ def test_game_bound_resume_exposes_human_wait_state(tmp_path: Path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+@pytest.mark.parametrize(
+    ("path", "approved"),
+    [
+        ("/api/games/game-1/proposals/proposal-1/approve", True),
+        ("/api/games/game-1/proposals/proposal-1/reject", False),
+    ],
+)
+def test_http_routes_strategic_proposal_decisions(
+    tmp_path: Path, monkeypatch, path: str, approved: bool
+):
+    panel = _panel(tmp_path)
+    calls = []
+
+    def decide(self, game_id, proposal_id, *, approved):
+        calls.append((game_id, proposal_id, approved))
+        return True, "strategic Proposal decision recorded"
+
+    monkeypatch.setattr(ControlPanelState, "decide_strategic_proposal", decide)
+    server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        result = _post(base, path)
+
+        assert result == {
+            "ok": True,
+            "reason": "strategic Proposal decision recorded",
+            "game_id": "game-1",
+            "proposal_id": "proposal-1",
+        }
+        assert calls == [("game-1", "proposal-1", approved)]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)

@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from civ6_workflow.bootstrap import build_store
+from civ6_workflow.config import AppConfig
 from civ6_workflow.domain import (
     AuthorityScopeSet,
     ApprovalDecision,
@@ -66,6 +68,7 @@ from civ6_workflow.models import (
     TaskStatus,
 )
 from civ6_workflow.store import WorkflowStore
+from civ6_workflow.web_ui import ControlPanelState
 from civ6_workflow.workflow_protocol import (
     InformationRequest,
     StrategicResearchProposalCandidate,
@@ -5622,3 +5625,399 @@ def test_concurrent_approve_reject_race_persists_one_terminal_authority(tmp_path
     assert len(
         store.list_strategic_contract_revisions(proposal.game_session_id)
     ) == int(isinstance(results[0], StrategicProposalAppliedTick))
+
+
+def test_phase1c_enablement_migrates_released_wait_deterministically(tmp_path):
+    path = tmp_path / "phase1c-enable-released-wait.sqlite3"
+    store, request, proposal, attempt = asyncio.run(_completed_proposal_state(path))
+    assert store.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(store, _Game(), _Planner()).tick())
+    resumed = next(
+        tick
+        for tick in store.list_workflow_ticks(proposal.game_session_id)
+        if isinstance(tick, StrategicProposalWaitResumedTick)
+    )
+    ready = _proposal_ready_tick(store, proposal.proposal_id)
+    resume_request = store.strategic_proposal_wait_resume_request_for_proposal(
+        proposal.proposal_id
+    )
+    assert resume_request is not None
+    assert request.completed_at is not None
+    assert attempt.completed_at is not None
+    expected_time = max(
+        proposal.created_at,
+        request.completed_at,
+        attempt.completed_at,
+        ready.completed_at,
+        resume_request.requested_at,
+        resumed.completed_at,
+    ) + timedelta(microseconds=1)
+
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+
+    invalidated = next(
+        tick
+        for tick in enabled.list_workflow_ticks(proposal.game_session_id)
+        if isinstance(tick, StrategicProposalInvalidatedTick)
+    )
+    assert invalidated.invalidation_origin is (
+        StrategicProposalInvalidationOrigin.PHASE1C_ENABLEMENT_MIGRATION
+    )
+    assert invalidated.invalidation_reason is (
+        StrategicProposalInvalidationReason.PRE_PHASE1C_WAIT_RELEASED
+    )
+    assert invalidated.started_at == invalidated.completed_at == expected_time
+    assert invalidated.source_resume_request_id == resume_request.resume_request_id
+    assert invalidated.source_wait_resumed_tick_id == resumed.tick_id
+    assert (
+        enabled.strategic_proposal_approval_record(
+            proposal.game_session_id, proposal.proposal_id
+        )
+        is None
+    )
+    assert enabled.get_active_strategic_contract(proposal.game_session_id) is None
+    assert enabled.list_tasks(proposal.game_session_id) == []
+
+    first = enabled.export_replay_state(proposal.game_session_id)
+    reopened = WorkflowStore(path, enable_phase1c_decisions=True)
+    assert reopened.export_replay_state(proposal.game_session_id) == first
+    restored = WorkflowStore(
+        tmp_path / "phase1c-enable-released-wait-restored.sqlite3",
+        enable_phase1c_decisions=True,
+    )
+    restored.import_replay_state(first)
+    assert restored.export_replay_state(proposal.game_session_id) == first
+
+
+def test_phase1c_enablement_preserves_unresolved_wait_and_rejects_generic_resume(
+    tmp_path,
+):
+    path = tmp_path / "phase1c-enable-unresolved-wait.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    before = store.export_replay_state(proposal.game_session_id)
+
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+
+    assert enabled.export_replay_state(proposal.game_session_id) == before
+    assert enabled.load_runtime_state(proposal.game_session_id) is (
+        RuntimeState.AWAITING_HUMAN
+    )
+    context = enabled.human_wait_context(proposal.game_session_id)
+    assert context is not None
+    assert context["proposal_id"] == proposal.proposal_id
+    with pytest.raises(ValueError, match="require APPROVE or REJECT"):
+        enabled.request_human_resume(proposal.game_session_id)
+    assert enabled.export_replay_state(proposal.game_session_id) == before
+
+
+def test_phase1c_enabled_replay_migrates_released_wait_before_commit(tmp_path):
+    source_path = tmp_path / "phase1c-enable-replay-source.sqlite3"
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(source_path)
+    )
+    assert source.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(source, _Game(), _Planner()).tick())
+    pre_enable = source.export_replay_state(proposal.game_session_id)
+    target = WorkflowStore(
+        tmp_path / "phase1c-enable-replay-target.sqlite3",
+        enable_phase1c_decisions=True,
+    )
+
+    target.import_replay_state(pre_enable)
+
+    terminal = [
+        tick
+        for tick in target.list_workflow_ticks(proposal.game_session_id)
+        if isinstance(tick, StrategicProposalInvalidatedTick)
+    ]
+    assert len(terminal) == 1
+    WorkflowStore(target.path, enable_phase1c_decisions=True)
+
+
+def _research_ready_game(game_id="game-1"):
+    game = _Game(game_id)
+    game.snapshot = game.snapshot.model_copy(
+        update={
+            "tech_civics": {
+                "current_research": "None",
+                "current_civic": "None",
+                "available_techs": [{"name": "Writing", "tech_type": "TECH_WRITING"}],
+                "available_civics": [
+                    {
+                        "name": "Code of Laws",
+                        "civic_type": "CIVIC_CODE_OF_LAWS",
+                    }
+                ],
+            }
+        }
+    )
+    return game
+
+
+def test_phase1c_enabled_engine_does_not_consume_pending_legacy_resume(tmp_path):
+    path = tmp_path / "phase1c-pending-resume.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    assert store.request_human_resume(proposal.game_session_id) is True
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+    planner = _Planner()
+
+    result = asyncio.run(_engine(enabled, _research_ready_game(), planner).tick())
+
+    assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
+    assert planner.calls == 0
+    assert not any(
+        isinstance(tick, StrategicProposalWaitResumedTick)
+        for tick in enabled.list_workflow_ticks(proposal.game_session_id)
+    )
+    wait = enabled.human_wait_context(proposal.game_session_id)
+    assert wait is not None
+    assert wait["proposal_id"] == proposal.proposal_id
+    assert wait["resume_requested"] is True
+
+    applied = enabled.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        _proposal_decision(enabled, proposal, ApprovalDecision.APPROVED),
+    )
+    assert isinstance(applied, StrategicProposalAppliedTick)
+
+
+def test_phase1c_approval_routes_research_from_mission_and_preserves_civic(
+    tmp_path,
+):
+    path = tmp_path / "phase1c-authoritative-routing.sqlite3"
+    store, request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    store.save_plan_bundle(
+        proposal.game_session_id,
+        1,
+        PlanBundle(
+            plan_id="phase1c-civic-policy",
+            summary="Preserve legacy civic authority.",
+            strategy_updates={"civic_queue": ["CIVIC_CODE_OF_LAWS"]},
+        ),
+        mode=ExecutionMode.AUTO,
+        auto_action_types={"set_civic"},
+        observation_id="obs-civic-policy",
+    )
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+    ready = _proposal_ready_tick(enabled, proposal.proposal_id)
+    approval = _proposal_decision(
+        enabled, proposal, ApprovalDecision.APPROVED
+    ).model_copy(update={"created_at": max(datetime.now(UTC), ready.completed_at)})
+    applied = enabled.approve_strategic_research_proposal(
+        proposal.game_session_id,
+        approval,
+    )
+
+    assert enabled.list_tasks(proposal.game_session_id) == []
+    planner = _Planner()
+    result = asyncio.run(_engine(enabled, _research_ready_game(), planner).tick())
+
+    assert result.workflow_tick["outcome"] == TickOutcomeKind.TASK_CREATED
+    tasks = enabled.list_tasks(proposal.game_session_id)
+    assert {task.action_type for task in tasks} == {"set_research", "set_civic"}
+    research = next(task for task in tasks if task.action_type == "set_research")
+    civic = next(task for task in tasks if task.action_type == "set_civic")
+    assert research.arguments == {"tech_or_civic": "TECH_WRITING"}
+    assert research.preconditions == [
+        {"type": "research_unselected"},
+        {"type": "research_available", "tech_type": "TECH_WRITING"},
+    ]
+    assert research.postconditions == [
+        {"type": "research_equals", "tech_type": "TECH_WRITING"}
+    ]
+    assert research.source_contract_id == proposal.target_contract_id
+    assert research.source_contract_revision == applied.activated_contract_revision
+    assert research.source_mission_id == applied.source_mission_id
+    assert research.source_mission_revision == applied.source_mission_revision
+    assert civic.source_contract_id is None
+    assert civic.source_mission_id is None
+    assert planner.calls == 0
+    assert len(enabled.list_provider_attempts(request.planner_request_id)) == 1
+
+
+@pytest.mark.parametrize("decision", [ApprovalDecision.REJECTED, "stale"])
+def test_phase1c_nonapproval_never_switches_research_authority(tmp_path, decision):
+    path = tmp_path / f"phase1c-no-activation-{decision}.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    if decision == "stale":
+        _commit_contract(store, proposal.game_session_id)
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+
+    if decision is ApprovalDecision.REJECTED:
+        terminal = enabled.reject_strategic_research_proposal(
+            proposal.game_session_id,
+            _proposal_decision(enabled, proposal, ApprovalDecision.REJECTED),
+        )
+        assert isinstance(terminal, StrategicProposalRejectedTick)
+    else:
+        terminal = enabled.approve_strategic_research_proposal(
+            proposal.game_session_id,
+            _proposal_decision(enabled, proposal, ApprovalDecision.APPROVED),
+        )
+        assert isinstance(terminal, StrategicProposalInvalidatedTick)
+
+    active = enabled.get_active_strategic_contract(proposal.game_session_id)
+    if active is not None:
+        assert active.authority_scope_set.mission_graph_scopes == ()
+        assert active.mission_graph.missions == ()
+    assert enabled.active_research_mission(proposal.game_session_id) is None
+    assert enabled.list_tasks(proposal.game_session_id) == []
+
+
+def test_control_panel_exposes_and_idempotently_decides_research_proposal(tmp_path):
+    path = tmp_path / "phase1c-control-panel.sqlite3"
+    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+    config = AppConfig.model_validate(
+        {
+            "runtime": {
+                "database_path": str(path),
+                "execution_mode": "confirm",
+                "auto_end_turn": False,
+            },
+            "codex": {
+                "backend": "responses",
+                "model": "test-model",
+                "api_key_env": "OPENAI_API_KEY",
+            },
+        }
+    )
+    panel = ControlPanelState(
+        config=config,
+        store=enabled,
+        run_tick_callback=lambda: {"turn": 1},
+        token="phase1c-token",
+    )
+
+    snapshot = panel.snapshot()
+    exposed = snapshot["human_actions"]["strategic_proposal"]
+    assert exposed["proposal_id"] == proposal.proposal_id
+    assert exposed["research_mission"]["scope"] == "research"
+
+    first = panel.decide_strategic_proposal(
+        proposal.game_session_id, proposal.proposal_id, approved=True
+    )
+    repeated = panel.decide_strategic_proposal(
+        proposal.game_session_id, proposal.proposal_id, approved=True
+    )
+    conflicting = panel.decide_strategic_proposal(
+        proposal.game_session_id, proposal.proposal_id, approved=False
+    )
+
+    assert first[0] is True
+    assert repeated[0] is True
+    assert conflicting == (
+        False,
+        "strategic Proposal already has a conflicting decision",
+    )
+    assert len(enabled.list_strategic_contract_revisions(proposal.game_session_id)) == 1
+    assert (
+        len(
+            [
+                tick
+                for tick in enabled.list_workflow_ticks(proposal.game_session_id)
+                if isinstance(tick, StrategicProposalAppliedTick)
+            ]
+        )
+        == 1
+    )
+
+
+def test_production_bootstrap_enables_phase1c_decisions(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config = AppConfig.model_validate(
+        {
+            "runtime": {
+                "database_path": "phase1c-bootstrap.sqlite3",
+                "execution_mode": "confirm",
+                "auto_end_turn": False,
+            },
+            "codex": {
+                "backend": "responses",
+                "model": "test-model",
+                "api_key_env": "OPENAI_API_KEY",
+            },
+        }
+    )
+
+    store = build_store(config, config_path)
+
+    assert store.phase1c_decisions_enabled is True
+    assert store.path == tmp_path / "phase1c-bootstrap.sqlite3"
+
+
+def test_phase1c_enablement_migrates_multiple_released_proposals_once(tmp_path):
+    path = tmp_path / "phase1c-multiple-released.sqlite3"
+    first, _request_one, proposal_one, _attempt_one = asyncio.run(
+        _completed_proposal_state(
+            path,
+            game_id="game-1",
+            planner_request_id="phase1c-request-one",
+        )
+    )
+    second, _request_two, proposal_two, _attempt_two = asyncio.run(
+        _completed_proposal_state(
+            path,
+            game_id="game-2",
+            planner_request_id="phase1c-request-two",
+        )
+    )
+    assert first.request_human_resume("game-1") is True
+    assert second.request_human_resume("game-2") is True
+    asyncio.run(_engine(first, _Game("game-1"), _Planner()).tick())
+    asyncio.run(_engine(second, _Game("game-2"), _Planner()).tick())
+
+    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
+
+    for proposal in (proposal_one, proposal_two):
+        terminal = [
+            tick
+            for tick in enabled.list_workflow_ticks(proposal.game_session_id)
+            if isinstance(tick, StrategicProposalInvalidatedTick)
+            and tick.proposal_id == proposal.proposal_id
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].invalidation_origin is (
+            StrategicProposalInvalidationOrigin.PHASE1C_ENABLEMENT_MIGRATION
+        )
+    first_state = {
+        game_id: enabled.export_replay_state(game_id)
+        for game_id in ("game-1", "game-2")
+    }
+
+    reopened = WorkflowStore(path, enable_phase1c_decisions=True)
+
+    assert {
+        game_id: reopened.export_replay_state(game_id)
+        for game_id in ("game-1", "game-2")
+    } == first_state
+
+
+def test_phase1c_enablement_preserves_generic_human_resume(tmp_path):
+    path = tmp_path / "phase1c-generic-resume.sqlite3"
+    store = WorkflowStore(path, enable_phase1c_decisions=True)
+    now = datetime.now(UTC)
+    store.persist_tick_and_runtime_state(
+        AwaitingHumanTick(
+            tick_id="phase1c-generic-wait",
+            game_session_id="game-generic",
+            turn_number=1,
+            starting_runtime_state=RuntimeState.OBSERVING,
+            observation_ids=("obs-generic",),
+            started_at=now,
+            completed_at=now,
+            blocking_reason="generic review",
+        ),
+        human_wait_context={
+            "version": "human-wait/v1",
+            "execution_mode": "confirm",
+            "observation_projection_hash": "generic",
+            "blocking_reason": "generic review",
+            "resume_requested": False,
+        },
+    )
+
+    assert store.request_human_resume("game-generic") is True
+    context = store.human_wait_context("game-generic")
+    assert context is not None
+    assert context["resume_requested"] is True

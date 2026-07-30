@@ -143,7 +143,7 @@ Startup and replay can read the pre-enable history only as migration input. Enab
 
 The approval transaction establishes effective strategy and research write authority only. It does not create StoredTask.
 
-Later Routing reads the active approved Contract and authoritative research Mission, performs a separate deterministic revision-bound projection, and enters the normal PlannerRequest lifecycle before executable work can exist. Proposal or Applied Tick identity alone cannot produce claimable work.
+Later Routing reads the active approved Contract and authoritative research Mission, performs a separate deterministic revision-bound projection, and enters the existing PlanBundle/StoredTask persistence and execution lifecycle before executable work can exist. It does not create another PlannerRequest or recall the Provider. Proposal or Applied Tick identity alone cannot produce claimable work.
 
 PR 1C-1 adds one optional all-or-none provenance group to the existing StoredTask and workflow_tasks representation:
 
@@ -220,6 +220,34 @@ only set_research StoredTask rows carrying the complete active
 Contract/Mission provenance group. Activation itself creates no StoredTask.
 The gate has no Engine, bootstrap, or user caller; production behavior remains
 Phase 1B until PR 1C-3 performs migration and enablement.
+
+### PR 1C-3 implementation record
+
+The production bootstrap now enables the existing Store-local decision
+capability. Startup and replay run the deterministic Phase 1B released-wait
+migration inside the Store writer transaction before enabled aggregate
+validation. Valid unresolved waits remain OPEN; released waits become
+source-bound system invalidations at the canonical causal time. No migration
+path writes Approval, Contract, authority, Provider, Mission, or StoredTask
+facts.
+
+The control panel exposes only explicit APPROVE and REJECT operations for a
+persisted Proposal-ready wait. Generic Proposal resume fails closed after
+enablement while supported non-Proposal waits retain their existing behavior.
+Approval calls the PR 1C-2 full-aggregate transaction. The existing Runtime
+then performs a separate deterministic routing projection from the active
+Contract and ACTIVE research Mission; that projection can emit only
+set_research with complete current provenance. Civic and every other
+legacy-owned scope remain on their prior paths. No second Engine, Store,
+Repository, or composition root was introduced.
+
+Reviewed implementation deviation: earlier Phase 1C wording required the later
+deterministic projection to enter a PlannerRequest lifecycle. The enabled
+implementation instead uses the existing deterministic progression compiler
+and PlanBundle/StoredTask persistence path. It creates no new PlannerRequest and
+does not recall the Provider. This keeps action selection inside the closed
+research-to-set_research mapping and matches PRD 3.0; Planner-driven
+MissionGraph repair remains Phase 2 work.
 
 ## Consequences
 

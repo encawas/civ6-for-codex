@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from typing import Any
+from .domain import Mission, StrategicContract, research_mission_action, thaw_json
 
 from .domain.observations import SlotState
 from .models import (
@@ -32,6 +33,8 @@ class ProgressionRuleCompiler:
     def compile(
         self,
         observation: NormalizedRuntimeObservation,
+        *,
+        include_research: bool = True,
     ) -> ProgressionCompilation:
         snapshot = observation.snapshot
         strategy = self.store.current_context(snapshot.game_id).get("strategy", {})
@@ -39,14 +42,18 @@ class ProgressionRuleCompiler:
             strategy = {}
         tasks: list[ProposedTask] = []
         events: list[GameEvent] = []
-        research = self._compile_category(
-            observation,
-            strategy,
-            category="research",
-            queue_keys=("research_queue", "tech_queue"),
-            action_type="set_research",
-            target_keys=("tech_type", "item_name", "name"),
-            events=events,
+        research = (
+            self._compile_category(
+                observation,
+                strategy,
+                category="research",
+                queue_keys=("research_queue", "tech_queue"),
+                action_type="set_research",
+                target_keys=("tech_type", "item_name", "name"),
+                events=events,
+            )
+            if include_research
+            else None
         )
         if research is not None:
             tasks.append(research)
@@ -71,6 +78,88 @@ class ProgressionRuleCompiler:
             ),
             events=events,
         )
+
+    def compile_authoritative_research(
+        self,
+        observation: NormalizedRuntimeObservation,
+        contract: StrategicContract,
+        mission: Mission,
+    ) -> ProgressionCompilation:
+        """Project the active research Mission without reopening legacy planning."""
+
+        research_mission_action(mission)
+        desired = thaw_json(mission.desired_outcome)
+        technology = str(desired["technology"])
+        progression = observation.canonical.progression
+        if progression.current_research.state is not SlotState.EMPTY:
+            return ProgressionCompilation()
+
+        task_id = self._mission_task_id(contract, mission, technology)
+        if self.store.task_status(observation.snapshot.game_id, task_id) is not None:
+            return ProgressionCompilation()
+
+        available = {item.value for item in progression.available_research_ids}
+        if technology not in available:
+            return ProgressionCompilation(
+                events=[
+                    GameEvent(
+                        event_type="research_mission_target_unavailable",
+                        turn=observation.snapshot.turn,
+                        entity_type="research",
+                        entity_id=technology,
+                        level=EventLevel.L3,
+                        risk=RiskLevel.MEDIUM,
+                        blocking=True,
+                        payload={
+                            "contract_id": contract.contract_id,
+                            "contract_revision": contract.revision,
+                            "mission_id": mission.mission_id,
+                            "mission_revision": mission.mission_revision,
+                            "technology": technology,
+                            "available": sorted(available),
+                        },
+                        dedupe_key=(
+                            "research_mission_target_unavailable:"
+                            f"{contract.revision}:{mission.mission_revision}:{technology}"
+                        ),
+                    )
+                ]
+            )
+
+        task = ProposedTask(
+            task_id=task_id,
+            action_type="set_research",
+            entity_type="research",
+            entity_id=technology,
+            due_turn=observation.snapshot.turn,
+            arguments={"tech_or_civic": technology},
+            preconditions=[
+                {"type": "research_unselected"},
+                {"type": "research_available", "tech_type": technology},
+            ],
+            postconditions=[{"type": "research_equals", "tech_type": technology}],
+            invalidators=[],
+            risk=RiskLevel.LOW,
+            reason="Execute the active StrategicContract research Mission.",
+        )
+        return ProgressionCompilation(
+            bundle=PlanBundle(
+                plan_id=f"mission-plan:{task_id}",
+                summary="Project the active research Mission into executable work.",
+                tasks=[task],
+            )
+        )
+
+    @staticmethod
+    def _mission_task_id(
+        contract: StrategicContract, mission: Mission, technology: str
+    ) -> str:
+        identity = (
+            f"{contract.contract_id}:{contract.revision}:"
+            f"{mission.mission_id}:{mission.mission_revision}:{technology}"
+        )
+        digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+        return f"mission-research:{digest}"
 
     def _compile_category(
         self,
