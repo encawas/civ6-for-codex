@@ -37,7 +37,7 @@ None. This repository has no previously published OpenSpec capabilities.
 - **Target authority:** approved StrategicContract revisions own effective research strategy and AuthorityScopeSet identifies MissionGraph as the sole research writer; rejected or invalidated Proposals never create a Contract revision.
 - **Affected scope:** research only. Civic, settler, city, diplomacy, tactical, and all other scopes retain their current authority.
 - **Persistence:** future work extends the existing WorkflowStateStore and replay stream. It must not add another repository, database authority, or mutable Proposal record.
-- **Rollback:** before enablement, the feature remains dormant. After cutover, rollback first drains or reconciles active attempts and approvals, then atomically restores a proven legacy research baseline without dual writes.
+- **Rollback boundary:** before PR 1C-3 enablement, disable the dormant gate or roll back code without changing persisted authority. After a game activates research, Phase 1C provides no automatic reverse switch or revision revocation; new research work pauses for human handling. Any future reverse migration requires a separate ADR and OpenSpec Change and appends a new forward revision without deleting, modifying, or revoking an effective revision.
 - **Dependencies:** the change builds on the Phase 1A PlannerRequest lifecycle and Phase 1B Contract/Proposal/wait audit. It does not replace their evidence.
 
 ## Non-goals

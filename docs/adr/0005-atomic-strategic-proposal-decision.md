@@ -122,7 +122,7 @@ INVALIDATED
 
 Replay validates incoming evidence together with retained state before deleting target-game data. A forged Approval, missing ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal state, partial authority switch, or impossible Tick interval fails before replacement.
 
-Identical repeated decisions are idempotent. Conflicting decisions fail. Concurrent decisions serialize at BEGIN IMMEDIATE; the first committed terminal result wins.
+PR 1C-1 defines the data contracts, Schema, canonical serialization, reads, import/export, and ordinary-save, startup, and replay validation for these evidence shapes. It does not perform a terminal decision and exposes no standalone public ApprovalRecord or terminal Tick save method. PR 1C-2 adds dedicated full-aggregate approved, rejected, and invalidated entry points. Only those transactions implement identical-decision idempotency, conflicting-decision failure, stale invalidation, and concurrent decision serialization.
 
 ## Consequences
 
@@ -175,8 +175,10 @@ WorkflowStateStore and the existing approval lineage remain the only persistence
 
 ## Dormant Rollout
 
-- **PR 1C-1:** protocol and persistence foundation. Add Proposal-specific terminal contracts, structured ContractCommit binding, and fail-closed validators. Do not connect Engine or user entry.
-- **PR 1C-2:** dormant atomic services and authority projection. Add approve/reject/invalidate transactions, research authority cutover, legacy write closure, routing projection, and recovery tests behind a dormant gate.
-- **PR 1C-3:** runtime entry and enablement. Add user actions and Engine integration, remove dormancy after end-to-end validation, finalize documents, then verify, sync, and archive the OpenSpec Change.
+- **PR 1C-1:** protocol and persistence foundation. Add Proposal-specific terminal data contracts, Schema, serialization, reads, import/export, and fail-closed ordinary-save, startup, and replay validators. Do not add public terminal transitions or connect Engine or user entry.
+- **PR 1C-2:** dormant atomic services and authority projection. Add dedicated approved, rejected, and invalidated full-aggregate transactions, research authority cutover, legacy write closure, routing projection, and recovery tests behind a dormant gate. No standalone ApprovalRecord or terminal Tick public save method may bypass them.
+- **PR 1C-3:** runtime entry and enablement. Install the official generated OpenSpec verify Skill, add user actions and Engine integration, remove dormancy after end-to-end validation, finalize documents, then verify, sync, and archive the OpenSpec Change.
 
 The OpenSpec Change remains active through PR 1C-1 and PR 1C-2. No Phase 1C production behavior is enabled before PR 1C-3.
+
+Before PR 1C-3 enablement, the dormant gate or code may be disabled without a persisted authority change. Once a game activates research, Phase 1C provides no automatic reverse switch or revision revocation. New research work pauses for human handling; any future reverse migration requires a separate ADR and OpenSpec Change and a new forward revision.

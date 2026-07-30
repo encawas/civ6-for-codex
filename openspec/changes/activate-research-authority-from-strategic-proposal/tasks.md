@@ -3,16 +3,16 @@
 - [ ] 1.1 Define Proposal-specific human decision contracts that accept only APPROVED and REJECTED, preserve immutable Proposal content, and reject mixed or duplicate terminal facts (strategic-proposal-decision: Proposal content remains immutable; Human decision has one durable authority; Human and system terminal dispositions are mutually exclusive).
 - [ ] 1.2 Define immutable StrategicProposalInvalidatedTick, StrategicProposalAppliedTick, and StrategicProposalRejectedTick contracts with deterministic identities and source bindings (strategic-proposal-decision: System invalidation has one durable authority).
 - [ ] 1.3 Extend StrategicContractCommit with structured Proposal ID/hash, Approval ID, PlannerRequest ID, and expected-base fields while preserving foundation commit idempotency (strategic-contract-activation: ContractCommit uses structured source binding).
-- [ ] 1.4 Add typed WorkflowStateStorePort operations and SQLite persistence for Proposal decisions and terminal Ticks without adding another Store, Repository, or database authority.
+- [ ] 1.4 Add Proposal decision and terminal Tick data contracts, SQLite Schema, canonical serialization, typed reads, replay import/export, and ordinary persistence support without adding a standalone public terminal-write operation, another Store, Repository, or database authority.
 - [ ] 1.5 Add shared ordinary-write, startup, and replay validators for terminal uniqueness, complete APPROVED/REJECTED/INVALIDATED evidence, approval_status redundancy, revision continuity, source binding, and pre-delete replay failure (strategic-contract-activation: Approval status is a redundant snapshot; Complete approval evidence is required; Replay preflight preserves target data on failure).
-- [ ] 1.6 Add protocol tests for immutable Proposal content, unsupported shared Approval decisions, identical decision idempotency, conflicting decisions, stale invalidation, mixed terminal facts, duplicate Invalidated Ticks, and rejected/invalidated no-Contract behavior.
+- [ ] 1.6 Add protocol and persistence-shape tests for immutable Proposal content, unsupported shared Approval decisions, mixed or incomplete terminal facts, duplicate Invalidated Ticks, and rejected/invalidated no-Contract evidence; PR 1C-1 validates but does not perform a terminal decision transition.
 - [ ] 1.7 Add forged-state database and replay tests for missing Approval, missing ContractCommit, wrong Proposal hash, missing Applied Tick, APPROVED status without Approval, invalidated activation evidence, and target preservation on failed import.
 - [ ] 1.8 Verify PR 1C-1 leaves Engine, user entry points, AuthorityScopeSet activation, legacy research writes, and current Phase 1B Proposal wait behavior unchanged.
 - [ ] 1.9 Reconcile ADR 0005, the MissionGraph SDD, migration plan, and this active OpenSpec Change with the concrete PR 1C-1 protocol; record reviewed deviations without syncing or archiving the Change.
 
 ## 2. PR 1C-2: Dormant Atomic Activation and Authority Projection
 
-- [ ] 2.1 Implement BEGIN IMMEDIATE approve, reject, and invalidate application services with same-decision idempotency and conflicting-decision rejection (strategic-proposal-decision: Repeated and conflicting decisions are deterministic).
+- [ ] 2.1 Implement dedicated BEGIN IMMEDIATE approved, rejected, and invalidated full-aggregate entry points with same-decision idempotency, conflicting-decision rejection, and stale-invalidation behavior; expose no standalone public ApprovalRecord or terminal Tick save method (strategic-proposal-decision: Repeated and conflicting decisions are deterministic).
 - [ ] 2.2 Implement all-or-nothing approval activation for ApprovalRecord, ContractCommit, Contract revision, Applied Tick, research AuthorityScopeSet, Runtime ROUTING, and Human Wait clearance (strategic-contract-activation: Approved activation is atomic; Activation appends the expected revision).
 - [ ] 2.3 Derive the approved Contract revision canonically from immutable Proposal content and prohibit edited approval or automatic rebase (strategic-contract-activation: Activated content derives from the Proposal).
 - [ ] 2.4 Implement atomic rejection and stale invalidation transitions that write no Contract revision and do not recall the Provider.
@@ -23,7 +23,6 @@
 - [ ] 2.9 Keep approve/reject/invalidate and authority routing behind a dormant feature gate with no production caller (research-authority-routing: Activation remains dormant until final enablement).
 - [ ] 2.10 Add deterministic concurrency tests for two approvals and approve/reject races, plus crash injection after Approval preparation, Contract preparation, and before transition Tick persistence.
 - [ ] 2.11 Add restart and replay round-trip tests proving one revision, complete evidence, atomic authority, no legacy writes, no direct StoredTask, non-research isolation, and pre-delete rejection of forged history.
-- [ ] 2.12 Add rollback tests that block on unresolved ActionAttempt or approval state and atomically restore one compatible legacy research authority (research-authority-routing: Rollback preserves one research authority).
 
 ## 3. PR 1C-3: Runtime Entry and Enablement
 

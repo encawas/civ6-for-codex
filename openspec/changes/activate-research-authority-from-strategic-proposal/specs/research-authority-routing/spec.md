@@ -51,10 +51,10 @@ The research activation transaction SHALL NOT transfer or modify the write autho
 - **WHEN** research activation commits while civic is legacy-owned
 - **THEN** civic remains legacy-owned and its strategic state is unchanged
 
-#### Scenario: Research Patch and civic Patch
+#### Scenario: Strategic writes respect scope ownership
 
 - **WHEN** research is MissionGraph-owned and civic is legacy-owned
-- **THEN** a research Patch may pass scope validation and a civic Patch is deterministically rejected
+- **THEN** MissionGraph-owned research strategic writes may pass scope validation and writes targeting legacy-owned non-research scopes are rejected
 
 ### Requirement: Dedicated decision transition precedes ordinary work
 
@@ -141,17 +141,3 @@ Protocol and dormant activation components MAY be deployed before user entry and
 
 - **WHEN** the user entry point, Engine integration, and end-to-end gates pass
 - **THEN** research decision and activation may be enabled without changing non-research scopes
-
-### Requirement: Rollback preserves one research authority
-
-Rollback after enablement SHALL reconcile active attempts and approvals, prove a compatible legacy research baseline, and atomically return research authority without enabling both writers.
-
-#### Scenario: Rollback is blocked by uncertain mutation
-
-- **WHEN** an unresolved research ActionAttempt could duplicate a mutation
-- **THEN** rollback remains blocked until observed or human reconciliation completes
-
-#### Scenario: Compatible rollback commits
-
-- **WHEN** active work is reconciled and a compatible legacy baseline is proven
-- **THEN** research authority returns atomically to legacy and MissionGraph research writes stop

@@ -514,14 +514,16 @@ independently strategic StoredTask. A stale Contract makes old StoredTask
 unclaimable, and an action cannot have two execution authorities.
 
 Before a Scope authority switch, every legacy-authority READY StoredTask must
-either be cancelled or superseded, or be converted by creating a new
-Mission-derived StoredTask projected deterministically from the current
-Contract and Mission revision. Conversion occurs in the controlled authority
-switch transaction or an explicit migration step, preserves an audit link from
-the old task to the new task, makes the old task unclaimable, and never rewrites
-the old task's provenance in place. At most one equivalent action may remain
-claimable. VERIFYING StoredTask completes fresh verification before switching;
-an UNCERTAIN ActionAttempt blocks the switch and any equivalent mutation.
+be cancelled, superseded, or otherwise made unclaimable. If that cannot be
+proved safe, activation is blocked. The authority-switch or Proposal-application
+transaction never creates a Mission-derived StoredTask. After activation and
+the dedicated Decision/Activation Tick complete, a later Routing step reads the
+active Contract and Mission, performs a separate deterministic revision-bound
+projection, and enters the normal Planner lifecycle before a replacement
+StoredTask may be created. The old task remains unclaimable, its provenance is
+not rewritten, and at most one equivalent action may be claimable. VERIFYING
+StoredTask completes fresh verification before switching; an UNCERTAIN
+ActionAttempt blocks the switch and any equivalent mutation.
 
 Phase 3 makes `domain.Task` and TurnActionGraph the research execution
 authority. `workflow_tasks` and `models.StoredTask` stop deciding research
@@ -575,7 +577,7 @@ create a Proposal, Contract, Mission, or approval Repository beside the Store.
 | System Proposal invalidation | StrategicProposalInvalidatedTick |
 | Strategic objectives and Missions | Current StrategicContract revision |
 | Strategic Scope write ownership | AuthorityScopeSet in the current StrategicContract revision |
-| Proposal decision transition audit | Applied, Rejected, Invalidated, Resume, and Error Ticks |
+| Proposal decision transition audit | Applied, Rejected, Resume, and Error Ticks |
 | Current-turn action dependencies | Current TurnActionGraph revision |
 | Research action execution through Phase 2 | Deterministically projected StoredTask |
 | Phase 3+ research action execution | TurnActionGraph / `domain.Task` |
@@ -588,6 +590,8 @@ create a Proposal, Contract, Mission, or approval Repository beside the Store.
 
 Model output is a proposal. Cache is not a fact source. Events are not current
 game facts. Compatibility RuntimeSnapshot is not a MissionGraph fact source.
+StrategicProposalInvalidatedTick also records an invalidation transition, but
+its core identity remains the sole authority for the system terminal outcome.
 PlanLease and MissionGraph cannot both decide one Strategic Scope. StoredTask
 and TurnActionGraph cannot both decide one action.
 

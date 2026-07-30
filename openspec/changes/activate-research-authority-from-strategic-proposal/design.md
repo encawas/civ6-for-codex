@@ -121,7 +121,9 @@ One aggregate validator covers terminal uniqueness, source binding, revision con
 
 Replay prepares and validates the complete incoming game aggregate together with retained external rows before deleting target-game data. Any forged Approval, missing ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal facts, partial authority switch, or impossible Tick ordering fails before replacement.
 
-Committed activation recovery is idempotent. The same decision identity returns the existing evidence and never appends a revision or calls the Provider again. Conflicting decisions fail. Two concurrent approvals produce one revision; concurrent approve/reject is decided by the first transaction to commit.
+PR 1C-1 adds only the data contracts, Schema, canonical serialization, typed reads, import/export, ordinary-save checks, and startup/replay aggregate validation needed to recognize these facts. It may reject forged or incomplete persisted states, but it does not implement a real decision transaction and exposes no public operation that can independently save an ApprovalRecord or terminal Tick or move a Proposal to APPROVED, REJECTED, or INVALIDATED.
+
+PR 1C-2 introduces three dedicated full-aggregate entry points for approved, rejected, and invalidated outcomes. Only those atomic operations implement same-decision idempotency, conflicting-decision rejection, stale invalidation, and concurrent decision behavior. The same committed decision identity returns existing evidence and never appends a revision or calls the Provider again. Two concurrent approvals produce one revision; concurrent approve/reject is decided by the first transaction to commit.
 
 ### 6. Treat the decision Tick as an exclusive transition interval
 
@@ -147,9 +149,9 @@ Alternative rejected: direct StoredTask creation would conflate candidate conten
 
 ### 8. Roll out through one active Change
 
-- **PR 1C-1:** add Proposal-specific decision contracts, terminal Tick contracts, structured ContractCommit provenance, persistence shapes, and fail-closed validators. Do not connect Engine or a user entry point.
-- **PR 1C-2:** implement atomic approve/reject/invalidate services, research AuthorityScopeSet activation, legacy research write closure, authoritative routing projection, and crash/concurrency/replay behavior behind a dormant gate.
-- **PR 1C-3:** add the user entry point and Engine integration, remove dormancy only after end-to-end verification, update final documents, then verify, sync, and archive this Change.
+- **PR 1C-1:** add Proposal-specific decision and terminal Tick data contracts, Schema, canonical serialization, typed reads, replay import/export, ordinary-save checks, and fail-closed startup/replay validators. It provides no public terminal transition operation and does not connect Engine or a user entry point.
+- **PR 1C-2:** implement dedicated atomic approved, rejected, and invalidated full-aggregate services, research AuthorityScopeSet activation, legacy research write closure, authoritative routing projection, and crash/concurrency/replay behavior behind a dormant gate. No standalone ApprovalRecord or terminal Tick public save method is permitted.
+- **PR 1C-3:** install the official generated `openspec-verify-change` Skill through OpenSpec profile/update, add the user entry point and Engine integration, remove dormancy only after end-to-end verification, update final documents, then verify, sync, and archive this Change.
 
 OpenSpec remains active through PR 1C-1 and PR 1C-2. It is development guidance, not runtime authority.
 
@@ -161,7 +163,7 @@ OpenSpec remains active through PR 1C-1 and PR 1C-2. It is development guidance,
 - **[Replay may accept a state ordinary persistence cannot create]** -> Reuse one aggregate validator and preflight before target deletion.
 - **[Decision and ordinary Tick overlap could expose impossible history]** -> Validate the whole protected interval and serialize Runtime transition under the same process and database boundaries.
 - **[Dormant code can drift before enablement]** -> Keep one OpenSpec Change and require PR 1C-3 end-to-end tests before removing the gate.
-- **[Rollback after mutations can duplicate work]** -> Block rollback while ActionAttempt or approval state is unresolved and require a proven compatible legacy baseline.
+- **[An activated game cannot safely return to legacy authority in Phase 1C]** -> Pause new research work and require human handling. Any future reverse migration needs a separate ADR and OpenSpec Change and must append a new forward revision without deleting, modifying, or revoking an effective revision.
 
 ## Migration Plan
 
@@ -170,6 +172,6 @@ OpenSpec remains active through PR 1C-1 and PR 1C-2. It is development guidance,
 3. Land PR 1C-2 atomic services and research projection dormant. Existing games remain legacy-owned until an explicit activation can commit.
 4. In PR 1C-3, expose the user decision entry point, integrate Engine routing, run migration/replay/concurrency end-to-end checks, and enable research activation.
 5. Keep non-research scopes unchanged. Keep legacy audit reads until exit and deletion criteria are met.
-6. For rollback, stop new research claims, reconcile attempts and approvals, prove a compatible legacy baseline, and atomically restore legacy ownership. Never dual-write.
+6. Before PR 1C-3 enablement, disable the dormant gate or roll back code without changing persisted authority. After a game activates research, Phase 1C offers no automatic reverse switch or revision revocation; pause new research work and require human handling. A future reverse migration requires a separate ADR and OpenSpec Change and a new forward revision.
 
 This Change is not synced or archived during steps 1-3. PR 1C-3 performs final verification, sync, and archive only after primary and secondary review.

@@ -369,21 +369,25 @@ Other Strategic Scopes remain legacy-owned.
 - Define Invalidated, Applied, and Rejected Tick contracts and terminal
   uniqueness.
 - Add structured ContractCommit source binding.
-- Add typed Store persistence and shared ordinary-write, startup, and replay
-  aggregate validators.
+- Add data contracts, Schema, canonical serialization, typed reads, replay
+  import/export, ordinary-save checks, and shared startup/replay aggregate
+  validators. Do not add a public operation that independently saves an
+  ApprovalRecord or terminal Tick or performs a terminal decision.
 - Add protocol and forged-state tests.
 - Do not connect Engine, user actions, authority activation, or legacy write
   closure.
 
 ### PR 1C-2: Dormant Atomic Activation and Authority Projection
 
-- Implement BEGIN IMMEDIATE approve, reject, and invalidate services.
+- Implement dedicated BEGIN IMMEDIATE approved, rejected, and invalidated
+  full-aggregate services. No standalone ApprovalRecord or terminal Tick public
+  save method may bypass them.
 - Atomically persist Approval, Contract revision, ContractCommit, transition
   Tick, research Mission, AuthorityScopeSet, Runtime transition, and wait
   clearance as applicable.
 - Close legacy research writes after ownership changes.
 - Add active Contract/Mission routing projection and stale-revision guards.
-- Add crash, restart, replay, concurrency, idempotency, and rollback coverage.
+- Add crash, restart, replay, concurrency, and idempotency coverage.
 - Keep every new production path behind a dormant gate with no user or Engine
   caller.
 
@@ -417,17 +421,20 @@ Other Strategic Scopes remain legacy-owned.
 - Active legacy PlannerRequest completes, supersedes, or follows an explicit
   migration path.
 - Research PlanLease completes, invalidates, or blocks switch.
-- Legacy READY StoredTask is cancelled or superseded, or converted by creating
-  a new deterministic Mission-derived task in the controlled switch or an
-  explicit migration step.
-- Conversion records old-to-new audit, leaves the old task unclaimable, never
-  rewrites provenance, and leaves at most one equivalent action claimable.
+- Legacy READY StoredTask is cancelled, superseded, or otherwise made
+  unclaimable before activation. If safe disposition cannot be proved,
+  activation is blocked.
 - VERIFYING StoredTask completes fresh verification before switch.
 - UNCERTAIN ActionAttempt blocks authority switch and equivalent mutation until
   observed or human reconciliation.
 - Pending legacy approval completes, invalidates, or resubmits against the new
   revision.
 - Proposal decision and activation do not directly create StoredTask.
+- After activation and the Decision/Activation Tick complete, later Routing
+  reads the active Contract/Mission revision, performs a separate deterministic
+  projection, and enters the normal Planner lifecycle before a replacement
+  StoredTask may be created. Old provenance is not rewritten, audit association
+  is retained, and at most one equivalent action is claimable.
 
 ### Tests
 
@@ -444,8 +451,9 @@ Other Strategic Scopes remain legacy-owned.
 - Replay failure occurs before target-game deletion.
 - Research and Contract activate atomically; legacy research writes fail
   afterward.
-- With research MissionGraph-owned and civic legacy-owned, a research Patch is
-  accepted and a civic Patch is deterministically rejected.
+- With research MissionGraph-owned and civic legacy-owned, MissionGraph-owned
+  research strategic writes may pass scope validation, while writes targeting
+  legacy-owned non-research scopes are rejected.
 - Ordinary Ticks neither precede nor overlap the Decision/Activation Tick.
 - Routing consumes only the active Contract/Mission revision; stale revisions
   cannot create claimable work.
@@ -455,10 +463,13 @@ Other Strategic Scopes remain legacy-owned.
 
 ### Rollback
 
-Before enablement, disable the dormant path and leave all games legacy-owned.
-After enablement, stop new claims, reconcile ActionAttempts and approvals, and
-prove a compatible legacy research baseline. Atomically return research
-authority to legacy and stop MissionGraph research writes. Never dual-write.
+Before PR 1C-3 enablement, disable the dormant gate or roll back code; no
+persisted authority switch has occurred. After a game completes research
+activation, Phase 1C provides no automatic reverse switch or revision
+revocation. Pause new research work and require human handling. Any future
+reverse migration requires a separate ADR and OpenSpec Change and must append a
+new forward revision without deleting, modifying, or revoking an effective
+revision.
 
 ### Exit criteria
 
@@ -469,7 +480,7 @@ authority to legacy and stop MissionGraph research writes. Never dual-write.
 - Research strategy is MissionGraph-owned and legacy research writes are
   closed only after successful activation.
 - Research execution remains solely StoredTask-owned until Phase 3.
-- Startup, replay, concurrency, crash recovery, rollback, and protected Tick
+- Startup, replay, concurrency, crash recovery, and protected Tick
   ordering pass.
 - Non-research scopes are unchanged and no second Engine or Store exists.
 
@@ -781,7 +792,7 @@ migration audit, replay fixtures, and control-surface reads.
 | OPEN/REQUESTED DecisionGap | Complete or supersede before switch |
 | Active PlannerRequest | Complete, supersede, or explicitly migrate |
 | PlanLease | Invalidate, complete, or block switch |
-| READY StoredTask | Cancel or supersede the old task, or create a deterministic Mission-derived replacement in the controlled switch transaction or explicit migration step |
+| READY StoredTask | Cancel, supersede, or otherwise make the old task unclaimable before activation; block activation if safe disposition cannot be proved |
 | VERIFYING StoredTask | Finish fresh verification before switch |
 | UNCERTAIN ActionAttempt | Reconcile manually or from facts; never generate equivalent replacement mutation |
 | Pending approval | Complete, invalidate, or resubmit on new revision |
@@ -790,20 +801,24 @@ migration audit, replay fixtures, and control-surface reads.
 An UNCERTAIN ActionAttempt blocks any switch that could generate the same
 semantic mutation.
 
-Any READY StoredTask conversion creates a new task referencing the current
-Contract and Mission revision, records old-to-new audit linkage, leaves the old
-task unclaimable, and does not rewrite old provenance in place. The migration
-must leave at most one equivalent action claimable.
+The authority-switch transaction does not create a Mission-derived StoredTask.
+After activation and its dedicated Tick complete, later Routing may create a
+replacement only through deterministic projection from the current Contract
+and Mission revision and the normal Planner lifecycle. It records old-to-new
+audit association, leaves the old task unclaimable, does not rewrite old
+provenance, and leaves at most one equivalent action claimable.
 
 ### Tests
 
 - Scope-specific safety and behavior characterization.
 - Authority Scope Set has one writer per scope.
-- With research MissionGraph-owned and civic legacy-owned, a research Patch is
-  accepted and a civic Patch is rejected deterministically.
+- With research MissionGraph-owned and civic legacy-owned, MissionGraph-owned
+  research strategic writes may pass scope validation, while writes targeting
+  legacy-owned non-research scopes are rejected.
 - No equivalent legacy/new action is claimable.
-- A legacy READY research task is cancelled or superseded during authority
-  switch, with at most one Mission-derived replacement claimable.
+- A legacy READY research task is cancelled, superseded, or made unclaimable
+  before authority activation; any Mission-derived replacement can become
+  claimable only after later Routing projection and the normal Planner lifecycle.
 - Active-object migration and rollback fixtures.
 - Multi-game isolation, replay, approvals, crash injection, and rebaseline.
 - Unmigrated scopes remain unchanged.
