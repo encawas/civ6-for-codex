@@ -124,17 +124,21 @@ source_proposal_hash
 source_approval_id
 source_planner_request_id
 expected_base_revision
+source_mission_id
+source_mission_revision
 ```
 
-These are typed fields in the durable commit contract. The existing reason remains descriptive and cannot substitute for any identity. Startup and replay compare every source field with Proposal, Approval, Request, Contract, and Applied Tick evidence.
+These are typed fields in the durable commit contract. StrategicProposalAppliedTick binds the same Mission identity and revision. The Proposal Mission, activated Contract Mission, ContractCommit, and Applied Tick must all resolve to one immutable Mission with `scope=research` and `status=ACTIVE`. Startup and replay compare every source field with Proposal, Approval, Request, Contract, Mission, and Applied Tick evidence.
+
+The action semantic is not free-form provenance. A closed domain mapping assigns `research -> set_research`; `desired_outcome`, tool-name strings, and free JSON cannot select or override the action. Civic, production, unit, city, every non-ACTIVE Mission, and every non-`set_research` action fail the aggregate before any activation fact commits.
 
 Alternative rejected: parsing a reason string is not canonical, typed, or safe under replay.
 
 ### 5. Validate the same aggregate on write, startup, and replay
 
-One aggregate validator covers terminal uniqueness, source binding, revision continuity, approval snapshot consistency, activation completeness, authority ownership, Runtime/wait state, and protected Tick intervals.
+One aggregate validator covers terminal uniqueness, source binding, revision continuity, approval snapshot consistency, activation completeness, research Mission scope/status/action semantics, authority ownership, Runtime/wait state, migration-origin causal time, and protected Tick intervals.
 
-Replay prepares and validates the complete incoming game aggregate together with retained external rows before deleting target-game data. Any forged Approval, missing ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal facts, partial authority switch, or impossible Tick ordering fails before replacement.
+Replay prepares and validates the complete incoming game aggregate together with retained external rows before deleting target-game data. Any forged Approval, missing ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal facts, non-ACTIVE or non-research Mission, non-`set_research` action, partial authority switch, or impossible migration/Tick ordering fails before replacement.
 
 PR 1C-1 adds only the data contracts, Schema, canonical serialization, typed reads, import/export, ordinary-save checks, and startup/replay aggregate validation needed to recognize these facts. It also adds four nullable, grouped provenance fields to the existing StoredTask/workflow_tasks representation: source_contract_id, source_contract_revision, source_mission_id, and source_mission_revision. Existing rows migrate with all four null; partial groups fail validation. PR 1C-1 does not change routing, claim, retry, confirmation, or recovery behavior.
 
@@ -169,6 +173,10 @@ StrategicProposalWaitResumedTick remains historical interaction evidence and is 
 
 The migration writes no ApprovalRecord, Contract revision, ContractCommit, MissionGraph authority, StoredTask, or Provider call. It handles multiple historical Proposals independently and is idempotent. Startup and replay may recognize the pre-enable state as migration input, but enabled ordinary work starts only after no OPEN Proposal retains a WaitResumedTick.
 
+A migration-origin Invalidated Tick carries typed origin `PHASE1C_ENABLEMENT_MIGRATION` and structured bindings to ProposalReadyTick, ResumeRequest, and StrategicProposalWaitResumedTick. Its logical `started_at` and `completed_at` are identical and equal one microsecond after the maximum of Proposal.created_at, source PlannerRequest.completed_at, final ProviderAttempt.completed_at, ProposalReadyTick.completed_at, ResumeRequest.requested_at, and StrategicProposalWaitResumedTick.completed_at. The value is derived only from durable Phase 1B evidence; it is not a guessed historical user-operation or current wall-clock time.
+
+Ordinary save, startup, and replay use one validator to resolve the bindings and recompute the exact timestamp. Missing sources, mismatched identities, an earlier or merely different timestamp, or a non-representable successor fails before mutation or replay deletion. A successful migration reopens normally and preserves the same Tick through export, empty-store import, and re-export.
+
 After enablement, strategic_contract_proposal_ready can leave AWAITING_HUMAN only through the dedicated APPROVE or REJECT aggregate transition. request_human_resume rejects Proposal waits but retains existing behavior for supported non-Proposal waits.
 
 Alternative rejected: treating an old Resume Tick as approval would fabricate human intent; leaving it OPEN would create a Proposal with no decision wait.
@@ -179,7 +187,7 @@ The approval transaction changes only research ownership. Legacy research Decisi
 
 Proposal application does not create StoredTask. A later Routing step reads the active Contract and authoritative research Mission, performs a separate deterministic revision-bound projection, and enters the normal PlannerRequest lifecycle.
 
-Mission-derived research StoredTask uses the four-field provenance group added in PR 1C-1. Before first cutover, set_research with all four fields null is explicitly legacy. After cutover, a set_research task is eligible only when all four fields are present and match the same-game active Contract and research Mission revisions. Each claim, retry, confirmation release, and recovery operation re-reads and validates the active aggregate in its own write transaction; null, partial, stale, or cross-game provenance cannot become claimable.
+Mission-derived research StoredTask uses the four-field provenance group added in PR 1C-1. Before first cutover, set_research with all four fields null is explicitly legacy. After cutover, a set_research task is eligible only when all four fields are present and match the same-game active Contract and an `ACTIVE` Mission whose scope is exactly `research`. ContractCommit and Applied Tick bind that same Mission identity/revision. Routing obtains the action only from the closed `research -> set_research` mapping; neither Mission desired_outcome nor arbitrary strings/JSON can choose an operation. Each claim, retry, confirmation release, and recovery operation re-reads and validates the active aggregate in its own write transaction; null, partial, stale, cross-game, non-research, non-ACTIVE, or non-`set_research` provenance cannot become claimable.
 
 Alternative rejected: direct StoredTask creation would conflate candidate content, effective strategy, routing projection, and execution authority.
 
@@ -202,6 +210,8 @@ OpenSpec remains active through PR 1C-1 and PR 1C-2. It is development guidance,
 - **[Decision and ordinary Tick overlap could expose impossible history]** -> Validate the whole protected interval and serialize Runtime transition under the same process and database boundaries.
 - **[StoredTask origin is not currently persisted]** -> Add one grouped provenance contract in PR 1C-1 and require revision validation in every post-cutover task mutation transaction.
 - **[Phase 1B Resume can leave an OPEN Proposal without a wait]** -> Migrate historical released waits to system invalidation and reject generic Proposal resume before enabling decisions.
+- **[Migration could invent an impossible historical time]** -> Bind migration-origin invalidation to durable Phase 1B sources and derive one canonical logical timestamp that every validation path recomputes.
+- **[Generic Mission data could escape the research slice]** -> Require the Proposal-derived ACTIVE research Mission and the closed set_research mapping across Proposal, Contract, commit, Applied Tick, routing, and task provenance.
 - **[Dormant code can drift before enablement]** -> Keep one OpenSpec Change and require PR 1C-3 end-to-end tests before removing the gate.
 - **[An activated game cannot safely return to legacy authority in Phase 1C]** -> Pause new research work and require human handling. Any future reverse migration needs a separate ADR and OpenSpec Change and must append a new forward revision without deleting, modifying, or revoking an effective revision.
 

@@ -368,8 +368,10 @@ Other Strategic Scopes remain legacy-owned.
 - Constrain StrategicResearchProposal human decisions to APPROVED or REJECTED
   without narrowing unrelated approval workflows.
 - Define Invalidated, Applied, and Rejected Tick contracts and terminal
-  uniqueness.
-- Add structured ContractCommit source binding.
+  uniqueness. Migration-origin InvalidatedTick includes typed origin, structured
+  Ready/Resume source bindings, and canonical causal time.
+- Add structured ContractCommit and AppliedTick source Mission identity/revision
+  binding.
 - Add optional grouped StoredTask/workflow_tasks source fields:
   source_contract_id, source_contract_revision, source_mission_id, and
   source_mission_revision. Existing rows migrate with all four NULL.
@@ -378,6 +380,9 @@ Other Strategic Scopes remain legacy-owned.
 - Add Proposal decision contracts and validation without a public operation
   that independently saves ApprovalRecord or terminal Tick or performs a
   terminal decision.
+- Validate that the Proposal-derived Mission has scope research and status
+  ACTIVE, and that its action semantic comes only from the closed
+  research-to-set_research mapping.
 - Add protocol, migration, round-trip, and forged-state tests while preserving
   current routing and task lifecycle behavior.
 - Do not connect Engine, user actions, authority activation, or legacy write
@@ -389,8 +394,10 @@ Other Strategic Scopes remain legacy-owned.
   full-aggregate services. No standalone ApprovalRecord or terminal Tick public
   save method may bypass them.
 - Atomically persist legacy research execution disposition, Approval, Contract
-  revision, ContractCommit, transition Tick, research Mission,
-  AuthorityScopeSet, Runtime transition, and wait clearance as applicable.
+  revision, ContractCommit, transition Tick, the Proposal-derived ACTIVE
+  research Mission, AuthorityScopeSet, Runtime transition, and wait clearance
+  as applicable. ContractCommit and AppliedTick bind the same Mission identity and
+  revision.
 - Close legacy research writes after ownership changes.
 - Add active Contract/Mission routing projection that writes the PR 1C-1 task
   provenance group, plus transaction-local claim, retry, confirmation-release,
@@ -403,7 +410,9 @@ Other Strategic Scopes remain legacy-owned.
 
 - Before enablement, atomically migrate Phase 1B OPEN Proposals with historical
   WaitResumedTick evidence to system invalidation. Preserve valid unresolved
-  Proposal waits and use existing stale reasons when the target or base changed.
+  Proposal waits, use existing stale reasons when the target or base changed,
+  and derive migration-origin Tick time from the canonical persisted causal
+  frontier rather than current wall clock or invented user time.
 - Add explicit user APPROVE/REJECT actions.
 - Reject request_human_resume for strategic_contract_proposal_ready after
   enablement while preserving supported non-Proposal resume behavior.
@@ -421,9 +430,12 @@ Other Strategic Scopes remain legacy-owned.
 - Proposal-derived Contract revisions append to the one existing root and use
   revision = expected base + 1.
 - The approved revision copies canonical Proposal objectives, constraints,
-  source Observation, and research Mission.
-- ContractCommit binds source Proposal ID/hash, Approval ID, PlannerRequest ID,
-  and expected base structurally.
+  source Observation, and the Proposal-derived Mission with scope research and
+  status ACTIVE. Non-research or non-ACTIVE Mission content is never activated.
+- ContractCommit and AppliedTick bind the same source Mission ID/revision in
+  addition to Proposal ID/hash, Approval ID, PlannerRequest ID, and expected
+  base. The action semantic is the closed mapping research -> set_research;
+  desired_outcome, tool-name strings, and free JSON cannot select an action.
 - Replay validates complete decision, activation, authority, Runtime/wait, and
   Tick evidence before deleting target-game data.
 - Existing workflow_tasks rows receive NULL for all four Contract/Mission
@@ -442,7 +454,28 @@ Phase 1B Proposal wait migration runs only at PR 1C-3 enablement:
 
 The migration handles multiple Proposals independently and is idempotent. It
 writes no ApprovalRecord, Contract revision, ContractCommit, MissionGraph
-authority, StoredTask, or Provider call. Pre-enable startup/replay treats
+authority, StoredTask, or Provider call. Each migration InvalidatedTick records
+origin PHASE1C_ENABLEMENT_MIGRATION and binds ProposalReadyTick, ResumeRequest,
+and StrategicProposalWaitResumedTick. Define:
+
+```text
+causal_frontier = max(
+  Proposal.created_at,
+  source PlannerRequest.completed_at,
+  final ProviderAttempt.completed_at,
+  ProposalReadyTick.completed_at,
+  ResumeRequest.requested_at,
+  StrategicProposalWaitResumedTick.completed_at,
+)
+started_at = completed_at = causal_frontier + 1 microsecond
+```
+
+Ordinary save, startup, and replay resolve those same bindings and require the
+exact value. Missing/mismatched sources, earlier or different time, or an
+unrepresentable successor rejects before mutation or target-data deletion.
+The formula uses only durable Phase 1B evidence, so no unavailable historical
+user time is required. Successful migration reopens normally and replay
+preserves the Tick rather than regenerating it. Pre-enable startup/replay treats
 OPEN plus WaitResumedTick only as migration input; after migration, that shape
 is invalid.
 
@@ -483,7 +516,9 @@ is invalid.
   StoredTask may be created.
 - Before first cutover, set_research with all four provenance fields NULL is
   legacy. After cutover, a valid Mission-derived set_research task has all four
-  fields and matches the active Contract/Mission identity and revision.
+  fields and matches the active Contract plus the same ACTIVE research Mission
+  bound by Proposal, ContractCommit, and AppliedTick. The action type must be
+  exactly set_research and cannot be selected from desired_outcome or free JSON.
 - Claim, retry, confirmation release, and recovery re-read those active
   revisions in their own write transactions. NULL, partial, stale, or
   cross-game provenance cannot become claimable.
@@ -501,8 +536,10 @@ is invalid.
   transition Tick leave no partial state.
 - Startup and replay reject forged Approval, forged Contract, missing
   ContractCommit, wrong Proposal hash, missing Applied Tick, mixed terminal
-  facts, duplicate Invalidated Ticks, partial authority state, partial task
-  provenance, and stale claimable Mission-derived research work.
+  facts, duplicate Invalidated Ticks, migration-origin Ticks with missing source
+  bindings or non-canonical causal time, partial authority state, partial task
+  provenance, non-research/non-ACTIVE Mission bindings, non-set_research action
+  semantics, and stale claimable Mission-derived research work.
 - PR 1C-1 migration/replay preserves all-null legacy task provenance and rejects
   partial or cross-game groups without changing legacy claim behavior.
 - Post-cutover claim/retry/confirm/recovery reject provenance-free legacy tasks
@@ -525,7 +562,12 @@ is invalid.
   unchanged.
 - An unresolved Phase 1B Proposal wait remains OPEN and decidable after upgrade.
 - One or multiple historical resumed OPEN Proposals migrate idempotently to
-  PRE_PHASE1C_WAIT_RELEASED invalidation unless a stale reason takes precedence.
+  PRE_PHASE1C_WAIT_RELEASED invalidation unless a stale reason takes precedence;
+  their source-bound canonical times are stable across startup and replay.
+- Migration rejects a forged timestamp before or unequal to its causal frontier
+  and leaves the existing target database untouched, while valid Phase 1B data
+  migrates, reopens, exports, imports into an empty store, and re-exports
+  semantically unchanged.
 - Generic Proposal resume fails after enablement, supported terminal Request
   resume remains unchanged, and migration writes no approval or activation.
 - Enabled startup/replay contains no OPEN Proposal with WaitResumedTick.
@@ -547,8 +589,10 @@ revision.
   INVALIDATED disposition from canonical durable facts.
 - Every Phase 1B released OPEN Proposal is invalidated before enablement, and
   Proposal-ready waits can then leave only through APPROVE or REJECT.
-- Approved content, Contract revision, ContractCommit, Applied Tick, research
-  Mission, and AuthorityScopeSet are one atomic aggregate.
+- Approved content, Contract revision, ContractCommit, Applied Tick, the
+  Proposal-derived ACTIVE research Mission, and AuthorityScopeSet are one atomic
+  aggregate; all
+  Mission identities/revisions agree and routing can emit only set_research.
 - Research strategy is MissionGraph-owned only after legacy execution is
   quiescent and legacy research writes are closed by the successful activation.
 - Research execution remains solely StoredTask-owned until Phase 3, with

@@ -67,6 +67,10 @@ A StrategicProposalWaitResumedTick created by the Phase 1B generic resume path S
 
 An OPEN Proposal with its unresolved strategic_contract_proposal_ready wait SHALL remain OPEN and eligible for APPROVE or REJECT. An OPEN Proposal with a historical StrategicProposalWaitResumedTick and no terminal decision SHALL receive exactly one StrategicProposalInvalidatedTick with reason PRE_PHASE1C_WAIT_RELEASED. If its Contract target or base is already stale, the existing deterministic stale invalidation reason takes precedence. The migration SHALL write no ApprovalRecord, Contract revision, ContractCommit, MissionGraph authority, StoredTask, or Provider call.
 
+A migration-generated StrategicProposalInvalidatedTick SHALL carry typed origin PHASE1C_ENABLEMENT_MIGRATION and structurally bind its ProposalReadyTick, ResumeRequest, and StrategicProposalWaitResumedTick. Its started_at and completed_at SHALL be equal to one microsecond after the maximum of Proposal.created_at, source PlannerRequest.completed_at, final ProviderAttempt.completed_at, ProposalReadyTick.completed_at, ResumeRequest.requested_at, and StrategicProposalWaitResumedTick.completed_at. This is a logical causal time derived from durable Phase 1B evidence, not a reconstructed user-operation time or migration wall clock.
+
+Ordinary persistence, startup, and replay SHALL resolve the same bound records and recompute the exact canonical time. Missing or mismatched source evidence, a timestamp before or unequal to that value, or a non-representable next microsecond SHALL fail closed. Migration failure SHALL preserve the old database. A valid migrated database SHALL reopen and SHALL preserve the same InvalidatedTick through export, empty-store import, and re-export without regenerating its time.
+
 After PR 1C-3 enables the decision protocol, a strategic_contract_proposal_ready wait SHALL leave AWAITING_HUMAN only through the dedicated APPROVE or REJECT aggregate transition. The generic request_human_resume operation SHALL reject that wait while remaining available to non-Proposal waits such as strategic_request_terminated.
 
 #### Scenario: Unresolved Phase 1B wait remains decidable
@@ -77,7 +81,22 @@ After PR 1C-3 enables the decision protocol, a strategic_contract_proposal_ready
 #### Scenario: Released Phase 1B wait is invalidated
 
 - **WHEN** enablement migration finds an OPEN Proposal with a StrategicProposalWaitResumedTick and no human or system terminal fact
-- **THEN** it atomically records one StrategicProposalInvalidatedTick with reason PRE_PHASE1C_WAIT_RELEASED without creating approval or activation evidence
+- **THEN** it atomically records one source-bound StrategicProposalInvalidatedTick with reason PRE_PHASE1C_WAIT_RELEASED and the canonical causal time, without creating approval or activation evidence
+
+#### Scenario: Valid Phase 1B history migrates deterministically
+
+- **WHEN** all required Proposal, Request, Attempt, Ready, ResumeRequest, and WaitResumed evidence is present and causally valid
+- **THEN** migration writes the canonical logical time, startup accepts it, and replay round trips the same Tick unchanged
+
+#### Scenario: Forged migration time fails closed
+
+- **WHEN** ordinary save, startup, or replay sees a migration-origin InvalidatedTick whose time precedes or differs from the canonical causal time
+- **THEN** validation rejects the aggregate and replay leaves existing target data untouched
+
+#### Scenario: Missing migration source fails closed
+
+- **WHEN** migration cannot resolve every structurally bound causal source or cannot represent the next microsecond
+- **THEN** migration writes nothing and the pre-upgrade database remains readable under the pre-enable behavior
 
 #### Scenario: Stale reason takes precedence
 

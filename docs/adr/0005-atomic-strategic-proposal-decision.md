@@ -56,9 +56,13 @@ source_proposal_hash
 source_approval_id
 source_planner_request_id
 expected_base_revision
+source_mission_id
+source_mission_revision
 ```
 
-A descriptive reason may supplement this data but cannot replace it. Startup and replay compare the structured fields with the Proposal, ApprovalRecord, PlannerRequest, Contract revision, and Applied Tick.
+A descriptive reason may supplement this data but cannot replace it. The matching StrategicProposalAppliedTick binds the same Mission identity and revision. Startup and replay compare the structured fields with the Proposal, ApprovalRecord, PlannerRequest, Contract revision, Mission, and Applied Tick.
+
+Proposal activation accepts the Proposal-derived Mission with `scope=research` and `status=ACTIVE`. The active revision contains that same immutable Mission identity and revision. Its executable operation is selected only by the closed domain mapping `research -> set_research`; `desired_outcome`, a tool-name string, or free JSON cannot select or override an action. Civic, production, unit, city, every non-ACTIVE Mission, and every operation other than `set_research` fail before Approval, ContractCommit, Applied Tick, Contract revision, or authority state becomes visible.
 
 ### Approval and research activation are one transaction
 
@@ -116,6 +120,22 @@ StrategicProposalWaitResumedTick is historical interaction evidence, not approva
 | No Proposal | No operation |
 
 The migration is idempotent for one or multiple Proposals and writes no ApprovalRecord, Contract revision, ContractCommit, MissionGraph authority, StoredTask, or Provider call. After enablement, request_human_resume rejects strategic_contract_proposal_ready; that wait can leave only through APPROVE or REJECT. Supported non-Proposal waits keep their existing resume behavior.
+
+A migration-origin Invalidated Tick has typed origin `PHASE1C_ENABLEMENT_MIGRATION` and structurally binds the source Proposal Ready Tick, ResumeRequest, and StrategicProposalWaitResumedTick. Its timestamp is a logical migration time, not a fabricated user-operation time:
+
+```text
+causal_frontier = max(
+  Proposal.created_at,
+  source PlannerRequest.completed_at,
+  final ProviderAttempt.completed_at,
+  ProposalReadyTick.completed_at,
+  ResumeRequest.requested_at,
+  StrategicProposalWaitResumedTick.completed_at,
+)
+started_at = completed_at = causal_frontier + 1 microsecond
+```
+
+Ordinary persistence, startup, and replay resolve the bound records and recompute this exact value. A missing source, mismatched identity, timestamp before or unequal to the canonical value, or non-representable next microsecond fails closed. The migration transaction leaves the old database unchanged on failure. Once written, export and replay preserve the Tick unchanged; they do not synthesize a new wall-clock time or require a historical timestamp that Phase 1B never recorded.
 
 Startup and replay can read the pre-enable history only as migration input. Enabled ordinary work cannot begin while an OPEN Proposal already has a WaitResumedTick.
 

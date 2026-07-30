@@ -149,7 +149,7 @@ source_mission_id
 source_mission_revision
 ```
 
-The four fields SHALL be either all null or all present. PR 1C-1 SHALL add the domain contract, nullable SQLite columns, all-null legacy migration, canonical serialization, replay import/export, and ordinary-save/startup/replay validation. It SHALL NOT change current research routing. A Mission-derived research StoredTask SHALL carry all four fields and they SHALL identify the active Contract revision and active research Mission revision for the same game.
+The four fields SHALL be either all null or all present. PR 1C-1 SHALL add the domain contract, nullable SQLite columns, all-null legacy migration, canonical serialization, replay import/export, and ordinary-save/startup/replay validation. It SHALL NOT change current research routing. A Mission-derived research StoredTask SHALL carry all four fields and they SHALL identify the active Contract revision and the same ACTIVE Mission with scope research that is bound by Proposal, ContractCommit, and AppliedTick for the same game. Its action_type SHALL be exactly set_research. The action SHALL come from the closed research -> set_research mapping and SHALL NOT be selected from desired_outcome, a tool-name string, or free JSON.
 
 #### Scenario: Existing task remains explicitly legacy
 
@@ -158,8 +158,18 @@ The four fields SHALL be either all null or all present. PR 1C-1 SHALL add the d
 
 #### Scenario: Mission-derived research task has complete provenance
 
-- **WHEN** post-activation Routing projects a set_research task from the active research Mission
+- **WHEN** post-activation Routing projects a set_research task from the ACTIVE research Mission bound by Proposal, ContractCommit, and AppliedTick
 - **THEN** all four source fields are present and match the active Contract and Mission identities and revisions
+
+#### Scenario: Non-research or non-ACTIVE provenance is rejected
+
+- **WHEN** routing or a task mutation binds civic, production, unit, city, PAUSED, BLOCKED, COMPLETED, FAILED, CANCELLED, INVALIDATED, or any other Mission not exactly ACTIVE research
+- **THEN** no Mission-derived research task becomes claimable and non-research authority remains unchanged
+
+#### Scenario: Wrong action semantic is rejected
+
+- **WHEN** provenance is complete but action_type is not set_research, or desired_outcome/free JSON attempts to select another tool
+- **THEN** routing and every task mutation fail closed
 
 #### Scenario: Partial provenance is rejected
 

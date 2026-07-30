@@ -283,11 +283,15 @@ Approval appends exactly `expected_base_revision + 1` and transfers
 research write authority to MissionGraph in the same atomic transaction. That
 transaction also binds the ContractCommit structurally to Proposal identity
 and hash, Approval identity, source PlannerRequest, and expected base; records
-the Applied Tick; moves Runtime to routing; and clears the protected wait. A
-stale base or target produces system invalidation without Approval, automatic
-rebase, or Provider recall. No intermediate state may expose partial approval,
-effective research strategy without matching authority, or dual research
-writers.
+the same Mission identity and revision in ContractCommit and Applied Tick;
+moves Runtime to routing; and clears the protected wait. The Mission must have
+`scope=research` and `status=ACTIVE`, and the Contract revision must contain
+that same immutable Mission. Its only executable operation is selected by the
+closed mapping `research -> set_research`; `desired_outcome`, tool-name text,
+and free JSON cannot select another action. A stale base or target produces
+system invalidation without Approval, automatic rebase, or Provider recall. No
+intermediate state may expose partial approval, effective research strategy
+without matching authority, or dual research writers.
 
 Before writing approval or changing AuthorityScopeSet, the same BEGIN IMMEDIATE
 transaction re-reads every legacy research StoredTask, all ActionAttempts,
@@ -313,6 +317,21 @@ writes no ApprovalRecord, Contract revision, ContractCommit, MissionGraph
 authority, StoredTask, or Provider call. Startup and replay recognize the
 pre-enable shape as migration input, but enabled ordinary work requires that no
 OPEN Proposal already has a WaitResumedTick.
+
+Each migration-origin StrategicProposalInvalidatedTick stores typed origin
+`PHASE1C_ENABLEMENT_MIGRATION` and binds its ProposalReadyTick, ResumeRequest,
+and StrategicProposalWaitResumedTick. Its canonical logical time is exactly one
+microsecond after the maximum persisted timestamp among Proposal creation,
+source PlannerRequest completion, final ProviderAttempt completion, Ready Tick
+completion, ResumeRequest submission, and WaitResumedTick completion. The Tick
+uses that value for both `started_at` and `completed_at`. This is a deterministic
+causal frontier, not a reconstructed historical user-action time.
+
+Ordinary validation, startup, and replay resolve the same bindings and recompute
+the same value. Missing or mismatched sources, any earlier or different Tick
+time, or a non-representable successor fails closed. Migration failure leaves
+the pre-upgrade database unchanged; a valid migrated database reopens and its
+export/import round trip preserves the Tick without regenerating its time.
 
 After enablement, a strategic_contract_proposal_ready wait can leave only
 through the dedicated APPROVE or REJECT aggregate transition.
@@ -556,10 +575,15 @@ routing or task lifecycle behavior and creates no second task model or table.
 
 Before first research cutover, action_type=set_research with null provenance is
 a legacy research StoredTask. After cutover, Mission-derived set_research has
-all four fields and matches the same-game active Contract and research Mission
-revisions. Planner cannot create an independently strategic StoredTask, a
-stale Contract or Mission makes old work unclaimable, and an action cannot
-have two execution authorities.
+all four fields and matches the same-game active Contract and a Mission whose
+scope is exactly `research` and status is exactly `ACTIVE`. The only valid
+projected action is the registry action `set_research`; Mission desired_outcome
+data cannot name or substitute an action, and civic, production, unit, city,
+non-ACTIVE, or other-scope Missions cannot produce research work. ContractCommit
+and Applied Tick bind the same Mission identity and revision consumed by
+routing. Planner cannot create an independently strategic StoredTask, a stale
+Contract or Mission makes old work unclaimable, and an action cannot have two
+execution authorities.
 
 The approval transaction freezes legacy research execution under the same
 writer lock as the Contract and AuthorityScopeSet commit:

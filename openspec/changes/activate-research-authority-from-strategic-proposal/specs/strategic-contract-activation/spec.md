@@ -49,7 +49,7 @@ The approved revision SHALL equal the Proposal's expected base revision plus one
 
 ### Requirement: Activated content derives from the Proposal
 
-The new StrategicContract revision SHALL preserve the Proposal's canonical strategic objectives, global constraints, proposed research Mission, target Contract identity, source Observation, and Proposal hash. Approval SHALL NOT edit, regenerate, or rebase that content.
+The new StrategicContract revision SHALL preserve the Proposal's canonical strategic objectives, global constraints, proposed research Mission, target Contract identity, source Observation, and Proposal hash. The Proposal and activated revision SHALL contain exactly the same Mission identity and revision with scope research and status ACTIVE. The only executable action semantic SHALL come from the closed mapping research -> set_research. Approval SHALL NOT edit, regenerate, rebase, or use desired_outcome, a tool-name string, or free JSON to select another action.
 
 #### Scenario: Approved content is copied canonically
 
@@ -61,14 +61,34 @@ The new StrategicContract revision SHALL preserve the Proposal's canonical strat
 - **WHEN** approval supplies replacement objectives, constraints, Mission content, Contract identity, or base revision
 - **THEN** activation fails and no terminal fact is persisted
 
+#### Scenario: Non-research Mission is rejected
+
+- **WHEN** Proposal or activation provenance binds a civic, production, unit, city, or other non-research Mission
+- **THEN** the complete activation transaction fails before any Approval, Contract, authority, ContractCommit, or AppliedTick fact commits
+
+#### Scenario: Non-ACTIVE Mission is rejected
+
+- **WHEN** Proposal or activation provenance binds a PAUSED, BLOCKED, COMPLETED, FAILED, CANCELLED, INVALIDATED, or other non-ACTIVE Mission
+- **THEN** activation fails atomically and research authority remains legacy-owned
+
+#### Scenario: Free-form action selection is rejected
+
+- **WHEN** desired_outcome, a tool-name string, or free JSON names an operation other than the closed research set_research mapping
+- **THEN** validation rejects the aggregate rather than treating the value as executable authority
+
 ### Requirement: ContractCommit uses structured source binding
 
-Every Proposal-derived StrategicContractCommit SHALL structurally bind the source Proposal ID, source Proposal hash, source Approval ID, source PlannerRequest ID, and expected base revision. A free-form reason SHALL NOT substitute for any binding.
+Every Proposal-derived StrategicContractCommit SHALL structurally bind the source Proposal ID, source Proposal hash, source Approval ID, source PlannerRequest ID, expected base revision, source Mission ID, and source Mission revision. The matching StrategicProposalAppliedTick SHALL bind the same Mission identity and revision. Both SHALL resolve to the immutable ACTIVE research Mission copied into the Contract revision. A free-form reason, desired_outcome, or tool-name string SHALL NOT substitute for any binding or action semantic.
 
 #### Scenario: Complete source binding
 
 - **WHEN** a Proposal-derived revision commits
-- **THEN** its ContractCommit contains all structured source identities and they match the persisted evidence
+- **THEN** its ContractCommit and AppliedTick contain the same source Mission identity/revision and all structured identities match the Proposal, ACTIVE research Mission, Contract revision, and persisted evidence
+
+#### Scenario: Mission binding mismatch is rejected
+
+- **WHEN** ContractCommit, AppliedTick, Contract revision, or Proposal names a different Mission identity or revision
+- **THEN** ordinary persistence, startup, and replay reject the aggregate
 
 #### Scenario: Wrong Proposal hash is rejected
 
@@ -101,7 +121,7 @@ A Proposal-derived Contract revision SHALL set approval_status to APPROVED and S
 
 ### Requirement: Complete approval evidence is required
 
-The durable APPROVED disposition SHALL consist of the immutable Proposal, matching APPROVED ApprovalRecord, matching StrategicContractCommit, expected StrategicContract revision, matching StrategicProposalAppliedTick with immutable legacy execution disposition audit references, and aggregate proof that no claimable, in-flight, verifying, uncertain, or revivable legacy research execution survived activation. The evidence SHALL exclude any invalidation fact.
+The durable APPROVED disposition SHALL consist of the immutable Proposal, matching APPROVED ApprovalRecord, matching StrategicContractCommit, expected StrategicContract revision, matching StrategicProposalAppliedTick with immutable legacy execution disposition audit references, the consistently bound Proposal-derived ACTIVE research Mission whose closed action mapping is set_research, and aggregate proof that no claimable, in-flight, verifying, uncertain, or revivable legacy research execution survived activation. The evidence SHALL exclude any invalidation fact or non-research/non-ACTIVE Mission.
 
 #### Scenario: Applied Tick missing
 
