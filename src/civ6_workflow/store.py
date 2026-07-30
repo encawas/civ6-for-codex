@@ -5,10 +5,10 @@ import hashlib
 import sqlite3
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import AbstractSet, Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
 from .action_retry import FailedAttemptResolution, resolve_failed_attempt
@@ -16,6 +16,8 @@ from .domain import (
     ActionAttempt,
     ApprovalDecision,
     ApprovalRecord,
+    STRATEGIC_RESEARCH_PROPOSAL_TYPE,
+    StrategicProposalApprovalRecord,
     ApprovalStatus,
     AwaitingHumanTick,
     AttemptReconciledTick,
@@ -44,6 +46,11 @@ from .domain import (
     StrategicProposalWaitResumeRequest,
     StrategicResearchProposal,
     StrategicProposalReadyTick,
+    StrategicProposalAppliedTick,
+    StrategicProposalInvalidatedTick,
+    StrategicProposalInvalidationOrigin,
+    StrategicProposalInvalidationReason,
+    StrategicProposalRejectedTick,
     StrategicRequestTerminatedTick,
     StrategicRequestWaitErrorTick,
     StrategicRequestWaitResumedTick,
@@ -52,6 +59,7 @@ from .domain import (
     build_strategic_proposal_wait_resume_request,
     build_strategic_contract_id,
     StrategicContractCommit,
+    research_mission_action,
     RuntimeState,
     TickOutcomeKind,
     TurnTransitionConfirmedTick,
@@ -211,6 +219,10 @@ CREATE TABLE IF NOT EXISTS workflow_tasks (
     approved_by TEXT,
     created_turn INTEGER NOT NULL,
     created_from_observation_id TEXT,
+    source_contract_id TEXT,
+    source_contract_revision INTEGER CHECK (source_contract_revision >= 1),
+    source_mission_id TEXT,
+    source_mission_revision INTEGER CHECK (source_mission_revision >= 1),
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (game_id, task_id)
 );
@@ -545,10 +557,10 @@ class WorkflowStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > 10:
+            if version > 11:
                 raise ValueError(
                     f"unsupported workflow database version {version}; "
-                    "maximum supported version is 10"
+                    "maximum supported version is 11"
                 )
             conn.executescript(SCHEMA)
             self._migrate(conn)
@@ -566,6 +578,10 @@ class WorkflowStore:
             "last_error": "TEXT",
             "approved_by": "TEXT",
             "created_from_observation_id": "TEXT",
+            "source_contract_id": "TEXT",
+            "source_contract_revision": "INTEGER",
+            "source_mission_id": "TEXT",
+            "source_mission_revision": "INTEGER",
             "updated_at": "TEXT",
         }
         for name, declaration in additions.items():
@@ -748,10 +764,10 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > 10:
+        if version > 11:
             raise ValueError(
                 f"unsupported workflow database version {version}; "
-                "maximum supported version is 10"
+                "maximum supported version is 11"
             )
         upgraded_from_pre_v7 = version < 7
         if upgraded_from_pre_v7:
@@ -791,6 +807,13 @@ class WorkflowStore:
         else:
             WorkflowStore._validate_phase1b_proposals_v10(conn)
 
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < 11:
+            WorkflowStore._migrate_phase1c_v11(conn)
+            conn.execute("PRAGMA user_version=11")
+        else:
+            WorkflowStore._validate_phase1c_v11(conn)
+
     @classmethod
     def _migrate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
         """Add the empty Contract aggregate tables without changing legacy authority."""
@@ -824,12 +847,123 @@ class WorkflowStore:
             commits,
             require_canonical=True,
         )
+        if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 11:
+            cls._validate_phase1c_v11(conn)
 
     @classmethod
     def _migrate_phase1b_v10(cls, conn: sqlite3.Connection) -> None:
         """Add candidate Proposal persistence without changing Contract authority."""
 
         cls._validate_phase1b_proposals_v10(conn)
+
+    @classmethod
+    def _migrate_phase1c_v11(cls, conn: sqlite3.Connection) -> None:
+        """Add dormant terminal evidence and all-null legacy task provenance."""
+
+        for row in conn.execute(
+            "SELECT contract_json FROM strategic_contract_revisions"
+        ).fetchall():
+            cls._validate_phase1b_contract_foundation(
+                StrategicContract.model_validate_json(str(row["contract_json"]))
+            )
+        cls._validate_phase1c_v11(conn)
+
+    @classmethod
+    def _validate_phase1c_v11(cls, conn: sqlite3.Connection) -> None:
+        cls._validate_phase1c_state_v11(
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_research_proposals ORDER BY proposal_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_proposal_wait_resume_requests "
+                    "ORDER BY requested_at, resume_request_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM provider_attempts "
+                    "ORDER BY planner_request_id, attempt_number"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM information_rounds "
+                    "ORDER BY planner_request_id, round_number"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_ticks ORDER BY started_at, tick_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM runtime_state ORDER BY game_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_meta WHERE key LIKE 'human_wait:%' "
+                    "ORDER BY key"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_roots ORDER BY game_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_revisions "
+                    "ORDER BY game_id, revision"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_commits "
+                    "ORDER BY game_id, committed_revision"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM approval_records ORDER BY created_at, approval_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_tasks ORDER BY game_id, task_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM action_attempts "
+                    "ORDER BY game_id, task_id, attempt_number"
+                ).fetchall()
+            ],
+            require_canonical=True,
+        )
 
     @classmethod
     def _normalize_contract_root_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1014,7 +1148,6 @@ class WorkflowStore:
                 raise ValueError("duplicate StrategicContract revision")
             revision_rows[key] = row
             contract = StrategicContract.model_validate_json(str(row["contract_json"]))
-            cls._validate_phase1b_contract_foundation(contract)
             revisions_by_game[game_id][revision] = contract
 
         commits_by_revision: dict[tuple[str, int], StrategicContractCommit] = {}
@@ -1083,6 +1216,53 @@ class WorkflowStore:
 
         if len(commits_by_revision) != len(revision_rows):
             raise ValueError("StrategicContract commit audit has no matching revision")
+
+    @classmethod
+    def _normalize_approval_record_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "approval_id",
+            "game_id",
+            "proposal_type",
+            "proposal_id",
+            "proposal_revision",
+            "decision",
+            "record_json",
+            "created_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"ApprovalRecord row is missing columns: {sorted(missing)}"
+            )
+        try:
+            record = ApprovalRecord.model_validate_json(str(normalized["record_json"]))
+            if record.proposal_type == STRATEGIC_RESEARCH_PROPOSAL_TYPE:
+                record = StrategicProposalApprovalRecord.model_validate(
+                    record.model_dump(mode="python")
+                )
+        except Exception as exc:
+            raise ValueError("invalid ApprovalRecord JSON") from exc
+        created_at = cls._parse_audit_datetime(
+            normalized["created_at"], "ApprovalRecord created_at"
+        )
+        if created_at is None or created_at.tzinfo is None:
+            raise ValueError("ApprovalRecord created_at must include a timezone")
+        if (
+            record.approval_id != str(normalized["approval_id"])
+            or record.proposal_type != str(normalized["proposal_type"])
+            or record.proposal_id != str(normalized["proposal_id"])
+            or record.proposal_revision != int(normalized["proposal_revision"])
+            or record.decision.value != str(normalized["decision"])
+            or record.created_at != created_at
+        ):
+            raise ValueError(
+                "ApprovalRecord relational columns disagree with record_json"
+            )
+        normalized["proposal_revision"] = record.proposal_revision
+        normalized["record_json"] = cls._dump(record.model_dump(mode="json"))
+        normalized["created_at"] = created_at.isoformat()
+        return normalized
 
     @staticmethod
     def _validate_phase1b_contract_foundation(contract: StrategicContract) -> None:
@@ -2226,6 +2406,7 @@ class WorkflowStore:
         contract_root_rows: Sequence[Mapping[str, Any]],
         *,
         require_canonical: bool,
+        terminal_proposal_ids: AbstractSet[str] = frozenset(),
     ) -> None:
         cls._validate_strategic_proposal_state(
             proposal_rows,
@@ -2394,6 +2575,8 @@ class WorkflowStore:
                     raise ValueError(
                         "Proposal wait-error Tick identity disagrees with Proposal"
                     )
+            if proposal.proposal_id in terminal_proposal_ids:
+                continue
             resumed_ticks = resumed_by_proposal.get(proposal.proposal_id, [])
             if len(resumed_ticks) > 1:
                 raise ValueError("Proposal cannot have two wait-resumed Ticks")
@@ -2526,6 +2709,9 @@ class WorkflowStore:
 
     @classmethod
     def _validate_phase1b_proposals_v10(cls, conn: sqlite3.Connection) -> None:
+        if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 11:
+            cls._validate_phase1c_v11(conn)
+            return
         cls._validate_strategic_proposal_lifecycle_v10(
             [
                 dict(row)
@@ -2586,6 +2772,689 @@ class WorkflowStore:
             ],
             require_canonical=True,
         )
+
+    @classmethod
+    def _validate_phase1c_state_v11(
+        cls,
+        proposal_rows: Sequence[Mapping[str, Any]],
+        resume_request_rows: Sequence[Mapping[str, Any]],
+        request_rows: Sequence[Mapping[str, Any]],
+        attempt_rows: Sequence[Mapping[str, Any]],
+        information_round_rows: Sequence[Mapping[str, Any]],
+        tick_rows: Sequence[Mapping[str, Any]],
+        runtime_rows: Sequence[Mapping[str, Any]],
+        workflow_meta_rows: Sequence[Mapping[str, Any]],
+        contract_root_rows: Sequence[Mapping[str, Any]],
+        contract_revision_rows: Sequence[Mapping[str, Any]],
+        contract_commit_rows: Sequence[Mapping[str, Any]],
+        approval_rows: Sequence[Mapping[str, Any]],
+        task_rows: Sequence[Mapping[str, Any]],
+        action_attempt_rows: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        ticks = [cls._workflow_tick_from_row(row) for row in tick_rows]
+        terminal_ticks = tuple(
+            tick
+            for tick in ticks
+            if isinstance(
+                tick,
+                (
+                    StrategicProposalAppliedTick,
+                    StrategicProposalRejectedTick,
+                    StrategicProposalInvalidatedTick,
+                ),
+            )
+        )
+        terminal_ids = {tick.proposal_id for tick in terminal_ticks}
+        migration_terminal_ids = {
+            tick.proposal_id
+            for tick in terminal_ticks
+            if isinstance(tick, StrategicProposalInvalidatedTick)
+            and tick.invalidation_origin
+            is StrategicProposalInvalidationOrigin.PHASE1C_ENABLEMENT_MIGRATION
+        }
+        cls._validate_strategic_proposal_lifecycle_v10(
+            proposal_rows,
+            resume_request_rows,
+            request_rows,
+            attempt_rows,
+            information_round_rows,
+            tick_rows,
+            runtime_rows,
+            workflow_meta_rows,
+            contract_root_rows,
+            require_canonical=require_canonical,
+            terminal_proposal_ids=terminal_ids - migration_terminal_ids,
+        )
+        cls._validate_strategic_contract_state(
+            contract_root_rows,
+            contract_revision_rows,
+            contract_commit_rows,
+            require_canonical=require_canonical,
+        )
+
+        proposals = {
+            proposal.proposal_id: proposal
+            for proposal in (
+                StrategicResearchProposal.model_validate_json(
+                    str(
+                        cls._normalize_strategic_research_proposal_row(row)[
+                            "proposal_json"
+                        ]
+                    )
+                )
+                for row in proposal_rows
+            )
+        }
+        requests = {
+            request.planner_request_id: request
+            for request in (
+                PlannerRequest.model_validate_json(
+                    str(
+                        cls._normalize_planner_request_row(
+                            row, validate_response_contract=True
+                        )["request_json"]
+                    )
+                )
+                for row in request_rows
+            )
+        }
+        attempts = {
+            attempt.provider_attempt_id: attempt
+            for attempt in (
+                ProviderAttempt.model_validate_json(
+                    str(cls._normalize_provider_attempt_row(row)["attempt_json"])
+                )
+                for row in attempt_rows
+            )
+        }
+        ready_ticks = {
+            tick.proposal_id: tick
+            for tick in ticks
+            if isinstance(tick, StrategicProposalReadyTick)
+        }
+        resumed_ticks = {
+            tick.proposal_id: tick
+            for tick in ticks
+            if isinstance(tick, StrategicProposalWaitResumedTick)
+        }
+        resume_requests = {
+            request.proposal_id: request
+            for request in (
+                StrategicProposalWaitResumeRequest.model_validate_json(
+                    str(
+                        cls._normalize_strategic_proposal_wait_resume_request_row(row)[
+                            "request_json"
+                        ]
+                    )
+                )
+                for row in resume_request_rows
+            )
+        }
+
+        approvals_by_proposal: dict[str, list[StrategicProposalApprovalRecord]] = {}
+        for row in approval_rows:
+            normalized = cls._normalize_approval_record_row(row)
+            if str(normalized["proposal_type"]) != STRATEGIC_RESEARCH_PROPOSAL_TYPE:
+                continue
+            if require_canonical and dict(row) != normalized:
+                raise ValueError("Strategic Proposal Approval row is not canonical")
+            approval = StrategicProposalApprovalRecord.model_validate_json(
+                str(normalized["record_json"])
+            )
+            proposal = proposals.get(approval.proposal_id)
+            if proposal is None:
+                raise ValueError("Strategic Proposal Approval references no Proposal")
+            if str(normalized["game_id"]) != proposal.game_session_id:
+                raise ValueError("Strategic Proposal Approval belongs to another game")
+            approvals_by_proposal.setdefault(approval.proposal_id, []).append(approval)
+
+        normalized_revisions = [
+            cls._normalize_contract_revision_row(row) for row in contract_revision_rows
+        ]
+        contracts = {
+            (
+                str(row["game_id"]),
+                int(row["revision"]),
+            ): StrategicContract.model_validate_json(str(row["contract_json"]))
+            for row in normalized_revisions
+        }
+        normalized_commits = [
+            cls._normalize_contract_commit_row(row) for row in contract_commit_rows
+        ]
+        commits = [
+            StrategicContractCommit.model_validate_json(str(row["commit_json"]))
+            for row in normalized_commits
+        ]
+        commits_by_proposal: dict[str, list[StrategicContractCommit]] = {}
+        commits_by_game_revision: dict[tuple[str, int], StrategicContractCommit] = {}
+        for commit in commits:
+            commits_by_game_revision[
+                (commit.game_session_id, commit.contract.revision)
+            ] = commit
+            if commit.source_proposal_id is None:
+                cls._validate_phase1b_contract_foundation(commit.contract)
+                if commit.contract.approval_status is not ApprovalStatus.NOT_REQUIRED:
+                    raise ValueError(
+                        "foundation Contract revision requires NOT_REQUIRED approval"
+                    )
+            else:
+                commits_by_proposal.setdefault(commit.source_proposal_id, []).append(
+                    commit
+                )
+
+        proposal_revisions_by_game: dict[str, set[int]] = {}
+        for commit in commits:
+            if commit.source_proposal_id is not None:
+                proposal_revisions_by_game.setdefault(
+                    commit.game_session_id, set()
+                ).add(commit.contract.revision)
+        for commit in commits:
+            if commit.source_proposal_id is None and any(
+                revision < commit.contract.revision
+                for revision in proposal_revisions_by_game.get(
+                    commit.game_session_id, set()
+                )
+            ):
+                raise ValueError(
+                    "foundation Contract commit cannot follow Proposal activation"
+                )
+
+        applied_by_proposal: dict[str, list[StrategicProposalAppliedTick]] = {}
+        rejected_by_proposal: dict[str, list[StrategicProposalRejectedTick]] = {}
+        invalidated_by_proposal: dict[str, list[StrategicProposalInvalidatedTick]] = {}
+        for tick in terminal_ticks:
+            if tick.proposal_id not in proposals:
+                raise ValueError("Strategic Proposal terminal Tick has no Proposal")
+            if isinstance(tick, StrategicProposalAppliedTick):
+                applied_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+            elif isinstance(tick, StrategicProposalRejectedTick):
+                rejected_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+            else:
+                invalidated_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+
+        roots = {
+            str(row["game_id"]): cls._normalize_contract_root_row(row)
+            for row in contract_root_rows
+        }
+
+        for proposal in proposals.values():
+            approval_records = approvals_by_proposal.get(proposal.proposal_id, [])
+            applied_ticks = applied_by_proposal.get(proposal.proposal_id, [])
+            rejected_ticks = rejected_by_proposal.get(proposal.proposal_id, [])
+            invalidated_ticks = invalidated_by_proposal.get(proposal.proposal_id, [])
+            proposal_commits = commits_by_proposal.get(proposal.proposal_id, [])
+            if any(
+                len(items) > 1
+                for items in (
+                    approval_records,
+                    applied_ticks,
+                    rejected_ticks,
+                    invalidated_ticks,
+                    proposal_commits,
+                )
+            ):
+                raise ValueError("Strategic Proposal has duplicate terminal evidence")
+            terminal_families = sum(
+                bool(items) for items in (approval_records, invalidated_ticks)
+            )
+            if terminal_families > 1:
+                raise ValueError("Strategic Proposal has mixed terminal authorities")
+            approval = approval_records[0] if approval_records else None
+            ready = ready_ticks[proposal.proposal_id]
+
+            if approval is None and not invalidated_ticks:
+                if applied_ticks or rejected_ticks or proposal_commits:
+                    raise ValueError("OPEN Proposal contains terminal transition facts")
+                continue
+
+            if approval is not None:
+                if approval.created_at < ready.completed_at:
+                    raise ValueError(
+                        "Strategic Proposal decision precedes Proposal Ready"
+                    )
+                if approval.decision is ApprovalDecision.APPROVED:
+                    if len(applied_ticks) != 1 or rejected_ticks or invalidated_ticks:
+                        raise ValueError("APPROVED Proposal evidence is incomplete")
+                    if len(proposal_commits) != 1:
+                        raise ValueError(
+                            "APPROVED Proposal requires one ContractCommit"
+                        )
+                    cls._validate_approved_proposal_v11(
+                        proposal,
+                        approval,
+                        proposal_commits[0],
+                        applied_ticks[0],
+                        ready,
+                        contracts,
+                        ticks,
+                    )
+                else:
+                    if len(rejected_ticks) != 1 or applied_ticks or invalidated_ticks:
+                        raise ValueError("REJECTED Proposal evidence is incomplete")
+                    if proposal_commits:
+                        raise ValueError("REJECTED Proposal cannot create a Contract")
+                    cls._validate_rejected_proposal_v11(
+                        proposal, approval, rejected_ticks[0], ready, ticks
+                    )
+                continue
+
+            if len(invalidated_ticks) != 1 or applied_ticks or rejected_ticks:
+                raise ValueError("INVALIDATED Proposal evidence is incomplete")
+            if proposal_commits:
+                raise ValueError("INVALIDATED Proposal cannot create a Contract")
+            cls._validate_invalidated_proposal_v11(
+                proposal,
+                invalidated_ticks[0],
+                ready,
+                requests,
+                attempts,
+                resume_requests,
+                resumed_ticks,
+                roots,
+                ticks,
+            )
+
+        for proposal_id in commits_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError("Proposal-derived ContractCommit has no Proposal")
+
+        cls._validate_task_provenance_v11(
+            task_rows,
+            action_attempt_rows,
+            roots,
+            contracts,
+            commits_by_game_revision,
+            applied_by_proposal,
+            require_canonical=require_canonical,
+        )
+
+    @classmethod
+    def _validate_terminal_tick_identity_v11(
+        cls,
+        proposal: StrategicResearchProposal,
+        tick: WorkflowTick,
+        ready: StrategicProposalReadyTick,
+    ) -> None:
+        if (
+            tick.game_session_id != proposal.game_session_id
+            or getattr(tick, "proposal_id", None) != proposal.proposal_id
+            or getattr(tick, "proposal_hash", None) != proposal.proposal_hash
+            or getattr(tick, "planner_request_id", None)
+            != proposal.source_planner_request_id
+            or getattr(tick, "proposal_ready_tick_id", None) != ready.tick_id
+            or getattr(tick, "target_contract_id", None) != proposal.target_contract_id
+            or getattr(tick, "expected_base_revision", None)
+            != proposal.expected_base_revision
+            or tick.started_at < ready.completed_at
+        ):
+            raise ValueError(
+                "Strategic Proposal terminal Tick source binding disagrees"
+            )
+
+    @classmethod
+    def _validate_approved_proposal_v11(
+        cls,
+        proposal: StrategicResearchProposal,
+        approval: StrategicProposalApprovalRecord,
+        commit: StrategicContractCommit,
+        applied: StrategicProposalAppliedTick,
+        ready: StrategicProposalReadyTick,
+        contracts: Mapping[tuple[str, int], StrategicContract],
+        ticks: Sequence[WorkflowTick],
+    ) -> None:
+        cls._validate_terminal_tick_identity_v11(proposal, applied, ready)
+        if any(
+            isinstance(tick, StrategicProposalWaitResumedTick)
+            and tick.proposal_id == proposal.proposal_id
+            for tick in ticks
+        ):
+            raise ValueError("APPROVED Proposal cannot have a generic Resume Tick")
+        mission = proposal.proposed_research_mission
+        research_mission_action(mission)
+        contract = commit.contract
+        base_contract = contracts.get(
+            (proposal.game_session_id, proposal.expected_base_revision)
+        )
+        expected_policy_snapshot = (
+            {} if base_contract is None else base_contract.policy_snapshot
+        )
+        matching_missions = tuple(
+            item
+            for item in contract.mission_graph.missions
+            if item.mission_id == mission.mission_id
+            and item.mission_revision == mission.mission_revision
+        )
+        if (
+            commit.game_session_id != proposal.game_session_id
+            or commit.contract_id != proposal.target_contract_id
+            or commit.expected_base_revision != proposal.expected_base_revision
+            or commit.source_proposal_id != proposal.proposal_id
+            or commit.source_proposal_hash != proposal.proposal_hash
+            or commit.source_approval_id != approval.approval_id
+            or commit.source_planner_request_id != proposal.source_planner_request_id
+            or commit.source_mission_id != mission.mission_id
+            or commit.source_mission_revision != mission.mission_revision
+            or contract.revision != proposal.expected_base_revision + 1
+            or contract.approval_status is not ApprovalStatus.APPROVED
+            or contract.authority_scope_set.mission_graph_scopes != ("research",)
+            or contract.mission_graph.missions != (mission,)
+            or contract.strategic_objectives != proposal.strategic_objectives
+            or contract.global_constraints != proposal.global_constraints
+            or contract.created_from_observation_id
+            != proposal.created_from_observation_id
+            or contract.policy_snapshot != expected_policy_snapshot
+            or len(matching_missions) != 1
+        ):
+            raise ValueError("APPROVED Proposal Contract evidence disagrees")
+        if (
+            applied.approval_id != approval.approval_id
+            or applied.contract_commit_id != commit.commit_id
+            or applied.activated_contract_revision != contract.revision
+            or applied.source_mission_id != mission.mission_id
+            or applied.source_mission_revision != mission.mission_revision
+            or not (applied.started_at <= approval.created_at <= applied.completed_at)
+        ):
+            raise ValueError(
+                "Strategic Proposal Applied Tick disagrees with activation"
+            )
+        cls._validate_explicit_wait_tick_interval(
+            ticks,
+            ready,
+            applied,
+            approval.created_at,
+            (AwaitingHumanTick, StrategicProposalWaitErrorTick),
+            label="Strategic Proposal approval",
+        )
+
+    @classmethod
+    def _validate_rejected_proposal_v11(
+        cls,
+        proposal: StrategicResearchProposal,
+        approval: StrategicProposalApprovalRecord,
+        rejected: StrategicProposalRejectedTick,
+        ready: StrategicProposalReadyTick,
+        ticks: Sequence[WorkflowTick],
+    ) -> None:
+        cls._validate_terminal_tick_identity_v11(proposal, rejected, ready)
+        if any(
+            isinstance(tick, StrategicProposalWaitResumedTick)
+            and tick.proposal_id == proposal.proposal_id
+            for tick in ticks
+        ):
+            raise ValueError("REJECTED Proposal cannot have a generic Resume Tick")
+        if rejected.approval_id != approval.approval_id or not (
+            rejected.started_at <= approval.created_at <= rejected.completed_at
+        ):
+            raise ValueError("Strategic Proposal Rejected Tick disagrees with decision")
+        cls._validate_explicit_wait_tick_interval(
+            ticks,
+            ready,
+            rejected,
+            approval.created_at,
+            (AwaitingHumanTick, StrategicProposalWaitErrorTick),
+            label="Strategic Proposal rejection",
+        )
+
+    @classmethod
+    def _validate_invalidated_proposal_v11(
+        cls,
+        proposal: StrategicResearchProposal,
+        invalidated: StrategicProposalInvalidatedTick,
+        ready: StrategicProposalReadyTick,
+        requests: Mapping[str, PlannerRequest],
+        attempts: Mapping[str, ProviderAttempt],
+        resume_requests: Mapping[str, StrategicProposalWaitResumeRequest],
+        resumed_ticks: Mapping[str, StrategicProposalWaitResumedTick],
+        roots: Mapping[str, Mapping[str, Any]],
+        ticks: Sequence[WorkflowTick],
+    ) -> None:
+        cls._validate_terminal_tick_identity_v11(proposal, invalidated, ready)
+        root = roots.get(proposal.game_session_id)
+        stale_reason = cls._strategic_proposal_stale_reason_v11(proposal, root)
+        if (
+            invalidated.invalidation_origin
+            is not StrategicProposalInvalidationOrigin.PHASE1C_ENABLEMENT_MIGRATION
+        ):
+            if (
+                stale_reason is None
+                or invalidated.invalidation_reason is not stale_reason
+            ):
+                raise ValueError(
+                    "runtime Invalidated Tick does not match current Contract state"
+                )
+            if proposal.proposal_id in resumed_ticks:
+                raise ValueError(
+                    "runtime-invalidated Proposal cannot have a generic Resume Tick"
+                )
+            cls._validate_explicit_wait_tick_interval(
+                ticks,
+                ready,
+                invalidated,
+                invalidated.started_at,
+                (AwaitingHumanTick, StrategicProposalWaitErrorTick),
+                label="Strategic Proposal invalidation",
+            )
+            return
+
+        expected_reason = (
+            StrategicProposalInvalidationReason.PRE_PHASE1C_WAIT_RELEASED
+            if stale_reason is None
+            else stale_reason
+        )
+        if invalidated.invalidation_reason is not expected_reason:
+            raise ValueError(
+                "migration Invalidated Tick does not use the deterministic reason"
+            )
+
+        request = requests.get(proposal.source_planner_request_id)
+        attempt = attempts.get(proposal.source_provider_attempt_id)
+        resume_request = resume_requests.get(proposal.proposal_id)
+        resumed = resumed_ticks.get(proposal.proposal_id)
+        if (
+            request is None
+            or request.completed_at is None
+            or attempt is None
+            or attempt.completed_at is None
+            or resume_request is None
+            or resumed is None
+            or invalidated.source_resume_request_id != resume_request.resume_request_id
+            or invalidated.source_wait_resumed_tick_id != resumed.tick_id
+            or invalidated.observation_ids != ready.observation_ids
+            or invalidated.started_at < resumed.completed_at
+        ):
+            raise ValueError(
+                "migration Invalidated Tick is missing bound causal evidence"
+            )
+        frontier = max(
+            proposal.created_at,
+            request.completed_at,
+            attempt.completed_at,
+            ready.completed_at,
+            resume_request.requested_at,
+            resumed.completed_at,
+        )
+        try:
+            canonical_time = frontier + timedelta(microseconds=1)
+        except OverflowError as exc:
+            raise ValueError(
+                "migration Invalidated Tick causal time is not representable"
+            ) from exc
+        if (
+            invalidated.started_at != canonical_time
+            or invalidated.completed_at != canonical_time
+        ):
+            raise ValueError(
+                "migration Invalidated Tick does not use canonical causal time"
+            )
+
+    @staticmethod
+    def _strategic_proposal_stale_reason_v11(
+        proposal: StrategicResearchProposal,
+        root: Mapping[str, Any] | None,
+    ) -> StrategicProposalInvalidationReason | None:
+        if proposal.target_kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            if root is None:
+                return None
+            if str(root["contract_id"]) != proposal.target_contract_id:
+                return StrategicProposalInvalidationReason.TARGET_CONTRACT_CHANGED
+            return StrategicProposalInvalidationReason.TARGET_CONTRACT_CREATED
+        if root is None or str(root["contract_id"]) != proposal.target_contract_id:
+            return StrategicProposalInvalidationReason.TARGET_CONTRACT_CHANGED
+        if int(root["active_revision"]) != proposal.expected_base_revision:
+            return StrategicProposalInvalidationReason.BASE_REVISION_CHANGED
+        return None
+
+    @classmethod
+    def _validate_task_provenance_v11(
+        cls,
+        task_rows: Sequence[Mapping[str, Any]],
+        action_attempt_rows: Sequence[Mapping[str, Any]],
+        roots: Mapping[str, Mapping[str, Any]],
+        contracts: Mapping[tuple[str, int], StrategicContract],
+        commits: Mapping[tuple[str, int], StrategicContractCommit],
+        applied_by_proposal: Mapping[str, list[StrategicProposalAppliedTick]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        tasks: dict[tuple[str, str], StoredTask] = {}
+        for row in task_rows:
+            normalized = cls._normalize_workflow_task_row(row)
+            if (
+                require_canonical
+                and set(row)
+                >= {
+                    "source_contract_id",
+                    "source_contract_revision",
+                    "source_mission_id",
+                    "source_mission_revision",
+                }
+                and dict(row) != normalized
+            ):
+                raise ValueError("StoredTask row is not canonical")
+            game_id = str(normalized["game_id"])
+            task = cls._row_to_task(normalized)
+            tasks[(game_id, task.task_id)] = task
+            if task.source_contract_id is None:
+                continue
+            contract = contracts.get((game_id, task.source_contract_revision))
+            if contract is None or contract.contract_id != task.source_contract_id:
+                raise ValueError(
+                    "StoredTask provenance resolves to no same-game Contract"
+                )
+            missions = tuple(
+                mission
+                for mission in contract.mission_graph.missions
+                if mission.mission_id == task.source_mission_id
+                and mission.mission_revision == task.source_mission_revision
+            )
+            if (
+                len(missions) != 1
+                or research_mission_action(missions[0]) != "set_research"
+            ):
+                raise ValueError(
+                    "StoredTask provenance resolves to no research Mission"
+                )
+            if task.action_type != "set_research":
+                raise ValueError(
+                    "Mission-derived research StoredTask must use set_research"
+                )
+
+        attempts_by_task: dict[tuple[str, str], list[ActionAttempt]] = {}
+        for row in action_attempt_rows:
+            try:
+                attempt = ActionAttempt.model_validate_json(str(row["attempt_json"]))
+            except Exception as exc:
+                raise ValueError("invalid ActionAttempt JSON") from exc
+            if attempt.game_session_id != str(row["game_id"]) or attempt.task_id != str(
+                row["task_id"]
+            ):
+                raise ValueError("ActionAttempt relational identity disagrees")
+            attempts_by_task.setdefault(
+                (attempt.game_session_id, attempt.task_id), []
+            ).append(attempt)
+
+        inert_statuses = {
+            TaskStatus.DONE,
+            TaskStatus.CANCELLED,
+            TaskStatus.EXPIRED,
+        }
+        unresolved_attempt_statuses = {
+            AttemptStatus.PREPARED,
+            AttemptStatus.VERIFYING,
+            AttemptStatus.UNCERTAIN,
+        }
+        for game_id, root in roots.items():
+            active_revision = int(root["active_revision"])
+            active = contracts[(game_id, active_revision)]
+            unsupported_scopes = set(
+                active.authority_scope_set.mission_graph_scopes
+            ) - {"research"}
+            if unsupported_scopes:
+                raise ValueError("Phase 1C cannot activate a non-research scope")
+            if "research" not in active.authority_scope_set.mission_graph_scopes:
+                continue
+            active_commit = commits.get((game_id, active_revision))
+            if active_commit is None or active_commit.source_proposal_id is None:
+                raise ValueError(
+                    "research authority requires a Proposal-derived active revision"
+                )
+            applied = applied_by_proposal.get(active_commit.source_proposal_id, [])
+            if len(applied) != 1:
+                raise ValueError("research authority requires one Applied Tick")
+            legacy_research_tasks = {
+                task_id: task
+                for (task_game, task_id), task in tasks.items()
+                if task_game == game_id
+                and task.action_type == "set_research"
+                and task.source_contract_id is None
+            }
+            dispositions = {
+                item.task_id: item for item in applied[0].legacy_task_dispositions
+            }
+            if set(dispositions) != set(legacy_research_tasks):
+                raise ValueError(
+                    "Applied Tick legacy disposition does not cover research tasks"
+                )
+            for task_id, task in legacy_research_tasks.items():
+                disposition = dispositions[task_id]
+                if (
+                    task.status not in inert_statuses
+                    or disposition.final_status != task.status.value
+                ):
+                    raise ValueError(
+                        "legacy research execution survived authority activation"
+                    )
+                task_attempts = attempts_by_task.get((game_id, task_id), [])
+                if tuple(sorted(item.action_attempt_id for item in task_attempts)) != (
+                    disposition.action_attempt_ids
+                ):
+                    raise ValueError(
+                        "legacy disposition Attempt references are incomplete"
+                    )
+                if any(
+                    item.status in unresolved_attempt_statuses for item in task_attempts
+                ):
+                    raise ValueError(
+                        "unresolved legacy research Attempt survived activation"
+                    )
+            for (task_game, _task_id), task in tasks.items():
+                if task_game != game_id or task.source_contract_id is None:
+                    continue
+                if task.status in inert_statuses:
+                    continue
+                if (
+                    task.source_contract_id != active.contract_id
+                    or task.source_contract_revision != active.revision
+                    or task.source_mission_id != active_commit.source_mission_id
+                    or task.source_mission_revision
+                    != active_commit.source_mission_revision
+                    or task.source_mission_id != applied[0].source_mission_id
+                    or task.source_mission_revision
+                    != applied[0].source_mission_revision
+                ):
+                    raise ValueError("stale Mission-derived task remains executable")
 
     @staticmethod
     def _migrate_phase4_v7(conn: sqlite3.Connection) -> None:
@@ -3421,6 +4290,11 @@ class WorkflowStore:
         self, commit: StrategicContractCommit
     ) -> StrategicContract:
         with self._connect() as conn:
+            if commit.source_proposal_id is not None:
+                raise ValueError(
+                    "Proposal-derived Contract commits require the Phase 1C "
+                    "aggregate decision transaction"
+                )
             self._validate_phase1b_contract_foundation(commit.contract)
             existing_row = conn.execute(
                 "SELECT * FROM strategic_contract_commits WHERE commit_id=?",
@@ -4767,7 +5641,9 @@ class WorkflowStore:
             ).fetchall()
         return [self._row_to_task(row) for row in rows]
 
-    def _row_to_task(self, row: sqlite3.Row) -> StoredTask:
+    @classmethod
+    def _row_to_task(cls, row: Mapping[str, Any]) -> StoredTask:
+        row = dict(row)
         return StoredTask(
             task_id=row["task_id"],
             plan_id=row["plan_id"],
@@ -4776,10 +5652,10 @@ class WorkflowStore:
             entity_id=row["entity_id"],
             due_turn=int(row["due_turn"]),
             expires_turn=row["expires_turn"],
-            arguments=self._load(row["arguments_json"]),
-            preconditions=self._load(row["preconditions_json"]),
-            postconditions=self._load(row["postconditions_json"]),
-            invalidators=self._load(row["invalidators_json"]),
+            arguments=cls._load(row["arguments_json"]),
+            preconditions=cls._load(row["preconditions_json"]),
+            postconditions=cls._load(row["postconditions_json"]),
+            invalidators=cls._load(row["invalidators_json"]),
             risk=row["risk"],
             requires_confirmation=bool(row["requires_confirmation"]),
             reason=row["reason"],
@@ -4790,7 +5666,28 @@ class WorkflowStore:
             last_error=row["last_error"],
             approved_by=row["approved_by"],
             created_from_observation_id=row["created_from_observation_id"],
+            source_contract_id=row.get("source_contract_id"),
+            source_contract_revision=row.get("source_contract_revision"),
+            source_mission_id=row.get("source_mission_id"),
+            source_mission_revision=row.get("source_mission_revision"),
         )
+
+    @classmethod
+    def _normalize_workflow_task_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        for column in (
+            "source_contract_id",
+            "source_contract_revision",
+            "source_mission_id",
+            "source_mission_revision",
+        ):
+            normalized.setdefault(column, None)
+        task = cls._row_to_task(normalized)
+        normalized["source_contract_id"] = task.source_contract_id
+        normalized["source_contract_revision"] = task.source_contract_revision
+        normalized["source_mission_id"] = task.source_mission_id
+        normalized["source_mission_revision"] = task.source_mission_revision
+        return normalized
 
     def set_task_status(
         self,
@@ -5262,6 +6159,7 @@ class WorkflowStore:
 
     def save_workflow_tick(self, tick: WorkflowTick) -> None:
         tick = validate_workflow_tick(tick)
+        self._reject_public_strategic_terminal_tick(tick)
         if isinstance(
             tick,
             (
@@ -5276,6 +6174,21 @@ class WorkflowStore:
         with self._connect() as conn:
             self._insert_workflow_tick_in_connection(conn, tick)
             self._validate_phase1b_proposals_v10(conn)
+
+    @staticmethod
+    def _reject_public_strategic_terminal_tick(tick: WorkflowTick) -> None:
+        if isinstance(
+            tick,
+            (
+                StrategicProposalAppliedTick,
+                StrategicProposalRejectedTick,
+                StrategicProposalInvalidatedTick,
+            ),
+        ):
+            raise ValueError(
+                "Strategic Proposal terminal Tick requires the Phase 1C aggregate "
+                "decision transaction"
+            )
 
     @classmethod
     def _validate_strategic_resume_transition_in_connection(
@@ -5584,6 +6497,7 @@ class WorkflowStore:
         human_wait_context: dict[str, Any] | None = None,
     ) -> FailedAttemptResolution | None:
         tick = validate_workflow_tick(tick)
+        self._reject_public_strategic_terminal_tick(tick)
         if attempt is not None and attempt.game_session_id != tick.game_session_id:
             raise ValueError("attempt and Tick must belong to the same game")
         if task_status is not None and attempt is None:
@@ -5925,6 +6839,11 @@ class WorkflowStore:
             self._save_plan_lease_in_connection(conn, lease)
 
     def save_approval_record(self, game_id: str, record: ApprovalRecord) -> None:
+        if record.proposal_type == STRATEGIC_RESEARCH_PROPOSAL_TYPE:
+            raise ValueError(
+                "Strategic Proposal Approval requires the Phase 1C aggregate "
+                "decision transaction"
+            )
         with self._connect() as conn:
             conn.execute(
                 """
@@ -5945,6 +6864,28 @@ class WorkflowStore:
                     record.created_at.isoformat(),
                 ),
             )
+
+    def strategic_proposal_approval_record(
+        self, game_id: str, proposal_id: str
+    ) -> StrategicProposalApprovalRecord | None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT record_json FROM approval_records
+                WHERE game_id=? AND proposal_type=? AND proposal_id=?
+                ORDER BY created_at, approval_id
+                """,
+                (game_id, STRATEGIC_RESEARCH_PROPOSAL_TYPE, proposal_id),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("Strategic Proposal has multiple human decisions")
+        return (
+            None
+            if not rows
+            else StrategicProposalApprovalRecord.model_validate_json(
+                str(rows[0]["record_json"])
+            )
+        )
 
     def latest_approval_record(
         self,
@@ -7502,6 +8443,7 @@ class WorkflowStore:
         human_wait_context: dict[str, Any] | None = None,
     ) -> None:
         tick = validate_workflow_tick(tick)
+        self._reject_public_strategic_terminal_tick(tick)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._validate_strategic_resume_transition_in_connection(
@@ -7860,6 +8802,10 @@ class WorkflowStore:
                     row = cls._normalize_strategic_research_proposal_row(row)
                 elif table == "strategic_proposal_wait_resume_requests":
                     row = cls._normalize_strategic_proposal_wait_resume_request_row(row)
+                elif table == "workflow_tasks":
+                    row = cls._normalize_workflow_task_row(row)
+                elif table == "approval_records":
+                    row = cls._normalize_approval_record_row(row)
                 elif table == "logical_planner_requests":
                     row = cls._normalize_planner_request_row(
                         row,
@@ -7981,33 +8927,6 @@ class WorkflowStore:
                 (game_id,),
             ).fetchall()
         ]
-        cls._validate_strategic_proposal_lifecycle_v10(
-            [
-                *external_proposals,
-                *prepared["strategic_research_proposals"],
-            ],
-            [
-                *external_resume_requests,
-                *prepared["strategic_proposal_wait_resume_requests"],
-            ],
-            [
-                *external_requests,
-                *prepared["logical_planner_requests"],
-            ],
-            [
-                *external_attempts,
-                *prepared["provider_attempts"],
-            ],
-            [
-                *external_information_rounds,
-                *prepared["information_rounds"],
-            ],
-            [*external_ticks, *prepared["workflow_ticks"]],
-            [*external_runtime, *prepared["runtime_state"]],
-            [*external_wait_meta, *prepared["workflow_meta"]],
-            [*external_roots, *prepared["strategic_contract_roots"]],
-            require_canonical=True,
-        )
         external_revisions = [
             dict(row)
             for row in conn.execute(
@@ -8022,10 +8941,45 @@ class WorkflowStore:
                 (game_id,),
             ).fetchall()
         ]
-        cls._validate_strategic_contract_state(
+        external_approvals = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM approval_records WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_tasks = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM workflow_tasks WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_action_attempts = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM action_attempts WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        cls._validate_phase1c_state_v11(
+            [*external_proposals, *prepared["strategic_research_proposals"]],
+            [
+                *external_resume_requests,
+                *prepared["strategic_proposal_wait_resume_requests"],
+            ],
+            [*external_requests, *prepared["logical_planner_requests"]],
+            [*external_attempts, *prepared["provider_attempts"]],
+            [*external_information_rounds, *prepared["information_rounds"]],
+            [*external_ticks, *prepared["workflow_ticks"]],
+            [*external_runtime, *prepared["runtime_state"]],
+            [*external_wait_meta, *prepared["workflow_meta"]],
             [*external_roots, *prepared["strategic_contract_roots"]],
             [*external_revisions, *prepared["strategic_contract_revisions"]],
             [*external_commits, *prepared["strategic_contract_commits"]],
+            [*external_approvals, *prepared["approval_records"]],
+            [*external_tasks, *prepared["workflow_tasks"]],
+            [*external_action_attempts, *prepared["action_attempts"]],
             require_canonical=True,
         )
 

@@ -97,8 +97,20 @@ def test_legacy_database_migrates_retry_state(tmp_path: Path):
     assert task.postconditions == []
     assert task.retry_count == 0
     assert task.max_retries == 2
+    assert task.source_contract_id is None
+    assert task.source_contract_revision is None
+    assert task.source_mission_id is None
+    assert task.source_mission_revision is None
     with sqlite3.connect(database) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        row = conn.execute(
+            """
+            SELECT source_contract_id, source_contract_revision,
+                   source_mission_id, source_mission_revision
+            FROM workflow_tasks WHERE game_id='game-1' AND task_id='legacy-task'
+            """
+        ).fetchone()
+        assert row == (None, None, None, None)
 
 
 def test_replay_store_state_restores_exact_task_status(tmp_path: Path):

@@ -176,6 +176,34 @@ Replay validates incoming evidence together with retained state before deleting 
 
 PR 1C-1 defines decision evidence and grouped StoredTask provenance data contracts, Schema, canonical serialization, reads, import/export, and ordinary-save/startup/replay validation. It changes no routing or task lifecycle behavior, performs no terminal decision, and exposes no standalone public ApprovalRecord or terminal Tick save method. PR 1C-2 adds dedicated full-aggregate decision entry points plus dormant provenance-emitting routing and task mutation guards. PR 1C-3 migrates Phase 1B released waits before enabling APPROVE/REJECT and disabling generic Proposal resume.
 
+### PR 1C-1 implementation record
+
+The protocol and persistence foundation is implemented as workflow database
+version 11. It reuses `approval_records`, `strategic_contract_commits`,
+`strategic_contract_revisions`, and `workflow_ticks`; no terminal-status table,
+parallel Repository, or second Store was added. Proposal-specific approval
+validation narrows only records whose type is
+`strategic_research_proposal`. Applied, Rejected, and Invalidated outcomes use
+typed immutable Tick records in the existing workflow Tick stream.
+
+Version 11 adds only the four nullable grouped provenance columns to
+`workflow_tasks`. Existing tasks migrate with all four values null. One
+aggregate validator is used after ordinary writes, during database startup,
+and during replay preflight. It validates complete terminal evidence,
+Proposal-derived Contract content, deterministic migration reason and causal
+time, research Mission scope/status/action semantics, task provenance, and
+legacy execution quiescence before replay can delete target data.
+
+The existing public Store operations reject a strategic Proposal
+ApprovalRecord, a Proposal-derived ContractCommit, or any strategic terminal
+Tick as a standalone write. Complete terminal aggregates are therefore
+readable and replayable in PR 1C-1, but no production path can create one.
+Engine, Planner lifecycle, Human Wait behavior, research routing, claim,
+retry, confirmation, and recovery are unchanged. The reviewed implementation
+choice is to extend the existing authority tables and canonical JSON rather
+than introduce dedicated terminal tables; this is consistent with the ADR and
+creates no protocol deviation.
+
 ## Consequences
 
 ### Positive

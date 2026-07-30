@@ -573,6 +573,23 @@ references, and a Mission that does not belong to the Contract fail ordinary
 save, startup, and replay validation. This PR 1C-1 foundation does not alter
 routing or task lifecycle behavior and creates no second task model or table.
 
+The concrete PR 1C-1 persistence version is workflow database v11. Proposal
+decisions remain external evidence in the existing `approval_records` table,
+terminal transitions remain typed records in `workflow_ticks`, and structured
+Proposal provenance remains part of the canonical
+`StrategicContractCommit`. No mutable Proposal status or parallel terminal
+table exists. A single aggregate validator is reused by ordinary persistence,
+startup, and replay preflight, including validation before replay deletes
+target-game rows.
+
+All existing public Store methods fail closed when asked to save a strategic
+Proposal ApprovalRecord, Proposal-derived ContractCommit, or Applied,
+Rejected, or Invalidated Tick independently. Thus v11 can migrate, read,
+validate, export, and import complete evidence without enabling a production
+decision path. Engine, Human Wait, legacy research routing, task claim, retry,
+confirmation, and recovery behavior remain the Phase 1B behavior until the
+later dormant and enablement PRs.
+
 Before first research cutover, action_type=set_research with null provenance is
 a legacy research StoredTask. After cutover, Mission-derived set_research has
 all four fields and matches the same-game active Contract and a Mission whose

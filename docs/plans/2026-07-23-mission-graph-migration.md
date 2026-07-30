@@ -388,6 +388,25 @@ Other Strategic Scopes remain legacy-owned.
 - Do not connect Engine, user actions, authority activation, or legacy write
   closure.
 
+Concrete implementation record:
+
+- Workflow database v11 adds the four nullable provenance columns to the
+  existing `workflow_tasks` table and migrates every legacy row with all four
+  values NULL.
+- Proposal-specific Approval records, terminal Ticks, Contract revisions, and
+  Contract commits reuse the existing authority tables and canonical replay
+  stream. No second Store, Repository, task model, or terminal-status table is
+  introduced.
+- Ordinary writes, startup, and pre-delete replay validation share one
+  complete Proposal/Contract/task aggregate validator.
+- Public standalone writes of strategic Proposal Approval, Proposal-derived
+  ContractCommit, and Applied/Rejected/Invalidated Tick fail closed. Complete
+  evidence can be restored for compatibility testing, but PR 1C-1 has no
+  production terminal transition.
+- The implementation has no reviewed deviation from the frozen protocol. The
+  table-reuse choice is the specified single-authority design, not an
+  alternative persistence path.
+
 ### PR 1C-2: Dormant Atomic Activation and Authority Projection
 
 - Implement dedicated BEGIN IMMEDIATE approved, rejected, and invalidated

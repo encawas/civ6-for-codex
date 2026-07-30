@@ -9,7 +9,7 @@ from typing import Any, Literal, Self
 from pydantic import Field, model_validator
 
 from .base import DomainModel
-from .contracts import Mission
+from .contracts import Mission, research_mission_action
 from .planner import PlannerRequestTargetKind, canonical_json_hash
 
 
@@ -138,6 +138,7 @@ class StrategicResearchProposal(DomainModel):
             raise ValueError("Proposal Mission belongs to another Contract")
         if mission.mission_revision != 1:
             raise ValueError("Proposal Mission revision must be 1")
+        research_mission_action(mission)
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("Proposal created_at must include a timezone")
         if self.proposal_hash != strategic_research_proposal_hash(self):

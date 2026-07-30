@@ -13,6 +13,7 @@ from .base import (
     DomainModel,
     ImmutableJsonObject,
     SubjectRef,
+    thaw_json,
 )
 
 
@@ -141,6 +142,12 @@ class StrategicContractCommit(DomainModel):
     contract: StrategicContract
     committed_at: datetime
     reason: str = Field(min_length=1)
+    source_proposal_id: str | None = Field(default=None, min_length=1)
+    source_proposal_hash: str | None = Field(default=None, min_length=64, max_length=64)
+    source_approval_id: str | None = Field(default=None, min_length=1)
+    source_planner_request_id: str | None = Field(default=None, min_length=1)
+    source_mission_id: str | None = Field(default=None, min_length=1)
+    source_mission_revision: int | None = Field(default=None, ge=1)
 
     def model_post_init(self, __context: object) -> None:
         if self.committed_at.tzinfo is None or self.committed_at.utcoffset() is None:
@@ -151,6 +158,63 @@ class StrategicContractCommit(DomainModel):
             raise ValueError("commit and Contract identities must agree")
         if self.contract.revision != self.expected_base_revision + 1:
             raise ValueError("Contract revision must immediately follow its base")
+        provenance = (
+            self.source_proposal_id,
+            self.source_proposal_hash,
+            self.source_approval_id,
+            self.source_planner_request_id,
+            self.source_mission_id,
+            self.source_mission_revision,
+        )
+        if any(value is not None for value in provenance) and not all(
+            value is not None for value in provenance
+        ):
+            raise ValueError(
+                "Proposal-derived Contract provenance must be all present or all null"
+            )
+        if self.source_proposal_id is not None:
+            if self.contract.approval_status is not ApprovalStatus.APPROVED:
+                raise ValueError(
+                    "Proposal-derived Contract requires APPROVED approval status"
+                )
+            matching = tuple(
+                mission
+                for mission in self.contract.mission_graph.missions
+                if mission.mission_id == self.source_mission_id
+                and mission.mission_revision == self.source_mission_revision
+            )
+            if len(matching) != 1:
+                raise ValueError(
+                    "Proposal-derived Contract provenance must identify one Mission"
+                )
+            research_mission_action(matching[0])
+
+
+def research_mission_action(mission: Mission) -> str:
+    """Resolve the closed research execution mapping without reading free-form JSON."""
+
+    if mission.scope != "research":
+        raise ValueError("Proposal-derived Mission scope must be research")
+    if mission.status is not MissionStatus.ACTIVE:
+        raise ValueError("Proposal-derived research Mission must be ACTIVE")
+    desired_outcome = thaw_json(mission.desired_outcome)
+    forbidden_action_keys = {
+        "action",
+        "action_type",
+        "tool",
+        "tool_name",
+        "operation",
+    }
+    if forbidden_action_keys.intersection(desired_outcome):
+        raise ValueError(
+            "research Mission desired_outcome cannot select an execution action"
+        )
+    technology = desired_outcome.get("technology")
+    if not isinstance(technology, str) or not technology.strip():
+        raise ValueError(
+            "research Mission desired_outcome requires a technology identity"
+        )
+    return "set_research"
 
 
 def build_strategic_contract_id(game_session_id: str) -> str:

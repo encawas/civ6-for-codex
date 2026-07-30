@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, model_validator
 
@@ -45,3 +45,18 @@ class ApprovalRecord(DomainModel):
                 "only edited-and-approved may contain replacement revision data"
             )
         return self
+
+
+STRATEGIC_RESEARCH_PROPOSAL_TYPE = "strategic_research_proposal"
+
+
+class StrategicProposalApprovalRecord(ApprovalRecord):
+    """The only human decision shape accepted for a research Proposal."""
+
+    proposal_type: Literal["strategic_research_proposal"] = (
+        STRATEGIC_RESEARCH_PROPOSAL_TYPE
+    )
+    proposal_revision: Literal[1] = 1
+    decision: Literal[ApprovalDecision.APPROVED, ApprovalDecision.REJECTED]
+    edited_payload: Literal[None] = None
+    replacement_revision: Literal[None] = None
