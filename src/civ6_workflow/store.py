@@ -17,6 +17,7 @@ from .domain import (
     ApprovalDecision,
     ApprovalRecord,
     STRATEGIC_RESEARCH_PROPOSAL_TYPE,
+    AuthorityScopeSet,
     StrategicProposalApprovalRecord,
     ApprovalStatus,
     AwaitingHumanTick,
@@ -30,7 +31,10 @@ from .domain import (
     InformationRound,
     InformationRoundStatus,
     InformationRequestedTick,
+    LegacyResearchTaskDisposition,
     LogicalPlannerRequestCreatedTick,
+    Mission,
+    MissionGraph,
     PlanLease,
     PlanLeaseStatus,
     PlannerAttemptCompletedTick,
@@ -56,6 +60,7 @@ from .domain import (
     StrategicRequestWaitResumedTick,
     StrategicProposalWaitErrorTick,
     StrategicProposalWaitResumedTick,
+    build_strategic_proposal_terminal_tick_id,
     build_strategic_proposal_wait_resume_request,
     build_strategic_contract_id,
     StrategicContractCommit,
@@ -69,6 +74,7 @@ from .domain import (
     ProviderAttemptStatus,
     canonical_json,
     canonical_json_hash,
+    thaw_json,
 )
 from .domain.planner import TERMINAL_PLANNER_STATUSES
 from .models import (
@@ -552,8 +558,16 @@ REPLAY_STATE_TABLES = (
 
 
 class WorkflowStore:
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        enable_phase1c_dormant_activation: bool = False,
+    ):
         self.path = Path(path)
+        self._phase1c_dormant_activation_enabled = bool(
+            enable_phase1c_dormant_activation
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -3356,6 +3370,11 @@ class WorkflowStore:
                 raise ValueError(
                     "StoredTask provenance resolves to no research Mission"
                 )
+            desired = thaw_json(missions[0].desired_outcome)
+            if task.arguments.get("tech_or_civic") != desired["technology"]:
+                raise ValueError(
+                    "Mission-derived research StoredTask target disagrees with Mission"
+                )
             if task.action_type != "set_research":
                 raise ValueError(
                     "Mission-derived research StoredTask must use set_research"
@@ -4571,6 +4590,699 @@ class WorkflowStore:
             ).fetchall()
         return [self._strategic_research_proposal_from_row(row) for row in rows]
 
+    def _require_phase1c_dormant_activation(self) -> None:
+        if not self._phase1c_dormant_activation_enabled:
+            raise ValueError(
+                "Phase 1C atomic Proposal decisions remain dormant until enablement"
+            )
+
+    @classmethod
+    def _strategic_proposal_terminal_tick_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+    ) -> WorkflowTick | None:
+        rows = conn.execute(
+            "SELECT * FROM workflow_ticks WHERE game_id=? AND outcome IN (?, ?, ?)",
+            (
+                proposal.game_session_id,
+                TickOutcomeKind.STRATEGIC_PROPOSAL_APPLIED.value,
+                TickOutcomeKind.STRATEGIC_PROPOSAL_REJECTED.value,
+                TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED.value,
+            ),
+        ).fetchall()
+        matches = tuple(
+            tick
+            for tick in (cls._workflow_tick_from_row(dict(row)) for row in rows)
+            if getattr(tick, "proposal_id", None) == proposal.proposal_id
+        )
+        if len(matches) > 1:
+            raise ValueError("Strategic Proposal has duplicate terminal evidence")
+        return None if not matches else matches[0]
+
+    @classmethod
+    def _strategic_proposal_approval_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+    ) -> StrategicProposalApprovalRecord | None:
+        rows = conn.execute(
+            "SELECT * FROM approval_records WHERE game_id=? AND proposal_type=? "
+            "AND proposal_id=? ORDER BY created_at, approval_id",
+            (
+                proposal.game_session_id,
+                STRATEGIC_RESEARCH_PROPOSAL_TYPE,
+                proposal.proposal_id,
+            ),
+        ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("Strategic Proposal has multiple human decisions")
+        if not rows:
+            return None
+        normalized = cls._normalize_approval_record_row(dict(rows[0]))
+        return StrategicProposalApprovalRecord.model_validate_json(
+            str(normalized["record_json"])
+        )
+
+    @classmethod
+    def _proposal_ready_tick_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+    ) -> StrategicProposalReadyTick:
+        rows = conn.execute(
+            "SELECT * FROM workflow_ticks WHERE game_id=? AND outcome=?",
+            (
+                proposal.game_session_id,
+                TickOutcomeKind.STRATEGIC_PROPOSAL_READY.value,
+            ),
+        ).fetchall()
+        matches = tuple(
+            tick
+            for tick in (cls._workflow_tick_from_row(dict(row)) for row in rows)
+            if isinstance(tick, StrategicProposalReadyTick)
+            and tick.proposal_id == proposal.proposal_id
+        )
+        if len(matches) != 1:
+            raise ValueError("Strategic Proposal requires one Proposal Ready Tick")
+        return matches[0]
+
+    @classmethod
+    def _open_proposal_for_decision_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_session_id: str,
+        proposal_id: str,
+    ) -> tuple[StrategicResearchProposal, StrategicProposalReadyTick]:
+        row = conn.execute(
+            "SELECT * FROM strategic_research_proposals WHERE game_id=? "
+            "AND proposal_id=?",
+            (game_session_id, proposal_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown StrategicResearchProposal: {proposal_id}")
+        proposal = cls._strategic_research_proposal_from_row(row)
+        ready = cls._proposal_ready_tick_in_connection(conn, proposal)
+        if (
+            cls._strategic_proposal_terminal_tick_in_connection(conn, proposal)
+            is not None
+        ):
+            raise ValueError("Strategic Proposal already has a terminal disposition")
+        if cls._strategic_proposal_approval_in_connection(conn, proposal) is not None:
+            raise ValueError("Strategic Proposal already has a human decision")
+        resume = conn.execute(
+            "SELECT 1 FROM strategic_proposal_wait_resume_requests WHERE proposal_id=?",
+            (proposal.proposal_id,),
+        ).fetchone()
+        if resume is not None:
+            raise ValueError(
+                "dormant Proposal decision cannot consume a Phase 1B Resume Request"
+            )
+        runtime = conn.execute(
+            "SELECT state FROM runtime_state WHERE game_id=?",
+            (proposal.game_session_id,),
+        ).fetchone()
+        if (
+            runtime is None
+            or RuntimeState(runtime["state"]) is not RuntimeState.AWAITING_HUMAN
+        ):
+            raise ValueError("Strategic Proposal decision requires AWAITING_HUMAN")
+        context_row = conn.execute(
+            "SELECT value_json FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(proposal.game_session_id),),
+        ).fetchone()
+        context = None if context_row is None else cls._load(context_row["value_json"])
+        expected = {
+            "wait_kind": "strategic_contract_proposal_ready",
+            "resume_policy": "explicit_only",
+            "planner_request_id": proposal.source_planner_request_id,
+            "proposal_id": proposal.proposal_id,
+            "target_kind": proposal.target_kind.value,
+            "expected_base_revision": proposal.expected_base_revision,
+            "resume_requested": False,
+        }
+        if not isinstance(context, dict) or any(
+            context.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError(
+                "Strategic Proposal decision requires its explicit-only wait"
+            )
+        return proposal, ready
+
+    @classmethod
+    def _insert_strategic_proposal_approval_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_session_id: str,
+        approval: StrategicProposalApprovalRecord,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO approval_records(approval_id, game_id, proposal_type, "
+            "proposal_id, proposal_revision, decision, record_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                approval.approval_id,
+                game_session_id,
+                approval.proposal_type,
+                approval.proposal_id,
+                approval.proposal_revision,
+                approval.decision.value,
+                cls._dump(approval.model_dump(mode="json")),
+                approval.created_at.isoformat(),
+            ),
+        )
+
+    @classmethod
+    def _legacy_research_dispositions_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+    ) -> tuple[LegacyResearchTaskDisposition, ...]:
+        rows = conn.execute(
+            "SELECT * FROM workflow_tasks WHERE game_id=? AND action_type=? "
+            "ORDER BY task_id",
+            (proposal.game_session_id, "set_research"),
+        ).fetchall()
+        disposable = {
+            TaskStatus.PENDING,
+            TaskStatus.READY,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
+            TaskStatus.ESCALATED,
+            TaskStatus.AWAITING_CONFIRMATION,
+        }
+        blocking = {
+            TaskStatus.RUNNING,
+            TaskStatus.VERIFYING,
+            TaskStatus.UNCERTAIN,
+        }
+        unresolved_attempts = {
+            AttemptStatus.PREPARED,
+            AttemptStatus.VERIFYING,
+            AttemptStatus.UNCERTAIN,
+        }
+        dispositions: list[LegacyResearchTaskDisposition] = []
+        for row in rows:
+            task = cls._row_to_task(row)
+            if task.source_contract_id is not None:
+                continue
+            attempt_rows = conn.execute(
+                "SELECT attempt_json FROM action_attempts WHERE game_id=? "
+                "AND task_id=? ORDER BY attempt_number",
+                (proposal.game_session_id, task.task_id),
+            ).fetchall()
+            attempts = tuple(
+                ActionAttempt.model_validate_json(item["attempt_json"])
+                for item in attempt_rows
+            )
+            if task.status in blocking or any(
+                attempt.status in unresolved_attempts for attempt in attempts
+            ):
+                raise ValueError(
+                    "legacy research execution is not quiescent for activation"
+                )
+            confirmation_closed = task.status is TaskStatus.AWAITING_CONFIRMATION
+            final_status = task.status
+            if task.status in disposable:
+                final_status = TaskStatus.CANCELLED
+                conn.execute(
+                    "UPDATE workflow_tasks SET status=?, last_error=?, approved_by=?, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE game_id=? AND task_id=?",
+                    (
+                        TaskStatus.CANCELLED.value,
+                        "cancelled by research authority activation",
+                        (
+                            "phase1c-authority-switch"
+                            if confirmation_closed
+                            else task.approved_by
+                        ),
+                        proposal.game_session_id,
+                        task.task_id,
+                    ),
+                )
+            dispositions.append(
+                LegacyResearchTaskDisposition(
+                    task_id=task.task_id,
+                    prior_status=task.status.value,
+                    final_status=final_status.value,
+                    action_attempt_ids=tuple(
+                        sorted(attempt.action_attempt_id for attempt in attempts)
+                    ),
+                    confirmation_closed=confirmation_closed,
+                )
+            )
+        return tuple(dispositions)
+
+    @classmethod
+    def _insert_proposal_contract_activation_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+        approval: StrategicProposalApprovalRecord,
+    ) -> StrategicContractCommit:
+        root = conn.execute(
+            "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+            (proposal.game_session_id,),
+        ).fetchone()
+        stale_reason = cls._strategic_proposal_stale_reason_v11(
+            proposal, None if root is None else dict(root)
+        )
+        if stale_reason is not None:
+            raise StaleStrategicContractBaseError(stale_reason.value)
+        base_contract = None
+        if proposal.expected_base_revision > 0:
+            base_row = conn.execute(
+                "SELECT * FROM strategic_contract_revisions WHERE game_id=? "
+                "AND revision=?",
+                (proposal.game_session_id, proposal.expected_base_revision),
+            ).fetchone()
+            if base_row is None:
+                raise StaleStrategicContractBaseError(
+                    "Strategic Proposal base revision is missing"
+                )
+            base_contract = cls._contract_from_revision_row(base_row)
+        mission = proposal.proposed_research_mission
+        research_mission_action(mission)
+        contract = StrategicContract(
+            contract_id=proposal.target_contract_id,
+            game_session_id=proposal.game_session_id,
+            revision=proposal.expected_base_revision + 1,
+            authority_scope_set=AuthorityScopeSet(mission_graph_scopes=("research",)),
+            mission_graph=MissionGraph(missions=(mission,)),
+            strategic_objectives=proposal.strategic_objectives,
+            global_constraints=proposal.global_constraints,
+            created_from_observation_id=proposal.created_from_observation_id,
+            approval_status=ApprovalStatus.APPROVED,
+            policy_snapshot=(
+                {} if base_contract is None else base_contract.policy_snapshot
+            ),
+        )
+        digest = hashlib.sha256(
+            f"{proposal.proposal_id}\0APPROVED".encode("utf-8")
+        ).hexdigest()[:24]
+        commit = StrategicContractCommit(
+            commit_id=f"strategic_commit_{digest}",
+            game_session_id=proposal.game_session_id,
+            contract_id=proposal.target_contract_id,
+            expected_base_revision=proposal.expected_base_revision,
+            contract=contract,
+            committed_at=approval.created_at,
+            reason="Proposal-derived research activation",
+            source_proposal_id=proposal.proposal_id,
+            source_proposal_hash=proposal.proposal_hash,
+            source_approval_id=approval.approval_id,
+            source_planner_request_id=proposal.source_planner_request_id,
+            source_mission_id=mission.mission_id,
+            source_mission_revision=mission.mission_revision,
+        )
+        if root is None:
+            conn.execute(
+                "INSERT INTO strategic_contract_roots(game_id, contract_id, "
+                "active_revision, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    proposal.game_session_id,
+                    proposal.target_contract_id,
+                    contract.revision,
+                    commit.committed_at.isoformat(),
+                ),
+            )
+        conn.execute(
+            "INSERT INTO strategic_contract_revisions(game_id, contract_id, revision, "
+            "contract_json, committed_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                proposal.game_session_id,
+                proposal.target_contract_id,
+                contract.revision,
+                cls._dump(contract.model_dump(mode="json")),
+                commit.committed_at.isoformat(),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO strategic_contract_commits(commit_id, game_id, contract_id, "
+            "expected_base_revision, committed_revision, commit_json, committed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                commit.commit_id,
+                proposal.game_session_id,
+                proposal.target_contract_id,
+                proposal.expected_base_revision,
+                contract.revision,
+                cls._dump(commit.model_dump(mode="json")),
+                commit.committed_at.isoformat(),
+            ),
+        )
+        if root is not None:
+            updated = conn.execute(
+                "UPDATE strategic_contract_roots SET active_revision=? WHERE game_id=? "
+                "AND contract_id=? AND active_revision=?",
+                (
+                    contract.revision,
+                    proposal.game_session_id,
+                    proposal.target_contract_id,
+                    proposal.expected_base_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleStrategicContractBaseError(
+                    "Strategic Proposal base changed during activation"
+                )
+        return commit
+
+    @staticmethod
+    def _decision_transition_window(
+        ready: StrategicProposalReadyTick,
+        authorized_at: datetime,
+        started_at: datetime | None,
+        completed_at: datetime | None,
+    ) -> tuple[datetime, datetime]:
+        start = authorized_at if started_at is None else started_at
+        completed = start if completed_at is None else completed_at
+        if start < ready.completed_at or not (start <= authorized_at <= completed):
+            raise ValueError("Strategic Proposal decision Tick has invalid causal time")
+        return start, completed
+
+    @classmethod
+    def _terminal_tick_for_existing_decision_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+        approval: StrategicProposalApprovalRecord | None,
+    ) -> WorkflowTick | None:
+        terminal = cls._strategic_proposal_terminal_tick_in_connection(conn, proposal)
+        if terminal is None:
+            return None
+        existing_approval = cls._strategic_proposal_approval_in_connection(
+            conn, proposal
+        )
+        if (
+            isinstance(terminal, StrategicProposalInvalidatedTick)
+            and existing_approval is None
+        ):
+            return terminal
+        if approval is not None and existing_approval == approval:
+            expected_type = (
+                StrategicProposalAppliedTick
+                if approval.decision is ApprovalDecision.APPROVED
+                else StrategicProposalRejectedTick
+            )
+            if isinstance(terminal, expected_type):
+                return terminal
+        raise ValueError("Strategic Proposal terminal decision conflicts")
+
+    @classmethod
+    def _invalidate_open_proposal_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+        ready: StrategicProposalReadyTick,
+        reason: StrategicProposalInvalidationReason,
+        *,
+        invalidated_at: datetime,
+        checkpoint: Callable[[str], None] | None,
+    ) -> StrategicProposalInvalidatedTick:
+        occurred_at = max(invalidated_at, ready.completed_at)
+        tick = StrategicProposalInvalidatedTick(
+            tick_id=build_strategic_proposal_terminal_tick_id(
+                proposal.proposal_id,
+                TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED,
+            ),
+            game_session_id=proposal.game_session_id,
+            turn_number=ready.turn_number,
+            starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+            observation_ids=ready.observation_ids,
+            started_at=occurred_at,
+            completed_at=occurred_at,
+            planner_request_id=proposal.source_planner_request_id,
+            proposal_id=proposal.proposal_id,
+            proposal_hash=proposal.proposal_hash,
+            proposal_ready_tick_id=ready.tick_id,
+            target_contract_id=proposal.target_contract_id,
+            expected_base_revision=proposal.expected_base_revision,
+            invalidation_origin=StrategicProposalInvalidationOrigin.RUNTIME,
+            invalidation_reason=reason,
+        )
+        if checkpoint is not None:
+            checkpoint("before_strategic_invalidated_tick")
+        cls._save_runtime_state_in_connection(
+            conn, proposal.game_session_id, RuntimeState.ROUTING, None
+        )
+        conn.execute(
+            "DELETE FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(proposal.game_session_id),),
+        )
+        cls._insert_workflow_tick_in_connection(conn, tick)
+        cls._validate_phase1b_proposals_v10(conn)
+        return tick
+
+    def approve_strategic_research_proposal(
+        self,
+        game_session_id: str,
+        approval: StrategicProposalApprovalRecord,
+        *,
+        transition_started_at: datetime | None = None,
+        transition_completed_at: datetime | None = None,
+        checkpoint: Callable[[str], None] | None = None,
+    ) -> StrategicProposalAppliedTick | StrategicProposalInvalidatedTick:
+        self._require_phase1c_dormant_activation()
+        if approval.decision is not ApprovalDecision.APPROVED:
+            raise ValueError("approval transaction requires APPROVED")
+        if checkpoint is not None:
+            checkpoint("before_strategic_decision_lock")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_phase1b_proposals_v10(conn)
+            row = conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE game_id=? "
+                "AND proposal_id=?",
+                (game_session_id, approval.proposal_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(
+                    f"unknown StrategicResearchProposal: {approval.proposal_id}"
+                )
+            proposal = self._strategic_research_proposal_from_row(row)
+            existing = self._terminal_tick_for_existing_decision_in_connection(
+                conn, proposal, approval
+            )
+            if existing is not None:
+                return existing
+            proposal, ready = self._open_proposal_for_decision_in_connection(
+                conn, game_session_id, approval.proposal_id
+            )
+            root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (game_session_id,),
+            ).fetchone()
+            stale_reason = self._strategic_proposal_stale_reason_v11(
+                proposal, None if root is None else dict(root)
+            )
+            if stale_reason is not None:
+                return self._invalidate_open_proposal_in_connection(
+                    conn,
+                    proposal,
+                    ready,
+                    stale_reason,
+                    invalidated_at=max(approval.created_at, ready.completed_at),
+                    checkpoint=checkpoint,
+                )
+            started_at, completed_at = self._decision_transition_window(
+                ready,
+                approval.created_at,
+                transition_started_at,
+                transition_completed_at,
+            )
+            dispositions = self._legacy_research_dispositions_in_connection(
+                conn, proposal
+            )
+            if checkpoint is not None:
+                checkpoint("after_legacy_research_disposition")
+            self._insert_strategic_proposal_approval_in_connection(
+                conn, game_session_id, approval
+            )
+            if checkpoint is not None:
+                checkpoint("after_strategic_approval")
+            commit = self._insert_proposal_contract_activation_in_connection(
+                conn, proposal, approval
+            )
+            if checkpoint is not None:
+                checkpoint("after_strategic_contract_activation")
+                checkpoint("before_strategic_applied_tick")
+            tick = StrategicProposalAppliedTick(
+                tick_id=build_strategic_proposal_terminal_tick_id(
+                    proposal.proposal_id,
+                    TickOutcomeKind.STRATEGIC_PROPOSAL_APPLIED,
+                ),
+                game_session_id=game_session_id,
+                turn_number=ready.turn_number,
+                starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+                observation_ids=ready.observation_ids,
+                started_at=started_at,
+                completed_at=completed_at,
+                planner_request_id=proposal.source_planner_request_id,
+                proposal_id=proposal.proposal_id,
+                proposal_hash=proposal.proposal_hash,
+                proposal_ready_tick_id=ready.tick_id,
+                approval_id=approval.approval_id,
+                target_contract_id=proposal.target_contract_id,
+                expected_base_revision=proposal.expected_base_revision,
+                contract_commit_id=commit.commit_id,
+                activated_contract_revision=commit.contract.revision,
+                source_mission_id=proposal.proposed_research_mission.mission_id,
+                source_mission_revision=(
+                    proposal.proposed_research_mission.mission_revision
+                ),
+                legacy_task_dispositions=dispositions,
+            )
+            self._save_runtime_state_in_connection(
+                conn, game_session_id, RuntimeState.ROUTING, None
+            )
+            self._persist_human_wait_context_in_connection(
+                conn, game_session_id, RuntimeState.ROUTING, None
+            )
+            self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1b_proposals_v10(conn)
+            return tick
+
+    def reject_strategic_research_proposal(
+        self,
+        game_session_id: str,
+        approval: StrategicProposalApprovalRecord,
+        *,
+        transition_started_at: datetime | None = None,
+        transition_completed_at: datetime | None = None,
+        checkpoint: Callable[[str], None] | None = None,
+    ) -> StrategicProposalRejectedTick | StrategicProposalInvalidatedTick:
+        self._require_phase1c_dormant_activation()
+        if approval.decision is not ApprovalDecision.REJECTED:
+            raise ValueError("rejection transaction requires REJECTED")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_phase1b_proposals_v10(conn)
+            row = conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE game_id=? "
+                "AND proposal_id=?",
+                (game_session_id, approval.proposal_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(
+                    f"unknown StrategicResearchProposal: {approval.proposal_id}"
+                )
+            proposal = self._strategic_research_proposal_from_row(row)
+            existing = self._terminal_tick_for_existing_decision_in_connection(
+                conn, proposal, approval
+            )
+            if existing is not None:
+                return existing
+            proposal, ready = self._open_proposal_for_decision_in_connection(
+                conn, game_session_id, approval.proposal_id
+            )
+            root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (game_session_id,),
+            ).fetchone()
+            stale_reason = self._strategic_proposal_stale_reason_v11(
+                proposal, None if root is None else dict(root)
+            )
+            if stale_reason is not None:
+                return self._invalidate_open_proposal_in_connection(
+                    conn,
+                    proposal,
+                    ready,
+                    stale_reason,
+                    invalidated_at=max(approval.created_at, ready.completed_at),
+                    checkpoint=checkpoint,
+                )
+            started_at, completed_at = self._decision_transition_window(
+                ready,
+                approval.created_at,
+                transition_started_at,
+                transition_completed_at,
+            )
+            self._insert_strategic_proposal_approval_in_connection(
+                conn, game_session_id, approval
+            )
+            if checkpoint is not None:
+                checkpoint("after_strategic_rejection")
+                checkpoint("before_strategic_rejected_tick")
+            tick = StrategicProposalRejectedTick(
+                tick_id=build_strategic_proposal_terminal_tick_id(
+                    proposal.proposal_id,
+                    TickOutcomeKind.STRATEGIC_PROPOSAL_REJECTED,
+                ),
+                game_session_id=game_session_id,
+                turn_number=ready.turn_number,
+                starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+                observation_ids=ready.observation_ids,
+                started_at=started_at,
+                completed_at=completed_at,
+                planner_request_id=proposal.source_planner_request_id,
+                proposal_id=proposal.proposal_id,
+                proposal_hash=proposal.proposal_hash,
+                proposal_ready_tick_id=ready.tick_id,
+                approval_id=approval.approval_id,
+                target_contract_id=proposal.target_contract_id,
+                expected_base_revision=proposal.expected_base_revision,
+            )
+            self._save_runtime_state_in_connection(
+                conn, game_session_id, RuntimeState.ROUTING, None
+            )
+            self._persist_human_wait_context_in_connection(
+                conn, game_session_id, RuntimeState.ROUTING, None
+            )
+            self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1b_proposals_v10(conn)
+            return tick
+
+    def invalidate_stale_strategic_research_proposal(
+        self,
+        game_session_id: str,
+        proposal_id: str,
+        *,
+        invalidated_at: datetime | None = None,
+        checkpoint: Callable[[str], None] | None = None,
+    ) -> StrategicProposalInvalidatedTick:
+        self._require_phase1c_dormant_activation()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_phase1b_proposals_v10(conn)
+            row = conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE game_id=? "
+                "AND proposal_id=?",
+                (game_session_id, proposal_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown StrategicResearchProposal: {proposal_id}")
+            proposal = self._strategic_research_proposal_from_row(row)
+            existing = self._strategic_proposal_terminal_tick_in_connection(
+                conn, proposal
+            )
+            if existing is not None:
+                if isinstance(existing, StrategicProposalInvalidatedTick):
+                    return existing
+                raise ValueError("Strategic Proposal terminal decision conflicts")
+            proposal, ready = self._open_proposal_for_decision_in_connection(
+                conn, game_session_id, proposal_id
+            )
+            root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (game_session_id,),
+            ).fetchone()
+            stale_reason = self._strategic_proposal_stale_reason_v11(
+                proposal, None if root is None else dict(root)
+            )
+            if stale_reason is None:
+                raise ValueError("Strategic Proposal is not stale")
+            return self._invalidate_open_proposal_in_connection(
+                conn,
+                proposal,
+                ready,
+                stale_reason,
+                invalidated_at=(
+                    datetime.now(UTC) if invalidated_at is None else invalidated_at
+                ),
+                checkpoint=checkpoint,
+            )
+
     @classmethod
     def _strategic_proposal_wait_resume_request_from_row(
         cls, row: Mapping[str, Any]
@@ -4963,6 +5675,17 @@ class WorkflowStore:
         if mode is ExecutionMode.AUTO:
             return
         with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT game_id, task_id FROM workflow_tasks "
+                "WHERE status=? AND approved_by IS NULL",
+                (TaskStatus.READY.value,),
+            ).fetchall()
+            for row in rows:
+                self._validate_research_task_authority_in_connection(
+                    conn,
+                    str(row["game_id"]),
+                    str(row["task_id"]),
+                )
             conn.execute(
                 """
                 UPDATE workflow_tasks
@@ -4985,6 +5708,7 @@ class WorkflowStore:
         """Cancel one concrete confirmation instead of changing global execution state."""
 
         with self._connect() as conn:
+            self._validate_research_task_authority_in_connection(conn, game_id, task_id)
             cursor = conn.execute(
                 """
                 UPDATE workflow_tasks SET
@@ -5021,6 +5745,12 @@ class WorkflowStore:
             if row is None:
                 return False, "plan lease was not found for this game"
             lease = PlanLease.model_validate_json(row["lease_json"])
+            if self._active_research_mission_in_connection(
+                conn, game_id
+            ) is not None and self._plan_lease_targets_research_in_connection(
+                conn, lease
+            ):
+                raise ValueError("legacy research PlanLease writes are closed")
             if lease.status is not PlanLeaseStatus.AWAITING_APPROVAL:
                 return False, "plan lease is not awaiting approval"
 
@@ -5135,6 +5865,9 @@ class WorkflowStore:
             if row is None:
                 return False, "action attempt is not the latest attempt for this game"
             attempt = ActionAttempt.model_validate_json(row["attempt_json"])
+            self._validate_research_task_authority_in_connection(
+                conn, game_id, attempt.task_id
+            )
             if attempt.status is not AttemptStatus.FAILED:
                 return False, "action attempt is not a failed retry candidate"
             resolution = resolve_failed_attempt(
@@ -5264,6 +5997,190 @@ class WorkflowStore:
                 ),
             )
 
+    @classmethod
+    def _active_research_mission_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+    ) -> tuple[StrategicContract, Mission] | None:
+        root = conn.execute(
+            "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+            (game_id,),
+        ).fetchone()
+        if root is None:
+            return None
+        revision_row = conn.execute(
+            "SELECT * FROM strategic_contract_revisions WHERE game_id=? AND revision=?",
+            (game_id, int(root["active_revision"])),
+        ).fetchone()
+        if revision_row is None:
+            raise ValueError("active StrategicContract revision is missing")
+        contract = cls._contract_from_revision_row(revision_row)
+        if "research" not in contract.authority_scope_set.mission_graph_scopes:
+            return None
+        commit_row = conn.execute(
+            "SELECT * FROM strategic_contract_commits "
+            "WHERE game_id=? AND committed_revision=?",
+            (game_id, contract.revision),
+        ).fetchone()
+        if commit_row is None:
+            raise ValueError("research authority Contract commit is missing")
+        commit = cls._contract_commit_from_row(commit_row)
+        missions = tuple(
+            mission
+            for mission in contract.mission_graph.missions
+            if mission.mission_id == commit.source_mission_id
+            and mission.mission_revision == commit.source_mission_revision
+        )
+        if len(missions) != 1:
+            raise ValueError("research authority resolves to no unique Mission")
+        research_mission_action(missions[0])
+        return contract, missions[0]
+
+    @staticmethod
+    def _bundle_contains_research_write(bundle: PlanBundle) -> bool:
+        research_strategy_keys = {
+            "research",
+            "research_queue",
+            "tech",
+            "tech_queue",
+            "technology",
+            "current_research",
+        }
+        return any(task.action_type == "set_research" for task in bundle.tasks) or any(
+            str(key).strip().lower() in research_strategy_keys
+            for key in bundle.strategy_updates
+        )
+
+    @classmethod
+    def _validate_research_task_authority_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+        task_id: str,
+        *,
+        allow_legacy_inert: bool = False,
+        action_type: str | None = None,
+    ) -> StoredTask | None:
+        row = conn.execute(
+            "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
+            (game_id, task_id),
+        ).fetchone()
+        if row is None:
+            active = cls._active_research_mission_in_connection(conn, game_id)
+            if active is not None and action_type == "set_research":
+                raise ValueError(
+                    "research Attempt requires a current Mission-derived StoredTask"
+                )
+            return None
+        task = cls._row_to_task(row)
+        active = cls._active_research_mission_in_connection(conn, game_id)
+        if task.action_type != "set_research" and task.source_contract_id is None:
+            return task
+        if active is None:
+            if task.source_contract_id is not None:
+                raise ValueError(
+                    "Mission-derived research task is not backed by active authority"
+                )
+            return task
+        contract, mission = active
+        if task.source_contract_id is None:
+            if allow_legacy_inert and task.status in {
+                TaskStatus.DONE,
+                TaskStatus.CANCELLED,
+                TaskStatus.EXPIRED,
+            }:
+                return task
+            raise ValueError(
+                "legacy provenance-free research task is closed after authority cutover"
+            )
+        if (
+            task.action_type != "set_research"
+            or task.source_contract_id != contract.contract_id
+            or task.source_contract_revision != contract.revision
+            or task.source_mission_id != mission.mission_id
+            or task.source_mission_revision != mission.mission_revision
+        ):
+            raise ValueError(
+                "research task provenance does not match active Contract/Mission"
+            )
+        desired = thaw_json(mission.desired_outcome)
+        if task.arguments.get("tech_or_civic") != desired["technology"]:
+            raise ValueError(
+                "research task target does not match the active Mission outcome"
+            )
+        return task
+
+    def save_authoritative_research_plan_bundle(
+        self,
+        game_id: str,
+        turn: int,
+        bundle: PlanBundle,
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+        observation_id: str,
+    ) -> None:
+        self._require_phase1c_dormant_activation()
+        self._reject_task_id_reuse(game_id, bundle)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active = self._active_research_mission_in_connection(conn, game_id)
+            if active is None:
+                raise ValueError("research authority is not active")
+            contract, mission = active
+            if (
+                bundle.strategy_updates
+                or bundle.city_plan_updates
+                or bundle.unit_plan_updates
+                or bundle.builder_plan_updates
+                or bundle.cancel_task_ids
+                or not bundle.tasks
+            ):
+                raise ValueError(
+                    "authoritative research projection accepts only research tasks"
+                )
+            desired = thaw_json(mission.desired_outcome)
+            for task in bundle.tasks:
+                if (
+                    task.action_type != research_mission_action(mission)
+                    or task.arguments.get("tech_or_civic") != desired["technology"]
+                ):
+                    raise ValueError(
+                        "authoritative research projection must match set_research Mission"
+                    )
+                existing = conn.execute(
+                    "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
+                    (game_id, task.task_id),
+                ).fetchone()
+                if existing is not None:
+                    stored = self._row_to_task(existing)
+                    if (
+                        stored.source_contract_id != contract.contract_id
+                        or stored.source_contract_revision != contract.revision
+                        or stored.source_mission_id != mission.mission_id
+                        or stored.source_mission_revision != mission.mission_revision
+                    ):
+                        raise ValueError(
+                            "authoritative research task identity has stale provenance"
+                        )
+            self._save_plan_bundle_in_connection(
+                conn,
+                game_id,
+                turn,
+                bundle,
+                mode=mode,
+                auto_action_types=(
+                    set(auto_action_types) if mode is ExecutionMode.AUTO else set()
+                ),
+                observation_id=observation_id,
+                source_contract_id=contract.contract_id,
+                source_contract_revision=contract.revision,
+                source_mission_id=mission.mission_id,
+                source_mission_revision=mission.mission_revision,
+            )
+            self._validate_phase1b_proposals_v10(conn)
+
     def save_plan_bundle(
         self,
         game_id: str,
@@ -5342,7 +6259,30 @@ class WorkflowStore:
         mode: ExecutionMode,
         auto_action_types: set[str],
         observation_id: str | None = None,
+        source_contract_id: str | None = None,
+        source_contract_revision: int | None = None,
+        source_mission_id: str | None = None,
+        source_mission_revision: int | None = None,
     ) -> None:
+        provenance = (
+            source_contract_id,
+            source_contract_revision,
+            source_mission_id,
+            source_mission_revision,
+        )
+        if any(value is not None for value in provenance) and not all(
+            value is not None for value in provenance
+        ):
+            raise ValueError("task Contract/Mission provenance must be complete")
+        active = self._active_research_mission_in_connection(conn, game_id)
+        if (
+            active is not None
+            and source_contract_id is None
+            and self._bundle_contains_research_write(bundle)
+        ):
+            raise ValueError(
+                "legacy research plan writes are closed after authority cutover"
+            )
         created_from_observation_id = (
             observation_id or f"legacy:{game_id}:{turn}:{bundle.plan_id}"
         )
@@ -5428,8 +6368,10 @@ class WorkflowStore:
                     entity_id, due_turn, expires_turn, arguments_json,
                     preconditions_json, postconditions_json, invalidators_json,
                     risk, requires_confirmation, reason, status, created_turn,
-                    created_from_observation_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_from_observation_id, source_contract_id,
+                    source_contract_revision, source_mission_id,
+                    source_mission_revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(game_id, task_id) DO UPDATE SET
                     plan_id=excluded.plan_id,
                     action_type=excluded.action_type,
@@ -5443,6 +6385,10 @@ class WorkflowStore:
                     invalidators_json=excluded.invalidators_json,
                     risk=excluded.risk,
                     requires_confirmation=excluded.requires_confirmation,
+                    source_contract_id=excluded.source_contract_id,
+                    source_contract_revision=excluded.source_contract_revision,
+                    source_mission_id=excluded.source_mission_id,
+                    source_mission_revision=excluded.source_mission_revision,
                     reason=excluded.reason,
                     status=CASE
                         WHEN workflow_tasks.status IN (
@@ -5471,6 +6417,10 @@ class WorkflowStore:
                     status.value,
                     turn,
                     created_from_observation_id,
+                    source_contract_id,
+                    source_contract_revision,
+                    source_mission_id,
+                    source_mission_revision,
                 ),
             )
 
@@ -5509,6 +6459,15 @@ class WorkflowStore:
 
     def refresh_due_statuses(self, game_id: str, turn: int) -> None:
         with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT task_id FROM workflow_tasks "
+                "WHERE game_id=? AND status=? AND due_turn<=?",
+                (game_id, TaskStatus.PENDING.value, turn),
+            ).fetchall()
+            for row in rows:
+                self._validate_research_task_authority_in_connection(
+                    conn, game_id, str(row["task_id"])
+                )
             conn.execute(
                 """
                 UPDATE workflow_tasks SET status=?, updated_at=CURRENT_TIMESTAMP
@@ -5639,7 +6598,11 @@ class WorkflowStore:
                 """,
                 (game_id, TaskStatus.READY.value, turn),
             ).fetchall()
-        return [self._row_to_task(row) for row in rows]
+            for row in rows:
+                self._validate_research_task_authority_in_connection(
+                    conn, game_id, str(row["task_id"])
+                )
+            return [self._row_to_task(row) for row in rows]
 
     @classmethod
     def _row_to_task(cls, row: Mapping[str, Any]) -> StoredTask:
@@ -5699,6 +6662,13 @@ class WorkflowStore:
         increment_retry: bool = False,
     ) -> None:
         with self._connect() as conn:
+            self._validate_research_task_authority_in_connection(
+                conn,
+                game_id,
+                task_id,
+                allow_legacy_inert=status
+                in {TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.EXPIRED},
+            )
             conn.execute(
                 """
                 UPDATE workflow_tasks SET
@@ -5713,6 +6683,7 @@ class WorkflowStore:
         self, game_id: str, task_id: str, approved_by: str = "user"
     ) -> bool:
         with self._connect() as conn:
+            self._validate_research_task_authority_in_connection(conn, game_id, task_id)
             cursor = conn.execute(
                 """
                 UPDATE workflow_tasks SET
@@ -5865,6 +6836,12 @@ class WorkflowStore:
         if attempt.action_type is None:
             raise ValueError("persisted attempts require action_type")
         with self._connect() as conn:
+            self._validate_research_task_authority_in_connection(
+                conn,
+                attempt.game_session_id,
+                attempt.task_id,
+                action_type=attempt.action_type,
+            )
             conn.execute(
                 """
                 INSERT INTO action_attempts(
@@ -5895,6 +6872,12 @@ class WorkflowStore:
         conn: sqlite3.Connection,
         attempt: ActionAttempt,
     ) -> None:
+        self._validate_research_task_authority_in_connection(
+            conn,
+            attempt.game_session_id,
+            attempt.task_id,
+            action_type=attempt.action_type,
+        )
         row = conn.execute(
             "SELECT attempt_json FROM action_attempts WHERE action_attempt_id=?",
             (attempt.action_attempt_id,),
@@ -6528,6 +7511,12 @@ class WorkflowStore:
                 )
             )
             if attempt is not None:
+                self._validate_research_task_authority_in_connection(
+                    conn,
+                    tick.game_session_id,
+                    attempt.task_id,
+                    action_type=attempt.action_type,
+                )
                 self._update_action_attempt_in_connection(conn, attempt)
                 if checkpoint is not None and attempt_checkpoint is not None:
                     checkpoint(attempt_checkpoint)
@@ -6684,12 +7673,23 @@ class WorkflowStore:
             ).fetchall()
         return [validate_workflow_tick(self._load(row["tick_json"])) for row in rows]
 
-    @staticmethod
+    @classmethod
     def _save_decision_gap_in_connection(
+        cls,
         conn: sqlite3.Connection,
         gap: DecisionGap,
         turn: int,
     ) -> None:
+        active = cls._active_research_mission_in_connection(conn, gap.game_session_id)
+        gap_tokens = {
+            str(gap.scope).strip().lower(),
+            str(gap.gap_type).strip().lower(),
+        }
+        if active is not None and any(
+            token == "research" or "research" in token or "tech" in token
+            for token in gap_tokens
+        ):
+            raise ValueError("legacy research DecisionGap writes are closed")
         now = datetime.now(UTC).isoformat()
         created_at = gap.created_at.isoformat() if gap.created_at else now
         updated_at = gap.updated_at.isoformat() if gap.updated_at else now
@@ -6804,9 +7804,69 @@ class WorkflowStore:
             )
 
     @staticmethod
-    def _save_plan_lease_in_connection(
+    def _plan_lease_targets_research_in_connection(
         conn: sqlite3.Connection, lease: PlanLease
+    ) -> bool:
+        if str(lease.scope).strip().lower() == "research" or any(
+            str(slot).strip().lower() == "research"
+            or "research" in str(slot).strip().lower()
+            or "tech" in str(slot).strip().lower()
+            for slot in lease.covered_slots
+        ):
+            return True
+        placeholders = ",".join("?" for _ in lease.decision_gap_ids)
+        rows = conn.execute(
+            "SELECT scope, gap_type FROM decision_gaps "
+            f"WHERE game_id=? AND decision_gap_id IN ({placeholders})",
+            (lease.game_session_id, *lease.decision_gap_ids),
+        ).fetchall()
+        return any(
+            str(row["scope"]).strip().lower() == "research"
+            or "research" in str(row["gap_type"]).strip().lower()
+            or "tech" in str(row["gap_type"]).strip().lower()
+            for row in rows
+        )
+
+    @classmethod
+    def _legacy_approval_targets_research_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        game_id: str,
+        record: ApprovalRecord,
+    ) -> bool:
+        if record.proposal_type != "decision_gap":
+            return False
+        gap = conn.execute(
+            "SELECT scope, gap_type FROM decision_gaps "
+            "WHERE game_id=? AND decision_gap_id=?",
+            (game_id, record.proposal_id),
+        ).fetchone()
+        if gap is not None and (
+            str(gap["scope"]).strip().lower() == "research"
+            or "research" in str(gap["gap_type"]).strip().lower()
+            or "tech" in str(gap["gap_type"]).strip().lower()
+        ):
+            return True
+        rows = conn.execute(
+            "SELECT lease_json FROM plan_leases WHERE game_id=?", (game_id,)
+        ).fetchall()
+        for row in rows:
+            lease = PlanLease.model_validate_json(row["lease_json"])
+            if (
+                record.proposal_id in lease.decision_gap_ids
+                and cls._plan_lease_targets_research_in_connection(conn, lease)
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _save_plan_lease_in_connection(
+        cls, conn: sqlite3.Connection, lease: PlanLease
     ) -> None:
+        if cls._active_research_mission_in_connection(
+            conn, lease.game_session_id
+        ) is not None and cls._plan_lease_targets_research_in_connection(conn, lease):
+            raise ValueError("legacy research PlanLease writes are closed")
         conn.execute(
             """
             INSERT INTO plan_leases(
@@ -6845,6 +7905,12 @@ class WorkflowStore:
                 "decision transaction"
             )
         with self._connect() as conn:
+            if self._active_research_mission_in_connection(
+                conn, game_id
+            ) is not None and self._legacy_approval_targets_research_in_connection(
+                conn, game_id, record
+            ):
+                raise ValueError("legacy research approval writes are closed")
             conn.execute(
                 """
                 INSERT INTO approval_records(

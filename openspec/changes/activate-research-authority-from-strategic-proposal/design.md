@@ -207,6 +207,13 @@ Alternative rejected: inferring provenance from action_type, plan_id, or caller 
 
 OpenSpec remains active through PR 1C-1 and PR 1C-2. It is development guidance, not runtime authority.
 
+PR 1C-2 is implemented behind a Store-local dormant gate with no Engine,
+bootstrap, or user caller. Its dedicated transactions, persisted authority
+checks, revision-bound research projection, task mutation guards, and shared
+startup/replay validation implement this design without enabling production
+decisions. PR 1C-3 remains responsible for compatibility migration, user entry,
+Runtime integration, and removal of dormancy.
+
 ## Risks / Trade-offs
 
 - **[Shared ApprovalRecord currently permits extra decisions]** -> Add Proposal-specific validation at every write, startup, and replay boundary without narrowing unrelated workflows.

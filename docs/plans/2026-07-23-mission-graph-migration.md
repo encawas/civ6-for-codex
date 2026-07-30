@@ -425,6 +425,14 @@ Concrete implementation record:
 - Keep every new production path behind a dormant gate with no user or Engine
   caller.
 
+Implementation status: complete behind the dormant Store gate. The three
+full-aggregate operations, atomic legacy execution disposition, authority
+activation, legacy research write closure, revision-bound set_research
+projection, task mutation guards, protected Tick intervals, and
+startup/replay validation are implemented and covered by crash, concurrency,
+restart, replay, and non-research isolation tests. No Engine, bootstrap, or
+user entry invokes them before PR 1C-3.
+
 ### PR 1C-3: Runtime Entry and Enablement
 
 - Before enablement, atomically migrate Phase 1B OPEN Proposals with historical
