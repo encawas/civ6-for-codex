@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from .domain import (
     StrategicContract,
     StrategicContractCommit,
+    StrategicProposalApprovalRecord,
     StrategicProposalWaitResumeRequest,
     StrategicResearchProposal,
 )
@@ -65,6 +66,10 @@ class WorkflowStorePort(Protocol):
     def list_strategic_proposal_wait_resume_requests(
         self, game_session_id: str
     ) -> list[StrategicProposalWaitResumeRequest]: ...
+
+    def strategic_proposal_approval_record(
+        self, game_session_id: str, proposal_id: str
+    ) -> StrategicProposalApprovalRecord | None: ...
 
     def __getattr__(self, name: str) -> Any: ...
 

@@ -144,6 +144,12 @@ PR 1C-1 adds only the data contracts, Schema, canonical serialization, typed rea
 
 PR 1C-1 may reject forged or incomplete persisted states, but it does not implement a real decision transaction and exposes no public operation that can independently save an ApprovalRecord or terminal Tick or move a Proposal to APPROVED, REJECTED, or INVALIDATED.
 
+#### PR 1C-1 concrete implementation record
+
+Workflow database v11 implements this foundation by adding the four nullable provenance columns to the existing `workflow_tasks` table. Proposal-specific approvals remain in `approval_records`, the three typed terminal outcomes remain in `workflow_ticks`, and Proposal provenance remains in canonical `StrategicContractCommit` data. No parallel terminal table, Repository, Store, or task model is introduced.
+
+Ordinary writes, startup, and replay preflight call the same Proposal/Contract/task aggregate validator. Public Store operations reject standalone strategic Proposal ApprovalRecord, Proposal-derived ContractCommit, and Applied/Rejected/Invalidated Tick writes. Engine, Human Wait, research routing, task claim, retry, confirmation, and recovery remain unchanged. The implementation therefore has no reviewed protocol deviation; reuse of the existing authority tables is the intended single-source design.
+
 PR 1C-2 introduces three dedicated full-aggregate entry points for approved, rejected, and invalidated outcomes. Only those atomic operations implement same-decision idempotency, conflicting-decision rejection, stale invalidation, and concurrent decision behavior. The same committed decision identity returns existing evidence and never appends a revision or calls the Provider again. Two concurrent approvals produce one revision; concurrent approve/reject is decided by the first transaction to commit.
 
 ### 6. Treat the decision Tick as an exclusive transition interval

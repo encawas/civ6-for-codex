@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -101,6 +101,26 @@ class StoredTask(ProposedTask):
     max_retries: int = Field(default=2, ge=0, le=10)
     last_error: str | None = None
     approved_by: str | None = None
+    source_contract_id: str | None = Field(default=None, min_length=1)
+    source_contract_revision: int | None = Field(default=None, ge=1)
+    source_mission_id: str | None = Field(default=None, min_length=1)
+    source_mission_revision: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_mission_provenance(self) -> Self:
+        provenance = (
+            self.source_contract_id,
+            self.source_contract_revision,
+            self.source_mission_id,
+            self.source_mission_revision,
+        )
+        if any(value is not None for value in provenance) and not all(
+            value is not None for value in provenance
+        ):
+            raise ValueError(
+                "StoredTask Contract/Mission provenance must be all present or all null"
+            )
+        return self
 
 
 class PlanBundle(StrictModel):

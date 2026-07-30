@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+import hashlib
 from typing import Annotated, Any, Literal, Self, TypeAlias
 
 from pydantic import Field, TypeAdapter, model_validator
@@ -46,6 +47,9 @@ class TickOutcomeKind(StrEnum):
     STRATEGIC_REQUEST_WAIT_ERROR = "STRATEGIC_REQUEST_WAIT_ERROR"
     STRATEGIC_PROPOSAL_WAIT_RESUMED = "STRATEGIC_PROPOSAL_WAIT_RESUMED"
     STRATEGIC_PROPOSAL_WAIT_ERROR = "STRATEGIC_PROPOSAL_WAIT_ERROR"
+    STRATEGIC_PROPOSAL_APPLIED = "STRATEGIC_PROPOSAL_APPLIED"
+    STRATEGIC_PROPOSAL_REJECTED = "STRATEGIC_PROPOSAL_REJECTED"
+    STRATEGIC_PROPOSAL_INVALIDATED = "STRATEGIC_PROPOSAL_INVALIDATED"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
     INFORMATION_COLLECTED = "INFORMATION_COLLECTED"
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
@@ -194,6 +198,148 @@ class StrategicProposalWaitResumedTick(TickRecord):
     ]
     expected_base_revision: int = Field(ge=0)
     resume_reason: Literal["explicit_user_resume"] = "explicit_user_resume"
+
+
+class StrategicProposalInvalidationOrigin(StrEnum):
+    RUNTIME = "RUNTIME"
+    PHASE1C_ENABLEMENT_MIGRATION = "PHASE1C_ENABLEMENT_MIGRATION"
+
+
+class StrategicProposalInvalidationReason(StrEnum):
+    BASE_REVISION_CHANGED = "BASE_REVISION_CHANGED"
+    TARGET_CONTRACT_CHANGED = "TARGET_CONTRACT_CHANGED"
+    TARGET_CONTRACT_CREATED = "TARGET_CONTRACT_CREATED"
+    PRE_PHASE1C_WAIT_RELEASED = "PRE_PHASE1C_WAIT_RELEASED"
+
+
+def build_strategic_proposal_terminal_tick_id(
+    proposal_id: str, outcome: TickOutcomeKind
+) -> str:
+    terminal_outcomes = {
+        TickOutcomeKind.STRATEGIC_PROPOSAL_APPLIED,
+        TickOutcomeKind.STRATEGIC_PROPOSAL_REJECTED,
+        TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED,
+    }
+    if outcome not in terminal_outcomes:
+        raise ValueError("terminal Proposal Tick ID requires a terminal outcome")
+    digest = hashlib.sha256(
+        f"{proposal_id}\0{outcome.value}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"strategic_terminal_{digest}"
+
+
+class LegacyResearchTaskDisposition(DomainModel):
+    task_id: str = Field(min_length=1)
+    prior_status: str = Field(min_length=1)
+    final_status: str = Field(min_length=1)
+    action_attempt_ids: tuple[str, ...] = ()
+    confirmation_closed: bool = False
+
+    def model_post_init(self, __context: object) -> None:
+        if self.action_attempt_ids != tuple(sorted(set(self.action_attempt_ids))):
+            raise ValueError("legacy disposition Attempt IDs must be unique and sorted")
+
+
+class StrategicProposalAppliedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_APPLIED] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_APPLIED
+    )
+    starting_runtime_state: Literal[RuntimeState.AWAITING_HUMAN]
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    proposal_id: str = Field(min_length=1)
+    proposal_hash: str = Field(min_length=64, max_length=64)
+    planner_request_id: str = Field(min_length=1)
+    proposal_ready_tick_id: str = Field(min_length=1)
+    approval_id: str = Field(min_length=1)
+    target_contract_id: str = Field(min_length=1)
+    expected_base_revision: int = Field(ge=0)
+    contract_commit_id: str = Field(min_length=1)
+    activated_contract_revision: int = Field(ge=1)
+    source_mission_id: str = Field(min_length=1)
+    source_mission_revision: int = Field(ge=1)
+    legacy_task_dispositions: tuple[LegacyResearchTaskDisposition, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_applied_tick(self) -> Self:
+        if self.tick_id != build_strategic_proposal_terminal_tick_id(
+            self.proposal_id, self.outcome
+        ):
+            raise ValueError("Applied Tick ID must be derived from the Proposal")
+        task_ids = tuple(item.task_id for item in self.legacy_task_dispositions)
+        if task_ids != tuple(sorted(set(task_ids))):
+            raise ValueError("legacy task dispositions must be unique and sorted")
+        return self
+
+
+class StrategicProposalRejectedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_REJECTED] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_REJECTED
+    )
+    starting_runtime_state: Literal[RuntimeState.AWAITING_HUMAN]
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    proposal_id: str = Field(min_length=1)
+    proposal_hash: str = Field(min_length=64, max_length=64)
+    planner_request_id: str = Field(min_length=1)
+    proposal_ready_tick_id: str = Field(min_length=1)
+    approval_id: str = Field(min_length=1)
+    target_contract_id: str = Field(min_length=1)
+    expected_base_revision: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_rejected_tick(self) -> Self:
+        if self.tick_id != build_strategic_proposal_terminal_tick_id(
+            self.proposal_id, self.outcome
+        ):
+            raise ValueError("Rejected Tick ID must be derived from the Proposal")
+        return self
+
+
+class StrategicProposalInvalidatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED
+    )
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    proposal_id: str = Field(min_length=1)
+    proposal_hash: str = Field(min_length=64, max_length=64)
+    planner_request_id: str = Field(min_length=1)
+    proposal_ready_tick_id: str = Field(min_length=1)
+    target_contract_id: str = Field(min_length=1)
+    expected_base_revision: int = Field(ge=0)
+    invalidation_origin: StrategicProposalInvalidationOrigin
+    invalidation_reason: StrategicProposalInvalidationReason
+    source_resume_request_id: str | None = Field(default=None, min_length=1)
+    source_wait_resumed_tick_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_invalidated_tick(self) -> Self:
+        if self.tick_id != build_strategic_proposal_terminal_tick_id(
+            self.proposal_id, self.outcome
+        ):
+            raise ValueError("Invalidated Tick ID must be derived from the Proposal")
+        migration_sources = (
+            self.source_resume_request_id,
+            self.source_wait_resumed_tick_id,
+        )
+        if (
+            self.invalidation_origin
+            is StrategicProposalInvalidationOrigin.PHASE1C_ENABLEMENT_MIGRATION
+        ):
+            if not all(value is not None for value in migration_sources):
+                raise ValueError(
+                    "migration Invalidated Tick requires Resume source bindings"
+                )
+            if self.started_at != self.completed_at:
+                raise ValueError(
+                    "migration Invalidated Tick uses one canonical causal time"
+                )
+        elif any(value is not None for value in migration_sources):
+            raise ValueError(
+                "runtime Invalidated Tick cannot contain migration source bindings"
+            )
+        return self
 
 
 class StrategicRequestTerminatedTick(TickRecord):
@@ -511,6 +657,9 @@ WorkflowTick: TypeAlias = Annotated[
     | StrategicRequestWaitErrorTick
     | StrategicProposalWaitResumedTick
     | StrategicProposalWaitErrorTick
+    | StrategicProposalAppliedTick
+    | StrategicProposalRejectedTick
+    | StrategicProposalInvalidatedTick
     | InformationRequestedTick
     | InformationCollectedTick
     | ContextGatheredTick

@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
@@ -8,12 +9,15 @@ import pytest
 
 from civ6_workflow.domain import (
     AuthorityScopeSet,
+    ApprovalDecision,
+    ApprovalStatus,
     AwaitingHumanTick,
     InformationRequestedTick,
     InformationRound,
     InformationRoundStatus,
     Mission,
     MissionGraph,
+    MissionStatus,
     ObservedOnlyTick,
     PlannerAttemptCompletedTick,
     ProviderAttempt,
@@ -25,6 +29,13 @@ from civ6_workflow.domain import (
     RuntimeState,
     StrategicContract,
     StrategicContractCommit,
+    StrategicProposalApprovalRecord,
+    StrategicProposalAppliedTick,
+    StrategicProposalInvalidatedTick,
+    StrategicProposalInvalidationOrigin,
+    StrategicProposalInvalidationReason,
+    StrategicProposalRejectedTick,
+    StrategicProposalReadyTick,
     StrategicRequestTerminatedTick,
     StrategicRequestWaitErrorTick,
     StrategicRequestWaitResumedTick,
@@ -33,12 +44,20 @@ from civ6_workflow.domain import (
     SubjectRef,
     TickOutcomeKind,
     build_strategic_contract_id,
+    build_strategic_proposal_terminal_tick_id,
     build_strategic_proposal_wait_resume_request_id,
     build_strategic_research_proposal,
+    build_strategic_research_proposal_id,
     canonical_json_hash,
 )
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
-from civ6_workflow.models import ExecutionMode, RuntimeSnapshot
+from civ6_workflow.models import (
+    ExecutionMode,
+    RiskLevel,
+    RuntimeSnapshot,
+    StoredTask,
+    TaskStatus,
+)
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.workflow_protocol import (
     InformationRequest,
@@ -1086,7 +1105,7 @@ def test_v9_upgrade_creates_empty_proposal_table_without_changing_state(tmp_path
     )
     assert upgraded.list_strategic_research_proposals("game-1") == []
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
 
 
 @pytest.mark.parametrize("kind", ["creation", "repair"])
@@ -3885,3 +3904,1128 @@ def test_startup_and_replay_reject_tick_before_resume_transition_completes(
     _insert_forged_replay_tick(path, row, metric)
     with pytest.raises(ValueError, match="explicit-only wait interval"):
         WorkflowStore(path)
+
+
+def _canonical_model_json(value):
+    return json.dumps(
+        value.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _append_terminal_tick_to_replay(state, tick):
+    payload = tick.model_dump(mode="json")
+    state["tables"]["workflow_ticks"].append(
+        {
+            "tick_id": tick.tick_id,
+            "game_id": tick.game_session_id,
+            "turn": tick.turn_number,
+            "outcome": tick.outcome.value,
+            "starting_runtime_state": tick.starting_runtime_state.value,
+            "ending_runtime_state": tick.ending_runtime_state.value,
+            "observation_ids_json": json.dumps(list(tick.observation_ids)),
+            "mutation_budget_used": tick.mutation_budget_used,
+            "selected_task_id": None,
+            "action_attempt_id": None,
+            "planner_request_id": tick.planner_request_id,
+            "started_at": tick.started_at.isoformat(),
+            "completed_at": tick.completed_at.isoformat(),
+            "metrics_json": json.dumps(payload["metrics"], separators=(",", ":")),
+            "tick_json": tick.model_dump_json(),
+        }
+    )
+    state["tables"]["turn_metrics"].append(
+        {
+            "tick_id": tick.tick_id,
+            "game_id": tick.game_session_id,
+            "turn": tick.turn_number,
+            "metrics_json": json.dumps(payload["metrics"], separators=(",", ":")),
+            "created_at": tick.completed_at.isoformat(),
+        }
+    )
+
+
+def _rejected_terminal_replay(store, proposal):
+    state = copy.deepcopy(store.export_replay_state(proposal.game_session_id))
+    ready = next(
+        tick
+        for tick in store.list_workflow_ticks(proposal.game_session_id)
+        if isinstance(tick, StrategicProposalReadyTick)
+        and tick.proposal_id == proposal.proposal_id
+    )
+    decided_at = ready.completed_at + timedelta(seconds=1)
+    approval = StrategicProposalApprovalRecord(
+        approval_id=f"approval-{proposal.proposal_id}",
+        proposal_id=proposal.proposal_id,
+        decision=ApprovalDecision.REJECTED,
+        actor="test-user",
+        created_at=decided_at,
+        reason="not this research plan",
+    )
+    rejected = StrategicProposalRejectedTick(
+        tick_id=build_strategic_proposal_terminal_tick_id(
+            proposal.proposal_id,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_REJECTED,
+        ),
+        game_session_id=proposal.game_session_id,
+        turn_number=ready.turn_number,
+        starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+        observation_ids=ready.observation_ids,
+        started_at=decided_at,
+        completed_at=decided_at + timedelta(seconds=1),
+        planner_request_id=proposal.source_planner_request_id,
+        proposal_id=proposal.proposal_id,
+        proposal_hash=proposal.proposal_hash,
+        proposal_ready_tick_id=ready.tick_id,
+        approval_id=approval.approval_id,
+        target_contract_id=proposal.target_contract_id,
+        expected_base_revision=proposal.expected_base_revision,
+    )
+    state["tables"]["approval_records"].append(
+        {
+            "approval_id": approval.approval_id,
+            "game_id": proposal.game_session_id,
+            "proposal_type": approval.proposal_type,
+            "proposal_id": approval.proposal_id,
+            "proposal_revision": approval.proposal_revision,
+            "decision": approval.decision.value,
+            "record_json": _canonical_model_json(approval),
+            "created_at": approval.created_at.isoformat(),
+        }
+    )
+    _append_terminal_tick_to_replay(state, rejected)
+    state["tables"]["workflow_meta"] = [
+        row
+        for row in state["tables"]["workflow_meta"]
+        if row["key"] != f"human_wait:{proposal.game_session_id}"
+    ]
+    runtime = state["tables"]["runtime_state"][0]
+    runtime["state"] = RuntimeState.ROUTING.value
+    runtime["active_attempt_id"] = None
+    runtime["revision"] = int(runtime["revision"]) + 1
+    return state, approval, rejected
+
+
+def _approved_terminal_replay(store, proposal):
+    state = copy.deepcopy(store.export_replay_state(proposal.game_session_id))
+    ready = next(
+        tick
+        for tick in store.list_workflow_ticks(proposal.game_session_id)
+        if isinstance(tick, StrategicProposalReadyTick)
+        and tick.proposal_id == proposal.proposal_id
+    )
+    decided_at = ready.completed_at + timedelta(seconds=1)
+    approval = StrategicProposalApprovalRecord(
+        approval_id=f"approval-{proposal.proposal_id}",
+        proposal_id=proposal.proposal_id,
+        decision=ApprovalDecision.APPROVED,
+        actor="test-user",
+        created_at=decided_at,
+        reason="approve research strategy",
+    )
+    contract = StrategicContract(
+        contract_id=proposal.target_contract_id,
+        game_session_id=proposal.game_session_id,
+        revision=proposal.expected_base_revision + 1,
+        authority_scope_set=AuthorityScopeSet(mission_graph_scopes=("research",)),
+        mission_graph=MissionGraph(missions=(proposal.proposed_research_mission,)),
+        strategic_objectives=proposal.strategic_objectives,
+        global_constraints=proposal.global_constraints,
+        created_from_observation_id=proposal.created_from_observation_id,
+        approval_status=ApprovalStatus.APPROVED,
+    )
+    commit = StrategicContractCommit(
+        commit_id=f"commit-{proposal.proposal_id}",
+        game_session_id=proposal.game_session_id,
+        contract_id=proposal.target_contract_id,
+        expected_base_revision=proposal.expected_base_revision,
+        contract=contract,
+        committed_at=decided_at,
+        reason="Proposal-derived research activation",
+        source_proposal_id=proposal.proposal_id,
+        source_proposal_hash=proposal.proposal_hash,
+        source_approval_id=approval.approval_id,
+        source_planner_request_id=proposal.source_planner_request_id,
+        source_mission_id=proposal.proposed_research_mission.mission_id,
+        source_mission_revision=proposal.proposed_research_mission.mission_revision,
+    )
+    applied = StrategicProposalAppliedTick(
+        tick_id=build_strategic_proposal_terminal_tick_id(
+            proposal.proposal_id,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_APPLIED,
+        ),
+        game_session_id=proposal.game_session_id,
+        turn_number=ready.turn_number,
+        starting_runtime_state=RuntimeState.AWAITING_HUMAN,
+        observation_ids=ready.observation_ids,
+        started_at=decided_at,
+        completed_at=decided_at + timedelta(seconds=1),
+        planner_request_id=proposal.source_planner_request_id,
+        proposal_id=proposal.proposal_id,
+        proposal_hash=proposal.proposal_hash,
+        proposal_ready_tick_id=ready.tick_id,
+        approval_id=approval.approval_id,
+        target_contract_id=proposal.target_contract_id,
+        expected_base_revision=proposal.expected_base_revision,
+        contract_commit_id=commit.commit_id,
+        activated_contract_revision=contract.revision,
+        source_mission_id=proposal.proposed_research_mission.mission_id,
+        source_mission_revision=proposal.proposed_research_mission.mission_revision,
+    )
+    state["tables"]["approval_records"].append(
+        {
+            "approval_id": approval.approval_id,
+            "game_id": proposal.game_session_id,
+            "proposal_type": approval.proposal_type,
+            "proposal_id": approval.proposal_id,
+            "proposal_revision": approval.proposal_revision,
+            "decision": approval.decision.value,
+            "record_json": _canonical_model_json(approval),
+            "created_at": approval.created_at.isoformat(),
+        }
+    )
+    roots = state["tables"]["strategic_contract_roots"]
+    if roots:
+        assert len(roots) == 1
+        roots[0]["active_revision"] = contract.revision
+    else:
+        roots.append(
+            {
+                "game_id": proposal.game_session_id,
+                "contract_id": contract.contract_id,
+                "active_revision": contract.revision,
+                "created_at": commit.committed_at.isoformat(),
+            }
+        )
+    state["tables"]["strategic_contract_revisions"].append(
+        {
+            "game_id": proposal.game_session_id,
+            "contract_id": contract.contract_id,
+            "revision": contract.revision,
+            "contract_json": _canonical_model_json(contract),
+            "committed_at": commit.committed_at.isoformat(),
+        }
+    )
+    state["tables"]["strategic_contract_commits"].append(
+        {
+            "commit_id": commit.commit_id,
+            "game_id": proposal.game_session_id,
+            "contract_id": contract.contract_id,
+            "expected_base_revision": commit.expected_base_revision,
+            "committed_revision": contract.revision,
+            "commit_json": _canonical_model_json(commit),
+            "committed_at": commit.committed_at.isoformat(),
+        }
+    )
+    _append_terminal_tick_to_replay(state, applied)
+    state["tables"]["workflow_meta"] = [
+        row
+        for row in state["tables"]["workflow_meta"]
+        if row["key"] != f"human_wait:{proposal.game_session_id}"
+    ]
+    runtime = state["tables"]["runtime_state"][0]
+    runtime["state"] = RuntimeState.ROUTING.value
+    runtime["active_attempt_id"] = None
+    runtime["revision"] = int(runtime["revision"]) + 1
+    return state, approval, commit, applied
+
+
+def _migration_invalidated_replay(store, request, proposal, attempt):
+    ready = next(
+        tick
+        for tick in store.list_workflow_ticks(proposal.game_session_id)
+        if isinstance(tick, StrategicProposalReadyTick)
+        and tick.proposal_id == proposal.proposal_id
+    )
+    resume_request = store.strategic_proposal_wait_resume_request_for_proposal(
+        proposal.proposal_id
+    )
+    resumed = next(
+        tick
+        for tick in store.list_workflow_ticks(proposal.game_session_id)
+        if isinstance(tick, StrategicProposalWaitResumedTick)
+        and tick.proposal_id == proposal.proposal_id
+    )
+    assert resume_request is not None
+    assert request.completed_at is not None
+    assert attempt.completed_at is not None
+    causal_time = max(
+        proposal.created_at,
+        request.completed_at,
+        attempt.completed_at,
+        ready.completed_at,
+        resume_request.requested_at,
+        resumed.completed_at,
+    ) + timedelta(microseconds=1)
+    root = store.get_active_strategic_contract(proposal.game_session_id)
+    if root is None:
+        invalidation_reason = (
+            StrategicProposalInvalidationReason.PRE_PHASE1C_WAIT_RELEASED
+        )
+    elif root.contract_id != proposal.target_contract_id:
+        invalidation_reason = (
+            StrategicProposalInvalidationReason.TARGET_CONTRACT_CHANGED
+        )
+    elif proposal.target_kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+        invalidation_reason = (
+            StrategicProposalInvalidationReason.TARGET_CONTRACT_CREATED
+        )
+    elif root.revision != proposal.expected_base_revision:
+        invalidation_reason = StrategicProposalInvalidationReason.BASE_REVISION_CHANGED
+    else:
+        invalidation_reason = (
+            StrategicProposalInvalidationReason.PRE_PHASE1C_WAIT_RELEASED
+        )
+    invalidated = StrategicProposalInvalidatedTick(
+        tick_id=build_strategic_proposal_terminal_tick_id(
+            proposal.proposal_id,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED,
+        ),
+        game_session_id=proposal.game_session_id,
+        turn_number=resumed.turn_number,
+        starting_runtime_state=RuntimeState.ROUTING,
+        observation_ids=ready.observation_ids,
+        started_at=causal_time,
+        completed_at=causal_time,
+        planner_request_id=proposal.source_planner_request_id,
+        proposal_id=proposal.proposal_id,
+        proposal_hash=proposal.proposal_hash,
+        proposal_ready_tick_id=ready.tick_id,
+        target_contract_id=proposal.target_contract_id,
+        expected_base_revision=proposal.expected_base_revision,
+        invalidation_origin=(
+            StrategicProposalInvalidationOrigin.PHASE1C_ENABLEMENT_MIGRATION
+        ),
+        invalidation_reason=invalidation_reason,
+        source_resume_request_id=resume_request.resume_request_id,
+        source_wait_resumed_tick_id=resumed.tick_id,
+    )
+    state = copy.deepcopy(store.export_replay_state(proposal.game_session_id))
+    _append_terminal_tick_to_replay(state, invalidated)
+    return state, invalidated
+
+
+def _research_task_replay_row(
+    proposal,
+    *,
+    action_type="set_research",
+    status=TaskStatus.READY,
+    provenance=True,
+):
+    return {
+        "game_id": proposal.game_session_id,
+        "task_id": "phase1c-research-task",
+        "plan_id": "phase1c-research-plan",
+        "action_type": action_type,
+        "entity_type": "player",
+        "entity_id": "player-1",
+        "due_turn": 1,
+        "expires_turn": None,
+        "arguments_json": json.dumps({"technology": "TECH_WRITING"}),
+        "preconditions_json": "[]",
+        "postconditions_json": "[]",
+        "invalidators_json": "[]",
+        "risk": RiskLevel.LOW.value,
+        "requires_confirmation": 0,
+        "reason": "Mission-derived research projection",
+        "status": status.value,
+        "retry_count": 0,
+        "max_retries": 2,
+        "last_error": None,
+        "approved_by": None,
+        "created_turn": 1,
+        "created_from_observation_id": proposal.created_from_observation_id,
+        "source_contract_id": proposal.target_contract_id if provenance else None,
+        "source_contract_revision": (
+            proposal.expected_base_revision + 1 if provenance else None
+        ),
+        "source_mission_id": (
+            proposal.proposed_research_mission.mission_id if provenance else None
+        ),
+        "source_mission_revision": (
+            proposal.proposed_research_mission.mission_revision if provenance else None
+        ),
+        "updated_at": NOW.isoformat(),
+    }
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        ApprovalDecision.CANCELLED,
+        ApprovalDecision.REQUESTED_REPLAN,
+        ApprovalDecision.EDITED_AND_APPROVED,
+    ],
+)
+def test_strategic_proposal_decision_contract_rejects_shared_decisions(decision):
+    fields = {
+        "approval_id": "approval-unsupported",
+        "proposal_id": "proposal-1",
+        "decision": decision,
+        "actor": "test-user",
+        "created_at": NOW,
+    }
+    if decision is ApprovalDecision.EDITED_AND_APPROVED:
+        fields.update(
+            edited_payload={"technology": "TECH_WRITING"}, replacement_revision=2
+        )
+    with pytest.raises(ValueError):
+        StrategicProposalApprovalRecord(**fields)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"status": MissionStatus.COMPLETED}, "must be ACTIVE"),
+        ({"scope": "civic", "slot": "player:civic"}, "scope must be research"),
+        (
+            {
+                "desired_outcome": {
+                    "technology": "TECH_WRITING",
+                    "tool_name": "set_civic",
+                }
+            },
+            "cannot select an execution action",
+        ),
+    ],
+)
+def test_proposal_provenance_requires_active_closed_research_mission(updates, message):
+    request_id = "request-fixed-for-proposal-id"
+    mission = _mission("game-1", build_strategic_contract_id("game-1")).model_copy(
+        update=updates
+    )
+    with pytest.raises(ValueError, match=message):
+        build_strategic_research_proposal(
+            proposal_id=build_strategic_research_proposal_id(request_id),
+            game_session_id="game-1",
+            source_planner_request_id=request_id,
+            source_provider_attempt_id="attempt-1",
+            source_provider_attempt_number=1,
+            target_kind=PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+            target_contract_id=build_strategic_contract_id("game-1"),
+            expected_base_revision=0,
+            strategic_objectives=(),
+            global_constraints=(),
+            proposed_research_mission=mission,
+            created_from_observation_id="obs-1",
+            created_at=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {"source_contract_id": "contract-1"},
+        {"source_contract_revision": 1},
+        {"source_mission_id": "mission-1"},
+        {"source_mission_revision": 1},
+    ],
+)
+def test_stored_task_rejects_partial_mission_provenance(provenance):
+    fields = {
+        "task_id": "task-1",
+        "plan_id": "plan-1",
+        "action_type": "set_research",
+        "entity_type": "player",
+        "entity_id": "player-1",
+        "due_turn": 1,
+        "arguments": {"technology": "TECH_WRITING"},
+        "preconditions": [],
+        "postconditions": [],
+        "invalidators": [],
+        "risk": RiskLevel.LOW,
+        "requires_confirmation": False,
+        "reason": "research projection",
+        "created_turn": 1,
+        "status": TaskStatus.READY,
+        **provenance,
+    }
+    with pytest.raises(ValueError, match="all present or all null"):
+        StoredTask(**fields)
+
+
+def test_stored_task_accepts_complete_mission_provenance():
+    task = StoredTask(
+        task_id="task-1",
+        plan_id="plan-1",
+        action_type="set_research",
+        entity_type="player",
+        entity_id="player-1",
+        due_turn=1,
+        arguments={"technology": "TECH_WRITING"},
+        preconditions=[],
+        postconditions=[],
+        invalidators=[],
+        risk=RiskLevel.LOW,
+        requires_confirmation=False,
+        reason="research projection",
+        created_turn=1,
+        status=TaskStatus.READY,
+        source_contract_id="contract-1",
+        source_contract_revision=1,
+        source_mission_id="mission-1",
+        source_mission_revision=1,
+    )
+
+    assert task.source_contract_id == "contract-1"
+
+
+def test_rejected_terminal_shape_round_trips_and_has_typed_read(tmp_path):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "rejected-source.sqlite3")
+    )
+    state, approval, rejected = _rejected_terminal_replay(source, proposal)
+    restored_path = tmp_path / "rejected-restored.sqlite3"
+    restored = WorkflowStore(restored_path)
+
+    restored.import_replay_state(state)
+
+    assert (
+        restored.strategic_proposal_approval_record(
+            proposal.game_session_id, proposal.proposal_id
+        )
+        == approval
+    )
+    assert rejected in restored.list_workflow_ticks(proposal.game_session_id)
+    WorkflowStore(restored_path)
+    second = WorkflowStore(tmp_path / "rejected-second.sqlite3")
+    second.import_replay_state(restored.export_replay_state(proposal.game_session_id))
+    assert second.export_replay_state(
+        proposal.game_session_id
+    ) == restored.export_replay_state(proposal.game_session_id)
+
+
+def test_approved_terminal_shape_round_trips_complete_contract_evidence(tmp_path):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "approved-source.sqlite3")
+    )
+    state, approval, commit, applied = _approved_terminal_replay(source, proposal)
+    restored_path = tmp_path / "approved-restored.sqlite3"
+    restored = WorkflowStore(restored_path)
+
+    restored.import_replay_state(state)
+
+    active = restored.get_active_strategic_contract(proposal.game_session_id)
+    assert active == commit.contract
+    assert active is not None
+    assert active.authority_scope_set.mission_graph_scopes == ("research",)
+    assert active.mission_graph.missions == (proposal.proposed_research_mission,)
+    assert (
+        restored.strategic_proposal_approval_record(
+            proposal.game_session_id, proposal.proposal_id
+        )
+        == approval
+    )
+    assert applied in restored.list_workflow_ticks(proposal.game_session_id)
+    WorkflowStore(restored_path)
+    replayed = WorkflowStore(tmp_path / "approved-replayed.sqlite3")
+    replayed.import_replay_state(restored.export_replay_state(proposal.game_session_id))
+    assert replayed.export_replay_state(
+        proposal.game_session_id
+    ) == restored.export_replay_state(proposal.game_session_id)
+
+
+def test_repair_proposal_approved_shape_appends_existing_contract(tmp_path):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(
+            tmp_path / "approved-repair-source.sqlite3",
+            repair=True,
+        )
+    )
+    state, _approval, commit, applied = _approved_terminal_replay(source, proposal)
+    restored_path = tmp_path / "approved-repair-restored.sqlite3"
+    restored = WorkflowStore(restored_path)
+
+    restored.import_replay_state(state)
+
+    revisions = restored.list_strategic_contract_revisions(proposal.game_session_id)
+    assert [item.revision for item in revisions] == [1, 2]
+    assert revisions[-1] == commit.contract
+    assert applied in restored.list_workflow_ticks(proposal.game_session_id)
+    WorkflowStore(restored_path)
+
+
+@pytest.mark.parametrize(
+    "missing_table",
+    ["approval_records", "strategic_contract_commits", "workflow_ticks"],
+)
+def test_approved_terminal_missing_evidence_fails_before_replay_delete(
+    tmp_path, missing_table
+):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(
+            tmp_path / f"approved-missing-{missing_table}.sqlite3"
+        )
+    )
+    invalid, approval, commit, applied = _approved_terminal_replay(source, proposal)
+    identities = {
+        "approval_records": ("approval_id", approval.approval_id),
+        "strategic_contract_commits": ("commit_id", commit.commit_id),
+        "workflow_ticks": ("tick_id", applied.tick_id),
+    }
+    key, value = identities[missing_table]
+    invalid["tables"][missing_table] = [
+        row for row in invalid["tables"][missing_table] if row[key] != value
+    ]
+    if missing_table == "workflow_ticks":
+        invalid["tables"]["turn_metrics"] = [
+            row
+            for row in invalid["tables"]["turn_metrics"]
+            if row["tick_id"] != applied.tick_id
+        ]
+    target = WorkflowStore(tmp_path / f"approved-target-{missing_table}.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises((ValueError, sqlite3.IntegrityError)):
+        target.import_replay_state(invalid)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
+
+
+def test_migration_invalidated_tick_uses_one_canonical_causal_time(tmp_path):
+    store, request, proposal, attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "migration-invalidated-source.sqlite3")
+    )
+    assert store.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(store, _Game(), _Planner()).tick())
+    state, invalidated = _migration_invalidated_replay(
+        store, request, proposal, attempt
+    )
+    restored_path = tmp_path / "migration-invalidated-restored.sqlite3"
+    restored = WorkflowStore(restored_path)
+
+    restored.import_replay_state(state)
+
+    assert invalidated in restored.list_workflow_ticks(proposal.game_session_id)
+    WorkflowStore(restored_path)
+    replayed = WorkflowStore(tmp_path / "migration-invalidated-replayed.sqlite3")
+    replayed.import_replay_state(restored.export_replay_state(proposal.game_session_id))
+    assert replayed.export_replay_state(
+        proposal.game_session_id
+    ) == restored.export_replay_state(proposal.game_session_id)
+
+
+def test_migration_invalidated_tick_uses_stale_reason_precedence(tmp_path):
+    store, request, proposal, attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "migration-stale-source.sqlite3")
+    )
+    assert store.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(store, _Game(), _Planner()).tick())
+    _commit_contract(store, proposal.game_session_id)
+    state, invalidated = _migration_invalidated_replay(
+        store, request, proposal, attempt
+    )
+    restored = WorkflowStore(tmp_path / "migration-stale-restored.sqlite3")
+
+    restored.import_replay_state(state)
+
+    assert (
+        invalidated.invalidation_reason
+        is StrategicProposalInvalidationReason.TARGET_CONTRACT_CREATED
+    )
+    WorkflowStore(restored.path)
+
+
+def test_migration_invalidated_wrong_reason_fails_before_replay_delete(tmp_path):
+    store, request, proposal, attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "migration-reason-source.sqlite3")
+    )
+    assert store.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(store, _Game(), _Planner()).tick())
+    invalid, invalidated = _migration_invalidated_replay(
+        store, request, proposal, attempt
+    )
+    row = next(
+        item
+        for item in invalid["tables"]["workflow_ticks"]
+        if item["tick_id"] == invalidated.tick_id
+    )
+    forged = invalidated.model_copy(
+        update={
+            "invalidation_reason": (
+                StrategicProposalInvalidationReason.TARGET_CONTRACT_CREATED
+            )
+        }
+    )
+    row["tick_json"] = forged.model_dump_json()
+    target = WorkflowStore(tmp_path / "migration-reason-target.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="deterministic reason"):
+        target.import_replay_state(invalid)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
+
+
+def test_migration_invalidated_wrong_time_fails_before_replay_delete(tmp_path):
+    store, request, proposal, attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "migration-time-source.sqlite3")
+    )
+    assert store.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(store, _Game(), _Planner()).tick())
+    invalid, invalidated = _migration_invalidated_replay(
+        store, request, proposal, attempt
+    )
+    row = next(
+        item
+        for item in invalid["tables"]["workflow_ticks"]
+        if item["tick_id"] == invalidated.tick_id
+    )
+    forged = invalidated.model_copy(
+        update={
+            "started_at": invalidated.started_at + timedelta(microseconds=1),
+            "completed_at": invalidated.completed_at + timedelta(microseconds=1),
+        }
+    )
+    row["started_at"] = forged.started_at.isoformat()
+    row["completed_at"] = forged.completed_at.isoformat()
+    row["tick_json"] = forged.model_dump_json()
+    target = WorkflowStore(tmp_path / "migration-time-target.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="canonical causal time"):
+        target.import_replay_state(invalid)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
+
+
+def test_complete_mission_task_provenance_round_trips_without_enabling_routing(
+    tmp_path,
+):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "task-provenance-source.sqlite3")
+    )
+    state, _approval, _commit, _applied = _approved_terminal_replay(source, proposal)
+    state["tables"]["workflow_tasks"].append(_research_task_replay_row(proposal))
+    restored = WorkflowStore(tmp_path / "task-provenance-restored.sqlite3")
+
+    restored.import_replay_state(state)
+
+    task = restored.get_task(proposal.game_session_id, "phase1c-research-task")
+    assert task is not None
+    assert task.action_type == "set_research"
+    assert task.source_contract_id == proposal.target_contract_id
+    assert task.source_contract_revision == proposal.expected_base_revision + 1
+    assert task.source_mission_id == proposal.proposed_research_mission.mission_id
+    assert task.source_mission_revision == 1
+
+
+@pytest.mark.parametrize("forgery", ["partial", "wrong_action", "legacy_ready"])
+def test_replay_rejects_invalid_research_task_provenance_before_delete(
+    tmp_path, forgery
+):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / f"task-forgery-{forgery}.sqlite3")
+    )
+    state, _approval, _commit, _applied = _approved_terminal_replay(source, proposal)
+    if forgery == "partial":
+        row = _research_task_replay_row(proposal)
+        row["source_mission_revision"] = None
+    elif forgery == "wrong_action":
+        row = _research_task_replay_row(proposal, action_type="set_civic")
+    else:
+        row = _research_task_replay_row(proposal, provenance=False)
+    state["tables"]["workflow_tasks"].append(row)
+    target = WorkflowStore(tmp_path / f"task-forgery-target-{forgery}.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError):
+        target.import_replay_state(state)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
+
+
+def test_replay_rejects_cross_game_task_provenance_before_delete(tmp_path):
+    source_a, _request_a, proposal_a, _attempt_a = asyncio.run(
+        _completed_proposal_state(
+            tmp_path / "cross-game-a.sqlite3",
+            game_id="game-a",
+            planner_request_id="request-cross-game-a",
+        )
+    )
+    state_a, _approval_a, _commit_a, _applied_a = _approved_terminal_replay(
+        source_a, proposal_a
+    )
+    source_b, _request_b, proposal_b, _attempt_b = asyncio.run(
+        _completed_proposal_state(
+            tmp_path / "cross-game-b.sqlite3",
+            game_id="game-b",
+            planner_request_id="request-cross-game-b",
+        )
+    )
+    state_b, _approval_b, _commit_b, _applied_b = _approved_terminal_replay(
+        source_b, proposal_b
+    )
+    row = _research_task_replay_row(proposal_a)
+    row["source_contract_id"] = proposal_b.target_contract_id
+    row["source_mission_id"] = proposal_b.proposed_research_mission.mission_id
+    state_a["tables"]["workflow_tasks"].append(row)
+    state_a["tables"]["agent_runs"] = []
+    target = WorkflowStore(tmp_path / "cross-game-target.sqlite3")
+    target.import_replay_state(state_b)
+    before_a = target.export_replay_state(proposal_a.game_session_id)
+    before_b = target.export_replay_state(proposal_b.game_session_id)
+
+    with pytest.raises(ValueError, match="same-game Contract"):
+        target.import_replay_state(state_a)
+
+    assert target.export_replay_state(proposal_a.game_session_id) == before_a
+    assert target.export_replay_state(proposal_b.game_session_id) == before_b
+
+
+def test_foundation_commit_cannot_remove_activated_research_authority(tmp_path):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "foundation-rollback-source.sqlite3")
+    )
+    state, _approval, commit, _applied = _approved_terminal_replay(source, proposal)
+    store = WorkflowStore(tmp_path / "foundation-rollback.sqlite3")
+    store.import_replay_state(state)
+    before = store.export_replay_state(proposal.game_session_id)
+    rollback_contract = StrategicContract(
+        contract_id=proposal.target_contract_id,
+        game_session_id=proposal.game_session_id,
+        revision=commit.contract.revision + 1,
+        strategic_objectives=("rollback authority",),
+    )
+    rollback_commit = StrategicContractCommit(
+        commit_id="foundation-rollback-commit",
+        game_session_id=proposal.game_session_id,
+        contract_id=proposal.target_contract_id,
+        expected_base_revision=commit.contract.revision,
+        contract=rollback_contract,
+        committed_at=commit.committed_at + timedelta(seconds=2),
+        reason="forged foundation rollback",
+    )
+
+    with pytest.raises(ValueError, match="cannot follow Proposal activation"):
+        store.commit_strategic_contract_revision(rollback_commit)
+
+    assert store.export_replay_state(proposal.game_session_id) == before
+    WorkflowStore(store.path)
+
+
+@pytest.mark.parametrize("missing", ["approval", "commit", "applied"])
+def test_startup_rejects_incomplete_approved_terminal_aggregate(tmp_path, missing):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(
+            tmp_path / f"startup-approved-{missing}-source.sqlite3"
+        )
+    )
+    state, approval, commit, applied = _approved_terminal_replay(source, proposal)
+    path = tmp_path / f"startup-approved-{missing}.sqlite3"
+    restored = WorkflowStore(path)
+    restored.import_replay_state(state)
+
+    with sqlite3.connect(path) as conn:
+        if missing == "approval":
+            conn.execute(
+                "DELETE FROM approval_records WHERE approval_id=?",
+                (approval.approval_id,),
+            )
+        elif missing == "commit":
+            conn.execute(
+                "DELETE FROM strategic_contract_commits WHERE commit_id=?",
+                (commit.commit_id,),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM workflow_ticks WHERE tick_id=?", (applied.tick_id,)
+            )
+
+    with pytest.raises(ValueError):
+        WorkflowStore(path)
+
+
+def test_startup_rejects_wrong_proposal_hash_in_contract_commit(tmp_path):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "startup-wrong-hash-source.sqlite3")
+    )
+    state, _approval, commit, _applied = _approved_terminal_replay(source, proposal)
+    path = tmp_path / "startup-wrong-hash.sqlite3"
+    restored = WorkflowStore(path)
+    restored.import_replay_state(state)
+    forged = commit.model_copy(update={"source_proposal_hash": "0" * 64})
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE strategic_contract_commits SET commit_json=?
+            WHERE commit_id=?
+            """,
+            (_canonical_model_json(forged), commit.commit_id),
+        )
+
+    with pytest.raises(ValueError, match="APPROVED Proposal"):
+        WorkflowStore(path)
+
+
+def test_replay_rejects_mixed_human_and_system_terminal_facts_before_delete(
+    tmp_path,
+):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "mixed-terminal-source.sqlite3")
+    )
+    invalid, _approval, _commit, applied = _approved_terminal_replay(source, proposal)
+    invalidated = StrategicProposalInvalidatedTick(
+        tick_id=build_strategic_proposal_terminal_tick_id(
+            proposal.proposal_id,
+            TickOutcomeKind.STRATEGIC_PROPOSAL_INVALIDATED,
+        ),
+        game_session_id=proposal.game_session_id,
+        turn_number=applied.turn_number,
+        starting_runtime_state=RuntimeState.ROUTING,
+        observation_ids=applied.observation_ids,
+        started_at=applied.completed_at + timedelta(seconds=1),
+        completed_at=applied.completed_at + timedelta(seconds=1),
+        planner_request_id=proposal.source_planner_request_id,
+        proposal_id=proposal.proposal_id,
+        proposal_hash=proposal.proposal_hash,
+        proposal_ready_tick_id=applied.proposal_ready_tick_id,
+        target_contract_id=proposal.target_contract_id,
+        expected_base_revision=proposal.expected_base_revision,
+        invalidation_origin=StrategicProposalInvalidationOrigin.RUNTIME,
+        invalidation_reason=(
+            StrategicProposalInvalidationReason.TARGET_CONTRACT_CREATED
+        ),
+    )
+    _append_terminal_tick_to_replay(invalid, invalidated)
+    target = WorkflowStore(tmp_path / "mixed-terminal-target.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="mixed terminal authorities"):
+        target.import_replay_state(invalid)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
+
+
+def test_replay_rejects_duplicate_invalidation_fact_before_delete(tmp_path):
+    store, request, proposal, attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "duplicate-invalidation-source.sqlite3")
+    )
+    assert store.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(store, _Game(), _Planner()).tick())
+    invalid, invalidated = _migration_invalidated_replay(
+        store, request, proposal, attempt
+    )
+    tick_row = next(
+        row
+        for row in invalid["tables"]["workflow_ticks"]
+        if row["tick_id"] == invalidated.tick_id
+    )
+    metric_row = next(
+        row
+        for row in invalid["tables"]["turn_metrics"]
+        if row["tick_id"] == invalidated.tick_id
+    )
+    invalid["tables"]["workflow_ticks"].append(copy.deepcopy(tick_row))
+    invalid["tables"]["turn_metrics"].append(copy.deepcopy(metric_row))
+    target = WorkflowStore(tmp_path / "duplicate-invalidation-target.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="duplicate replay primary key"):
+        target.import_replay_state(invalid)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
+
+
+def test_startup_rejects_partial_or_wrong_action_task_provenance(tmp_path):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "startup-task-source.sqlite3")
+    )
+    state, _approval, _commit, _applied = _approved_terminal_replay(source, proposal)
+    state["tables"]["workflow_tasks"].append(_research_task_replay_row(proposal))
+    path = tmp_path / "startup-task.sqlite3"
+    restored = WorkflowStore(path)
+    restored.import_replay_state(state)
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE workflow_tasks SET action_type='set_civic'
+            WHERE game_id=? AND task_id='phase1c-research-task'
+            """,
+            (proposal.game_session_id,),
+        )
+
+    with pytest.raises(ValueError, match="set_research"):
+        WorkflowStore(path)
+
+
+def test_startup_rejects_noncanonical_migration_invalidation_time(tmp_path):
+    store, request, proposal, attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "startup-migration-source.sqlite3")
+    )
+    assert store.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(store, _Game(), _Planner()).tick())
+    state, invalidated = _migration_invalidated_replay(
+        store, request, proposal, attempt
+    )
+    path = tmp_path / "startup-migration.sqlite3"
+    restored = WorkflowStore(path)
+    restored.import_replay_state(state)
+    forged = invalidated.model_copy(
+        update={
+            "started_at": invalidated.started_at + timedelta(microseconds=1),
+            "completed_at": invalidated.completed_at + timedelta(microseconds=1),
+        }
+    )
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE workflow_ticks
+            SET started_at=?, completed_at=?, tick_json=?
+            WHERE tick_id=?
+            """,
+            (
+                forged.started_at.isoformat(),
+                forged.completed_at.isoformat(),
+                forged.model_dump_json(),
+                forged.tick_id,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="canonical causal time"):
+        WorkflowStore(path)
+
+
+def test_replay_rejects_incomplete_rejected_terminal_before_delete(tmp_path):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "incomplete-source.sqlite3")
+    )
+    invalid, _approval, rejected = _rejected_terminal_replay(source, proposal)
+    invalid["tables"]["workflow_ticks"] = [
+        row
+        for row in invalid["tables"]["workflow_ticks"]
+        if row["tick_id"] != rejected.tick_id
+    ]
+    invalid["tables"]["turn_metrics"] = [
+        row
+        for row in invalid["tables"]["turn_metrics"]
+        if row["tick_id"] != rejected.tick_id
+    ]
+    target = WorkflowStore(tmp_path / "incomplete-target.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="Proposal"):
+        target.import_replay_state(invalid)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        "save_workflow_tick",
+        "persist_tick_and_runtime_state",
+        "persist_phase4_tick",
+    ],
+)
+def test_public_store_rejects_strategic_terminal_facts(tmp_path, entrypoint):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / "public-terminal.sqlite3")
+    )
+    _state, approval, rejected = _rejected_terminal_replay(source, proposal)
+    before = source.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="aggregate decision transaction"):
+        source.save_approval_record(proposal.game_session_id, approval)
+    with pytest.raises(ValueError, match="aggregate decision transaction"):
+        getattr(source, entrypoint)(rejected)
+
+    assert source.export_replay_state(proposal.game_session_id) == before
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ["proposal_hash", "strategic_objectives", "extra_mission"],
+)
+def test_replay_rejects_forged_approved_contract_content_before_delete(
+    tmp_path, forgery
+):
+    source, _request, proposal, _attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / f"approved-forgery-{forgery}.sqlite3")
+    )
+    invalid, _approval, commit, _applied = _approved_terminal_replay(source, proposal)
+    revision_row = invalid["tables"]["strategic_contract_revisions"][0]
+    commit_row = invalid["tables"]["strategic_contract_commits"][0]
+    if forgery == "proposal_hash":
+        forged_commit = commit.model_copy(update={"source_proposal_hash": "0" * 64})
+    else:
+        contract = commit.contract
+        if forgery == "strategic_objectives":
+            forged_contract = contract.model_copy(
+                update={"strategic_objectives": ("forged objective",)}
+            )
+        else:
+            extra = proposal.proposed_research_mission.model_copy(
+                update={
+                    "mission_id": "mission-z-extra",
+                    "objective": "extra research",
+                }
+            )
+            forged_contract = contract.model_copy(
+                update={
+                    "mission_graph": MissionGraph(
+                        missions=(
+                            proposal.proposed_research_mission,
+                            extra,
+                        )
+                    )
+                }
+            )
+        forged_commit = commit.model_copy(update={"contract": forged_contract})
+        revision_row["contract_json"] = _canonical_model_json(forged_contract)
+    commit_row["commit_json"] = _canonical_model_json(forged_commit)
+    target = WorkflowStore(tmp_path / f"approved-forgery-{forgery}-target.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError, match="APPROVED Proposal"):
+        target.import_replay_state(invalid)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
+
+
+@pytest.mark.parametrize("missing", ["resume_request", "resumed_tick"])
+def test_replay_rejects_migration_invalidation_missing_source_before_delete(
+    tmp_path, missing
+):
+    store, request, proposal, attempt = asyncio.run(
+        _completed_proposal_state(tmp_path / f"migration-missing-{missing}.sqlite3")
+    )
+    assert store.request_human_resume(proposal.game_session_id) is True
+    asyncio.run(_engine(store, _Game(), _Planner()).tick())
+    invalid, invalidated = _migration_invalidated_replay(
+        store, request, proposal, attempt
+    )
+    if missing == "resume_request":
+        invalid["tables"]["strategic_proposal_wait_resume_requests"] = []
+    else:
+        invalid["tables"]["workflow_ticks"] = [
+            row
+            for row in invalid["tables"]["workflow_ticks"]
+            if row["tick_id"] != invalidated.source_wait_resumed_tick_id
+        ]
+        invalid["tables"]["turn_metrics"] = [
+            row
+            for row in invalid["tables"]["turn_metrics"]
+            if row["tick_id"] != invalidated.source_wait_resumed_tick_id
+        ]
+    target = WorkflowStore(tmp_path / f"migration-missing-{missing}-target.sqlite3")
+    target.set_meta("last_game_id", proposal.game_session_id)
+    before = target.export_replay_state(proposal.game_session_id)
+
+    with pytest.raises(ValueError):
+        target.import_replay_state(invalid)
+
+    assert target.export_replay_state(proposal.game_session_id) == before
