@@ -17,16 +17,22 @@ from .domain import (
     ApprovalDecision,
     ApprovalRecord,
     ApprovalStatus,
+    AwaitingHumanTick,
     AttemptReconciledTick,
     AttemptRecoveredTick,
     AttemptStatus,
     DecisionGap,
     DecisionGapStatus,
     DecisionGroup,
+    InformationCollectedTick,
     InformationRound,
     InformationRoundStatus,
+    InformationRequestedTick,
+    LogicalPlannerRequestCreatedTick,
     PlanLease,
     PlanLeaseStatus,
+    PlannerAttemptCompletedTick,
+    PlannerBackoffTick,
     PlannerRequest,
     PlannerResponseEvidenceCompatibility,
     PlannerRequestStatus,
@@ -34,11 +40,24 @@ from .domain import (
     PlannerRequestTargetKind,
     ProviderAttempt,
     StrategicContract,
+    STRATEGIC_PROPOSAL_TARGET_KINDS,
+    StrategicProposalWaitResumeRequest,
+    StrategicResearchProposal,
+    StrategicProposalReadyTick,
+    StrategicRequestTerminatedTick,
+    StrategicRequestWaitErrorTick,
+    StrategicRequestWaitResumedTick,
+    StrategicProposalWaitErrorTick,
+    StrategicProposalWaitResumedTick,
+    build_strategic_proposal_wait_resume_request,
+    build_strategic_contract_id,
     StrategicContractCommit,
     RuntimeState,
+    TickOutcomeKind,
     TurnTransitionConfirmedTick,
     WorkflowTick,
     validate_workflow_tick,
+    validate_workflow_tick_json,
     ProviderAttemptStatus,
     canonical_json,
     canonical_json_hash,
@@ -54,7 +73,10 @@ from .models import (
     TaskStatus,
     TickMetrics,
 )
-from .workflow_protocol import canonical_workflow_plan_bundle_payload
+from .workflow_protocol import (
+    canonical_strategic_research_proposal_response_payload,
+    canonical_workflow_plan_bundle_payload,
+)
 
 
 _STICKY_EVENT_TYPES = {
@@ -67,6 +89,10 @@ _STICKY_EVENT_TYPES = {
 
 class TaskIdentityConflictError(ValueError):
     """Raised when an existing task ID is reused for different semantics."""
+
+
+class StaleStrategicContractBaseError(ValueError):
+    """Raised when Proposal persistence loses its frozen Contract base."""
 
 
 class _PlannerResponseFacts(StrEnum):
@@ -291,8 +317,31 @@ CREATE TABLE IF NOT EXISTS information_rounds (
         REFERENCES logical_planner_requests(planner_request_id)
 );
 
+CREATE TABLE IF NOT EXISTS strategic_research_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    source_planner_request_id TEXT NOT NULL UNIQUE,
+    source_provider_attempt_id TEXT NOT NULL UNIQUE,
+    source_provider_attempt_number INTEGER NOT NULL
+        CHECK (source_provider_attempt_number >= 1),
+    target_kind TEXT NOT NULL,
+    target_contract_id TEXT NOT NULL,
+    expected_base_revision INTEGER NOT NULL CHECK (expected_base_revision >= 0),
+    proposal_hash TEXT NOT NULL,
+    proposal_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (source_planner_request_id)
+        REFERENCES logical_planner_requests(planner_request_id),
+    FOREIGN KEY (source_provider_attempt_id)
+        REFERENCES provider_attempts(provider_attempt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategic_research_proposals_game
+ON strategic_research_proposals (game_id, target_kind, target_contract_id);
+
 CREATE TABLE IF NOT EXISTS plan_leases (
     plan_lease_id TEXT PRIMARY KEY,
+
     game_id TEXT NOT NULL,
     scope TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -440,6 +489,24 @@ CREATE TABLE IF NOT EXISTS workflow_ticks (
 
 CREATE INDEX IF NOT EXISTS idx_workflow_ticks_game_turn
 ON workflow_ticks (game_id, turn);
+
+CREATE TABLE IF NOT EXISTS strategic_proposal_wait_resume_requests (
+    resume_request_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    proposal_id TEXT NOT NULL UNIQUE,
+    planner_request_id TEXT NOT NULL,
+    proposal_ready_tick_id TEXT NOT NULL UNIQUE,
+    target_kind TEXT NOT NULL,
+    expected_base_revision INTEGER NOT NULL CHECK (expected_base_revision >= 0),
+    request_json TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id)
+        REFERENCES strategic_research_proposals(proposal_id),
+    FOREIGN KEY (planner_request_id)
+        REFERENCES logical_planner_requests(planner_request_id),
+    FOREIGN KEY (proposal_ready_tick_id)
+        REFERENCES workflow_ticks(tick_id)
+);
 """
 
 REPLAY_STATE_TABLES = (
@@ -457,6 +524,7 @@ REPLAY_STATE_TABLES = (
     "approval_records",
     "logical_planner_requests",
     "provider_attempts",
+    "strategic_research_proposals",
     "information_rounds",
     "plan_leases",
     "planner_suppressions",
@@ -467,6 +535,7 @@ REPLAY_STATE_TABLES = (
     "action_attempt_transitions",
     "runtime_state",
     "workflow_ticks",
+    "strategic_proposal_wait_resume_requests",
 )
 
 
@@ -476,10 +545,10 @@ class WorkflowStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > 9:
+            if version > 10:
                 raise ValueError(
                     f"unsupported workflow database version {version}; "
-                    "maximum supported version is 9"
+                    "maximum supported version is 10"
                 )
             conn.executescript(SCHEMA)
             self._migrate(conn)
@@ -679,10 +748,10 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > 9:
+        if version > 10:
             raise ValueError(
                 f"unsupported workflow database version {version}; "
-                "maximum supported version is 9"
+                "maximum supported version is 10"
             )
         upgraded_from_pre_v7 = version < 7
         if upgraded_from_pre_v7:
@@ -714,6 +783,13 @@ class WorkflowStore:
             conn.execute("PRAGMA user_version=9")
         else:
             WorkflowStore._validate_phase1b_v9(conn)
+
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < 10:
+            WorkflowStore._migrate_phase1b_v10(conn)
+            conn.execute("PRAGMA user_version=10")
+        else:
+            WorkflowStore._validate_phase1b_proposals_v10(conn)
 
     @classmethod
     def _migrate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
@@ -748,6 +824,12 @@ class WorkflowStore:
             commits,
             require_canonical=True,
         )
+
+    @classmethod
+    def _migrate_phase1b_v10(cls, conn: sqlite3.Connection) -> None:
+        """Add candidate Proposal persistence without changing Contract authority."""
+
+        cls._validate_phase1b_proposals_v10(conn)
 
     @classmethod
     def _normalize_contract_root_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1012,6 +1094,1498 @@ class WorkflowStore:
                 "v9 StrategicContract foundation requires empty authority scope and "
                 "MissionGraph"
             )
+
+    @classmethod
+    def _normalize_strategic_research_proposal_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "proposal_id",
+            "game_id",
+            "source_planner_request_id",
+            "source_provider_attempt_id",
+            "source_provider_attempt_number",
+            "target_kind",
+            "target_contract_id",
+            "expected_base_revision",
+            "proposal_hash",
+            "proposal_json",
+            "created_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                f"StrategicResearchProposal row is missing columns: {sorted(missing)}"
+            )
+        try:
+            proposal = StrategicResearchProposal.model_validate_json(
+                str(normalized["proposal_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid StrategicResearchProposal JSON") from exc
+        created_at = cls._parse_audit_datetime(
+            normalized["created_at"], "StrategicResearchProposal created_at"
+        )
+        if created_at is None or created_at.tzinfo is None:
+            raise ValueError("StrategicResearchProposal created_at requires timezone")
+        relational = {
+            "proposal_id": proposal.proposal_id,
+            "game_id": proposal.game_session_id,
+            "source_planner_request_id": proposal.source_planner_request_id,
+            "source_provider_attempt_id": proposal.source_provider_attempt_id,
+            "source_provider_attempt_number": proposal.source_provider_attempt_number,
+            "target_kind": proposal.target_kind.value,
+            "target_contract_id": proposal.target_contract_id,
+            "expected_base_revision": proposal.expected_base_revision,
+            "proposal_hash": proposal.proposal_hash,
+            "created_at": proposal.created_at,
+        }
+        for column, expected in relational.items():
+            actual = created_at if column == "created_at" else normalized[column]
+            if column in {
+                "source_provider_attempt_number",
+                "expected_base_revision",
+            }:
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"StrategicResearchProposal {column} must be an integer"
+                    ) from exc
+            if actual != expected:
+                raise ValueError(
+                    "StrategicResearchProposal relational columns disagree with JSON"
+                )
+        normalized.update(
+            {
+                "source_provider_attempt_number": proposal.source_provider_attempt_number,
+                "expected_base_revision": proposal.expected_base_revision,
+                "proposal_json": cls._dump(proposal.model_dump(mode="json")),
+                "created_at": proposal.created_at.isoformat(),
+            }
+        )
+        return normalized
+
+    @classmethod
+    def _normalize_strategic_proposal_wait_resume_request_row(
+        cls, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        required = {
+            "resume_request_id",
+            "game_id",
+            "proposal_id",
+            "planner_request_id",
+            "proposal_ready_tick_id",
+            "target_kind",
+            "expected_base_revision",
+            "request_json",
+            "requested_at",
+        }
+        missing = required - normalized.keys()
+        if missing:
+            raise ValueError(
+                "Strategic Proposal Resume Request row is missing columns: "
+                f"{sorted(missing)}"
+            )
+        try:
+            request = StrategicProposalWaitResumeRequest.model_validate_json(
+                str(normalized["request_json"])
+            )
+        except Exception as exc:
+            raise ValueError("invalid Strategic Proposal Resume Request JSON") from exc
+        requested_at = cls._parse_audit_datetime(
+            normalized["requested_at"],
+            "Strategic Proposal Resume Request requested_at",
+        )
+        if requested_at is None or requested_at.tzinfo is None:
+            raise ValueError("Strategic Proposal Resume Request requires timezone")
+        relational = {
+            "resume_request_id": request.resume_request_id,
+            "game_id": request.game_session_id,
+            "proposal_id": request.proposal_id,
+            "planner_request_id": request.planner_request_id,
+            "proposal_ready_tick_id": request.proposal_ready_tick_id,
+            "target_kind": request.target_kind.value,
+            "expected_base_revision": request.expected_base_revision,
+            "requested_at": request.requested_at,
+        }
+        for column, expected in relational.items():
+            actual = requested_at if column == "requested_at" else normalized[column]
+            if column == "expected_base_revision":
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Strategic Proposal Resume Request base must be an integer"
+                    ) from exc
+            if actual != expected:
+                raise ValueError(
+                    "Strategic Proposal Resume Request columns disagree with JSON"
+                )
+        normalized.update(
+            {
+                "expected_base_revision": request.expected_base_revision,
+                "request_json": cls._dump(request.model_dump(mode="json")),
+                "requested_at": request.requested_at.isoformat(),
+            }
+        )
+        return normalized
+
+    @classmethod
+    def _validate_strategic_proposal_attempt(
+        cls,
+        proposal: StrategicResearchProposal,
+        request: PlannerRequest,
+        attempt_rows: Sequence[Mapping[str, Any]],
+    ) -> None:
+        normalized_attempts = [
+            cls._normalize_provider_attempt_row(row) for row in attempt_rows
+        ]
+        matching = [
+            row
+            for row in normalized_attempts
+            if str(row["planner_request_id"]) == request.planner_request_id
+        ]
+        if not matching:
+            raise ValueError("Proposal requires a matching final ProviderAttempt")
+        maximum = max(int(row["attempt_number"]) for row in matching)
+        if request.provider_attempt_count != maximum:
+            raise ValueError(
+                "Proposal requires provider_attempt_count to match the maximum Attempt"
+            )
+        if proposal.source_provider_attempt_number != maximum:
+            raise ValueError("Proposal must bind the maximum ProviderAttempt number")
+        final_row = next(
+            row for row in matching if int(row["attempt_number"]) == maximum
+        )
+        if final_row["game_id"] != proposal.game_session_id:
+            raise ValueError("Proposal final ProviderAttempt belongs to another game")
+        final_attempt = ProviderAttempt.model_validate_json(
+            str(final_row["attempt_json"])
+        )
+        if final_attempt.provider_attempt_id != proposal.source_provider_attempt_id:
+            raise ValueError("Proposal must bind the final ProviderAttempt identity")
+        if (
+            final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+            or final_attempt.completed_at is None
+        ):
+            raise ValueError("Proposal requires a completed SUCCEEDED final Attempt")
+
+    @staticmethod
+    def _validate_strategic_proposal_target(
+        proposal: StrategicResearchProposal, request: PlannerRequest
+    ) -> None:
+        target = request.target
+        if target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+            raise ValueError("Proposal parent Request target is not supported")
+        if proposal.target_kind is not target.kind:
+            raise ValueError("Proposal target kind disagrees with PlannerRequest")
+        if target.strategic_scope != "research":
+            raise ValueError("Strategic research Proposal requires research scope")
+        if target.kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            contract_id = target.strategic_contract_id or build_strategic_contract_id(
+                request.game_session_id
+            )
+            base_revision = 0
+        else:
+            assert target.strategic_contract_id is not None
+            assert target.base_contract_revision is not None
+            contract_id = target.strategic_contract_id
+            base_revision = target.base_contract_revision
+        if proposal.target_contract_id != contract_id:
+            raise ValueError("Proposal Contract ID disagrees with PlannerRequest")
+        if proposal.expected_base_revision != base_revision:
+            raise ValueError("Proposal base revision disagrees with PlannerRequest")
+
+    @classmethod
+    def _validate_strategic_proposal_state(
+        cls,
+        proposal_rows: Sequence[Mapping[str, Any]],
+        request_rows: Sequence[Mapping[str, Any]],
+        attempt_rows: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        normalized_proposals = [
+            cls._normalize_strategic_research_proposal_row(row) for row in proposal_rows
+        ]
+        normalized_requests = [
+            cls._normalize_planner_request_row(row, validate_response_contract=True)
+            for row in request_rows
+        ]
+        normalized_attempts = [
+            cls._normalize_provider_attempt_row(row) for row in attempt_rows
+        ]
+        if require_canonical:
+            for index, row in enumerate(proposal_rows):
+                source = dict(row)
+                normalized = normalized_proposals[index]
+                if source != normalized:
+                    raise ValueError("StrategicResearchProposal row is not canonical")
+
+        requests: dict[str, PlannerRequest] = {}
+        for row in normalized_requests:
+            request = PlannerRequest.model_validate_json(str(row["request_json"]))
+            if request.planner_request_id in requests:
+                raise ValueError("duplicate PlannerRequest identity")
+            requests[request.planner_request_id] = request
+
+        proposals_by_request: dict[str, StrategicResearchProposal] = {}
+        proposal_ids: set[str] = set()
+        attempt_ids: set[str] = set()
+        for row in normalized_proposals:
+            proposal = StrategicResearchProposal.model_validate_json(
+                str(row["proposal_json"])
+            )
+            if proposal.proposal_id in proposal_ids:
+                raise ValueError("duplicate StrategicResearchProposal identity")
+            proposal_ids.add(proposal.proposal_id)
+            if proposal.source_planner_request_id in proposals_by_request:
+                raise ValueError("a PlannerRequest cannot have two Proposals")
+            if proposal.source_provider_attempt_id in attempt_ids:
+                raise ValueError("a ProviderAttempt cannot support two Proposals")
+            attempt_ids.add(proposal.source_provider_attempt_id)
+            proposals_by_request[proposal.source_planner_request_id] = proposal
+
+            request = requests.get(proposal.source_planner_request_id)
+            if request is None:
+                raise ValueError("Proposal parent PlannerRequest does not exist")
+            if request.game_session_id != proposal.game_session_id:
+                raise ValueError(
+                    "Proposal and PlannerRequest belong to different games"
+                )
+            if request.status is not PlannerRequestStatus.COMPLETED:
+                raise ValueError("Proposal parent PlannerRequest must be COMPLETED")
+            if proposal.created_from_observation_id != request.observation_id:
+                raise ValueError(
+                    "Proposal observation identity disagrees with PlannerRequest"
+                )
+            validation = request.validation_result
+            if (
+                validation is None
+                or validation.get("proposal_id") != proposal.proposal_id
+                or validation.get("proposal_hash") != proposal.proposal_hash
+            ):
+                raise ValueError(
+                    "Proposal identity disagrees with PlannerRequest validation result"
+                )
+            projection_context = request.input_projection.get(
+                "strategic_proposal_context", request.input_projection
+            )
+            if not isinstance(projection_context, Mapping):
+                raise ValueError("Proposal PlannerRequest input projection is missing")
+            expected_projection = {
+                "target_contract_id": proposal.target_contract_id,
+                "expected_base_revision": proposal.expected_base_revision,
+                "strategic_scope": "research",
+            }
+            if any(
+                projection_context.get(key) != value
+                for key, value in expected_projection.items()
+            ):
+                raise ValueError(
+                    "Proposal identity disagrees with frozen input projection"
+                )
+            cls._validate_strategic_proposal_target(proposal, request)
+            cls._validate_strategic_proposal_attempt(
+                proposal, request, normalized_attempts
+            )
+
+        for request in requests.values():
+            if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                continue
+            proposal = proposals_by_request.get(request.planner_request_id)
+            if request.status is PlannerRequestStatus.COMPLETED and proposal is None:
+                raise ValueError(
+                    "COMPLETED non-legacy PlannerRequest requires Proposal"
+                )
+            if (
+                request.status is not PlannerRequestStatus.COMPLETED
+                and proposal is not None
+            ):
+                raise ValueError("non-COMPLETED PlannerRequest cannot own Proposal")
+
+    @classmethod
+    def _workflow_tick_from_row(cls, row: Mapping[str, Any]) -> WorkflowTick:
+        required = {
+            "tick_id",
+            "game_id",
+            "turn",
+            "outcome",
+            "starting_runtime_state",
+            "ending_runtime_state",
+            "observation_ids_json",
+            "mutation_budget_used",
+            "planner_request_id",
+            "started_at",
+            "completed_at",
+            "tick_json",
+        }
+        missing = required - row.keys()
+        if missing:
+            raise ValueError(f"WorkflowTick row is missing columns: {sorted(missing)}")
+        try:
+            tick = validate_workflow_tick_json(str(row["tick_json"]))
+        except Exception as exc:
+            raise ValueError("invalid WorkflowTick JSON") from exc
+        checks = {
+            "tick_id": tick.tick_id,
+            "game_id": tick.game_session_id,
+            "turn": tick.turn_number,
+            "outcome": tick.outcome.value,
+            "starting_runtime_state": tick.starting_runtime_state.value,
+            "ending_runtime_state": tick.ending_runtime_state.value,
+            "mutation_budget_used": tick.mutation_budget_used,
+            "planner_request_id": getattr(tick, "planner_request_id", None),
+        }
+        for column, expected in checks.items():
+            actual = row[column]
+            if column in {"turn", "mutation_budget_used"}:
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"WorkflowTick {column} must be an integer"
+                    ) from exc
+            elif actual is not None:
+                actual = str(actual)
+            if actual != expected:
+                raise ValueError(f"WorkflowTick {column} conflicts with tick_json")
+        try:
+            observation_ids = tuple(cls._load(str(row["observation_ids_json"])))
+        except Exception as exc:
+            raise ValueError("invalid WorkflowTick observation IDs") from exc
+        if observation_ids != tick.observation_ids:
+            raise ValueError("WorkflowTick observation IDs conflict with tick_json")
+        for column, expected in (
+            ("started_at", tick.started_at),
+            ("completed_at", tick.completed_at),
+        ):
+            if cls._parse_audit_datetime(row[column], column) != expected:
+                raise ValueError(f"WorkflowTick {column} conflicts with tick_json")
+        return tick
+
+    @classmethod
+    def _validate_strategic_information_round_state(
+        cls,
+        requests: Mapping[str, PlannerRequest],
+        attempt_rows: Sequence[Mapping[str, Any]],
+        round_rows: Sequence[Mapping[str, Any]],
+        tick_rows: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        attempts_by_request: dict[str, list[tuple[str, ProviderAttempt]]] = {}
+        for source_row in attempt_rows:
+            normalized = cls._normalize_provider_attempt_row(source_row)
+            parent = requests.get(str(normalized["planner_request_id"]))
+            if (
+                parent is None
+                or parent.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS
+            ):
+                continue
+            game_id = str(normalized["game_id"])
+            if game_id != parent.game_session_id:
+                raise ValueError(
+                    "strategic ProviderAttempt game disagrees with PlannerRequest"
+                )
+            attempt = ProviderAttempt.model_validate_json(
+                str(normalized["attempt_json"])
+            )
+            attempts_by_request.setdefault(parent.planner_request_id, []).append(
+                (game_id, attempt)
+            )
+
+        rounds_by_request: dict[str, list[InformationRound]] = {}
+        seen_round_ids: set[str] = set()
+        seen_numbers: set[tuple[str, int]] = set()
+        for source_row in round_rows:
+            normalized = cls._normalize_information_round_row(source_row)
+            round_record = InformationRound.model_validate_json(
+                str(normalized["round_json"])
+            )
+            parent = requests.get(round_record.planner_request_id)
+            if parent is None:
+                raise ValueError(
+                    "InformationRound parent PlannerRequest does not exist"
+                )
+            if parent.game_session_id != str(normalized["game_id"]):
+                raise ValueError("InformationRound game disagrees with PlannerRequest")
+            if parent.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                continue
+            if require_canonical and dict(source_row) != normalized:
+                raise ValueError("strategic InformationRound row is not canonical")
+            if round_record.information_round_id in seen_round_ids:
+                raise ValueError("duplicate strategic InformationRound identity")
+            seen_round_ids.add(round_record.information_round_id)
+            number_key = (
+                round_record.planner_request_id,
+                round_record.round_number,
+            )
+            if number_key in seen_numbers:
+                raise ValueError("duplicate strategic InformationRound number")
+            seen_numbers.add(number_key)
+            rounds_by_request.setdefault(round_record.planner_request_id, []).append(
+                round_record
+            )
+
+        strategic_request_ids = {
+            request.planner_request_id
+            for request in requests.values()
+            if request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+        }
+        requested_ticks: dict[tuple[str, str], list[InformationRequestedTick]] = {}
+        collected_ticks: dict[tuple[str, str], list[InformationCollectedTick]] = {}
+        attempt_completed_ticks: dict[str, list[PlannerAttemptCompletedTick]] = {}
+        for source_row in tick_rows:
+            tick = cls._workflow_tick_from_row(source_row)
+            if isinstance(tick, InformationRequestedTick):
+                if tick.planner_request_id in strategic_request_ids:
+                    requested_ticks.setdefault(
+                        (tick.planner_request_id, tick.information_round_id), []
+                    ).append(tick)
+            elif isinstance(tick, InformationCollectedTick):
+                if tick.planner_request_id in strategic_request_ids:
+                    collected_ticks.setdefault(
+                        (tick.planner_request_id, tick.information_round_id), []
+                    ).append(tick)
+            elif isinstance(tick, PlannerAttemptCompletedTick):
+                if tick.planner_request_id in strategic_request_ids:
+                    attempt_completed_ticks.setdefault(
+                        tick.planner_request_id, []
+                    ).append(tick)
+
+        for request in requests.values():
+            if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                continue
+            attempts = sorted(
+                attempts_by_request.get(request.planner_request_id, []),
+                key=lambda item: item[1].attempt_number,
+            )
+            attempt_numbers = [item[1].attempt_number for item in attempts]
+            maximum_attempt_number = attempt_numbers[-1] if attempt_numbers else 0
+            if request.provider_attempt_count != maximum_attempt_number:
+                raise ValueError(
+                    "strategic provider_attempt_count disagrees with Attempt history"
+                )
+            if attempt_numbers != list(range(1, maximum_attempt_number + 1)):
+                raise ValueError("strategic ProviderAttempt numbers must be contiguous")
+            attempts_by_id = {
+                attempt.provider_attempt_id: attempt for _game_id, attempt in attempts
+            }
+            completion_ticks = attempt_completed_ticks.get(
+                request.planner_request_id, []
+            )
+            for completion_tick in completion_ticks:
+                attempt = attempts_by_id.get(completion_tick.provider_attempt_id)
+                if (
+                    attempt is None
+                    or completion_tick.game_session_id != request.game_session_id
+                    or completion_tick.provider_attempt_count < 1
+                    or attempt.status is ProviderAttemptStatus.STARTED
+                    or attempt.completed_at is None
+                    or completion_tick.completed_at < attempt.completed_at
+                ):
+                    raise ValueError(
+                        "strategic PlannerAttemptCompletedTick has no matching "
+                        "completed ProviderAttempt"
+                    )
+            latest_attempt = attempts[-1][1] if attempts else None
+            if request.status is PlannerRequestStatus.PENDING:
+                if attempts:
+                    raise ValueError(
+                        "PENDING strategic PlannerRequest cannot have ProviderAttempts"
+                    )
+            elif request.status is PlannerRequestStatus.IN_PROGRESS:
+                if (
+                    latest_attempt is not None
+                    and latest_attempt.status is ProviderAttemptStatus.SUCCEEDED
+                ):
+                    raise ValueError(
+                        "IN_PROGRESS strategic PlannerRequest cannot end in a "
+                        "SUCCEEDED ProviderAttempt"
+                    )
+                if latest_attempt is None or latest_attempt.status not in {
+                    ProviderAttemptStatus.STARTED,
+                    ProviderAttemptStatus.FAILED,
+                }:
+                    raise ValueError(
+                        "IN_PROGRESS strategic PlannerRequest requires a current "
+                        "ProviderAttempt"
+                    )
+            elif request.status is PlannerRequestStatus.BACKOFF:
+                retry_at = request.next_retry_at
+                if (
+                    latest_attempt is None
+                    or latest_attempt.status is not ProviderAttemptStatus.FAILED
+                    or latest_attempt.completed_at is None
+                    or retry_at is None
+                    or retry_at.utcoffset() is None
+                ):
+                    raise ValueError(
+                        "strategic BACKOFF requires a final FAILED ProviderAttempt "
+                        "and timezone-aware next_retry_at"
+                    )
+                matching_ticks = [
+                    item
+                    for item in completion_ticks
+                    if item.provider_attempt_id == latest_attempt.provider_attempt_id
+                ]
+                if len(matching_ticks) != 1:
+                    raise ValueError(
+                        "strategic BACKOFF requires one matching "
+                        "PlannerAttemptCompletedTick"
+                    )
+            if (
+                request.status is not PlannerRequestStatus.BACKOFF
+                and request.next_retry_at is not None
+            ):
+                raise ValueError("only strategic BACKOFF may retain next_retry_at")
+            if request.status in {
+                PlannerRequestStatus.PARTIALLY_COMPLETED,
+                PlannerRequestStatus.CANCELLED,
+            }:
+                raise ValueError(
+                    "strategic PlannerRequest uses an unsupported lifecycle status"
+                )
+            if (
+                request.status is PlannerRequestStatus.SUPERSEDED
+                and request.failure_category != "stale_strategic_contract_base"
+            ):
+                raise ValueError("strategic SUPERSEDED requires a stale Contract base")
+            if request.status is PlannerRequestStatus.FAILED and (
+                latest_attempt is None
+                or latest_attempt.status is not ProviderAttemptStatus.FAILED
+                or latest_attempt.completed_at is None
+            ):
+                raise ValueError(
+                    "FAILED strategic PlannerRequest requires a final FAILED "
+                    "ProviderAttempt"
+                )
+            if request.status in {
+                PlannerRequestStatus.COMPLETED,
+                PlannerRequestStatus.REJECTED,
+            } and (
+                latest_attempt is None
+                or latest_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or latest_attempt.completed_at is None
+            ):
+                raise ValueError(
+                    "response-terminal strategic PlannerRequest requires a final "
+                    "SUCCEEDED ProviderAttempt"
+                )
+            rounds = sorted(
+                rounds_by_request.get(request.planner_request_id, []),
+                key=lambda item: item.round_number,
+            )
+            if len(rounds) > 1 or any(
+                round_record.round_number != 1 for round_record in rounds
+            ):
+                raise ValueError(
+                    "strategic PlannerRequest supports exactly one information round"
+                )
+            round_keys = {
+                (request.planner_request_id, item.information_round_id)
+                for item in rounds
+            }
+            tick_keys = {
+                key
+                for key in (*requested_ticks.keys(), *collected_ticks.keys())
+                if key[0] == request.planner_request_id
+            }
+            if tick_keys - round_keys:
+                raise ValueError(
+                    "strategic information Tick references no InformationRound"
+                )
+            for round_record in rounds:
+                key = (request.planner_request_id, round_record.information_round_id)
+                request_ticks = requested_ticks.get(key, [])
+                collect_ticks = collected_ticks.get(key, [])
+                if (
+                    len(request_ticks) != 1
+                    or request_ticks[0].game_session_id != request.game_session_id
+                ):
+                    raise ValueError(
+                        "strategic InformationRound requires one requesting Tick"
+                    )
+                expected_collected_ticks = (
+                    1 if round_record.status is InformationRoundStatus.COLLECTED else 0
+                )
+                if len(collect_ticks) != expected_collected_ticks or any(
+                    tick.game_session_id != request.game_session_id
+                    for tick in collect_ticks
+                ):
+                    raise ValueError(
+                        "strategic InformationRound collection Tick disagrees"
+                    )
+                source_attempts = [
+                    attempt
+                    for game_id, attempt in attempts
+                    if game_id == request.game_session_id
+                    and attempt.provider_attempt_id
+                    == round_record.source_provider_attempt_id
+                    and attempt.attempt_number
+                    == round_record.source_provider_attempt_number
+                ]
+                if len(source_attempts) != 1:
+                    raise ValueError(
+                        "strategic InformationRound requires one source ProviderAttempt"
+                    )
+                source_attempt = source_attempts[0]
+                if (
+                    source_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                    or source_attempt.completed_at is None
+                ):
+                    raise ValueError(
+                        "strategic InformationRound source ProviderAttempt must "
+                        "be completed and SUCCEEDED"
+                    )
+                requesting_tick = request_ticks[0]
+                if (
+                    source_attempt.completed_at > round_record.requested_at
+                    or round_record.requested_at > requesting_tick.completed_at
+                ):
+                    raise ValueError(
+                        "strategic InformationRound request timing is not causal"
+                    )
+                if any(
+                    attempt.attempt_number > source_attempt.attempt_number
+                    and attempt.started_at < requesting_tick.completed_at
+                    for _game_id, attempt in attempts
+                ):
+                    raise ValueError(
+                        "strategic InformationRound source was not the latest "
+                        "ProviderAttempt when requested"
+                    )
+                if collect_ticks:
+                    collected_tick = collect_ticks[0]
+                    if requesting_tick.completed_at > collected_tick.started_at:
+                        raise ValueError(
+                            "strategic information was collected before it was "
+                            "requested"
+                        )
+                    if (
+                        round_record.completed_at is None
+                        or round_record.completed_at < collected_tick.started_at
+                        or round_record.completed_at > collected_tick.completed_at
+                    ):
+                        raise ValueError(
+                            "strategic InformationRound completion timing disagrees "
+                            "with its collection Tick"
+                        )
+            requested = [
+                item
+                for item in rounds
+                if item.status is InformationRoundStatus.REQUESTED
+            ]
+            collected = [
+                item
+                for item in rounds
+                if item.status is InformationRoundStatus.COLLECTED
+            ]
+            failed = [
+                item for item in rounds if item.status is InformationRoundStatus.FAILED
+            ]
+            if request.information_round_count != len(collected):
+                raise ValueError(
+                    "strategic information_round_count disagrees with collected history"
+                )
+            if bool(request.information_results) != bool(collected):
+                raise ValueError(
+                    "strategic information_results disagree with collected history"
+                )
+            if collected and canonical_json(
+                request.information_results
+            ) != canonical_json(collected[0].results):
+                raise ValueError(
+                    "strategic information_results disagree with collected Round"
+                )
+            if failed and request.status not in TERMINAL_PLANNER_STATUSES:
+                raise ValueError(
+                    "strategic failed InformationRound requires a terminal Request"
+                )
+            for round_record in rounds:
+                current_round_allowance = (
+                    0 if round_record.status is InformationRoundStatus.COLLECTED else 1
+                )
+                if round_record.round_number > (
+                    request.information_round_count + current_round_allowance
+                ):
+                    raise ValueError(
+                        "strategic InformationRound exceeds proven lifecycle count"
+                    )
+            if request.status is PlannerRequestStatus.AWAITING_INFORMATION:
+                if not request.pending_information_requests:
+                    raise ValueError(
+                        "strategic AWAITING_INFORMATION Request requires pending inputs"
+                    )
+                if (
+                    len(requested) != 1
+                    or not rounds
+                    or requested[0].round_number != rounds[-1].round_number
+                ):
+                    raise ValueError(
+                        "strategic AWAITING_INFORMATION Request requires one latest "
+                        "REQUESTED InformationRound"
+                    )
+                if canonical_json(requested[0].requests) != canonical_json(
+                    request.pending_information_requests
+                ):
+                    raise ValueError(
+                        "strategic InformationRound requests disagree with "
+                        "PlannerRequest pending inputs"
+                    )
+            elif request.status in TERMINAL_PLANNER_STATUSES:
+                if request.pending_information_requests:
+                    raise ValueError(
+                        "terminal strategic PlannerRequest cannot retain pending inputs"
+                    )
+                if requested:
+                    raise ValueError(
+                        "terminal strategic PlannerRequest cannot retain a REQUESTED "
+                        "InformationRound"
+                    )
+            elif requested:
+                raise ValueError(
+                    "strategic REQUESTED InformationRound requires an "
+                    "AWAITING_INFORMATION PlannerRequest"
+                )
+
+            source_attempt_keys = {
+                (
+                    round_record.source_provider_attempt_id,
+                    round_record.source_provider_attempt_number,
+                )
+                for round_record in rounds
+            }
+            response_facts = cls._classify_planner_request_response(request)
+            final_response_uses_success = (
+                request.status in TERMINAL_PLANNER_STATUSES
+                and response_facts
+                in {
+                    _PlannerResponseFacts.CANONICAL_RESPONSE,
+                    _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE,
+                }
+            )
+            for _game_id, attempt in attempts:
+                if attempt.status is not ProviderAttemptStatus.SUCCEEDED:
+                    continue
+                if (
+                    attempt.provider_attempt_id,
+                    attempt.attempt_number,
+                ) in source_attempt_keys:
+                    continue
+                if (
+                    final_response_uses_success
+                    and attempt.attempt_number == maximum_attempt_number
+                ):
+                    continue
+                raise ValueError(
+                    "strategic SUCCEEDED ProviderAttempt has no response aggregate"
+                )
+            if (
+                request.status is PlannerRequestStatus.IN_PROGRESS
+                and attempts
+                and attempts[-1][1].status is ProviderAttemptStatus.SUCCEEDED
+            ):
+                raise ValueError(
+                    "IN_PROGRESS strategic PlannerRequest cannot end in a "
+                    "SUCCEEDED ProviderAttempt"
+                )
+            if request.status in {
+                PlannerRequestStatus.AWAITING_INFORMATION,
+                PlannerRequestStatus.READY_TO_CONTINUE,
+            } and (
+                not attempts
+                or attempts[-1][1].status is not ProviderAttemptStatus.SUCCEEDED
+            ):
+                raise ValueError(
+                    "strategic information lifecycle requires a final SUCCEEDED "
+                    "ProviderAttempt"
+                )
+
+    @staticmethod
+    def _strategic_request_base_is_stale(
+        request: PlannerRequest,
+        contract_root: Mapping[str, Any] | None,
+    ) -> bool:
+        target = request.target
+        if target.kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            target_contract_id = (
+                target.strategic_contract_id
+                or build_strategic_contract_id(request.game_session_id)
+            )
+            expected_base_revision = 0
+            base_is_stale = contract_root is not None
+        elif target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR:
+            target_contract_id = target.strategic_contract_id
+            expected_base_revision = target.base_contract_revision
+            base_is_stale = (
+                contract_root is None
+                or str(contract_root["contract_id"]) != target_contract_id
+                or int(contract_root["active_revision"]) != expected_base_revision
+            )
+        else:
+            return False
+        projection_context = request.input_projection.get(
+            "strategic_proposal_context", request.input_projection
+        )
+        if not isinstance(projection_context, Mapping):
+            return True
+        projection_is_stale = (
+            target.strategic_scope != "research"
+            or projection_context.get("target_contract_id") != target_contract_id
+            or projection_context.get("expected_base_revision")
+            != expected_base_revision
+            or projection_context.get("strategic_scope") != "research"
+        )
+        return base_is_stale or projection_is_stale
+
+    @classmethod
+    def _validate_explicit_wait_tick_interval(
+        cls,
+        ticks: Sequence[WorkflowTick],
+        opening_tick: WorkflowTick,
+        resumed_tick: WorkflowTick | None,
+        resume_authorized_at: datetime | None,
+        allowed_tick_types: tuple[type[Any], ...],
+        *,
+        label: str,
+    ) -> None:
+        if (resumed_tick is None) != (resume_authorized_at is None):
+            raise ValueError(f"{label} resume Tick and authorization must agree")
+        if (
+            resumed_tick is not None
+            and resumed_tick.started_at < opening_tick.completed_at
+        ):
+            raise ValueError(f"{label} resume Tick precedes the explicit-only wait")
+        if (
+            resume_authorized_at is not None
+            and resume_authorized_at < opening_tick.completed_at
+        ):
+            raise ValueError(f"{label} resume authorization precedes the wait")
+        if (
+            resumed_tick is not None
+            and resume_authorized_at is not None
+            and resume_authorized_at > resumed_tick.completed_at
+        ):
+            raise ValueError(f"{label} resume Tick completes before authorization")
+        for tick in ticks:
+            if (
+                tick.game_session_id != opening_tick.game_session_id
+                or tick.tick_id == opening_tick.tick_id
+                or (resumed_tick is not None and tick.tick_id == resumed_tick.tick_id)
+                or tick.completed_at <= opening_tick.completed_at
+                or (
+                    resumed_tick is not None
+                    and tick.started_at >= resumed_tick.completed_at
+                )
+            ):
+                continue
+            if (
+                not isinstance(tick, allowed_tick_types)
+                or tick.starting_runtime_state is not RuntimeState.AWAITING_HUMAN
+                or tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN
+                or tick.started_at < opening_tick.completed_at
+                or (
+                    resumed_tick is not None
+                    and tick.completed_at > resumed_tick.started_at
+                )
+            ):
+                raise ValueError(
+                    f"{label} explicit-only wait interval contains an invalid Tick"
+                )
+
+    @classmethod
+    def _validate_strategic_terminal_wait_state(
+        cls,
+        requests: Mapping[str, PlannerRequest],
+        attempt_rows: Sequence[Mapping[str, Any]],
+        ticks: Sequence[WorkflowTick],
+        runtime_by_game: Mapping[str, RuntimeState],
+        wait_by_game: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        attempts_by_request: dict[str, list[ProviderAttempt]] = {}
+        for row in attempt_rows:
+            normalized = cls._normalize_provider_attempt_row(row)
+            attempt = ProviderAttempt.model_validate_json(
+                str(normalized["attempt_json"])
+            )
+            attempts_by_request.setdefault(attempt.planner_request_id, []).append(
+                attempt
+            )
+        terminated_by_request: dict[str, list[StrategicRequestTerminatedTick]] = {}
+        resumed_by_request: dict[str, list[StrategicRequestWaitResumedTick]] = {}
+        errors_by_request: dict[str, list[StrategicRequestWaitErrorTick]] = {}
+        for tick in ticks:
+            if isinstance(tick, StrategicRequestTerminatedTick):
+                terminated_by_request.setdefault(tick.planner_request_id, []).append(
+                    tick
+                )
+            elif isinstance(tick, StrategicRequestWaitResumedTick):
+                resumed_by_request.setdefault(tick.planner_request_id, []).append(tick)
+            elif isinstance(tick, StrategicRequestWaitErrorTick):
+                errors_by_request.setdefault(tick.planner_request_id, []).append(tick)
+
+        unresolved_by_game: dict[
+            str, tuple[PlannerRequest, StrategicRequestTerminatedTick]
+        ] = {}
+        terminal_statuses = {
+            PlannerRequestStatus.FAILED,
+            PlannerRequestStatus.REJECTED,
+            PlannerRequestStatus.SUPERSEDED,
+        }
+        strategic_request_ids = {
+            request.planner_request_id
+            for request in requests.values()
+            if request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+        }
+        referenced_request_ids = (
+            set(terminated_by_request)
+            | set(resumed_by_request)
+            | set(errors_by_request)
+        )
+        if referenced_request_ids - strategic_request_ids:
+            raise ValueError(
+                "Strategic Request wait Tick references an unknown Request"
+            )
+        for request in requests.values():
+            if request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                continue
+            termination_ticks = terminated_by_request.get(
+                request.planner_request_id, []
+            )
+            if request.status not in terminal_statuses:
+                if (
+                    termination_ticks
+                    or resumed_by_request.get(request.planner_request_id)
+                    or errors_by_request.get(request.planner_request_id)
+                ):
+                    raise ValueError(
+                        "non-terminal strategic Request has a terminal-wait Tick"
+                    )
+                continue
+            if len(termination_ticks) != 1:
+                raise ValueError(
+                    "terminal strategic Request requires exactly one termination Tick"
+                )
+            termination = termination_ticks[0]
+            attempts = sorted(
+                attempts_by_request.get(request.planner_request_id, []),
+                key=lambda item: item.attempt_number,
+            )
+            latest_attempt = attempts[-1] if attempts else None
+            expected_attempt_id = (
+                None if latest_attempt is None else latest_attempt.provider_attempt_id
+            )
+            if (
+                termination.game_session_id != request.game_session_id
+                or termination.terminal_status is not request.status
+                or termination.failure_category != request.failure_category
+                or termination.provider_attempt_id != expected_attempt_id
+                or request.completed_at is None
+                or termination.completed_at < request.completed_at
+                or (
+                    latest_attempt is not None
+                    and (
+                        latest_attempt.completed_at is None
+                        or termination.completed_at < latest_attempt.completed_at
+                    )
+                )
+            ):
+                raise ValueError(
+                    "strategic Request termination Tick disagrees with Request or Attempt"
+                )
+            resume_ticks = resumed_by_request.get(request.planner_request_id, [])
+            if len(resume_ticks) > 1:
+                raise ValueError("strategic Request wait cannot have two resumed Ticks")
+            error_ticks = errors_by_request.get(request.planner_request_id, [])
+            for error_tick in error_ticks:
+                if (
+                    error_tick.game_session_id != request.game_session_id
+                    or error_tick.terminal_tick_id != termination.tick_id
+                    or error_tick.terminal_status is not request.status
+                    or error_tick.failure_category != request.failure_category
+                    or error_tick.started_at < termination.completed_at
+                ):
+                    raise ValueError(
+                        "strategic Request wait-error Tick disagrees with termination"
+                    )
+            if resume_ticks:
+                resumed = resume_ticks[0]
+                if (
+                    resumed.game_session_id != request.game_session_id
+                    or resumed.terminal_tick_id != termination.tick_id
+                    or resumed.terminal_status is not request.status
+                    or resumed.started_at < termination.completed_at
+                    or resumed.resumed_at < termination.completed_at
+                ):
+                    raise ValueError(
+                        "strategic Request wait-resumed Tick disagrees with termination"
+                    )
+                if any(
+                    error_tick.completed_at > resumed.started_at
+                    for error_tick in error_ticks
+                ):
+                    raise ValueError(
+                        "strategic Request wait-error Tick occurred after wait resumed"
+                    )
+                cls._validate_explicit_wait_tick_interval(
+                    ticks,
+                    termination,
+                    resumed,
+                    resumed.resumed_at,
+                    (AwaitingHumanTick, StrategicRequestWaitErrorTick),
+                    label="strategic Request terminal",
+                )
+                continue
+            cls._validate_explicit_wait_tick_interval(
+                ticks,
+                termination,
+                None,
+                None,
+                (AwaitingHumanTick, StrategicRequestWaitErrorTick),
+                label="strategic Request terminal",
+            )
+            if request.game_session_id in unresolved_by_game:
+                raise ValueError(
+                    "a game cannot have two unresolved strategic Request waits"
+                )
+            unresolved_by_game[request.game_session_id] = (request, termination)
+
+        for game_id, (request, termination) in unresolved_by_game.items():
+            if runtime_by_game.get(game_id) is not RuntimeState.AWAITING_HUMAN:
+                raise ValueError(
+                    "unresolved strategic Request termination requires AWAITING_HUMAN"
+                )
+            context = wait_by_game.get(game_id)
+            expected = {
+                "wait_kind": "strategic_request_terminated",
+                "resume_policy": "explicit_only",
+                "planner_request_id": request.planner_request_id,
+                "terminal_tick_id": termination.tick_id,
+                "terminal_status": request.status.value,
+                "failure_category": request.failure_category,
+            }
+            if context is None or any(
+                context.get(key) != value for key, value in expected.items()
+            ):
+                raise ValueError(
+                    "strategic Request termination Human Wait context disagrees"
+                )
+            request_error_ticks = errors_by_request.get(request.planner_request_id, [])
+            expected_blocking_reason = (
+                max(
+                    request_error_ticks, key=lambda item: item.completed_at
+                ).blocking_reason
+                if request_error_ticks
+                else termination.blocking_reason
+            )
+            if context.get("blocking_reason") != expected_blocking_reason:
+                raise ValueError(
+                    "strategic Request termination blocking reason disagrees"
+                )
+            if type(context.get("resume_requested")) is not bool:
+                raise ValueError(
+                    "strategic Request termination resume_requested must be a bool"
+                )
+            if context["resume_requested"] is True:
+                requested_at = cls._parse_audit_datetime(
+                    context.get("resume_requested_at"),
+                    "strategic Request wait resume_requested_at",
+                )
+                if requested_at < termination.completed_at:
+                    raise ValueError(
+                        "strategic Request wait resume precedes termination"
+                    )
+            elif "resume_requested_at" in context:
+                raise ValueError(
+                    "unrequested strategic Request wait contains resume timestamp"
+                )
+        for game_id, context in wait_by_game.items():
+            if context.get("wait_kind") != "strategic_request_terminated":
+                continue
+            if game_id not in unresolved_by_game:
+                raise ValueError(
+                    "strategic Request termination context is resolved or unknown"
+                )
+
+    @classmethod
+    def _validate_strategic_proposal_lifecycle_v10(
+        cls,
+        proposal_rows: Sequence[Mapping[str, Any]],
+        resume_request_rows: Sequence[Mapping[str, Any]],
+        request_rows: Sequence[Mapping[str, Any]],
+        attempt_rows: Sequence[Mapping[str, Any]],
+        information_round_rows: Sequence[Mapping[str, Any]],
+        tick_rows: Sequence[Mapping[str, Any]],
+        runtime_rows: Sequence[Mapping[str, Any]],
+        workflow_meta_rows: Sequence[Mapping[str, Any]],
+        contract_root_rows: Sequence[Mapping[str, Any]],
+        *,
+        require_canonical: bool,
+    ) -> None:
+        cls._validate_strategic_proposal_state(
+            proposal_rows,
+            request_rows,
+            attempt_rows,
+            require_canonical=require_canonical,
+        )
+        roots_by_game: dict[str, dict[str, Any]] = {}
+        for row in contract_root_rows:
+            normalized = cls._normalize_contract_root_row(row)
+            if require_canonical and dict(row) != normalized:
+                raise ValueError("StrategicContract root row is not canonical")
+            game_id = str(normalized["game_id"])
+            if game_id in roots_by_game:
+                raise ValueError("duplicate StrategicContract root game identity")
+            roots_by_game[game_id] = normalized
+
+        requests: dict[str, PlannerRequest] = {}
+        for row in request_rows:
+            normalized = cls._normalize_planner_request_row(
+                row, validate_response_contract=True
+            )
+            request = PlannerRequest.model_validate_json(
+                str(normalized["request_json"])
+            )
+            if request.planner_request_id in requests:
+                raise ValueError("duplicate PlannerRequest identity")
+            if (
+                request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+                and request.status is PlannerRequestStatus.SUPERSEDED
+                and not cls._strategic_request_base_is_stale(
+                    request, roots_by_game.get(request.game_session_id)
+                )
+            ):
+                raise ValueError(
+                    "strategic SUPERSEDED Request has no stale Contract base"
+                )
+            requests[request.planner_request_id] = request
+        cls._validate_strategic_information_round_state(
+            requests,
+            attempt_rows,
+            information_round_rows,
+            tick_rows,
+            require_canonical=require_canonical,
+        )
+
+        proposals: dict[str, StrategicResearchProposal] = {}
+        for row in proposal_rows:
+            normalized = cls._normalize_strategic_research_proposal_row(row)
+            proposal = StrategicResearchProposal.model_validate_json(
+                str(normalized["proposal_json"])
+            )
+            proposals[proposal.proposal_id] = proposal
+
+        resume_requests_by_proposal: dict[
+            str, list[StrategicProposalWaitResumeRequest]
+        ] = {}
+        resume_request_ids: set[str] = set()
+        for row in resume_request_rows:
+            normalized = cls._normalize_strategic_proposal_wait_resume_request_row(row)
+            if require_canonical and dict(row) != normalized:
+                raise ValueError(
+                    "Strategic Proposal Resume Request row is not canonical"
+                )
+            resume_request = StrategicProposalWaitResumeRequest.model_validate_json(
+                str(normalized["request_json"])
+            )
+            if resume_request.resume_request_id in resume_request_ids:
+                raise ValueError("duplicate Strategic Proposal Resume Request identity")
+            resume_request_ids.add(resume_request.resume_request_id)
+            resume_requests_by_proposal.setdefault(
+                resume_request.proposal_id, []
+            ).append(resume_request)
+
+        ticks = [cls._workflow_tick_from_row(row) for row in tick_rows]
+        ready_by_proposal: dict[str, list[StrategicProposalReadyTick]] = {}
+        resumed_by_proposal: dict[str, list[StrategicProposalWaitResumedTick]] = {}
+        errors_by_proposal: dict[str, list[StrategicProposalWaitErrorTick]] = {}
+        for tick in ticks:
+            if isinstance(tick, StrategicProposalReadyTick):
+                ready_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+            elif isinstance(tick, StrategicProposalWaitResumedTick):
+                resumed_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+            elif isinstance(tick, StrategicProposalWaitErrorTick):
+                errors_by_proposal.setdefault(tick.proposal_id, []).append(tick)
+
+        runtime_by_game: dict[str, RuntimeState] = {}
+        for row in runtime_rows:
+            game_id = str(row["game_id"])
+            if game_id in runtime_by_game:
+                raise ValueError("duplicate RuntimeState game identity")
+            runtime_by_game[game_id] = RuntimeState(str(row["state"]))
+
+        wait_by_game: dict[str, dict[str, Any]] = {}
+        for row in workflow_meta_rows:
+            key = str(row["key"])
+            if not key.startswith("human_wait:"):
+                continue
+            game_id = key.split(":", 1)[1]
+            if game_id in wait_by_game:
+                raise ValueError("duplicate Human Wait context")
+            context = cls._load(str(row["value_json"]))
+            if not isinstance(context, dict):
+                raise ValueError("Human Wait context must be an object")
+            wait_by_game[game_id] = context
+
+        cls._validate_strategic_terminal_wait_state(
+            requests,
+            attempt_rows,
+            ticks,
+            runtime_by_game,
+            wait_by_game,
+        )
+
+        unresolved_by_game: dict[
+            str,
+            tuple[StrategicResearchProposal, StrategicProposalWaitResumeRequest | None],
+        ] = {}
+        for proposal in proposals.values():
+            ready_ticks = ready_by_proposal.get(proposal.proposal_id, [])
+            if len(ready_ticks) != 1:
+                raise ValueError(
+                    "Proposal requires exactly one matching Proposal-ready Tick"
+                )
+            ready = ready_ticks[0]
+            if (
+                ready.game_session_id != proposal.game_session_id
+                or ready.planner_request_id != proposal.source_planner_request_id
+                or ready.target_kind is not proposal.target_kind
+                or ready.expected_base_revision != proposal.expected_base_revision
+            ):
+                raise ValueError("Proposal-ready Tick identity disagrees with Proposal")
+            resume_requests = resume_requests_by_proposal.get(proposal.proposal_id, [])
+            if len(resume_requests) > 1:
+                raise ValueError("Proposal cannot have two Resume Requests")
+            resume_request = resume_requests[0] if resume_requests else None
+            if resume_request is not None:
+                if (
+                    resume_request.game_session_id != proposal.game_session_id
+                    or resume_request.planner_request_id
+                    != proposal.source_planner_request_id
+                    or resume_request.proposal_ready_tick_id != ready.tick_id
+                    or resume_request.target_kind is not proposal.target_kind
+                    or resume_request.expected_base_revision
+                    != proposal.expected_base_revision
+                ):
+                    raise ValueError(
+                        "Strategic Proposal Resume Request identity disagrees with "
+                        "Proposal or Ready Tick"
+                    )
+                if resume_request.requested_at < ready.completed_at:
+                    raise ValueError(
+                        "Strategic Proposal Resume Request precedes Proposal-ready Tick"
+                    )
+            for error_tick in errors_by_proposal.get(proposal.proposal_id, []):
+                if (
+                    error_tick.game_session_id != proposal.game_session_id
+                    or error_tick.planner_request_id
+                    != proposal.source_planner_request_id
+                    or error_tick.proposal_ready_tick_id != ready.tick_id
+                    or error_tick.target_kind is not proposal.target_kind
+                    or error_tick.expected_base_revision
+                    != proposal.expected_base_revision
+                    or error_tick.started_at < ready.completed_at
+                ):
+                    raise ValueError(
+                        "Proposal wait-error Tick identity disagrees with Proposal"
+                    )
+            resumed_ticks = resumed_by_proposal.get(proposal.proposal_id, [])
+            if len(resumed_ticks) > 1:
+                raise ValueError("Proposal cannot have two wait-resumed Ticks")
+            if resumed_ticks:
+                if resume_request is None:
+                    raise ValueError(
+                        "Proposal wait-resumed Tick requires an immutable Resume Request"
+                    )
+                resumed = resumed_ticks[0]
+                if (
+                    resumed.game_session_id != proposal.game_session_id
+                    or resumed.planner_request_id != proposal.source_planner_request_id
+                    or resumed.target_kind is not proposal.target_kind
+                    or resumed.expected_base_revision != proposal.expected_base_revision
+                    or resumed.resume_request_id != resume_request.resume_request_id
+                    or resumed.proposal_ready_tick_id != ready.tick_id
+                ):
+                    raise ValueError(
+                        "Proposal wait-resumed Tick identity disagrees with Proposal"
+                    )
+                if resumed.completed_at < resume_request.requested_at:
+                    raise ValueError(
+                        "Proposal wait-resumed Tick precedes its Resume Request"
+                    )
+                if any(
+                    error_tick.completed_at > resumed.started_at
+                    for error_tick in errors_by_proposal.get(proposal.proposal_id, [])
+                ):
+                    raise ValueError(
+                        "Proposal wait-error Tick occurred after Proposal wait resumed"
+                    )
+                cls._validate_explicit_wait_tick_interval(
+                    ticks,
+                    ready,
+                    resumed,
+                    resume_request.requested_at,
+                    (AwaitingHumanTick, StrategicProposalWaitErrorTick),
+                    label="strategic Proposal",
+                )
+                continue
+            cls._validate_explicit_wait_tick_interval(
+                ticks,
+                ready,
+                None,
+                None,
+                (AwaitingHumanTick, StrategicProposalWaitErrorTick),
+                label="strategic Proposal",
+            )
+            if proposal.game_session_id in unresolved_by_game:
+                raise ValueError("a game cannot have two unresolved Proposal waits")
+            unresolved_by_game[proposal.game_session_id] = (proposal, resume_request)
+
+        for proposal_id in ready_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError("Proposal-ready Tick references an unknown Proposal")
+        for proposal_id in resumed_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError(
+                    "Proposal wait-resumed Tick references an unknown Proposal"
+                )
+        for proposal_id in errors_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError(
+                    "Proposal wait-error Tick references an unknown Proposal"
+                )
+        for proposal_id in resume_requests_by_proposal:
+            if proposal_id not in proposals:
+                raise ValueError("Resume Request references an unknown Proposal")
+
+        for game_id, unresolved in unresolved_by_game.items():
+            proposal, resume_request = unresolved
+            if runtime_by_game.get(game_id) is not RuntimeState.AWAITING_HUMAN:
+                raise ValueError(
+                    "unresolved Proposal wait requires AWAITING_HUMAN RuntimeState"
+                )
+            context = wait_by_game.get(game_id)
+            if context is None:
+                raise ValueError("unresolved Proposal wait requires Human Wait context")
+            expected = {
+                "wait_kind": "strategic_contract_proposal_ready",
+                "resume_policy": "explicit_only",
+                "reason": "strategic_contract_proposal_ready",
+                "planner_request_id": proposal.source_planner_request_id,
+                "proposal_id": proposal.proposal_id,
+                "target_kind": proposal.target_kind.value,
+                "expected_base_revision": proposal.expected_base_revision,
+            }
+            if any(context.get(key) != value for key, value in expected.items()):
+                raise ValueError(
+                    "Proposal Human Wait context disagrees with unresolved Proposal"
+                )
+            if type(context.get("resume_requested")) is not bool:
+                raise ValueError("Proposal Human Wait resume_requested must be a bool")
+            if resume_request is None:
+                if context["resume_requested"] is not False:
+                    raise ValueError(
+                        "Proposal wait cannot be requested without a Resume Request"
+                    )
+                if "resume_request_id" in context or "resume_requested_at" in context:
+                    raise ValueError(
+                        "unrequested Proposal wait cannot contain Resume Request facts"
+                    )
+            else:
+                if context["resume_requested"] is not True:
+                    raise ValueError(
+                        "Proposal Resume Request requires resume_requested=True"
+                    )
+                if context.get("resume_request_id") != resume_request.resume_request_id:
+                    raise ValueError("Proposal Human Wait Resume Request ID disagrees")
+                requested_at = cls._parse_audit_datetime(
+                    context.get("resume_requested_at"),
+                    "Proposal Human Wait resume_requested_at",
+                )
+                if requested_at != resume_request.requested_at:
+                    raise ValueError("Proposal Human Wait requested_at disagrees")
+                if (
+                    context.get("proposal_ready_tick_id")
+                    != resume_request.proposal_ready_tick_id
+                ):
+                    raise ValueError("Proposal Human Wait Ready Tick ID disagrees")
+
+        for game_id, context in wait_by_game.items():
+            if context.get("wait_kind") != "strategic_contract_proposal_ready":
+                continue
+            if game_id not in unresolved_by_game:
+                raise ValueError(
+                    "special Proposal Human Wait context references a resolved "
+                    "or unknown Proposal"
+                )
+
+    @classmethod
+    def _validate_phase1b_proposals_v10(cls, conn: sqlite3.Connection) -> None:
+        cls._validate_strategic_proposal_lifecycle_v10(
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_research_proposals ORDER BY proposal_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_proposal_wait_resume_requests "
+                    "ORDER BY requested_at, resume_request_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM logical_planner_requests ORDER BY planner_request_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM provider_attempts ORDER BY planner_request_id, attempt_number"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM information_rounds "
+                    "ORDER BY planner_request_id, round_number"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_ticks ORDER BY started_at, tick_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM runtime_state ORDER BY game_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM workflow_meta WHERE key LIKE 'human_wait:%' "
+                    "ORDER BY key"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_roots ORDER BY game_id"
+                ).fetchall()
+            ],
+            require_canonical=True,
+        )
 
     @staticmethod
     def _migrate_phase4_v7(conn: sqlite3.Connection) -> None:
@@ -1970,6 +3544,255 @@ class WorkflowStore:
             return commit.contract
 
     @classmethod
+    def _strategic_research_proposal_from_row(
+        cls, row: Mapping[str, Any]
+    ) -> StrategicResearchProposal:
+        normalized = cls._normalize_strategic_research_proposal_row(row)
+        if dict(row) != normalized:
+            raise ValueError("StrategicResearchProposal row is not canonical")
+        return StrategicResearchProposal.model_validate_json(
+            str(normalized["proposal_json"])
+        )
+
+    @staticmethod
+    def _validate_proposal_contract_base_in_connection(
+        conn: sqlite3.Connection, proposal: StrategicResearchProposal
+    ) -> None:
+        root = conn.execute(
+            "SELECT contract_id, active_revision FROM strategic_contract_roots "
+            "WHERE game_id=?",
+            (proposal.game_session_id,),
+        ).fetchone()
+        if proposal.target_kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION:
+            if root is not None:
+                raise StaleStrategicContractBaseError(
+                    "Contract creation Proposal became stale"
+                )
+            return
+        if (
+            root is None
+            or str(root["contract_id"]) != proposal.target_contract_id
+            or int(root["active_revision"]) != proposal.expected_base_revision
+        ):
+            raise StaleStrategicContractBaseError(
+                "Mission repair Proposal Contract base became stale"
+            )
+
+    @classmethod
+    def _save_strategic_research_proposal_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        proposal: StrategicResearchProposal,
+    ) -> StrategicResearchProposal:
+        existing_row = conn.execute(
+            "SELECT * FROM strategic_research_proposals WHERE proposal_id=?",
+            (proposal.proposal_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = cls._strategic_research_proposal_from_row(existing_row)
+            if existing != proposal:
+                raise ValueError("Proposal identity was reused with new content")
+            return existing
+        request_row = conn.execute(
+            "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+            (proposal.source_planner_request_id,),
+        ).fetchone()
+        if request_row is None:
+            raise ValueError("Proposal parent PlannerRequest does not exist")
+        request = cls._planner_request_from_row(request_row)
+        if request.status is not PlannerRequestStatus.COMPLETED:
+            raise ValueError("Proposal parent PlannerRequest must be COMPLETED")
+        cls._validate_strategic_proposal_target(proposal, request)
+        attempt_rows = conn.execute(
+            "SELECT * FROM provider_attempts WHERE planner_request_id=? "
+            "ORDER BY attempt_number",
+            (request.planner_request_id,),
+        ).fetchall()
+        cls._validate_strategic_proposal_attempt(proposal, request, attempt_rows)
+        cls._validate_proposal_contract_base_in_connection(conn, proposal)
+        conflicting = conn.execute(
+            "SELECT proposal_id FROM strategic_research_proposals "
+            "WHERE source_planner_request_id=? OR source_provider_attempt_id=?",
+            (
+                proposal.source_planner_request_id,
+                proposal.source_provider_attempt_id,
+            ),
+        ).fetchone()
+        if conflicting is not None:
+            raise ValueError(
+                "PlannerRequest or ProviderAttempt already owns a Proposal"
+            )
+        conn.execute(
+            """
+            INSERT INTO strategic_research_proposals(
+                proposal_id, game_id, source_planner_request_id,
+                source_provider_attempt_id, source_provider_attempt_number,
+                target_kind, target_contract_id, expected_base_revision,
+                proposal_hash, proposal_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                proposal.proposal_id,
+                proposal.game_session_id,
+                proposal.source_planner_request_id,
+                proposal.source_provider_attempt_id,
+                proposal.source_provider_attempt_number,
+                proposal.target_kind.value,
+                proposal.target_contract_id,
+                proposal.expected_base_revision,
+                proposal.proposal_hash,
+                cls._dump(proposal.model_dump(mode="json")),
+                proposal.created_at.isoformat(),
+            ),
+        )
+        return proposal
+
+    def save_strategic_research_proposal(
+        self, proposal: StrategicResearchProposal
+    ) -> StrategicResearchProposal:
+        with self._connect() as conn:
+            existing_row = conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE proposal_id=?",
+                (proposal.proposal_id,),
+            ).fetchone()
+            if existing_row is None:
+                raise ValueError(
+                    "new Proposal requires the complete Proposal-ready Tick transaction"
+                )
+            saved = self._strategic_research_proposal_from_row(existing_row)
+            if saved != proposal:
+                raise ValueError("Proposal identity was reused with new content")
+            self._validate_phase1b_proposals_v10(conn)
+            return saved
+
+    def get_strategic_research_proposal(
+        self, proposal_id: str
+    ) -> StrategicResearchProposal | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+        return None if row is None else self._strategic_research_proposal_from_row(row)
+
+    def strategic_research_proposal_for_request(
+        self, planner_request_id: str
+    ) -> StrategicResearchProposal | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategic_research_proposals "
+                "WHERE source_planner_request_id=?",
+                (planner_request_id,),
+            ).fetchone()
+        return None if row is None else self._strategic_research_proposal_from_row(row)
+
+    def list_strategic_research_proposals(
+        self, game_session_id: str
+    ) -> list[StrategicResearchProposal]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategic_research_proposals "
+                "WHERE game_id=? ORDER BY proposal_id",
+                (game_session_id,),
+            ).fetchall()
+        return [self._strategic_research_proposal_from_row(row) for row in rows]
+
+    @classmethod
+    def _strategic_proposal_wait_resume_request_from_row(
+        cls, row: Mapping[str, Any]
+    ) -> StrategicProposalWaitResumeRequest:
+        normalized = cls._normalize_strategic_proposal_wait_resume_request_row(row)
+        if dict(row) != normalized:
+            raise ValueError("Strategic Proposal Resume Request row is not canonical")
+        return StrategicProposalWaitResumeRequest.model_validate_json(
+            str(normalized["request_json"])
+        )
+
+    @classmethod
+    def _insert_strategic_proposal_wait_resume_request_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        request: StrategicProposalWaitResumeRequest,
+    ) -> None:
+        row = cls._normalize_strategic_proposal_wait_resume_request_row(
+            {
+                "resume_request_id": request.resume_request_id,
+                "game_id": request.game_session_id,
+                "proposal_id": request.proposal_id,
+                "planner_request_id": request.planner_request_id,
+                "proposal_ready_tick_id": request.proposal_ready_tick_id,
+                "target_kind": request.target_kind.value,
+                "expected_base_revision": request.expected_base_revision,
+                "request_json": request.model_dump_json(),
+                "requested_at": request.requested_at.isoformat(),
+            }
+        )
+        columns = (
+            "resume_request_id",
+            "game_id",
+            "proposal_id",
+            "planner_request_id",
+            "proposal_ready_tick_id",
+            "target_kind",
+            "expected_base_revision",
+            "request_json",
+            "requested_at",
+        )
+        conn.execute(
+            """
+            INSERT INTO strategic_proposal_wait_resume_requests(
+                resume_request_id, game_id, proposal_id, planner_request_id,
+                proposal_ready_tick_id, target_kind, expected_base_revision,
+                request_json, requested_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(row[column] for column in columns),
+        )
+
+    def get_strategic_proposal_wait_resume_request(
+        self, resume_request_id: str
+    ) -> StrategicProposalWaitResumeRequest | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE resume_request_id=?",
+                (resume_request_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._strategic_proposal_wait_resume_request_from_row(row)
+        )
+
+    def strategic_proposal_wait_resume_request_for_proposal(
+        self, proposal_id: str
+    ) -> StrategicProposalWaitResumeRequest | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._strategic_proposal_wait_resume_request_from_row(row)
+        )
+
+    def list_strategic_proposal_wait_resume_requests(
+        self, game_session_id: str
+    ) -> list[StrategicProposalWaitResumeRequest]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE game_id=? ORDER BY requested_at, resume_request_id",
+                (game_session_id,),
+            ).fetchall()
+        return [
+            self._strategic_proposal_wait_resume_request_from_row(row) for row in rows
+        ]
+
+    @classmethod
     def _set_meta_in_connection(
         cls, conn: sqlite3.Connection, key: str, value: Any
     ) -> None:
@@ -1988,6 +3811,10 @@ class WorkflowStore:
         return f"human_wait:{game_id}"
 
     def set_meta(self, key: str, value: Any) -> None:
+        if key.startswith("human_wait:"):
+            raise ValueError(
+                "human_wait metadata must use the dedicated Human Wait APIs"
+            )
         with self._connect() as conn:
             self._set_meta_in_connection(conn, key, value)
 
@@ -2006,6 +3833,8 @@ class WorkflowStore:
         """Durably request one safe re-evaluation of an active human wait."""
 
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_phase1b_proposals_v10(conn)
             state = conn.execute(
                 "SELECT state FROM runtime_state WHERE game_id=?", (game_id,)
             ).fetchone()
@@ -2018,6 +3847,134 @@ class WorkflowStore:
             context = {} if row is None else self._load(row["value_json"])
             if not isinstance(context, dict):
                 context = {}
+            if context.get("wait_kind") == "strategic_request_terminated":
+                if type(context.get("resume_requested")) is not bool:
+                    raise ValueError(
+                        "strategic Request wait resume_requested must be a bool"
+                    )
+                terminal_row = conn.execute(
+                    "SELECT * FROM workflow_ticks WHERE tick_id=? AND game_id=?",
+                    (context.get("terminal_tick_id"), game_id),
+                ).fetchone()
+                if terminal_row is None:
+                    raise ValueError(
+                        "strategic Request wait references no termination Tick"
+                    )
+                terminal = self._workflow_tick_from_row(dict(terminal_row))
+                expected = {
+                    "resume_policy": "explicit_only",
+                    "planner_request_id": getattr(terminal, "planner_request_id", None),
+                    "terminal_tick_id": getattr(terminal, "tick_id", None),
+                    "terminal_status": getattr(
+                        getattr(terminal, "terminal_status", None), "value", None
+                    ),
+                    "failure_category": getattr(terminal, "failure_category", None),
+                }
+                if not isinstance(terminal, StrategicRequestTerminatedTick) or any(
+                    context.get(field) != value for field, value in expected.items()
+                ):
+                    raise ValueError(
+                        "strategic Request wait disagrees with termination Tick"
+                    )
+                if context["resume_requested"] is True:
+                    self._parse_audit_datetime(
+                        context.get("resume_requested_at"),
+                        "strategic Request wait resume_requested_at",
+                    )
+                    return True
+                requested_at = max(datetime.now(UTC), terminal.completed_at)
+                context.update(
+                    {
+                        "version": "human-wait/v1",
+                        "resume_requested": True,
+                        "resume_requested_at": requested_at.isoformat(),
+                    }
+                )
+                self._set_meta_in_connection(conn, key, context)
+                self._validate_phase1b_proposals_v10(conn)
+                return True
+            if (
+                context.get("wait_kind") == "strategic_contract_proposal_ready"
+                and context.get("resume_policy") == "explicit_only"
+            ):
+                if type(context.get("resume_requested")) is not bool:
+                    raise ValueError(
+                        "Proposal Human Wait resume_requested must be a bool"
+                    )
+                proposal_row = conn.execute(
+                    "SELECT * FROM strategic_research_proposals "
+                    "WHERE proposal_id=? AND game_id=?",
+                    (context.get("proposal_id"), game_id),
+                ).fetchone()
+                if proposal_row is None:
+                    raise ValueError("Proposal Human Wait references no Proposal")
+                proposal = self._strategic_research_proposal_from_row(proposal_row)
+                ready_ticks = []
+                for tick_row in conn.execute(
+                    "SELECT * FROM workflow_ticks WHERE game_id=?",
+                    (game_id,),
+                ).fetchall():
+                    tick = self._workflow_tick_from_row(dict(tick_row))
+                    if (
+                        isinstance(tick, StrategicProposalReadyTick)
+                        and tick.proposal_id == proposal.proposal_id
+                    ):
+                        ready_ticks.append(tick)
+                if len(ready_ticks) != 1:
+                    raise ValueError(
+                        "Proposal Human Wait requires one Proposal-ready Tick"
+                    )
+                ready = ready_ticks[0]
+                existing_row = conn.execute(
+                    "SELECT * FROM strategic_proposal_wait_resume_requests "
+                    "WHERE proposal_id=?",
+                    (proposal.proposal_id,),
+                ).fetchone()
+                if context["resume_requested"] is True:
+                    if existing_row is None:
+                        raise ValueError(
+                            "Proposal context claims resume without an audit record"
+                        )
+                    existing = self._strategic_proposal_wait_resume_request_from_row(
+                        existing_row
+                    )
+                    if (
+                        context.get("resume_request_id") != existing.resume_request_id
+                        or context.get("proposal_ready_tick_id") != ready.tick_id
+                    ):
+                        raise ValueError(
+                            "Proposal Resume Request context disagrees with audit"
+                        )
+                    return True
+                if existing_row is not None:
+                    raise ValueError(
+                        "Proposal context omits an existing Resume Request"
+                    )
+                requested_at = max(datetime.now(UTC), ready.completed_at)
+                resume_request = build_strategic_proposal_wait_resume_request(
+                    game_session_id=game_id,
+                    proposal_id=proposal.proposal_id,
+                    planner_request_id=proposal.source_planner_request_id,
+                    proposal_ready_tick_id=ready.tick_id,
+                    target_kind=proposal.target_kind,
+                    expected_base_revision=proposal.expected_base_revision,
+                    requested_at=requested_at,
+                )
+                self._insert_strategic_proposal_wait_resume_request_in_connection(
+                    conn, resume_request
+                )
+                context.update(
+                    {
+                        "version": "human-wait/v1",
+                        "resume_requested": True,
+                        "resume_requested_at": requested_at.isoformat(),
+                        "resume_request_id": resume_request.resume_request_id,
+                        "proposal_ready_tick_id": ready.tick_id,
+                    }
+                )
+                self._set_meta_in_connection(conn, key, context)
+                self._validate_phase1b_proposals_v10(conn)
+                return True
             context.update(
                 {
                     "version": "human-wait/v1",
@@ -3253,6 +5210,7 @@ class WorkflowStore:
             self._save_runtime_state_in_connection(
                 conn, game_id, state, active_attempt_id
             )
+            self._validate_phase1b_proposals_v10(conn)
 
     @classmethod
     def _insert_workflow_tick_in_connection(
@@ -3304,8 +5262,313 @@ class WorkflowStore:
 
     def save_workflow_tick(self, tick: WorkflowTick) -> None:
         tick = validate_workflow_tick(tick)
+        if isinstance(
+            tick,
+            (
+                StrategicProposalWaitErrorTick,
+                StrategicRequestWaitErrorTick,
+                StrategicRequestWaitResumedTick,
+            ),
+        ):
+            raise ValueError(
+                "Strategic wait transition Tick must be persisted atomically"
+            )
         with self._connect() as conn:
             self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1b_proposals_v10(conn)
+
+    @classmethod
+    def _validate_strategic_resume_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        human_wait_context: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(tick, StrategicProposalWaitResumedTick):
+            return
+        if human_wait_context is not None:
+            raise ValueError("Proposal wait resume must clear Human Wait context")
+        cls._validate_phase1b_proposals_v10(conn)
+        state_row = conn.execute(
+            "SELECT state FROM runtime_state WHERE game_id=?",
+            (tick.game_session_id,),
+        ).fetchone()
+        if state_row is None or state_row["state"] != RuntimeState.AWAITING_HUMAN.value:
+            raise ValueError("Proposal wait resume requires AWAITING_HUMAN")
+        wait_row = conn.execute(
+            "SELECT value_json FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(tick.game_session_id),),
+        ).fetchone()
+        if wait_row is None:
+            raise ValueError("Proposal wait resume requires Human Wait context")
+        context = cls._load(wait_row["value_json"])
+        if not isinstance(context, dict):
+            raise ValueError("Proposal Human Wait context must be an object")
+        expected = {
+            "wait_kind": "strategic_contract_proposal_ready",
+            "resume_policy": "explicit_only",
+            "resume_requested": True,
+            "resume_request_id": tick.resume_request_id,
+            "proposal_ready_tick_id": tick.proposal_ready_tick_id,
+            "planner_request_id": tick.planner_request_id,
+            "proposal_id": tick.proposal_id,
+            "target_kind": tick.target_kind.value,
+            "expected_base_revision": tick.expected_base_revision,
+        }
+        if any(context.get(key) != value for key, value in expected.items()):
+            raise ValueError("Proposal Resume Tick disagrees with Human Wait context")
+        resume_row = conn.execute(
+            "SELECT * FROM strategic_proposal_wait_resume_requests "
+            "WHERE resume_request_id=?",
+            (tick.resume_request_id,),
+        ).fetchone()
+        if resume_row is None:
+            raise ValueError(
+                "Proposal Resume Tick requires an immutable Resume Request"
+            )
+        resume_request = cls._strategic_proposal_wait_resume_request_from_row(
+            resume_row
+        )
+        if (
+            resume_request.game_session_id != tick.game_session_id
+            or resume_request.proposal_id != tick.proposal_id
+            or resume_request.planner_request_id != tick.planner_request_id
+            or resume_request.proposal_ready_tick_id != tick.proposal_ready_tick_id
+            or resume_request.target_kind is not tick.target_kind
+            or resume_request.expected_base_revision != tick.expected_base_revision
+            or tick.completed_at < resume_request.requested_at
+        ):
+            raise ValueError("Proposal Resume Tick disagrees with Resume Request")
+        ready_row = conn.execute(
+            "SELECT * FROM workflow_ticks WHERE tick_id=?",
+            (tick.proposal_ready_tick_id,),
+        ).fetchone()
+        if ready_row is None:
+            raise ValueError("Proposal Resume Tick references no Ready Tick")
+        ready = cls._workflow_tick_from_row(dict(ready_row))
+        if (
+            not isinstance(ready, StrategicProposalReadyTick)
+            or ready.game_session_id != tick.game_session_id
+            or ready.proposal_id != tick.proposal_id
+        ):
+            raise ValueError("Proposal Resume Tick references the wrong Ready Tick")
+        if tick.started_at < ready.completed_at:
+            raise ValueError("Proposal Resume Tick precedes the Proposal Ready Tick")
+
+    @classmethod
+    def _preserve_concurrent_strategic_resume_context_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        candidate: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(
+            tick,
+            (
+                AwaitingHumanTick,
+                StrategicProposalWaitErrorTick,
+                StrategicRequestWaitErrorTick,
+            ),
+        ):
+            return candidate
+        row = conn.execute(
+            "SELECT value_json FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(tick.game_session_id),),
+        ).fetchone()
+        if row is None:
+            return candidate
+        current = cls._load(str(row["value_json"]))
+        if not isinstance(current, dict):
+            return candidate
+        is_proposal_resume = (
+            current.get("wait_kind") == "strategic_contract_proposal_ready"
+            and current.get("resume_policy") == "explicit_only"
+            and current.get("resume_requested") is True
+        )
+        is_terminal_resume = (
+            current.get("wait_kind") == "strategic_request_terminated"
+            and current.get("resume_policy") == "explicit_only"
+            and current.get("resume_requested") is True
+        )
+        if not (is_proposal_resume or is_terminal_resume):
+            return candidate
+        preserved = dict(current)
+        if candidate is not None and isinstance(candidate.get("blocking_reason"), str):
+            preserved["blocking_reason"] = candidate["blocking_reason"]
+        return preserved
+
+    @classmethod
+    def _validate_strategic_request_wait_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        human_wait_context: dict[str, Any] | None,
+    ) -> None:
+        state_row = conn.execute(
+            "SELECT state FROM runtime_state WHERE game_id=?",
+            (tick.game_session_id,),
+        ).fetchone()
+        wait_row = conn.execute(
+            "SELECT value_json FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(tick.game_session_id),),
+        ).fetchone()
+        current = None if wait_row is None else cls._load(str(wait_row["value_json"]))
+        active = (
+            state_row is not None
+            and state_row["state"] == RuntimeState.AWAITING_HUMAN.value
+            and isinstance(current, dict)
+            and current.get("wait_kind") == "strategic_request_terminated"
+            and current.get("resume_policy") == "explicit_only"
+        )
+        is_special_tick = isinstance(
+            tick, (StrategicRequestWaitResumedTick, StrategicRequestWaitErrorTick)
+        )
+        if not active:
+            if is_special_tick:
+                raise ValueError(
+                    "strategic Request wait transition requires an active wait"
+                )
+            return
+        if tick.starting_runtime_state is not RuntimeState.AWAITING_HUMAN:
+            raise ValueError(
+                "strategic Request wait transition must start AWAITING_HUMAN"
+            )
+        expected = {
+            "planner_request_id": getattr(tick, "planner_request_id", None),
+            "terminal_tick_id": getattr(tick, "terminal_tick_id", None),
+            "terminal_status": getattr(
+                getattr(tick, "terminal_status", None), "value", None
+            ),
+        }
+        if isinstance(tick, StrategicRequestWaitResumedTick):
+            if human_wait_context is not None:
+                raise ValueError(
+                    "strategic Request wait resume must clear Human Wait context"
+                )
+            expected["resume_requested"] = True
+            if any(current.get(field) != value for field, value in expected.items()):
+                raise ValueError(
+                    "strategic Request wait-resumed Tick disagrees with context"
+                )
+            requested_at = cls._parse_audit_datetime(
+                current.get("resume_requested_at"),
+                "strategic Request wait resume_requested_at",
+            )
+            if tick.resumed_at != requested_at:
+                raise ValueError(
+                    "strategic Request wait-resumed Tick has the wrong resume time"
+                )
+            existing_rows = conn.execute(
+                "SELECT * FROM workflow_ticks WHERE game_id=? AND outcome=?",
+                (
+                    tick.game_session_id,
+                    TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED.value,
+                ),
+            ).fetchall()
+            if any(
+                isinstance(
+                    existing := cls._workflow_tick_from_row(dict(row)),
+                    StrategicRequestWaitResumedTick,
+                )
+                and existing.planner_request_id == tick.planner_request_id
+                for row in existing_rows
+            ):
+                raise ValueError("strategic Request wait already has a resumed Tick")
+            return
+        if tick.ending_runtime_state is not RuntimeState.AWAITING_HUMAN:
+            raise ValueError(
+                "only a strategic Request wait-resumed Tick may leave the wait"
+            )
+        if not isinstance(tick, (AwaitingHumanTick, StrategicRequestWaitErrorTick)):
+            raise ValueError(
+                "strategic Request wait only accepts waiting or diagnostic Ticks"
+            )
+        stable_identity = {
+            "wait_kind": "strategic_request_terminated",
+            "resume_policy": "explicit_only",
+            "planner_request_id": current.get("planner_request_id"),
+            "terminal_tick_id": current.get("terminal_tick_id"),
+            "terminal_status": current.get("terminal_status"),
+            "failure_category": current.get("failure_category"),
+        }
+        if not isinstance(human_wait_context, dict) or any(
+            human_wait_context.get(field) != value
+            for field, value in stable_identity.items()
+        ):
+            raise ValueError(
+                "strategic Request wait Tick requires matching persistence context"
+            )
+        if isinstance(tick, StrategicRequestWaitErrorTick) and (
+            tick.planner_request_id != current.get("planner_request_id")
+            or tick.terminal_tick_id != current.get("terminal_tick_id")
+            or tick.terminal_status.value != current.get("terminal_status")
+            or tick.failure_category != current.get("failure_category")
+        ):
+            raise ValueError("strategic Request wait-error Tick disagrees with context")
+
+    @classmethod
+    def _validate_strategic_wait_error_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        human_wait_context: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(tick, StrategicProposalWaitErrorTick):
+            return
+        state_row = conn.execute(
+            "SELECT state FROM runtime_state WHERE game_id=?",
+            (tick.game_session_id,),
+        ).fetchone()
+        if state_row is None or state_row["state"] != RuntimeState.AWAITING_HUMAN.value:
+            raise ValueError(
+                "Proposal wait-error Tick requires an active AWAITING_HUMAN wait"
+            )
+        wait_row = conn.execute(
+            "SELECT value_json FROM workflow_meta WHERE key=?",
+            (cls._human_wait_meta_key(tick.game_session_id),),
+        ).fetchone()
+        if wait_row is None:
+            raise ValueError(
+                "Proposal wait-error Tick requires active Human Wait context"
+            )
+        current = cls._load(str(wait_row["value_json"]))
+        expected = {
+            "wait_kind": "strategic_contract_proposal_ready",
+            "resume_policy": "explicit_only",
+            "proposal_ready_tick_id": tick.proposal_ready_tick_id,
+            "planner_request_id": tick.planner_request_id,
+            "proposal_id": tick.proposal_id,
+            "target_kind": tick.target_kind.value,
+            "expected_base_revision": tick.expected_base_revision,
+        }
+        if not isinstance(current, dict) or any(
+            current.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError(
+                "Proposal wait-error Tick disagrees with active Human Wait context"
+            )
+        if not isinstance(human_wait_context, dict) or any(
+            human_wait_context.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError(
+                "Proposal wait-error Tick requires matching persistence context"
+            )
+        resumed_rows = conn.execute(
+            "SELECT * FROM workflow_ticks WHERE game_id=? AND outcome=?",
+            (
+                tick.game_session_id,
+                TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED.value,
+            ),
+        ).fetchall()
+        if any(
+            isinstance(
+                resumed := cls._workflow_tick_from_row(dict(row)),
+                StrategicProposalWaitResumedTick,
+            )
+            and resumed.proposal_id == tick.proposal_id
+            for row in resumed_rows
+        ):
+            raise ValueError("Proposal wait-error Tick cannot follow wait resume")
 
     def persist_tick_and_runtime_state(
         self,
@@ -3335,6 +5598,21 @@ class WorkflowStore:
         failure_resolution: FailedAttemptResolution | None = None
         task_retry_count: int | None = None
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_strategic_resume_transition_in_connection(
+                conn, tick, human_wait_context
+            )
+            self._validate_strategic_wait_error_transition_in_connection(
+                conn, tick, human_wait_context
+            )
+            self._validate_strategic_request_wait_transition_in_connection(
+                conn, tick, human_wait_context
+            )
+            human_wait_context = (
+                self._preserve_concurrent_strategic_resume_context_in_connection(
+                    conn, tick, human_wait_context
+                )
+            )
             if attempt is not None:
                 self._update_action_attempt_in_connection(conn, attempt)
                 if checkpoint is not None and attempt_checkpoint is not None:
@@ -3392,6 +5670,7 @@ class WorkflowStore:
             if checkpoint is not None:
                 checkpoint("after_runtime_state_update")
             self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1b_proposals_v10(conn)
         return failure_resolution
 
     def finalize_attempt_success(
@@ -3742,10 +6021,6 @@ class WorkflowStore:
             return _PlannerResponseFacts.LEGACY_V7_MISSING_PAYLOAD
         if request.status not in response_statuses:
             return _PlannerResponseFacts.NO_RESPONSE
-        if request.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
-            raise ValueError(
-                "non-legacy planner response contract is not enabled before Phase 1B"
-            )
         response_evidence = {
             "response_payload": request.response_payload,
             "response_hash": request.response_hash,
@@ -3767,19 +6042,33 @@ class WorkflowStore:
                 f"PlannerRequest completion requires: {', '.join(sorted(missing))}"
             )
         PlannerRequest.model_validate_json(request.model_dump_json())
-        canonical_payload = canonical_workflow_plan_bundle_payload(
-            request.response_payload
-        )
+        match request.target.kind:
+            case PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+                canonical_payload = canonical_workflow_plan_bundle_payload(
+                    request.response_payload
+                )
+                contract_name = "WorkflowPlanBundle"
+            case (
+                PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION
+                | PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
+            ):
+                canonical_payload = (
+                    canonical_strategic_research_proposal_response_payload(
+                        request.response_payload
+                    )
+                )
+                contract_name = "StrategicResearchProposalResponse"
+            case _:
+                raise ValueError("unsupported PlannerRequest response target")
         if canonical_json(request.response_payload) != canonical_json(
             canonical_payload
         ):
             raise ValueError(
-                "legacy planner response_payload must be a canonical WorkflowPlanBundle"
+                f"planner response_payload must be a canonical {contract_name}"
             )
         if request.response_hash != canonical_json_hash(canonical_payload):
             raise ValueError(
-                "legacy planner response_hash must use the canonical "
-                "WorkflowPlanBundle payload"
+                f"planner response_hash must use the canonical {contract_name} payload"
             )
         return _PlannerResponseFacts.CANONICAL_RESPONSE
 
@@ -3991,9 +6280,59 @@ class WorkflowStore:
                 conn, request.game_session_id, abandoned
             )
 
+    @staticmethod
+    def _is_clean_initial_strategic_request(request: PlannerRequest) -> bool:
+        return (
+            request.status is PlannerRequestStatus.PENDING
+            and request.provider_attempt_count == 0
+            and request.information_round_count == 0
+            and request.pending_information_requests == ()
+            and not request.information_results
+            and request.completed_at is None
+            and request.response_payload is None
+            and request.response_hash is None
+            and request.validation_result is None
+            and request.response_evidence_compatibility is None
+            and request.failure_category is None
+            and request.next_retry_at is None
+        )
+
     def save_planner_request(self, request: PlannerRequest) -> None:
         with self._connect() as conn:
+            existing_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (request.planner_request_id,),
+            ).fetchone()
+            existing = (
+                None
+                if existing_row is None
+                else self._planner_request_from_row(existing_row)
+            )
+            strategic_candidate = request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+            strategic_existing = (
+                existing is not None
+                and existing.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+            )
+            if strategic_candidate or strategic_existing:
+                if existing is None:
+                    if not strategic_candidate or not (
+                        self._is_clean_initial_strategic_request(request)
+                    ):
+                        raise ValueError(
+                            "new strategic PlannerRequest must be a clean PENDING request"
+                        )
+                    self._save_planner_request_in_connection(conn, request)
+                    self._validate_phase1b_proposals_v10(conn)
+                    return
+                if request != existing:
+                    raise ValueError(
+                        "strategic PlannerRequest lifecycle requires an atomic "
+                        "Runtime transaction"
+                    )
+                self._validate_phase1b_proposals_v10(conn)
+                return
             self._save_planner_request_in_connection(conn, request)
+            self._validate_phase1b_proposals_v10(conn)
 
     def get_planner_request(self, planner_request_id: str) -> PlannerRequest | None:
         with self._connect() as conn:
@@ -4236,10 +6575,12 @@ class WorkflowStore:
         conn: sqlite3.Connection,
         game_id: str,
         attempt: ProviderAttempt,
+        *,
+        validate_aggregate: bool = True,
     ) -> None:
         parent = conn.execute(
             """
-            SELECT game_id FROM logical_planner_requests
+            SELECT * FROM logical_planner_requests
             WHERE planner_request_id=?
             """,
             (attempt.planner_request_id,),
@@ -4250,12 +6591,21 @@ class WorkflowStore:
             raise ValueError(
                 "ProviderAttempt game_id conflicts with parent PlannerRequest"
             )
+        parent_request = cls._planner_request_from_row(parent)
         existing_row = conn.execute(
             """
             SELECT * FROM provider_attempts WHERE provider_attempt_id=?
             """,
             (attempt.provider_attempt_id,),
         ).fetchone()
+        if (
+            parent_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+            and existing_row is None
+            and attempt.status is not ProviderAttemptStatus.STARTED
+        ):
+            raise ValueError(
+                "new strategic ProviderAttempt must be persisted as STARTED"
+            )
         if existing_row is not None:
             existing = cls._provider_attempt_from_row(conn, existing_row)
             existing_game_id = str(existing_row["game_id"])
@@ -4316,10 +6666,7 @@ class WorkflowStore:
         )
         parent_request = cls._planner_request_from_row(
             conn.execute(
-                """
-                SELECT * FROM logical_planner_requests
-                WHERE planner_request_id=?
-                """,
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
                 (attempt.planner_request_id,),
             ).fetchone()
         )
@@ -4334,9 +6681,40 @@ class WorkflowStore:
                 (attempt.planner_request_id,),
             ).fetchall(),
         )
+        if validate_aggregate:
+            cls._validate_phase1b_proposals_v10(conn)
 
     def save_provider_attempt(self, game_id: str, attempt: ProviderAttempt) -> None:
         with self._connect() as conn:
+            parent_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (attempt.planner_request_id,),
+            ).fetchone()
+            if parent_row is None:
+                raise ValueError("ProviderAttempt parent PlannerRequest does not exist")
+            parent = self._planner_request_from_row(parent_row)
+            if parent.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                existing_row = conn.execute(
+                    "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+                    (attempt.provider_attempt_id,),
+                ).fetchone()
+                if existing_row is None:
+                    raise ValueError(
+                        "new strategic ProviderAttempt requires "
+                        "start_provider_attempt()"
+                    )
+                existing = self._provider_attempt_from_row(conn, existing_row)
+                if attempt == existing:
+                    self._validate_phase1b_proposals_v10(conn)
+                    return
+                if not (
+                    existing.status is ProviderAttemptStatus.STARTED
+                    and attempt.status is ProviderAttemptStatus.FAILED
+                ):
+                    raise ValueError(
+                        "strategic ProviderAttempt success requires an atomic "
+                        "Runtime transaction"
+                    )
             self._save_provider_attempt_in_connection(conn, game_id, attempt)
 
     def start_provider_attempt(
@@ -4352,6 +6730,37 @@ class WorkflowStore:
         if request.game_session_id != game_id:
             raise ValueError("planner request belongs to another game")
         with self._connect() as conn:
+            request_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (request.planner_request_id,),
+            ).fetchone()
+            if request_row is None:
+                raise ValueError("PlannerRequest does not exist")
+            stored_request = self._planner_request_from_row(request_row)
+            if (
+                request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+                or stored_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+            ):
+                if request != stored_request:
+                    raise ValueError(
+                        "strategic ProviderAttempt must start from the current Request"
+                    )
+                if request.status not in {
+                    PlannerRequestStatus.PENDING,
+                    PlannerRequestStatus.IN_PROGRESS,
+                    PlannerRequestStatus.BACKOFF,
+                    PlannerRequestStatus.READY_TO_CONTINUE,
+                }:
+                    raise ValueError(
+                        "strategic ProviderAttempt cannot start from this Request status"
+                    )
+                if request.status is PlannerRequestStatus.BACKOFF and (
+                    request.next_retry_at is None
+                    or attempt.started_at < request.next_retry_at
+                ):
+                    raise ValueError(
+                        "strategic ProviderAttempt cannot start before next_retry_at"
+                    )
             rows = conn.execute(
                 """
                 SELECT * FROM provider_attempts
@@ -4377,7 +6786,9 @@ class WorkflowStore:
                         },
                     }
                 )
-                self._save_provider_attempt_in_connection(conn, game_id, interrupted)
+                self._save_provider_attempt_in_connection(
+                    conn, game_id, interrupted, validate_aggregate=False
+                )
             expected = int(
                 conn.execute(
                     """
@@ -4393,12 +6804,18 @@ class WorkflowStore:
                     f"provider attempt_number must be {expected}, "
                     f"got {attempt.attempt_number}"
                 )
-            in_progress = request.model_copy(
-                update={
-                    "status": PlannerRequestStatus.IN_PROGRESS,
-                    "provider_attempt_count": attempt.attempt_number,
-                }
-            )
+            updates = {
+                "status": PlannerRequestStatus.IN_PROGRESS,
+                "provider_attempt_count": attempt.attempt_number,
+            }
+            if request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                updates.update(
+                    {
+                        "failure_category": None,
+                        "next_retry_at": None,
+                    }
+                )
+            in_progress = request.model_copy(update=updates)
             self._save_planner_request_in_connection(conn, in_progress)
             self._save_provider_attempt_in_connection(conn, game_id, attempt)
         return in_progress
@@ -4524,6 +6941,8 @@ class WorkflowStore:
             game_id,
             round_record.planner_request_id,
             round_record.round_number,
+            round_record.source_provider_attempt_id,
+            round_record.source_provider_attempt_number,
             canonical_json(round_record.requests),
             round_record.requested_at,
         )
@@ -4615,7 +7034,35 @@ class WorkflowStore:
         self, game_id: str, round_record: InformationRound
     ) -> None:
         with self._connect() as conn:
+            parent_row = conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (round_record.planner_request_id,),
+            ).fetchone()
+            if parent_row is None:
+                raise ValueError(
+                    "InformationRound parent PlannerRequest does not exist"
+                )
+            parent = self._planner_request_from_row(parent_row)
+            if parent.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS:
+                existing_row = conn.execute(
+                    "SELECT * FROM information_rounds WHERE information_round_id=?",
+                    (round_record.information_round_id,),
+                ).fetchone()
+                if existing_row is None:
+                    raise ValueError(
+                        "strategic InformationRound creation requires an atomic "
+                        "Runtime transaction"
+                    )
+                existing = self._information_round_from_row(conn, existing_row)
+                if str(existing_row["game_id"]) != game_id or round_record != existing:
+                    raise ValueError(
+                        "strategic InformationRound lifecycle requires an atomic "
+                        "Runtime transaction"
+                    )
+                self._validate_phase1b_proposals_v10(conn)
+                return
             self._save_information_round_in_connection(conn, game_id, round_record)
+            self._validate_phase1b_proposals_v10(conn)
 
     def list_information_rounds(
         self, planner_request_id: str
@@ -4629,6 +7076,386 @@ class WorkflowStore:
                 (planner_request_id,),
             ).fetchall()
             return [self._information_round_from_row(conn, row) for row in rows]
+
+    @classmethod
+    def _validate_strategic_request_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        planner_request: PlannerRequest | None,
+        provider_attempts: Sequence[ProviderAttempt],
+        information_round: InformationRound | None,
+        strategic_research_proposal: StrategicResearchProposal | None,
+    ) -> None:
+        referenced_request_id = getattr(tick, "planner_request_id", None)
+        referenced_row = (
+            None
+            if not isinstance(referenced_request_id, str)
+            else conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+                (referenced_request_id,),
+            ).fetchone()
+        )
+        referenced_request = (
+            None
+            if referenced_row is None
+            else cls._planner_request_from_row(referenced_row)
+        )
+        if planner_request is None:
+            if (
+                referenced_request is not None
+                and referenced_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+                and isinstance(
+                    tick,
+                    (
+                        PlannerAttemptCompletedTick,
+                        PlannerBackoffTick,
+                        InformationRequestedTick,
+                        InformationCollectedTick,
+                        StrategicProposalReadyTick,
+                        StrategicRequestTerminatedTick,
+                    ),
+                )
+            ):
+                raise ValueError(
+                    "strategic PlannerRequest Tick requires its Request aggregate"
+                )
+            return
+
+        existing_row = conn.execute(
+            "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+            (planner_request.planner_request_id,),
+        ).fetchone()
+        existing = (
+            None
+            if existing_row is None
+            else cls._planner_request_from_row(existing_row)
+        )
+        strategic = planner_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS or (
+            existing is not None
+            and existing.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+        )
+        if not strategic:
+            return
+        if (
+            planner_request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS
+            or planner_request.game_session_id != tick.game_session_id
+        ):
+            raise ValueError("strategic PlannerRequest aggregate identity disagrees")
+        if existing is None:
+            if (
+                not isinstance(tick, LogicalPlannerRequestCreatedTick)
+                or tick.planner_request_id != planner_request.planner_request_id
+                or tick.request_target_kind is not planner_request.target.kind
+                or not cls._is_clean_initial_strategic_request(planner_request)
+                or provider_attempts
+                or information_round is not None
+                or strategic_research_proposal is not None
+            ):
+                raise ValueError(
+                    "strategic PlannerRequest creation aggregate is invalid"
+                )
+            return
+        if existing.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+            raise ValueError("PlannerRequest target kind cannot change")
+        if planner_request == existing:
+            if (
+                isinstance(tick, PlannerBackoffTick)
+                and existing.status is PlannerRequestStatus.BACKOFF
+                and tick.planner_request_id == existing.planner_request_id
+                and not provider_attempts
+                and information_round is None
+                and strategic_research_proposal is None
+            ):
+                return
+            raise ValueError(
+                "strategic PlannerRequest aggregate has no valid lifecycle transition"
+            )
+
+        transition = (existing.status, planner_request.status)
+        information_transitions = {
+            (
+                PlannerRequestStatus.IN_PROGRESS,
+                PlannerRequestStatus.AWAITING_INFORMATION,
+            ),
+            (
+                PlannerRequestStatus.AWAITING_INFORMATION,
+                PlannerRequestStatus.READY_TO_CONTINUE,
+            ),
+            (
+                PlannerRequestStatus.AWAITING_INFORMATION,
+                PlannerRequestStatus.FAILED,
+            ),
+        }
+        if transition in information_transitions:
+            return
+        if planner_request.status is PlannerRequestStatus.SUPERSEDED:
+            contract_root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (existing.game_session_id,),
+            ).fetchone()
+            latest_attempt_row = conn.execute(
+                "SELECT * FROM provider_attempts WHERE planner_request_id=? "
+                "ORDER BY attempt_number DESC LIMIT 1",
+                (existing.planner_request_id,),
+            ).fetchone()
+            latest_attempt_id = (
+                None
+                if latest_attempt_row is None
+                else str(latest_attempt_row["provider_attempt_id"])
+            )
+            if (
+                isinstance(tick, StrategicRequestTerminatedTick)
+                and tick.planner_request_id == existing.planner_request_id
+                and tick.terminal_status is PlannerRequestStatus.SUPERSEDED
+                and tick.failure_category == planner_request.failure_category
+                and tick.provider_attempt_id == latest_attempt_id
+                and planner_request.failure_category == "stale_strategic_contract_base"
+                and planner_request.completed_at is not None
+                and planner_request.next_retry_at is None
+                and not provider_attempts
+                and strategic_research_proposal is None
+                and cls._strategic_request_base_is_stale(
+                    existing,
+                    None if contract_root is None else dict(contract_root),
+                )
+            ):
+                return
+            raise ValueError("strategic SUPERSEDED transition is invalid")
+        if existing.status is not PlannerRequestStatus.IN_PROGRESS:
+            raise ValueError(
+                "strategic PlannerRequest status transition is not allowed"
+            )
+        if len(provider_attempts) != 1:
+            raise ValueError(
+                "strategic Provider completion requires one ProviderAttempt "
+                "in the same Runtime transaction"
+            )
+        final_attempt = provider_attempts[0]
+        stored_attempt_row = conn.execute(
+            "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+            (final_attempt.provider_attempt_id,),
+        ).fetchone()
+        stored_attempt = (
+            None
+            if stored_attempt_row is None
+            else cls._provider_attempt_from_row(conn, stored_attempt_row)
+        )
+        if (
+            stored_attempt is None
+            or stored_attempt.status is not ProviderAttemptStatus.STARTED
+            or final_attempt.planner_request_id != existing.planner_request_id
+            or final_attempt.attempt_number != existing.provider_attempt_count
+            or planner_request.provider_attempt_count != existing.provider_attempt_count
+            or final_attempt.completed_at is None
+        ):
+            raise ValueError(
+                "strategic Request transition requires its current completed "
+                "ProviderAttempt"
+            )
+
+        if planner_request.status is PlannerRequestStatus.BACKOFF:
+            if (
+                not isinstance(tick, PlannerAttemptCompletedTick)
+                or tick.planner_request_id != existing.planner_request_id
+                or tick.provider_attempt_id != final_attempt.provider_attempt_id
+                or tick.provider_attempt_count < 1
+                or final_attempt.status is not ProviderAttemptStatus.FAILED
+                or planner_request.next_retry_at is None
+                or planner_request.next_retry_at.utcoffset() is None
+                or planner_request.failure_category != "transient_provider_failure"
+                or planner_request.completed_at is not None
+                or information_round is not None
+                or strategic_research_proposal is not None
+            ):
+                raise ValueError("strategic BACKOFF transition is invalid")
+            return
+        if planner_request.status is PlannerRequestStatus.FAILED:
+            if (
+                not isinstance(tick, StrategicRequestTerminatedTick)
+                or tick.planner_request_id != existing.planner_request_id
+                or tick.terminal_status is not PlannerRequestStatus.FAILED
+                or tick.failure_category != planner_request.failure_category
+                or tick.provider_attempt_id != final_attempt.provider_attempt_id
+                or tick.completed_at < final_attempt.completed_at
+                or final_attempt.status is not ProviderAttemptStatus.FAILED
+                or planner_request.completed_at is None
+                or planner_request.next_retry_at is not None
+                or information_round is not None
+                or strategic_research_proposal is not None
+            ):
+                raise ValueError("strategic FAILED transition is invalid")
+            return
+        if planner_request.status is PlannerRequestStatus.REJECTED:
+            if (
+                not isinstance(tick, StrategicRequestTerminatedTick)
+                or tick.planner_request_id != existing.planner_request_id
+                or tick.terminal_status is not PlannerRequestStatus.REJECTED
+                or tick.failure_category != planner_request.failure_category
+                or tick.provider_attempt_id != final_attempt.provider_attempt_id
+                or tick.completed_at < final_attempt.completed_at
+                or final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or planner_request.completed_at is None
+                or planner_request.next_retry_at is not None
+                or information_round is not None
+                or strategic_research_proposal is not None
+                or cls._classify_planner_request_response(planner_request)
+                not in {
+                    _PlannerResponseFacts.CANONICAL_RESPONSE,
+                    _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE,
+                }
+            ):
+                raise ValueError("strategic REJECTED transition is invalid")
+            return
+        if planner_request.status is PlannerRequestStatus.COMPLETED:
+            if (
+                not isinstance(tick, StrategicProposalReadyTick)
+                or tick.planner_request_id != existing.planner_request_id
+                or final_attempt.status is not ProviderAttemptStatus.SUCCEEDED
+                or planner_request.completed_at is None
+                or planner_request.next_retry_at is not None
+                or information_round is not None
+                or strategic_research_proposal is None
+                or strategic_research_proposal.source_planner_request_id
+                != existing.planner_request_id
+                or strategic_research_proposal.source_provider_attempt_id
+                != final_attempt.provider_attempt_id
+                or strategic_research_proposal.proposal_id != tick.proposal_id
+            ):
+                raise ValueError("strategic COMPLETED transition is invalid")
+            return
+        raise ValueError("strategic PlannerRequest transition is invalid")
+
+    @classmethod
+    def _validate_strategic_information_transition_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        tick: WorkflowTick,
+        planner_request: PlannerRequest | None,
+        provider_attempts: Sequence[ProviderAttempt],
+        information_round: InformationRound | None,
+    ) -> None:
+        if information_round is None:
+            return
+        parent_row = conn.execute(
+            "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
+            (information_round.planner_request_id,),
+        ).fetchone()
+        if parent_row is None:
+            raise ValueError("InformationRound parent PlannerRequest does not exist")
+        current_request = cls._planner_request_from_row(parent_row)
+        if current_request.target.kind not in STRATEGIC_PROPOSAL_TARGET_KINDS:
+            return
+        if (
+            planner_request is None
+            or planner_request.planner_request_id != current_request.planner_request_id
+            or planner_request.game_session_id != tick.game_session_id
+            or information_round.planner_request_id
+            != planner_request.planner_request_id
+        ):
+            raise ValueError(
+                "strategic InformationRound requires its PlannerRequest in the "
+                "same Runtime transaction"
+            )
+        existing_row = conn.execute(
+            "SELECT * FROM information_rounds WHERE information_round_id=?",
+            (information_round.information_round_id,),
+        ).fetchone()
+        if existing_row is None:
+            if (
+                not isinstance(tick, InformationRequestedTick)
+                or tick.planner_request_id != planner_request.planner_request_id
+                or tick.information_round_id != information_round.information_round_id
+                or current_request.status is not PlannerRequestStatus.IN_PROGRESS
+                or planner_request.status
+                is not PlannerRequestStatus.AWAITING_INFORMATION
+                or information_round.status is not InformationRoundStatus.REQUESTED
+            ):
+                raise ValueError(
+                    "strategic InformationRound request transition is invalid"
+                )
+            matching = [
+                attempt
+                for attempt in provider_attempts
+                if attempt.provider_attempt_id
+                == information_round.source_provider_attempt_id
+                and attempt.attempt_number
+                == information_round.source_provider_attempt_number
+                and attempt.planner_request_id == planner_request.planner_request_id
+            ]
+            if len(matching) != 1:
+                raise ValueError(
+                    "strategic InformationRound requires the successful "
+                    "ProviderAttempt in the same Runtime transaction"
+                )
+            source = matching[0]
+            source_row = conn.execute(
+                "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
+                (source.provider_attempt_id,),
+            ).fetchone()
+            if source_row is None:
+                raise ValueError(
+                    "strategic InformationRound source ProviderAttempt was not started"
+                )
+            started = cls._provider_attempt_from_row(conn, source_row)
+            if (
+                started.status is not ProviderAttemptStatus.STARTED
+                or source.status is not ProviderAttemptStatus.SUCCEEDED
+                or source.completed_at is None
+                or source.attempt_number != current_request.provider_attempt_count
+                or planner_request.provider_attempt_count
+                != current_request.provider_attempt_count
+                or source.completed_at > information_round.requested_at
+            ):
+                raise ValueError(
+                    "strategic InformationRound source ProviderAttempt is not "
+                    "the completed current Attempt"
+                )
+            return
+
+        existing = cls._information_round_from_row(conn, existing_row)
+        if existing.status is not InformationRoundStatus.REQUESTED:
+            raise ValueError(
+                "terminal strategic InformationRound cannot transition again"
+            )
+        if cls._information_round_creation_definition(
+            tick.game_session_id, information_round
+        ) != cls._information_round_creation_definition(
+            str(existing_row["game_id"]), existing
+        ):
+            raise ValueError("InformationRound creation identity is immutable")
+        if provider_attempts:
+            raise ValueError(
+                "strategic InformationRound completion cannot add ProviderAttempts"
+            )
+        if information_round.status is InformationRoundStatus.COLLECTED:
+            if (
+                not isinstance(tick, InformationCollectedTick)
+                or tick.planner_request_id != planner_request.planner_request_id
+                or tick.information_round_id != information_round.information_round_id
+                or current_request.status
+                is not PlannerRequestStatus.AWAITING_INFORMATION
+                or planner_request.status is not PlannerRequestStatus.READY_TO_CONTINUE
+            ):
+                raise ValueError(
+                    "strategic InformationRound collection transition is invalid"
+                )
+            return
+        if information_round.status is InformationRoundStatus.FAILED:
+            if (
+                not isinstance(tick, StrategicRequestTerminatedTick)
+                or tick.planner_request_id != planner_request.planner_request_id
+                or tick.terminal_status is not planner_request.status
+                or tick.failure_category != planner_request.failure_category
+                or current_request.status
+                is not PlannerRequestStatus.AWAITING_INFORMATION
+                or planner_request.status not in TERMINAL_PLANNER_STATUSES
+            ):
+                raise ValueError(
+                    "strategic InformationRound failure transition is invalid"
+                )
+            return
+        raise ValueError("strategic InformationRound requires a lifecycle transition")
 
     def record_planner_suppression(
         self,
@@ -4663,6 +7490,7 @@ class WorkflowStore:
         decision_group: DecisionGroup | None = None,
         plan_leases: Sequence[PlanLease] = (),
         planner_request: PlannerRequest | None = None,
+        strategic_research_proposal: StrategicResearchProposal | None = None,
         provider_attempts: Sequence[ProviderAttempt] = (),
         information_round: InformationRound | None = None,
         plan_bundle: PlanBundle | None = None,
@@ -4675,6 +7503,31 @@ class WorkflowStore:
     ) -> None:
         tick = validate_workflow_tick(tick)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_strategic_resume_transition_in_connection(
+                conn, tick, human_wait_context
+            )
+            self._validate_strategic_wait_error_transition_in_connection(
+                conn, tick, human_wait_context
+            )
+            self._validate_strategic_request_wait_transition_in_connection(
+                conn, tick, human_wait_context
+            )
+            self._validate_strategic_request_transition_in_connection(
+                conn,
+                tick,
+                planner_request,
+                provider_attempts,
+                information_round,
+                strategic_research_proposal,
+            )
+            self._validate_strategic_information_transition_in_connection(
+                conn,
+                tick,
+                planner_request,
+                provider_attempts,
+                information_round,
+            )
             if plan_bundle is not None:
                 if plan_bundle_mode is None:
                     raise ValueError("plan bundle persistence requires execution mode")
@@ -4713,12 +7566,21 @@ class WorkflowStore:
                 )
             for provider_attempt in provider_attempts:
                 self._save_provider_attempt_in_connection(
-                    conn, tick.game_session_id, provider_attempt
+                    conn,
+                    tick.game_session_id,
+                    provider_attempt,
+                    validate_aggregate=False,
                 )
             if planner_request is not None:
                 if planner_request.game_session_id != tick.game_session_id:
                     raise ValueError("planner request and Tick must belong to one game")
                 self._save_planner_request_in_connection(conn, planner_request)
+            if strategic_research_proposal is not None:
+                if strategic_research_proposal.game_session_id != tick.game_session_id:
+                    raise ValueError("proposal and Tick must belong to one game")
+                self._save_strategic_research_proposal_in_connection(
+                    conn, strategic_research_proposal
+                )
             if information_round is not None:
                 self._save_information_round_in_connection(
                     conn, tick.game_session_id, information_round
@@ -4751,6 +7613,11 @@ class WorkflowStore:
                         TaskStatus.AWAITING_CONFIRMATION.value,
                     ),
                 )
+            human_wait_context = (
+                self._preserve_concurrent_strategic_resume_context_in_connection(
+                    conn, tick, human_wait_context
+                )
+            )
             self._save_runtime_state_in_connection(
                 conn,
                 tick.game_session_id,
@@ -4764,6 +7631,7 @@ class WorkflowStore:
                 human_wait_context,
             )
             self._insert_workflow_tick_in_connection(conn, tick)
+            self._validate_phase1b_proposals_v10(conn)
 
     def planner_metrics(self, game_id: str) -> dict[str, Any]:
         with self._connect() as conn:
@@ -4904,6 +7772,7 @@ class WorkflowStore:
                 "last_game_id",
                 "last_observed_turn",
                 f"unit_observations_initialized:{game_id}",
+                self._human_wait_meta_key(game_id),
             )
             placeholders = ",".join("?" for _ in meta_keys)
             tables["workflow_meta"] = [
@@ -4927,6 +7796,7 @@ class WorkflowStore:
             "last_game_id",
             "last_observed_turn",
             f"unit_observations_initialized:{game_id}",
+            cls._human_wait_meta_key(game_id),
         }
         for table in (*REPLAY_STATE_TABLES, "workflow_meta"):
             rows = tables.get(table, [])
@@ -4986,6 +7856,10 @@ class WorkflowStore:
                     row = cls._normalize_contract_revision_row(row)
                 elif table == "strategic_contract_commits":
                     row = cls._normalize_contract_commit_row(row)
+                elif table == "strategic_research_proposals":
+                    row = cls._normalize_strategic_research_proposal_row(row)
+                elif table == "strategic_proposal_wait_resume_requests":
+                    row = cls._normalize_strategic_proposal_wait_resume_request_row(row)
                 elif table == "logical_planner_requests":
                     row = cls._normalize_planner_request_row(
                         row,
@@ -5043,6 +7917,63 @@ class WorkflowStore:
                 PlannerRequest.model_validate_json(str(row["request_json"])),
                 prepared["provider_attempts"],
             )
+        external_proposals = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_research_proposals WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_resume_requests = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM strategic_proposal_wait_resume_requests "
+                "WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_requests = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM logical_planner_requests WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_attempts = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM provider_attempts WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_information_rounds = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM information_rounds WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_ticks = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM workflow_ticks WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_runtime = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM runtime_state WHERE game_id<>?",
+                (game_id,),
+            ).fetchall()
+        ]
+        external_wait_meta = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM workflow_meta WHERE key LIKE 'human_wait:%' AND key<>?",
+                (cls._human_wait_meta_key(game_id),),
+            ).fetchall()
+        ]
         external_roots = [
             dict(row)
             for row in conn.execute(
@@ -5050,6 +7981,33 @@ class WorkflowStore:
                 (game_id,),
             ).fetchall()
         ]
+        cls._validate_strategic_proposal_lifecycle_v10(
+            [
+                *external_proposals,
+                *prepared["strategic_research_proposals"],
+            ],
+            [
+                *external_resume_requests,
+                *prepared["strategic_proposal_wait_resume_requests"],
+            ],
+            [
+                *external_requests,
+                *prepared["logical_planner_requests"],
+            ],
+            [
+                *external_attempts,
+                *prepared["provider_attempts"],
+            ],
+            [
+                *external_information_rounds,
+                *prepared["information_rounds"],
+            ],
+            [*external_ticks, *prepared["workflow_ticks"]],
+            [*external_runtime, *prepared["runtime_state"]],
+            [*external_wait_meta, *prepared["workflow_meta"]],
+            [*external_roots, *prepared["strategic_contract_roots"]],
+            require_canonical=True,
+        )
         external_revisions = [
             dict(row)
             for row in conn.execute(
@@ -5110,12 +8068,13 @@ class WorkflowStore:
             conn.execute(
                 """
                 DELETE FROM workflow_meta
-                WHERE key IN (?, ?, ?)
+                WHERE key IN (?, ?, ?, ?)
                 """,
                 (
                     "last_game_id",
                     "last_observed_turn",
                     f"unit_observations_initialized:{game_id}",
+                    self._human_wait_meta_key(game_id),
                 ),
             )
             for table in (*REPLAY_STATE_TABLES, "workflow_meta"):

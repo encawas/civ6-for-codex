@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .domain import StrategicContract, StrategicContractCommit
+from .domain import (
+    StrategicContract,
+    StrategicContractCommit,
+    StrategicProposalWaitResumeRequest,
+    StrategicResearchProposal,
+)
 from .models import ActionResult, RuntimeSnapshot, StoredTask
 
 
@@ -32,6 +37,34 @@ class WorkflowStorePort(Protocol):
     def list_strategic_contract_commits(
         self, game_session_id: str
     ) -> list[StrategicContractCommit]: ...
+
+    def save_strategic_research_proposal(
+        self, proposal: StrategicResearchProposal
+    ) -> StrategicResearchProposal: ...
+
+    def get_strategic_research_proposal(
+        self, proposal_id: str
+    ) -> StrategicResearchProposal | None: ...
+
+    def strategic_research_proposal_for_request(
+        self, planner_request_id: str
+    ) -> StrategicResearchProposal | None: ...
+
+    def list_strategic_research_proposals(
+        self, game_session_id: str
+    ) -> list[StrategicResearchProposal]: ...
+
+    def get_strategic_proposal_wait_resume_request(
+        self, resume_request_id: str
+    ) -> StrategicProposalWaitResumeRequest | None: ...
+
+    def strategic_proposal_wait_resume_request_for_proposal(
+        self, proposal_id: str
+    ) -> StrategicProposalWaitResumeRequest | None: ...
+
+    def list_strategic_proposal_wait_resume_requests(
+        self, game_session_id: str
+    ) -> list[StrategicProposalWaitResumeRequest]: ...
 
     def __getattr__(self, name: str) -> Any: ...
 

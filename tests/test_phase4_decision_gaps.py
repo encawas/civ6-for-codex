@@ -685,7 +685,7 @@ def _engine(tmp_path, planner):
     return engine, game, recording
 
 
-def test_nonlegacy_request_waits_before_legacy_stale_routing(tmp_path):
+def test_nonlegacy_request_is_superseded_before_legacy_stale_routing(tmp_path):
     async def scenario():
         snapshot = RuntimeSnapshot(
             turn=1,
@@ -731,18 +731,21 @@ def test_nonlegacy_request_waits_before_legacy_stale_routing(tmp_path):
 
         result = await engine.tick()
 
-        assert result.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
-        assert result.workflow_tick["blocking_reason"] == (
-            "non-legacy planner request routing is not enabled before Phase 1B"
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
         )
-        assert store.get_planner_request(request.planner_request_id) == request
+        assert result.workflow_tick["blocking_reason"] == (
+            "MissionGraph repair requires an active Contract"
+        )
+        stored = store.get_planner_request(request.planner_request_id)
+        assert stored.status is PlannerRequestStatus.SUPERSEDED
+        assert stored.failure_category == "stale_strategic_contract_base"
         assert store.list_provider_attempts(request.planner_request_id) == []
         assert store.list_information_rounds(request.planner_request_id) == []
         assert store.list_decision_gaps("opening") == []
         assert store.list_plan_leases("opening") == []
-        assert store.provider_budget_request_count_for_turn("opening", 1) == (
-            budget_before
-        )
+        assert budget_before == 1
+        assert store.provider_budget_request_count_for_turn("opening", 1) == 0
         assert delegate.calls == 0
 
     asyncio.run(scenario())
@@ -773,9 +776,9 @@ def _persist_legacy_in_progress_request(
         [gap],
         now=datetime.now(UTC),
     )
-    old_payload = engine._build_agent_request(
-        game.snapshot, [event]
-    ).model_dump(mode="json")
+    old_payload = engine._build_agent_request(game.snapshot, [event]).model_dump(
+        mode="json"
+    )
     old_constraints = dict(old_payload["constraints"])
     if planner_input_contract_revision is None:
         for key in _PLANNER_CONTRACT_KEYS:
@@ -849,13 +852,13 @@ def test_planner_receives_filtered_canonical_input_contracts(tmp_path):
         assert set(constraints["action_argument_contracts"]) == {"set_research"}
         assert set(constraints["action_entity_types"]) == {"set_research"}
         assert set(constraints["condition_contracts"]) == {"set_research"}
-        assert constraints["entity_id_arguments"] == {
-            "research": "tech_or_civic"
-        }
+        assert constraints["entity_id_arguments"] == {"research": "tech_or_civic"}
         assert set(constraints["allowed_action_types"]) == {"set_research"}
-        assert set(constraints["allowed_information_tools"]) == set(
-            constraints["information_tool_arguments"]
-        ) == set(READ_ONLY_QUERY_SPECS)
+        assert (
+            set(constraints["allowed_information_tools"])
+            == set(constraints["information_tool_arguments"])
+            == set(READ_ONLY_QUERY_SPECS)
+        )
         assert "unit_move" not in constraints["action_argument_contracts"]
         assert "builder_improve" not in constraints["action_entity_types"]
 
@@ -949,15 +952,11 @@ def test_legacy_active_request_is_superseded_and_rebuilt_with_contracts(
         superseded = await engine.tick()
 
         assert (
-            superseded.workflow_tick["outcome"]
-            == TickOutcomeKind.DECISION_GAP_UPDATED
+            superseded.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
         )
         stored_old = engine.store.get_planner_request(request_id)
         assert stored_old.status is PlannerRequestStatus.SUPERSEDED
-        assert (
-            stored_old.failure_category
-            == "planner_contract_revision_migration"
-        )
+        assert stored_old.failure_category == "planner_contract_revision_migration"
         assert engine.store.list_provider_attempts(request_id) == []
         assert planner.summary.logical_requests == 0
         assert planner.summary.provider_attempts == 0
@@ -1003,16 +1002,10 @@ def test_contract_migration_recovers_started_attempt_across_three_ticks(tmp_path
 
         migrated = await engine.tick()
 
-        assert (
-            migrated.workflow_tick["outcome"]
-            == TickOutcomeKind.DECISION_GAP_UPDATED
-        )
+        assert migrated.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
         stored_old = engine.store.get_planner_request(request_id)
         assert stored_old.status is PlannerRequestStatus.SUPERSEDED
-        assert (
-            stored_old.failure_category
-            == "planner_contract_revision_migration"
-        )
+        assert stored_old.failure_category == "planner_contract_revision_migration"
         attempts = engine.store.list_provider_attempts(request_id)
         assert [attempt.status for attempt in attempts] == [
             ProviderAttemptStatus.ABANDONED
@@ -1037,9 +1030,7 @@ def test_contract_migration_recovers_started_attempt_across_three_ticks(tmp_path
         )
         assert replacement.status is PlannerRequestStatus.PENDING
         assert replacement.policy_revision == PLANNER_REQUEST_POLICY_REVISION
-        assert _PLANNER_CONTRACT_KEYS <= set(
-            replacement.request_payload["constraints"]
-        )
+        assert _PLANNER_CONTRACT_KEYS <= set(replacement.request_payload["constraints"])
         assert replacement.request_payload != old_payload
         assert delegate.calls == 0
         assert planner.summary.provider_attempts == 0
@@ -1086,8 +1077,7 @@ def test_call_policy_change_does_not_receive_contract_migration_budget_exemption
         superseded = await engine.tick()
 
         assert (
-            superseded.workflow_tick["outcome"]
-            == TickOutcomeKind.DECISION_GAP_UPDATED
+            superseded.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
         )
         stored_old = engine.store.get_planner_request(request_id)
         assert stored_old.status is PlannerRequestStatus.SUPERSEDED
@@ -1148,9 +1138,7 @@ def test_contract_migration_resolves_externally_filled_research_gap(tmp_path):
             blocking=True,
             dedupe_key="research_direction_required:empire",
         )
-        _persist_legacy_in_progress_request(
-            engine, game, gap, event, request_id
-        )
+        _persist_legacy_in_progress_request(engine, game, gap, event, request_id)
         game.snapshot = game.snapshot.model_copy(
             update={
                 "tech_civics": {
@@ -1162,10 +1150,7 @@ def test_contract_migration_resolves_externally_filled_research_gap(tmp_path):
 
         resolved = await engine.tick()
 
-        assert (
-            resolved.workflow_tick["outcome"]
-            == TickOutcomeKind.DECISION_GAP_UPDATED
-        )
+        assert resolved.workflow_tick["outcome"] == TickOutcomeKind.DECISION_GAP_UPDATED
         stored_old = engine.store.get_planner_request(request_id)
         assert stored_old.status is PlannerRequestStatus.SUPERSEDED
         assert stored_old.failure_category == "stale_planning_input"
@@ -1177,7 +1162,10 @@ def test_contract_migration_resolves_externally_filled_research_gap(tmp_path):
             "research-migration", gap.decision_gap_id
         )
         assert stored_gap.status is DecisionGapStatus.RESOLVED
-        assert stored_gap.resolution_reason == "research slot was filled outside the workflow"
+        assert (
+            stored_gap.resolution_reason
+            == "research slot was filled outside the workflow"
+        )
         assert engine.store.active_planner_request("research-migration") is None
         assert engine.store.logical_request_count_for_turn("research-migration", 1) == 1
         assert delegate.calls == 0
@@ -1325,12 +1313,8 @@ def test_provider_budget_contract_migration_exemption_is_narrow(
 def test_planner_input_hash_versions_call_policy_and_contract(tmp_path):
     engine, _, _ = _engine(tmp_path, _ResolvingPlanner())
     decision_hash = "same-decision-input"
-    call_policy_changed = (
-        f"planner-call-policy/v2+{PLANNER_INPUT_CONTRACT_REVISION}"
-    )
-    input_contract_changed = (
-        f"{PLANNER_CALL_POLICY_REVISION}+planner-input-contract/v3"
-    )
+    call_policy_changed = f"planner-call-policy/v2+{PLANNER_INPUT_CONTRACT_REVISION}"
+    input_contract_changed = f"{PLANNER_CALL_POLICY_REVISION}+planner-input-contract/v3"
     revisions = (
         PLANNER_REQUEST_POLICY_REVISION,
         call_policy_changed,
@@ -2323,7 +2307,7 @@ def test_issue7_v6_phase4_identity_migration_is_idempotent(tmp_path):
     again = WorkflowStore(path)
     assert again.get_planner_request(request.planner_request_id) == migrated_request
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 def _settler_domain_lease_for_completion():

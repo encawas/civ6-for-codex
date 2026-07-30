@@ -18,10 +18,7 @@ def _canonical_json_value(value: Any) -> Any:
     if isinstance(value, DomainModel):
         return _canonical_json_value(value.model_dump(mode="json"))
     if isinstance(value, Mapping):
-        return {
-            str(key): _canonical_json_value(item)
-            for key, item in value.items()
-        }
+        return {str(key): _canonical_json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_canonical_json_value(item) for item in value]
     return value
@@ -117,13 +114,10 @@ class PlannerRequestTarget(DomainModel):
                     "STRATEGIC_CONTRACT_CREATION cannot contain legacy fields"
                 )
             if self.strategic_scope is None:
-                raise ValueError(
-                    "STRATEGIC_CONTRACT_CREATION requires strategic_scope"
-                )
+                raise ValueError("STRATEGIC_CONTRACT_CREATION requires strategic_scope")
             if self.base_contract_revision is not None:
                 raise ValueError(
-                    "STRATEGIC_CONTRACT_CREATION cannot contain "
-                    "base_contract_revision"
+                    "STRATEGIC_CONTRACT_CREATION cannot contain base_contract_revision"
                 )
             if self.affected_mission_ids:
                 raise ValueError(
@@ -133,9 +127,7 @@ class PlannerRequestTarget(DomainModel):
             if self.decision_group_id is not None or self.decision_gap_ids:
                 raise ValueError("MISSION_GRAPH_REPAIR cannot contain legacy fields")
             if self.strategic_contract_id is None:
-                raise ValueError(
-                    "MISSION_GRAPH_REPAIR requires strategic_contract_id"
-                )
+                raise ValueError("MISSION_GRAPH_REPAIR requires strategic_contract_id")
             if self.base_contract_revision is None or self.base_contract_revision < 1:
                 raise ValueError(
                     "MISSION_GRAPH_REPAIR requires base_contract_revision >= 1"
@@ -233,9 +225,7 @@ class PlannerRequest(DomainModel):
     response_payload: ImmutableJsonObject | None = None
     response_hash: str | None = None
     validation_result: ImmutableJsonObject | None = None
-    response_evidence_compatibility: (
-        PlannerResponseEvidenceCompatibility | None
-    ) = None
+    response_evidence_compatibility: PlannerResponseEvidenceCompatibility | None = None
     pending_information_requests: tuple[ImmutableJsonObject, ...] = ()
     information_results: ImmutableJsonObject = {}
     information_round_count: int = Field(default=0, ge=0)
@@ -244,7 +234,9 @@ class PlannerRequest(DomainModel):
     failure_category: str | None = None
     next_retry_at: datetime | None = None
 
-    @field_validator("plan_revision_refs", "pending_information_requests", mode="before")
+    @field_validator(
+        "plan_revision_refs", "pending_information_requests", mode="before"
+    )
     @classmethod
     def restore_json_tuples(cls, value: Any) -> Any:
         return tuple(value) if isinstance(value, list) else value
@@ -307,17 +299,13 @@ class PlannerRequest(DomainModel):
             PlannerRequestStatus.REJECTED,
         }
         if self.response_evidence_compatibility is not None:
-            if (
-                self.target.kind
-                is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP
-            ):
+            if self.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
                 raise ValueError(
                     "legacy response compatibility requires a legacy target"
                 )
             if self.status not in response_statuses:
                 raise ValueError(
-                    "legacy response compatibility requires a response-terminal "
-                    "status"
+                    "legacy response compatibility requires a response-terminal status"
                 )
             if self.response_payload is not None:
                 raise ValueError(
@@ -332,8 +320,7 @@ class PlannerRequest(DomainModel):
                     "completed planner requests require validated response evidence"
                 )
             if (
-                self.target.kind
-                is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+                self.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP
                 and self.response_payload is None
             ):
                 raise ValueError(
@@ -400,6 +387,8 @@ class InformationRound(DomainModel):
     information_round_id: str
     planner_request_id: str
     round_number: int = Field(ge=1)
+    source_provider_attempt_id: str | None = None
+    source_provider_attempt_number: int | None = Field(default=None, ge=1)
     status: InformationRoundStatus
     requests: tuple[ImmutableJsonObject, ...] = Field(min_length=1)
     results: ImmutableJsonObject = {}
@@ -408,6 +397,12 @@ class InformationRound(DomainModel):
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
+        if (self.source_provider_attempt_id is None) != (
+            self.source_provider_attempt_number is None
+        ):
+            raise ValueError(
+                "information round ProviderAttempt identity must be complete"
+            )
         terminal = self.status is not InformationRoundStatus.REQUESTED
         if terminal != (self.completed_at is not None):
             raise ValueError("terminal information rounds require completed_at")

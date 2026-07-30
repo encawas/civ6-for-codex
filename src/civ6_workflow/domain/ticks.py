@@ -12,7 +12,7 @@ from pydantic_core import to_json
 
 from .attempts import AttemptStatus
 from .base import DomainModel, ImmutableJsonObject
-from .planner import PlannerRequestTargetKind
+from .planner import PlannerRequestStatus, PlannerRequestTargetKind
 
 
 class RuntimeState(StrEnum):
@@ -40,6 +40,12 @@ class TickOutcomeKind(StrEnum):
     PLAN_LEASE_UPDATED = "PLAN_LEASE_UPDATED"
     LOGICAL_PLANNER_REQUEST_CREATED = "LOGICAL_PLANNER_REQUEST_CREATED"
     PLANNER_ATTEMPT_COMPLETED = "PLANNER_ATTEMPT_COMPLETED"
+    STRATEGIC_PROPOSAL_READY = "STRATEGIC_PROPOSAL_READY"
+    STRATEGIC_REQUEST_TERMINATED = "STRATEGIC_REQUEST_TERMINATED"
+    STRATEGIC_REQUEST_WAIT_RESUMED = "STRATEGIC_REQUEST_WAIT_RESUMED"
+    STRATEGIC_REQUEST_WAIT_ERROR = "STRATEGIC_REQUEST_WAIT_ERROR"
+    STRATEGIC_PROPOSAL_WAIT_RESUMED = "STRATEGIC_PROPOSAL_WAIT_RESUMED"
+    STRATEGIC_PROPOSAL_WAIT_ERROR = "STRATEGIC_PROPOSAL_WAIT_ERROR"
     INFORMATION_REQUESTED = "INFORMATION_REQUESTED"
     INFORMATION_COLLECTED = "INFORMATION_COLLECTED"
     CONTEXT_GATHERED = "CONTEXT_GATHERED"
@@ -132,14 +138,9 @@ class LogicalPlannerRequestCreatedTick(TickRecord):
 
     @model_validator(mode="after")
     def validate_target_summary(self) -> Self:
-        if (
-            self.request_target_kind
-            is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
-        ):
+        if self.request_target_kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
             if not self.decision_gap_ids:
-                raise ValueError(
-                    "legacy PlannerRequest Tick requires DecisionGap IDs"
-                )
+                raise ValueError("legacy PlannerRequest Tick requires DecisionGap IDs")
         elif self.decision_gap_ids:
             raise ValueError(
                 "non-legacy PlannerRequest Tick cannot contain DecisionGap IDs"
@@ -156,6 +157,110 @@ class PlannerAttemptCompletedTick(TickRecord):
     planner_request_id: str
     provider_attempt_id: str
     provider_attempt_count: int = Field(ge=0)
+
+
+class StrategicProposalReadyTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_READY] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_READY
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    proposal_id: str
+    target_kind: Literal[
+        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+    ]
+    expected_base_revision: int = Field(ge=0)
+    blocking_reason: str = Field(min_length=1)
+
+
+class StrategicProposalWaitResumedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_RESUMED
+    )
+    starting_runtime_state: Literal[RuntimeState.AWAITING_HUMAN]
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    resume_request_id: str
+    proposal_ready_tick_id: str
+    planner_request_id: str
+    proposal_id: str
+    target_kind: Literal[
+        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+    ]
+    expected_base_revision: int = Field(ge=0)
+    resume_reason: Literal["explicit_user_resume"] = "explicit_user_resume"
+
+
+class StrategicRequestTerminatedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED] = (
+        TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    terminal_status: Literal[
+        PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.REJECTED,
+        PlannerRequestStatus.SUPERSEDED,
+    ]
+    failure_category: str = Field(min_length=1)
+    provider_attempt_id: str | None = None
+    blocking_reason: str = Field(min_length=1)
+
+
+class StrategicRequestWaitResumedTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED] = (
+        TickOutcomeKind.STRATEGIC_REQUEST_WAIT_RESUMED
+    )
+    starting_runtime_state: Literal[RuntimeState.AWAITING_HUMAN]
+    ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    terminal_tick_id: str
+    terminal_status: Literal[
+        PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.REJECTED,
+        PlannerRequestStatus.SUPERSEDED,
+    ]
+    resume_reason: Literal["explicit_user_resume"] = "explicit_user_resume"
+    resumed_at: datetime
+
+    @model_validator(mode="after")
+    def validate_resume_time(self) -> Self:
+        try:
+            if self.resumed_at > self.completed_at:
+                raise ValueError("resumed_at must not follow completed_at")
+        except TypeError as exc:
+            raise ValueError("resume timestamp must use a compatible timezone") from exc
+        return self
+
+
+class StrategicRequestWaitErrorTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_REQUEST_WAIT_ERROR] = (
+        TickOutcomeKind.STRATEGIC_REQUEST_WAIT_ERROR
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    planner_request_id: str
+    terminal_tick_id: str
+    terminal_status: Literal[
+        PlannerRequestStatus.FAILED,
+        PlannerRequestStatus.REJECTED,
+        PlannerRequestStatus.SUPERSEDED,
+    ]
+    failure_category: str = Field(min_length=1)
+    blocking_reason: str = Field(min_length=1)
+    error_category: str = Field(min_length=1)
+    diagnostic_summary: str = Field(min_length=1, max_length=500)
 
 
 class InformationRequestedTick(TickRecord):
@@ -180,6 +285,7 @@ class InformationCollectedTick(TickRecord):
     mutation_budget_used: Literal[0] = 0
     planner_request_id: str
     information_round_id: str
+
 
 class ContextGatheredTick(TickRecord):
     outcome: Literal[TickOutcomeKind.CONTEXT_GATHERED] = (
@@ -364,6 +470,27 @@ class SystemErrorTick(TickRecord):
     action_attempt_id: str | None = None
 
 
+class StrategicProposalWaitErrorTick(TickRecord):
+    outcome: Literal[TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_ERROR] = (
+        TickOutcomeKind.STRATEGIC_PROPOSAL_WAIT_ERROR
+    )
+    ending_runtime_state: Literal[RuntimeState.AWAITING_HUMAN] = (
+        RuntimeState.AWAITING_HUMAN
+    )
+    mutation_budget_used: Literal[0] = 0
+    blocking_reason: str = Field(min_length=1)
+    error_category: str = Field(min_length=1)
+    diagnostic_summary: str = Field(min_length=1, max_length=500)
+    proposal_ready_tick_id: str
+    planner_request_id: str
+    proposal_id: str
+    target_kind: Literal[
+        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR,
+    ]
+    expected_base_revision: int = Field(ge=0)
+
+
 class NoSafeActionTick(TickRecord):
     outcome: Literal[TickOutcomeKind.NO_SAFE_ACTION] = TickOutcomeKind.NO_SAFE_ACTION
     ending_runtime_state: Literal[RuntimeState.ROUTING] = RuntimeState.ROUTING
@@ -378,6 +505,12 @@ WorkflowTick: TypeAlias = Annotated[
     | PlanLeaseUpdatedTick
     | LogicalPlannerRequestCreatedTick
     | PlannerAttemptCompletedTick
+    | StrategicProposalReadyTick
+    | StrategicRequestTerminatedTick
+    | StrategicRequestWaitResumedTick
+    | StrategicRequestWaitErrorTick
+    | StrategicProposalWaitResumedTick
+    | StrategicProposalWaitErrorTick
     | InformationRequestedTick
     | InformationCollectedTick
     | ContextGatheredTick

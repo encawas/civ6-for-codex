@@ -34,10 +34,19 @@ from .domain import (
     MutationUncertainTick,
     NoSafeActionTick,
     PlanRequestedTick,
+    PlannerRequest,
+    PlannerRequestStatus,
+    ProviderAttemptStatus,
     RuntimeState,
+    STRATEGIC_PROPOSAL_TARGET_KINDS,
+    StrategicProposalWaitErrorTick,
+    StrategicProposalWaitResumedTick,
+    StrategicRequestWaitErrorTick,
+    StrategicRequestWaitResumedTick,
     SystemErrorTick,
     TaskCreatedTick,
     TaskInvalidatedTick,
+    TickOutcomeKind,
     TurnTransitionConfirmedTick,
     TurnTransitionStartedTick,
     TurnTransitionWaitingTick,
@@ -323,6 +332,45 @@ class WorkflowEngine:
 
         if ctx.starting_state is RuntimeState.AWAITING_HUMAN:
             wait = self.store.human_wait_context(snapshot.game_id) or {}
+            if (
+                wait.get("wait_kind") == "strategic_contract_proposal_ready"
+                and wait.get("resume_policy") == "explicit_only"
+                and wait.get("resume_requested") is True
+            ):
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    StrategicProposalWaitResumedTick,
+                    resume_request_id=wait.get("resume_request_id"),
+                    proposal_ready_tick_id=wait.get("proposal_ready_tick_id"),
+                    planner_request_id=wait.get("planner_request_id"),
+                    proposal_id=wait.get("proposal_id"),
+                    target_kind=wait.get("target_kind"),
+                    expected_base_revision=wait.get("expected_base_revision"),
+                    resume_reason="explicit_user_resume",
+                )
+            if wait.get("wait_kind") == "strategic_request_terminated":
+                if wait.get("resume_requested") is True:
+                    return self._finish(
+                        ctx,
+                        snapshot,
+                        StrategicRequestWaitResumedTick,
+                        planner_request_id=wait.get("planner_request_id"),
+                        terminal_tick_id=wait.get("terminal_tick_id"),
+                        terminal_status=wait.get("terminal_status"),
+                        resume_reason="explicit_user_resume",
+                        resumed_at=datetime.fromisoformat(
+                            str(wait.get("resume_requested_at")).replace("Z", "+00:00")
+                        ),
+                    )
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    AwaitingHumanTick,
+                    blocking_reason=str(
+                        wait.get("blocking_reason") or "human review is required"
+                    ),
+                )
             if wait.get("requires_unit_details") is True and snapshot.units is None:
                 raw = await self._read_snapshot(ctx.metrics, include_units=True)
                 observation = self._normalize_snapshot(raw, ctx.metrics)
@@ -1050,11 +1098,35 @@ class WorkflowEngine:
         }
         tick = validate_workflow_tick(tick_type(**common, **fields))
         human_wait_context = None
-        if isinstance(tick, AwaitingHumanTick):
-            human_wait_context = self._human_wait_context(snapshot)
+        if isinstance(
+            tick,
+            (
+                AwaitingHumanTick,
+                StrategicProposalWaitErrorTick,
+                StrategicRequestWaitErrorTick,
+            ),
+        ):
+            existing_wait = self.store.human_wait_context(snapshot.game_id)
+            if existing_wait is not None and (
+                (
+                    existing_wait.get("wait_kind")
+                    == "strategic_contract_proposal_ready"
+                    and existing_wait.get("resume_policy") == "explicit_only"
+                )
+                or existing_wait.get("wait_kind") == "strategic_request_terminated"
+            ):
+                human_wait_context = dict(existing_wait)
+            else:
+                human_wait_context = self._human_wait_context(snapshot)
             human_wait_context["blocking_reason"] = tick.blocking_reason
 
-        if attempt_update is None:
+        if isinstance(
+            tick, (StrategicProposalWaitResumedTick, StrategicRequestWaitResumedTick)
+        ):
+            if attempt_update is not None:
+                raise ValueError("Proposal wait resume cannot update an ActionAttempt")
+            self.store.persist_phase4_tick(tick, human_wait_context=None)
+        elif attempt_update is None:
             self.store.persist_tick_and_runtime_state(
                 tick,
                 active_attempt_id=runtime_active_attempt_id,
@@ -1114,7 +1186,15 @@ class WorkflowEngine:
             result.failed_task_ids.extend(failed_task_ids)
         if blocked_task_ids:
             result.blocked_task_ids.extend(blocked_task_ids)
-        if isinstance(tick, (AwaitingHumanTick, SystemErrorTick)):
+        if isinstance(
+            tick,
+            (
+                AwaitingHumanTick,
+                StrategicProposalWaitErrorTick,
+                StrategicRequestWaitErrorTick,
+                SystemErrorTick,
+            ),
+        ):
             result.paused = True
             result.pause_reason = tick.blocking_reason
         return result
@@ -1170,6 +1250,7 @@ class WorkflowEngine:
             active_attempt_id = (
                 None if active_attempt is None else active_attempt.action_attempt_id
             )
+            wait = self.store.human_wait_context(game_id)
             if not ctx.observation_ids:
                 ctx.observation_ids.append(f"error_obs_{uuid4().hex}")
             snapshot = RuntimeSnapshot(
@@ -1177,6 +1258,62 @@ class WorkflowEngine:
                 game_id=game_id,
                 overview={"turn": max(0, turn)},
             )
+            if (
+                ctx.starting_state is RuntimeState.AWAITING_HUMAN
+                and isinstance(wait, dict)
+                and wait.get("wait_kind") == "strategic_contract_proposal_ready"
+                and wait.get("resume_policy") == "explicit_only"
+            ):
+                proposal_ready_tick_id = wait.get("proposal_ready_tick_id")
+                if not isinstance(proposal_ready_tick_id, str):
+                    ready_ticks = [
+                        tick
+                        for tick in self.store.list_workflow_ticks(game_id)
+                        if tick.outcome is TickOutcomeKind.STRATEGIC_PROPOSAL_READY
+                        and getattr(tick, "proposal_id", None)
+                        == wait.get("proposal_id")
+                    ]
+                    if len(ready_ticks) != 1:
+                        raise ValueError(
+                            "Proposal wait has no unique Proposal-ready Tick"
+                        )
+                    proposal_ready_tick_id = ready_ticks[0].tick_id
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    StrategicProposalWaitErrorTick,
+                    blocking_reason=(
+                        "workflow Tick failed while Proposal wait remains active"
+                    ),
+                    error_category=category,
+                    diagnostic_summary=summary,
+                    proposal_ready_tick_id=proposal_ready_tick_id,
+                    planner_request_id=wait.get("planner_request_id"),
+                    proposal_id=wait.get("proposal_id"),
+                    target_kind=wait.get("target_kind"),
+                    expected_base_revision=wait.get("expected_base_revision"),
+                    runtime_active_attempt_id=active_attempt_id,
+                )
+            if (
+                ctx.starting_state is RuntimeState.AWAITING_HUMAN
+                and isinstance(wait, dict)
+                and wait.get("wait_kind") == "strategic_request_terminated"
+            ):
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    StrategicRequestWaitErrorTick,
+                    blocking_reason=(
+                        "workflow Tick failed while strategic Request wait remains active"
+                    ),
+                    error_category=category,
+                    diagnostic_summary=summary,
+                    planner_request_id=wait.get("planner_request_id"),
+                    terminal_tick_id=wait.get("terminal_tick_id"),
+                    terminal_status=wait.get("terminal_status"),
+                    failure_category=wait.get("failure_category"),
+                    runtime_active_attempt_id=active_attempt_id,
+                )
             return self._finish(
                 ctx,
                 snapshot,
@@ -1434,7 +1571,30 @@ class WorkflowEngine:
             allow_information_requests=allow_information_requests,
         )
 
-    def _active_backoff(self) -> dict[str, Any] | None:
+    def _active_backoff(
+        self, request: "PlannerRequest | None" = None
+    ) -> dict[str, Any] | None:
+        if (
+            request is not None
+            and request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
+        ):
+            if request.status is not PlannerRequestStatus.BACKOFF:
+                return None
+            if request.next_retry_at is None:
+                raise ValueError("strategic BACKOFF request requires next_retry_at")
+            remaining = (request.next_retry_at - self._now()).total_seconds()
+            if remaining <= 0:
+                return None
+            attempts = self.store.list_provider_attempts(request.planner_request_id)
+            return {
+                "category": request.failure_category,
+                "failure_count": sum(
+                    attempt.status is ProviderAttemptStatus.FAILED
+                    for attempt in attempts
+                ),
+                "until": request.next_retry_at.isoformat(),
+                "remaining_seconds": remaining,
+            }
         value = self.store.get_meta("planner_provider_backoff")
         if not isinstance(value, dict):
             return None
@@ -1721,6 +1881,10 @@ class WorkflowEngine:
             # Legacy records predate a durable comparison baseline. Reconcile once
             # from the fresh observation and immediately write a v1 baseline.
             return "legacy human wait has no durable comparison baseline"
+        if context.get("wait_kind") == "strategic_contract_proposal_ready":
+            if context.get("resume_requested") is True:
+                return "explicit user resume was requested"
+            return None
         if context.get("resume_requested") is True:
             return "explicit user resume was requested"
         if (

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import json
 import math
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal, Self
 from uuid import uuid4
 
 from pydantic import Field, field_validator, model_validator
 
 from .decisioning import SETTLER_GAP_TYPES, STRATEGIC_GAP_TYPES
-from .domain import ContinuationPolicy, thaw_json
+from .domain import ContinuationPolicy, Mission, PlannerRequestTargetKind, thaw_json
 
 from .models import (
     ExecutionMode,
@@ -236,6 +237,25 @@ class WorkflowPlanBundle(BasePlanBundle):
     )
 
 
+class StrategicResearchProposalCandidate(StrictModel):
+    strategic_objectives: tuple[str, ...] = ()
+    global_constraints: tuple[str, ...] = ()
+    proposed_research_mission: Mission
+    created_from_observation_id: str
+
+
+class StrategicResearchProposalResponse(StrictModel):
+    schema_version: Literal["strategic-research-proposal-response/v1"]
+    information_requests: tuple[InformationRequest, ...] = ()
+    proposal_candidates: tuple[StrategicResearchProposalCandidate, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> Self:
+        if self.information_requests and self.proposal_candidates:
+            raise ValueError("information response cannot include Proposal candidates")
+        return self
+
+
 def canonical_workflow_plan_bundle_payload(value: Any) -> dict[str, Any]:
     source = (
         value.model_dump(mode="python")
@@ -243,6 +263,33 @@ def canonical_workflow_plan_bundle_payload(value: Any) -> dict[str, Any]:
         else thaw_json(value)
     )
     return WorkflowPlanBundle.model_validate(source).model_dump(mode="json")
+
+
+def canonical_strategic_research_proposal_response_payload(
+    value: Any,
+) -> dict[str, Any]:
+    if hasattr(value, "model_dump_json"):
+        source_json = value.model_dump_json()
+    elif isinstance(value, str):
+        source_json = value
+    else:
+        source_json = json.dumps(
+            thaw_json(value), ensure_ascii=False, separators=(",", ":")
+        )
+    response = StrategicResearchProposalResponse.model_validate_json(source_json)
+    return response.model_dump(mode="json")
+
+
+def planner_response_model_for_request(
+    request: "WorkflowAgentRequest",
+) -> type[WorkflowPlanBundle] | type[StrategicResearchProposalResponse]:
+    target_kind = request.constraints.get("planner_request_target_kind")
+    if target_kind in {
+        PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value,
+        PlannerRequestTargetKind.MISSION_GRAPH_REPAIR.value,
+    }:
+        return StrategicResearchProposalResponse
+    return WorkflowPlanBundle
 
 
 class WorkflowAgentRequest(BaseAgentRequest):
