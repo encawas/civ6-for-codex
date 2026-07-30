@@ -9,6 +9,7 @@ Related documents:
 - [ADR 0002: One StrategicContract Aggregate per Game Session](../adr/0002-strategic-contract-mission-graph.md)
 - [ADR 0003: State Authority, Observation Completeness, and Module Boundaries](../adr/0003-state-authority-module-boundaries.md)
 - [ADR 0004: TurnActionGraph and Wave/Barrier Execution](../adr/0004-turn-action-graph-execution.md)
+- [ADR 0005: Atomic Strategic Proposal Decision and Research Authority Activation](../adr/0005-atomic-strategic-proposal-decision.md)
 - [MissionGraph Runtime Migration Plan](../plans/2026-07-23-mission-graph-migration.md)
 
 ## 1. Purpose
@@ -41,12 +42,14 @@ StrategicContract
 | `bootstrap.py` | Sole production composition root | Retain |
 | `WorkflowEngine` | Coordinates Ticks, rules, planning, execution, and recovery | Incrementally shrink in place into `WorkflowRuntime` |
 | `DecisionGap` | Durable unresolved strategic question | Migrate by Strategic Scope, then retire as strategic authority |
-| `PlannerRequest` | Durable logical planning request | Generalize and retain |
+| `PlannerRequest` | Durable logical planning request with legacy and strategic targets | Generalized in Phase 1A; retain |
 | `ProviderAttempt` | Audit of calls across the model boundary | Retain |
 | `InformationRound` | Declarative information-gathering continuation | Retain |
+| `StrategicContract` / `MissionGraph` | One revisioned aggregate root; Phase 1B persistence currently permits only empty scope and Mission state | Retain and activate by reviewed scope |
+| `StrategicResearchProposal` | Immutable research candidate bound to Request, Attempt, Contract base, and Observation | Retain; add terminal decision and activation evidence in Phase 1C |
 | `Plan` / `PlanLease` | Current durable intent and validity | Replace by scope with StrategicContract/MissionGraph |
 | `models.PlanBundle` | Legacy Planner output and task collection | Delete after migration adapters retire |
-| `models.StoredTask` | Current production execution task | Retain as execution authority in Phases 1-2; retire in Phase 3 |
+| `models.StoredTask` | Current production execution task | Retain through Phase 2, including after Phase 1C research activation; retire in Phase 3 |
 | `domain.Task` | New domain task model | Evolve into the canonical TurnActionGraph node contract |
 | `ActionAttempt` | Action delivery, recovery, and verification audit | Retain |
 | Rules / Progression | Compile deterministic tasks and events | Retain; never make them a new state authority |
@@ -57,6 +60,15 @@ StrategicContract
 The repository currently contains legacy types in `models.py` and newer types
 in `domain/`. MissionGraph migration must converge those types. It must not
 add a third long-lived Plan, Task, or Runtime state model.
+
+The implemented baseline is now Phase 1A plus Phase 1B. Phase 1A generalized
+PlannerRequest targets without replacing ProviderAttempt or InformationRound.
+Phase 1B established the one-Contract persistence root and durable replay, then
+added immutable StrategicResearchProposal generation and explicit-only Human
+Wait recovery. It deliberately did not approve or apply a Proposal, persist a
+non-empty Authority Scope Set or MissionGraph, switch research authority, or
+project Mission-derived StoredTask. Legacy research planning and execution
+remain authoritative until Phase 1C atomically changes that ownership.
 
 ## 3. System Invariants
 
@@ -85,8 +97,9 @@ StrategicContract is the logical strategic root aggregate for one
 not separate Contract roots.
 
 During migration the active Contract carries a persistent, auditable
-Authority Scope Set. Physical fields and tables are deferred, but its meaning
-is fixed:
+Authority Scope Set. Phase 1B persists this structure but requires it to remain
+empty, so every Scope is still legacy-owned. After Phase 1C atomically
+activates research, the mixed-ownership state is:
 
 ```text
 research -> MissionGraph authority
@@ -182,8 +195,11 @@ The Contract concept expresses at least:
 - approval state;
 - a versioned policy snapshot.
 
-PR 0 intentionally does not fix exact fields, validation models, or database
-columns.
+Phase 1B persists the minimum Contract identity, revision, objectives,
+constraints, approval snapshot, policy snapshot, Authority Scope Set, and
+MissionGraph shapes needed for the foundation. The exact model may evolve only
+through versioned contracts that preserve one aggregate root and immutable
+revision history.
 
 ### 6.2 MissionGraph
 
@@ -208,6 +224,80 @@ Commit invariants:
 - repeating the same patch commit cannot increment revision twice;
 - Contract, MissionGraph, patch audit, and Authority Scope Set changes share
   one transaction boundary.
+
+### 6.3 Strategic Proposal Decision and Atomic Scope Activation
+
+Phase 1B persists a StrategicResearchProposal as immutable candidate content.
+It is bound to its source PlannerRequest, final ProviderAttempt, target
+Contract identity, expected base revision, source Observation, canonical hash,
+and Proposal Ready Tick. The explicit-only Human Wait protects that candidate
+but does not approve, reject, invalidate, or apply it.
+
+Five facts have distinct authorities:
+
+| Fact | Sole authority |
+| --- | --- |
+| AI candidate content | StrategicResearchProposal |
+| Human APPROVED or REJECTED disposition | ApprovalRecord |
+| Permanent invalidation caused by system facts | StrategicProposalInvalidatedTick |
+| Effective strategic objectives and Missions | Active StrategicContract revision |
+| Current write owner for each Strategic Scope | AuthorityScopeSet in the active revision |
+
+Proposal content remains immutable. Its disposition is derived from durable
+facts:
+
+```text
+no ApprovalRecord and no Invalidated Tick -> OPEN
+APPROVED ApprovalRecord                 -> APPROVED
+REJECTED ApprovalRecord                 -> REJECTED
+StrategicProposalInvalidatedTick        -> INVALIDATED
+```
+
+The StrategicResearchProposal decision protocol permits only APPROVED and
+REJECTED human decisions, even when shared approval infrastructure supports
+other decisions for other workflows. Each Proposal has at most one human
+terminal ApprovalRecord or one system Invalidated Tick. APPROVED plus
+REJECTED, either human result plus INVALIDATED, or multiple Invalidated Ticks
+are invalid.
+
+Complete durable evidence is:
+
+```text
+APPROVED
+= Proposal + APPROVED ApprovalRecord + StrategicContractCommit
++ StrategicContract revision + StrategicProposalAppliedTick
+
+REJECTED
+= Proposal + REJECTED ApprovalRecord + StrategicProposalRejectedTick
+
+INVALIDATED
+= Proposal + StrategicProposalInvalidatedTick
+```
+
+A Proposal-derived Contract revision records `approval_status=APPROVED` as
+an immutable redundant snapshot of its matching ApprovalRecord. The snapshot
+is not approval authority. Foundation revisions may use `NOT_REQUIRED`.
+Rejected and invalidated Proposals create no Contract revision.
+
+Approval appends exactly `expected_base_revision + 1` and transfers
+research write authority to MissionGraph in the same atomic transaction. That
+transaction also binds the ContractCommit structurally to Proposal identity
+and hash, Approval identity, source PlannerRequest, and expected base; records
+the Applied Tick; moves Runtime to routing; and clears the protected wait. A
+stale base or target produces system invalidation without Approval, automatic
+rebase, or Provider recall. No intermediate state may expose partial approval,
+effective research strategy without matching authority, or dual research
+writers.
+
+RuntimeState, Human Wait context, Applied, Rejected, Resume, and Error Ticks
+are transition or interaction evidence. None substitutes for ApprovalRecord.
+Ordinary work begins only after the dedicated decision or activation Tick
+completes.
+
+Proposal application does not directly create StoredTask. Later routing reads
+the active Contract and authoritative MissionGraph revision, performs a
+separate deterministic projection, and enters the normal Planner lifecycle.
+Proposal or transition-Tick identity alone cannot create claimable work.
 
 ## 7. Planner Boundary
 
@@ -411,7 +501,7 @@ compile a new current execution projection.
 
 ### 11.1 Phased execution authority
 
-Phases 1-2:
+After Phase 1C research activation and through Phase 2:
 
 ```text
 MissionGraph                 = research strategic authority
@@ -467,11 +557,12 @@ All workflow state remains behind one `WorkflowStateStorePort`. The design
 does not create `StrategicContractRepository`, `MissionRepository`,
 `PatchRepository`, or `TurnActionRepository`.
 
-Typed Contract methods may be added to the one Store Port. SQLite implements
-the port while Domain remains independent of SQLite. Contract, MissionGraph,
-patch audit, and Authority Scope Set changes commit through one database
-authority and transaction. The current dynamic `__getattr__` boundary should
-later converge to explicit typed methods, but PR 0 does not implement it.
+Phase 1B exposes typed Contract and Proposal operations on the one Store Port.
+SQLite implements the port while Domain remains independent of SQLite.
+Contract, MissionGraph, Proposal decision audit, patch audit, and Authority
+Scope Set changes commit through one database authority and transaction.
+Phase 1C extends those typed operations and aggregate validators; it does not
+create a Proposal, Contract, Mission, or approval Repository beside the Store.
 
 ## 14. State Authority Matrix
 
@@ -479,14 +570,18 @@ later converge to explicit typed methods, but PR 0 does not implement it.
 | --- | --- |
 | Current game facts | Current Canonical NormalizedObservation |
 | Historical game facts | Accepted historical Observation projections |
-| Strategic objectives, Missions, and scope authority | Current StrategicContract revision |
+| AI strategic candidate content | StrategicResearchProposal |
+| Human Proposal disposition | ApprovalRecord |
+| System Proposal invalidation | StrategicProposalInvalidatedTick |
+| Strategic objectives and Missions | Current StrategicContract revision |
+| Strategic Scope write ownership | AuthorityScopeSet in the current StrategicContract revision |
+| Proposal decision transition audit | Applied, Rejected, Invalidated, Resume, and Error Ticks |
 | Current-turn action dependencies | Current TurnActionGraph revision |
-| Phase 1-2 research action execution | Deterministically projected StoredTask |
+| Research action execution through Phase 2 | Deterministically projected StoredTask |
 | Phase 3+ research action execution | TurnActionGraph / `domain.Task` |
 | Action delivery boundary | ActionAttempt |
 | Model call boundary | PlannerRequest / ProviderAttempt |
 | Information query continuation | InformationRound |
-| Approval facts | ApprovalRecord |
 | Action contracts | Action Registry, Condition Contract, and validation |
 | Runtime phase | Workflow State in WorkflowStateStore |
 | Configuration policy | Loaded and versioned configuration snapshot |
@@ -654,6 +749,18 @@ Patch or action node requires approval
 -> next Tick revalidates against fresh Observation
 ```
 
+StrategicResearchProposal uses the stricter atomic sequence:
+
+```text
+Proposal Ready + explicit-only Human Wait
+-> user APPROVED / REJECTED or system detects stale Proposal
+-> dedicated decision transaction and transition Tick
+-> APPROVED: Contract revision and research authority commit together
+-> REJECTED / INVALIDATED: no Contract revision
+-> transition Tick completes
+-> Runtime resumes routing
+```
+
 ## 17. Preserved Safety Semantics
 
 Migration preserves:
@@ -673,11 +780,14 @@ Migration preserves:
 
 ## 18. Non-goals and Deferred Decisions
 
-PR 0 excludes functional code, database fields/indexes, Patch JSON Schema,
-exact Pydantic fields, model selection, parent/child model protocols,
-multi-agent platforms, graph databases, CQRS, generic event sourcing,
-distributed queues, multiple mutations per Tick, generic Barrier plugins,
-new city-production semantics, UI redesign, and a complete Civ6 tool list.
+This architecture excludes Proposal editing, automatic approval or rebase,
+approval permissions, multi-approver workflows, revocation of effective
+Contract revisions, multiple MissionGraph roots, non-research authority
+activation during Phase 1C, generic MissionGraph editing, parent/child Agent
+protocols, multi-agent platforms, graph databases, CQRS, generic event
+sourcing, distributed queues, multiple mutations per Tick, generic Barrier
+plugins, UI redesign, and a complete Civ6 tool list.
 
-It also does not create conceptual module files or pre-create empty
-interfaces. A migration phase introduces only the boundaries it needs.
+A migration phase introduces only the concrete boundaries it needs. It does
+not pre-create empty interfaces or parallel runtime, Store, approval,
+planning, or execution implementations.
