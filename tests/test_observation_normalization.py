@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import civ6_workflow.conditions as conditions_module
+from civ6_workflow.bootstrap import build_runtime_services
 from civ6_workflow.domain import (
     NORMALIZATION_VERSION,
     SlotState,
@@ -232,6 +233,7 @@ class _ReadPolicyGame:
 def _policy_engine(tmp_path: Path, snapshot: RuntimeSnapshot):
     game = _ReadPolicyGame(snapshot)
     engine = WorkflowEngine(
+        service_factory=build_runtime_services,
         store=WorkflowStore(tmp_path / "workflow.sqlite3"),
         game=game,
         planner=_NoPlanner(),

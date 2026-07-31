@@ -7,10 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from .actions import ACTION_REGISTRY
+from .batch_executor import BatchExecutor
 from .codex_planner import CodexPlanner
+from .conditions import ConditionEvaluator
 from .config import AppConfig
-from .engine import EngineConfig, WorkflowEngine
+from .engine import EngineConfig, RuntimeServices, WorkflowEngine
+from .gate import EventGate, GateConfig
 from .mcp_port import Civ6GamePort, Civ6McpClient
+from .planner_lifecycle import PlannerLifecycleCoordinator, PlannerLifecycleRuntime
 from .ports import GamePort, Planner
 from .models import ExecutionMode, RuntimeSnapshot
 from .replay import (
@@ -23,7 +27,9 @@ from .replay import (
 )
 from .state_api import Civ6StateApi
 from .store import WorkflowStore
+from .turn_compiler import TurnCompiler
 from .web_ui import ControlPanelHTTPServer, ControlPanelState
+from .workflow_queries import InformationQueryRouter
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +63,50 @@ def build_store(config: AppConfig, config_path: str | Path) -> WorkflowStore:
     )
 
 
+def build_runtime_services(engine: WorkflowEngine) -> RuntimeServices:
+    """Build the one application-service graph used by every Runtime entry point."""
+
+    conditions = ConditionEvaluator()
+    information_queries = InformationQueryRouter(engine.game)
+    return RuntimeServices(
+        gate=EventGate(
+            engine.store,
+            GateConfig(
+                default_cooldown_turns=max(0, int(engine.config.default_cooldown_turns))
+            ),
+        ),
+        conditions=conditions,
+        batch_executor=BatchExecutor(
+            store=engine.store,
+            game=engine.game,
+            conditions=conditions,
+            verification_attempts=engine.config.verification_attempts,
+            now=lambda: engine._now(),
+            monotonic=lambda: engine._monotonic(),
+            checkpoint=lambda name: engine._checkpoint(name),
+        ),
+        turn_compiler=TurnCompiler(),
+        information_queries=information_queries,
+        planner_lifecycle=PlannerLifecycleCoordinator(
+            PlannerLifecycleRuntime(
+                store=engine.store,
+                game=engine.game,
+                planner=engine.planner,
+                config=engine.config,
+                conditions=conditions,
+                information_queries=information_queries,
+                now=lambda: engine._now(),
+                monotonic=lambda: engine._monotonic(),
+                checkpoint=lambda name: engine._checkpoint(name),
+                observation_id=lambda: engine._active_observation_id,
+                human_wait_context=lambda snapshot: engine._human_wait_context(
+                    snapshot
+                ),
+            )
+        ),
+    )
+
+
 def compose_runtime(
     *,
     store: WorkflowStore,
@@ -73,6 +123,7 @@ def compose_runtime(
         config=engine_config,
         clock=clock,
         crash_injector=crash_injector,
+        service_factory=build_runtime_services,
     )
     return RuntimeComposition(store=store, game=game, planner=planner, engine=engine)
 

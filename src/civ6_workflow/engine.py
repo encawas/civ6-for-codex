@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 from uuid import uuid4
 
 from .actions import (
@@ -37,7 +37,7 @@ from .domain import (
     validate_workflow_tick,
 )
 from .events import events_from_snapshot
-from .gate import EventGate, GateConfig
+from .gate import EventGate
 from .ports import (
     GamePort,
     MutationBudget,
@@ -59,7 +59,7 @@ from .observation_normalization import (
     NormalizedRuntimeObservation,
     normalize_runtime_snapshot,
 )
-from .planner_lifecycle import PlannerLifecycleCoordinator, PlannerLifecycleRuntime
+from .planner_lifecycle import PlannerLifecycleCoordinator
 from .recovery import recover_turn_rewind
 from .runtime_errors import FatalTickPersistenceError, InjectedCrashBoundary
 from .turn_compiler import TurnCompiler
@@ -105,6 +105,18 @@ class EngineConfig:
             "end_turn",
         }
     )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeServices:
+    """Application services supplied by the canonical composition root."""
+
+    gate: EventGate
+    conditions: ConditionEvaluator
+    batch_executor: BatchExecutor
+    turn_compiler: TurnCompiler
+    information_queries: InformationQueryRouter
+    planner_lifecycle: PlannerLifecycleCoordinator
 
 
 @dataclass(slots=True)
@@ -189,6 +201,7 @@ class WorkflowEngine:
         config: EngineConfig | None = None,
         clock: Any | None = None,
         crash_injector: Any | None = None,
+        service_factory: Callable[[WorkflowEngine], RuntimeServices],
     ):
         self.store = store
         self.game = game
@@ -196,41 +209,15 @@ class WorkflowEngine:
         self.config = config or EngineConfig()
         self.clock = clock
         self.crash_injector = crash_injector
-        self.gate = EventGate(
-            store,
-            GateConfig(
-                default_cooldown_turns=max(0, int(self.config.default_cooldown_turns))
-            ),
-        )
-        self.conditions = ConditionEvaluator()
-        self.batch_executor = BatchExecutor(
-            store=self.store,
-            game=self.game,
-            conditions=self.conditions,
-            verification_attempts=self.config.verification_attempts,
-            now=self._now,
-            monotonic=self._monotonic,
-            checkpoint=self._checkpoint,
-        )
-        self.turn_compiler = TurnCompiler()
-        self.information_queries = InformationQueryRouter(self.game)
-        self.planner_lifecycle = PlannerLifecycleCoordinator(
-            PlannerLifecycleRuntime(
-                store=self.store,
-                game=self.game,
-                planner=self.planner,
-                config=self.config,
-                conditions=self.conditions,
-                information_queries=self.information_queries,
-                now=lambda: self._now(),
-                monotonic=lambda: self._monotonic(),
-                checkpoint=lambda name: self._checkpoint(name),
-                observation_id=lambda: self._active_observation_id,
-                human_wait_context=lambda snapshot: self._human_wait_context(snapshot),
-            )
-        )
         self._available_tools: set[str] | None = None
         self._active_observation_id: str | None = None
+        services = service_factory(self)
+        self.gate = services.gate
+        self.conditions = services.conditions
+        self.batch_executor = services.batch_executor
+        self.turn_compiler = services.turn_compiler
+        self.information_queries = services.information_queries
+        self.planner_lifecycle = services.planner_lifecycle
 
     def request_end_turn_retry(self, game_id: str, turn: int) -> None:
         """Persist explicit authorization to retry the latest rejected end turn."""

@@ -2,6 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 
+from civ6_workflow.bootstrap import build_runtime_services
 from civ6_workflow.domain import AttemptStatus, TickOutcomeKind
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
 from civ6_workflow.models import (
@@ -75,6 +76,7 @@ def snapshot(*, production="UNIT_BUILDER", turn=10, blockers=None):
 
 def engine(store, game, planner=None, **config):
     return WorkflowEngine(
+        service_factory=build_runtime_services,
         store=store,
         game=game,
         planner=planner or Planner(),

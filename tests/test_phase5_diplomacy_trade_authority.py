@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from civ6_workflow.bootstrap import build_runtime_services
 from civ6_workflow.domain import (
     ApprovalStatus,
     AuthorityScopeSet,
@@ -228,6 +229,7 @@ def test_runtime_compiles_empty_graph_and_waits_without_legacy_planning(tmp_path
         _activate(store, base)
         planner = _Planner()
         engine = WorkflowEngine(
+            service_factory=build_runtime_services,
             store=store,
             game=_Game(_snapshot()),
             planner=planner,
@@ -258,6 +260,7 @@ def test_runtime_compiles_empty_graph_and_waits_without_legacy_planning(tmp_path
         restored.import_replay_state(replay)
         restored_planner = _Planner()
         restored_engine = WorkflowEngine(
+            service_factory=build_runtime_services,
             store=restored,
             game=_Game(_snapshot()),
             planner=restored_planner,

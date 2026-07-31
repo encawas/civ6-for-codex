@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from civ6_workflow.bootstrap import build_store
+from civ6_workflow.bootstrap import build_runtime_services, build_store
 from civ6_workflow.config import AppConfig
 from civ6_workflow.domain import (
     AuthorityScopeSet,
@@ -280,6 +280,7 @@ def _request(
 
 def _engine(store, game, planner):
     return WorkflowEngine(
+        service_factory=build_runtime_services,
         store=store,
         game=game,
         planner=planner,
@@ -6034,6 +6035,7 @@ def test_turn_action_graph_approval_survives_equivalent_observation(tmp_path):
     game = ConfirmedResearchGame(proposal.game_session_id)
     game.snapshot = _research_ready_game(proposal.game_session_id).snapshot
     engine = WorkflowEngine(
+        service_factory=build_runtime_services,
         store=enabled,
         game=game,
         planner=_Planner(),
@@ -6103,6 +6105,7 @@ def test_turn_change_expires_old_graph_before_any_node_can_be_claimed(tmp_path):
     )
     game = _research_ready_game(proposal.game_session_id)
     engine = WorkflowEngine(
+        service_factory=build_runtime_services,
         store=enabled,
         game=game,
         planner=_Planner(),
