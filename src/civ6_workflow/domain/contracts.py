@@ -292,7 +292,7 @@ class StrategicContractCommit(DomainModel):
                 raise ValueError(
                     "Action-derived Contract requires completed Mission evidence"
                 )
-            strategic_mission_action(
+            strategic_mission_action_types(
                 mission.model_copy(update={"status": MissionStatus.ACTIVE})
             )
         if self.source_scope_activation_id is not None:
@@ -398,6 +398,56 @@ def opening_strategy_mission_policy(mission: Mission) -> dict[str, object]:
     return policy
 
 
+def settler_mission_plan(mission: Mission) -> dict[str, object]:
+    """Validate one approved settlement target without accepting free-form actions."""
+
+    if mission.scope != "settler":
+        raise ValueError("settler Mission scope must be settler")
+    if mission.status is not MissionStatus.ACTIVE:
+        raise ValueError("settler Mission must be ACTIVE")
+    desired_outcome = thaw_json(mission.desired_outcome)
+    if set(desired_outcome) != {"settler"}:
+        raise ValueError("settler Mission desired_outcome must contain only settler")
+    plan = desired_outcome["settler"]
+    if not isinstance(plan, dict):
+        raise ValueError("settler Mission requires a settlement plan")
+    if set(plan) != {
+        "unit_id",
+        "target_x",
+        "target_y",
+        "baseline_city_count",
+        "owner",
+    }:
+        raise ValueError("settler Mission plan fields do not match the closed contract")
+    unit_id = plan["unit_id"]
+    if not isinstance(unit_id, (str, int)) or not str(unit_id).strip():
+        raise ValueError("settler Mission requires a unit identity")
+    if str(unit_id) != mission.subject.subject_id:
+        raise ValueError("settler Mission subject must match its unit identity")
+    for key in ("target_x", "target_y", "baseline_city_count"):
+        if type(plan[key]) is not int:
+            raise ValueError(f"settler Mission {key} must be an integer")
+    if int(plan["baseline_city_count"]) < 0:
+        raise ValueError("settler Mission baseline city count cannot be negative")
+    owner = plan["owner"]
+    if not isinstance(owner, (str, int)) or not str(owner).strip():
+        raise ValueError("settler Mission requires an owner identity")
+    return plan
+
+
+def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
+    """Return the closed action set permitted by one executable Mission scope."""
+
+    if mission.scope == "research":
+        return (research_mission_action(mission),)
+    if mission.scope == "civic":
+        return (civic_mission_action(mission),)
+    if mission.scope == "settler":
+        settler_mission_plan(mission)
+        return ("unit_found_city", "unit_move")
+    raise ValueError(f"scope has no Phase 5 execution contract: {mission.scope}")
+
+
 def validate_scope_activation_mission(mission: Mission, scope: str) -> None:
     """Validate one Mission introduced by a reviewed authority switch."""
 
@@ -406,17 +456,18 @@ def validate_scope_activation_mission(mission: Mission, scope: str) -> None:
     if scope == "opening_strategy":
         opening_strategy_mission_policy(mission)
         return
-    strategic_mission_action(mission)
+    strategic_mission_action_types(mission)
 
 
 def strategic_mission_action(mission: Mission) -> str:
     """Resolve one supported strategic execution action by authoritative scope."""
 
-    if mission.scope == "research":
-        return research_mission_action(mission)
-    if mission.scope == "civic":
-        return civic_mission_action(mission)
-    raise ValueError(f"scope has no Phase 5 execution contract: {mission.scope}")
+    actions = strategic_mission_action_types(mission)
+    if len(actions) != 1:
+        raise ValueError(
+            f"scope requires observation-dependent action selection: {mission.scope}"
+        )
+    return actions[0]
 
 
 def build_strategic_contract_id(game_session_id: str) -> str:

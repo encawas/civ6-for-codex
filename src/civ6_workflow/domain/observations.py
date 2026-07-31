@@ -140,6 +140,8 @@ class ObservationCompleteness(DomainModel):
                 and self.current_civic
                 and self.available_civics
             )
+        if scope == "settler":
+            return self.cities and self.units
         return False
 
 

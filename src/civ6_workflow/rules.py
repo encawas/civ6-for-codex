@@ -53,8 +53,20 @@ class DeterministicRuleCompiler:
     def __init__(self, store: WorkflowStorePort):
         self.store = store
 
-    def compile(self, observation: NormalizedRuntimeObservation) -> RuleCompilation:
+    def compile(
+        self,
+        observation: NormalizedRuntimeObservation,
+        *,
+        include_settler: bool | None = None,
+    ) -> RuleCompilation:
         snapshot = observation.snapshot
+        if include_settler is None:
+            active_contract = self.store.get_active_strategic_contract(snapshot.game_id)
+            include_settler = (
+                active_contract is None
+                or "settler"
+                not in active_contract.authority_scope_set.mission_graph_scopes
+            )
         context = self.store.current_context(snapshot.game_id)
         tasks: list[ProposedTask] = []
         events: list[GameEvent] = []
@@ -89,6 +101,7 @@ class DeterministicRuleCompiler:
                 snapshot,
                 unit_context,
                 unit_blocker_present=has_unit_blocker,
+                include_settler=include_settler,
             )
             tasks.extend(unit_tasks)
             events.extend(unit_events)
@@ -124,6 +137,7 @@ class DeterministicRuleCompiler:
         context: dict[str, Any],
         *,
         unit_blocker_present: bool,
+        include_settler: bool,
     ) -> tuple[list[ProposedTask], list[GameEvent]]:
         tasks, events = self._compile_standard_unit_blocker(
             snapshot,
@@ -150,6 +164,8 @@ class DeterministicRuleCompiler:
             ).upper()
             if "SETTLER" not in unit_type:
                 retained.append(event)
+                continue
+            if not include_settler:
                 continue
 
             raw_id = unit.get("unit_id", unit.get("id", event.entity_id))

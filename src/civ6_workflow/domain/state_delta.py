@@ -172,10 +172,48 @@ class StateDeltaBuilder:
                     )
                 )
 
+        if (
+            baseline.completeness.units
+            and current.completeness.units
+            and baseline.units is not None
+            and current.units is not None
+        ):
+            before_units = {
+                unit.entity_id.value: unit.model_dump(mode="json")
+                for unit in baseline.units
+            }
+            after_units = {
+                unit.entity_id.value: unit.model_dump(mode="json")
+                for unit in current.units
+            }
+            self._append_entity_changes(
+                changes,
+                scope="settler",
+                collection="units",
+                before=before_units,
+                after=after_units,
+            )
+        if baseline.completeness.cities and current.completeness.cities:
+            before_cities = {
+                city.entity_id.value: city.model_dump(mode="json")
+                for city in baseline.cities
+            }
+            after_cities = {
+                city.entity_id.value: city.model_dump(mode="json")
+                for city in current.cities
+            }
+            self._append_entity_changes(
+                changes,
+                scope="settler",
+                collection="cities",
+                before=before_cities,
+                after=after_cities,
+            )
+
         if not changes:
             if not any(
                 current.completeness.supports_scope(scope)
-                for scope in ("research", "civic")
+                for scope in ("research", "civic", "settler")
             ):
                 return ObservationComparisonResult(
                     kind=ObservationComparisonKind.REBASELINE_REQUIRED,
@@ -208,6 +246,48 @@ class StateDeltaBuilder:
             reason="comparable strategic facts changed",
             state_delta=delta,
         )
+
+    @staticmethod
+    def _append_entity_changes(
+        changes: list[StateDeltaChange],
+        *,
+        scope: str,
+        collection: str,
+        before: dict[str, object],
+        after: dict[str, object],
+    ) -> None:
+        for entity_id in sorted(set(before) | set(after)):
+            field_path = f"{collection}.{entity_id}"
+            if entity_id not in before:
+                changes.append(
+                    StateDeltaChange(
+                        change_kind=StateDeltaChangeKind.ENTITY_CREATED,
+                        scope=scope,
+                        field_path=field_path,
+                        before=None,
+                        after=after[entity_id],
+                    )
+                )
+            elif entity_id not in after:
+                changes.append(
+                    StateDeltaChange(
+                        change_kind=StateDeltaChangeKind.ENTITY_DELETED,
+                        scope=scope,
+                        field_path=field_path,
+                        before=before[entity_id],
+                        after=None,
+                    )
+                )
+            elif before[entity_id] != after[entity_id]:
+                changes.append(
+                    StateDeltaChange(
+                        change_kind=StateDeltaChangeKind.FIELD_CHANGED,
+                        scope=scope,
+                        field_path=field_path,
+                        before=before[entity_id],
+                        after=after[entity_id],
+                    )
+                )
 
 
 class MissionImpactAnalyzer:

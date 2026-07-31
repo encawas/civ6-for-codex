@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import AbstractSet, Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
+from .actions import resolve_action_spec
 from .action_retry import FailedAttemptResolution, resolve_failed_attempt
 from .domain import (
     ACTIVE_TURN_ACTION_NODE_STATUSES,
@@ -75,7 +76,8 @@ from .domain import (
     StrategicContractCommit,
     opening_strategy_mission_policy,
     research_mission_action,
-    strategic_mission_action,
+    settler_mission_plan,
+    strategic_mission_action_types,
     validate_scope_activation_mission,
     RuntimeState,
     ScopeAuthorityActivatedTick,
@@ -1210,27 +1212,31 @@ class WorkflowStore:
                     raise ValueError(
                         "active TurnActionNode Mission provenance is stale"
                     )
-                desired = thaw_json(mission.desired_outcome)
-                target_key = "technology" if mission.scope == "research" else "civic"
                 if (
                     node.source_mission_revision != mission.mission_revision
-                    or node.action_type != strategic_mission_action(mission)
-                    or node.arguments.get("tech_or_civic") != desired[target_key]
+                    or not cls._mission_action_matches(
+                        mission,
+                        node.action_type,
+                        node.arguments,
+                        node.entity_id,
+                    )
                 ):
                     raise ValueError(
                         "active TurnActionNode Mission provenance is stale"
                     )
             for mission in missions:
+                action_types = strategic_mission_action_types(mission)
+                placeholders = ",".join("?" for _ in action_types)
                 duplicate = conn.execute(
-                    """
+                    f"""
                     SELECT task_id FROM workflow_tasks
-                    WHERE game_id=? AND action_type=?
+                    WHERE game_id=? AND action_type IN ({placeholders})
                       AND status IN (?, ?, ?, ?, ?, ?)
                     LIMIT 1
                     """,
                     (
                         graph.game_session_id,
-                        strategic_mission_action(mission),
+                        *action_types,
                         TaskStatus.PENDING.value,
                         TaskStatus.AWAITING_CONFIRMATION.value,
                         TaskStatus.READY.value,
@@ -1807,6 +1813,7 @@ class WorkflowStore:
                 or node.source_mission_id != commit.source_execution_mission_id
                 or node.source_mission_revision
                 != commit.source_execution_mission_revision
+                or node.action_type == "unit_move"
                 or base is None
                 or commit.source_action_attempt_id in action_commit_attempt_ids
             ):
@@ -1845,9 +1852,15 @@ class WorkflowStore:
                 raise ValueError(
                     "Action-derived Contract commit changes unrelated strategy facts"
                 )
-            if node.action_type != strategic_mission_action(
-                source
-            ) or attempt.action_type != strategic_mission_action(source):
+            if (
+                not cls._mission_action_matches(
+                    source,
+                    node.action_type,
+                    node.arguments,
+                    node.entity_id,
+                )
+                or attempt.action_type != node.action_type
+            ):
                 raise ValueError(
                     "Action-derived Contract commit disagrees with Mission action"
                 )
@@ -1878,6 +1891,7 @@ class WorkflowStore:
                 for mission in contract.mission_graph.missions
                 if mission.scope in contract.authority_scope_set.mission_graph_scopes
                 and mission.status is MissionStatus.ACTIVE
+                and mission.scope in {"research", "civic", "settler"}
             )
             if len({mission.scope for mission in missions}) != len(missions):
                 raise ValueError(
@@ -1885,7 +1899,9 @@ class WorkflowStore:
                 )
             missions_by_id = {mission.mission_id: mission for mission in missions}
             active_action_types = {
-                strategic_mission_action(mission) for mission in missions
+                action_type
+                for mission in missions
+                for action_type in strategic_mission_action_types(mission)
             }
             for node_id in graph.node_ids:
                 node = node_models[node_id]
@@ -1894,12 +1910,14 @@ class WorkflowStore:
                     raise ValueError(
                         "active TurnActionNode Mission provenance is stale"
                     )
-                desired = thaw_json(mission.desired_outcome)
-                target_key = "technology" if mission.scope == "research" else "civic"
                 if (
                     node.source_mission_revision != mission.mission_revision
-                    or node.action_type != strategic_mission_action(mission)
-                    or node.arguments.get("tech_or_civic") != desired[target_key]
+                    or not cls._mission_action_matches(
+                        mission,
+                        node.action_type,
+                        node.arguments,
+                        node.entity_id,
+                    )
                 ):
                     raise ValueError(
                         "active TurnActionNode Mission provenance is stale"
@@ -4622,7 +4640,7 @@ class WorkflowStore:
             }
             added_ids = set(result_missions) - set(base_missions)
             if (
-                scope not in {"civic", "opening_strategy"}
+                scope not in {"civic", "opening_strategy", "settler"}
                 or scope in base.authority_scope_set.mission_graph_scopes
                 or commit.contract.authority_scope_set.mission_graph_scopes
                 != expected_scopes
@@ -4709,7 +4727,7 @@ class WorkflowStore:
         for game_id, contract in active_contracts.items():
             owned_migration_scopes = set(
                 contract.authority_scope_set.mission_graph_scopes
-            ).intersection({"civic", "opening_strategy"})
+            ).intersection({"civic", "opening_strategy", "settler"})
             for scope in owned_migration_scopes:
                 for (gap_game_id, _gap_id), gap in gaps.items():
                     if (
@@ -5174,13 +5192,15 @@ class WorkflowStore:
             )
             if len(missions) != 1:
                 raise ValueError("StoredTask provenance resolves to no Mission")
-            action_type = strategic_mission_action(missions[0])
-            desired = thaw_json(missions[0].desired_outcome)
-            target_key = "technology" if missions[0].scope == "research" else "civic"
-            if task.arguments.get("tech_or_civic") != desired[target_key]:
+            allowed_actions = strategic_mission_action_types(missions[0])
+            if task.action_type not in allowed_actions:
+                if len(allowed_actions) == 1:
+                    raise ValueError(
+                        f"Mission-derived task action must be {allowed_actions[0]}"
+                    )
+                raise ValueError("Mission-derived task action is outside its Mission")
+            if not cls._mission_action_matches_task(missions[0], task):
                 raise ValueError("Mission-derived task target disagrees with Mission")
-            if task.action_type != action_type:
-                raise ValueError(f"Mission-derived task action must be {action_type}")
 
         attempts_by_task: dict[tuple[str, str], list[ActionAttempt]] = {}
         for row in action_attempt_rows:
@@ -5211,12 +5231,12 @@ class WorkflowStore:
             active = contracts[(game_id, active_revision)]
             unsupported_scopes = set(
                 active.authority_scope_set.mission_graph_scopes
-            ) - {"research", "civic", "opening_strategy"}
+            ) - {"research", "civic", "opening_strategy", "settler"}
             if unsupported_scopes:
                 raise ValueError("active Contract contains an unsupported scope")
             owned_scopes = set(
                 active.authority_scope_set.mission_graph_scopes
-            ).intersection({"research", "civic", "opening_strategy"})
+            ).intersection({"research", "civic", "opening_strategy", "settler"})
             if not owned_scopes:
                 continue
             active_commit = commits.get((game_id, active_revision))
@@ -5275,12 +5295,16 @@ class WorkflowStore:
                             "opening_strategy authority requires one activation Tick"
                         )
                     continue
-                action_type = "set_research" if scope == "research" else "set_civic"
+                action_types = {
+                    "research": {"set_research"},
+                    "civic": {"set_civic"},
+                    "settler": {"unit_move", "unit_found_city"},
+                }[scope]
                 legacy_tasks = {
                     task_id: task
                     for (task_game, task_id), task in tasks.items()
                     if task_game == game_id
-                    and task.action_type == action_type
+                    and task.action_type in action_types
                     and task.source_contract_id is None
                 }
                 for task_id, task in legacy_tasks.items():
@@ -5339,7 +5363,7 @@ class WorkflowStore:
                     or task.source_contract_revision != active.revision
                     or mission is None
                     or task.source_mission_revision != mission.mission_revision
-                    or task.action_type != strategic_mission_action(mission)
+                    or not cls._mission_action_matches_task(mission, task)
                 ):
                     raise ValueError("stale Mission-derived task remains executable")
 
@@ -6454,6 +6478,28 @@ class WorkflowStore:
             activated_at=activated_at,
         )
 
+    def activate_settler_authority(
+        self,
+        *,
+        game_session_id: str,
+        expected_base_revision: int,
+        mission: Mission,
+        activation_id: str,
+        observation_id: str,
+        turn_number: int,
+        activated_at: datetime,
+    ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]:
+        return self._activate_scope_authority(
+            scope="settler",
+            game_session_id=game_session_id,
+            expected_base_revision=expected_base_revision,
+            mission=mission,
+            activation_id=activation_id,
+            observation_id=observation_id,
+            turn_number=turn_number,
+            activated_at=activated_at,
+        )
+
     def _activate_scope_authority(
         self,
         *,
@@ -6468,7 +6514,7 @@ class WorkflowStore:
     ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]:
         if activated_at.tzinfo is None or activated_at.utcoffset() is None:
             raise ValueError("scope activation time must include a timezone")
-        if scope not in {"civic", "opening_strategy"}:
+        if scope not in {"civic", "opening_strategy", "settler"}:
             raise ValueError(f"scope authority activation is unsupported: {scope}")
         validate_scope_activation_mission(mission, scope)
         digest = hashlib.sha256(
@@ -6563,6 +6609,38 @@ class WorkflowStore:
                 raise ValueError(
                     f"{scope} activation requires a complete same-turn Observation"
                 )
+            if scope == "settler":
+                plan = settler_mission_plan(mission)
+                unit = observation.unit(str(plan["unit_id"]))
+                unit_values = {} if unit is None else thaw_json(unit.values)
+                targets = unit_values.get(
+                    "targets", unit_values.get("candidate_targets", ())
+                )
+                safe_target = isinstance(targets, list) and any(
+                    isinstance(target, dict)
+                    and target.get("x") == plan["target_x"]
+                    and target.get("y") == plan["target_y"]
+                    and target.get("legal") is True
+                    and target.get("reachable") is True
+                    for target in targets
+                )
+                target_occupied = any(
+                    thaw_json(city.values).get("x") == plan["target_x"]
+                    and thaw_json(city.values).get("y") == plan["target_y"]
+                    for city in observation.cities
+                )
+                if (
+                    unit is None
+                    or "SETTLER" not in unit.unit_type.upper()
+                    or str(unit_values.get("owner")) != str(plan["owner"])
+                    or len(observation.cities) != plan["baseline_city_count"]
+                    or not safe_target
+                    or target_occupied
+                ):
+                    raise ValueError(
+                        "settler activation requires a safe unoccupied target "
+                        "and matching canonical unit evidence"
+                    )
 
             active_request_statuses = {
                 PlannerRequestStatus.PENDING.value,
@@ -6660,6 +6738,12 @@ class WorkflowStore:
                 task_rows = conn.execute(
                     "SELECT * FROM workflow_tasks WHERE game_id=? AND action_type=?",
                     (game_session_id, "set_civic"),
+                ).fetchall()
+            elif scope == "settler":
+                task_rows = conn.execute(
+                    "SELECT * FROM workflow_tasks WHERE game_id=? "
+                    "AND action_type IN (?, ?)",
+                    (game_session_id, "unit_move", "unit_found_city"),
                 ).fetchall()
             elif scope_lease_task_ids:
                 placeholders = ",".join("?" for _ in scope_lease_task_ids)
@@ -7030,7 +7114,7 @@ class WorkflowStore:
             base_contract = self._contract_from_revision_row(base_row)
             patch_scope = planner_request.target.strategic_scope
             if (
-                patch_scope not in {"research", "civic"}
+                patch_scope not in {"research", "civic", "settler"}
                 or patch_scope
                 not in base_contract.authority_scope_set.mission_graph_scopes
             ):
@@ -8798,7 +8882,7 @@ class WorkflowStore:
                 else set(active[0].authority_scope_set.mission_graph_scopes)
             )
             for scope in owned_scopes.intersection(
-                {"research", "civic", "opening_strategy"}
+                {"research", "civic", "opening_strategy", "settler"}
             ):
                 if self._plan_lease_targets_scope_in_connection(conn, lease, scope):
                     raise ValueError(f"legacy {scope} PlanLease writes are closed")
@@ -9048,6 +9132,42 @@ class WorkflowStore:
                 ),
             )
 
+    @staticmethod
+    def _mission_action_matches(
+        mission: Mission,
+        action_type: str,
+        arguments: Mapping[str, Any],
+        entity_id: str,
+    ) -> bool:
+        if action_type not in strategic_mission_action_types(mission):
+            return False
+        desired = thaw_json(mission.desired_outcome)
+        if mission.scope in {"research", "civic"}:
+            target_key = "technology" if mission.scope == "research" else "civic"
+            return str(arguments.get("tech_or_civic")) == str(desired[target_key])
+        if mission.scope == "settler":
+            plan = settler_mission_plan(mission)
+            if str(entity_id) != str(plan["unit_id"]) or str(
+                arguments.get("unit_id")
+            ) != str(plan["unit_id"]):
+                return False
+            if action_type == "unit_move":
+                return (
+                    arguments.get("target_x") == plan["target_x"]
+                    and arguments.get("target_y") == plan["target_y"]
+                )
+            return set(arguments) == {"unit_id"}
+        return False
+
+    @classmethod
+    def _mission_action_matches_task(cls, mission: Mission, task: StoredTask) -> bool:
+        return cls._mission_action_matches(
+            mission,
+            task.action_type,
+            task.arguments,
+            str(task.entity_id),
+        )
+
     @classmethod
     def _active_scope_missions_in_connection(
         cls,
@@ -9113,12 +9233,14 @@ class WorkflowStore:
             return None
         contract, missions = active
         executable = tuple(
-            mission for mission in missions if mission.scope in {"research", "civic"}
+            mission
+            for mission in missions
+            if mission.scope in {"research", "civic", "settler"}
         )
         if not executable:
             return None
         for mission in executable:
-            strategic_mission_action(mission)
+            strategic_mission_action_types(mission)
         return contract, executable
 
     @classmethod
@@ -9355,8 +9477,6 @@ class WorkflowStore:
                     raise ValueError(
                         "TurnActionNode does not match active strategic authority"
                     )
-                desired = thaw_json(mission.desired_outcome)
-                target_key = "technology" if mission.scope == "research" else "civic"
                 if (
                     node.graph_id != graph.graph_id
                     or node.game_session_id != graph.game_session_id
@@ -9367,8 +9487,12 @@ class WorkflowStore:
                     or node.source_contract_id != contract.contract_id
                     or node.source_contract_revision != contract.revision
                     or node.source_mission_revision != mission.mission_revision
-                    or node.action_type != strategic_mission_action(mission)
-                    or node.arguments.get("tech_or_civic") != desired[target_key]
+                    or not self._mission_action_matches(
+                        mission,
+                        node.action_type,
+                        node.arguments,
+                        node.entity_id,
+                    )
                 ):
                     raise ValueError(
                         "TurnActionNode does not match active strategic authority"
@@ -9428,7 +9552,11 @@ class WorkflowStore:
                     )
 
             active_action_types = tuple(
-                sorted(strategic_mission_action(mission) for mission in missions)
+                sorted(
+                    action_type
+                    for mission in missions
+                    for action_type in strategic_mission_action_types(mission)
+                )
             )
             placeholders = ", ".join("?" for _item in active_action_types)
             legacy_rows = (
@@ -9646,6 +9774,19 @@ class WorkflowStore:
             str(key).strip().lower() in opening_keys for key in bundle.strategy_updates
         )
 
+    @staticmethod
+    def _bundle_contains_settler_write(bundle: PlanBundle) -> bool:
+        if any(
+            task.action_type in {"unit_move", "unit_found_city"}
+            for task in bundle.tasks
+        ):
+            return True
+        return any(
+            isinstance(update, dict)
+            and str(update.get("goal", "")).strip().lower() == "found_city"
+            for update in bundle.unit_plan_updates
+        )
+
     @classmethod
     def _validate_research_task_authority_in_connection(
         cls,
@@ -9656,7 +9797,12 @@ class WorkflowStore:
         allow_legacy_inert: bool = False,
         action_type: str | None = None,
     ) -> StoredTask | None:
-        action_scopes = {"set_research": "research", "set_civic": "civic"}
+        action_scopes = {
+            "set_research": "research",
+            "set_civic": "civic",
+            "unit_move": "settler",
+            "unit_found_city": "settler",
+        }
         active = cls._active_execution_missions_in_connection(conn, game_id)
         contract = None if active is None else active[0]
         missions = () if active is None else active[1]
@@ -9686,15 +9832,12 @@ class WorkflowStore:
             mission = missions_by_id.get(str(graph_task.source_mission_id))
             if contract is None or mission is None:
                 raise ValueError("TurnActionNode is not backed by strategic authority")
-            desired = thaw_json(mission.desired_outcome)
-            target_key = "technology" if mission.scope == "research" else "civic"
             if (
-                graph_task.action_type != strategic_mission_action(mission)
+                not cls._mission_action_matches_task(mission, graph_task)
                 or graph_task.source_contract_id != contract.contract_id
                 or graph_task.source_contract_revision != contract.revision
                 or graph_task.source_mission_id != mission.mission_id
                 or graph_task.source_mission_revision != mission.mission_revision
-                or graph_task.arguments.get("tech_or_civic") != desired[target_key]
                 or (action_type is not None and graph_task.action_type != action_type)
             ):
                 raise ValueError(
@@ -9752,17 +9895,13 @@ class WorkflowStore:
         if (
             contract is None
             or mission is None
-            or task.action_type != strategic_mission_action(mission)
+            or not cls._mission_action_matches_task(mission, task)
             or task.source_contract_id != contract.contract_id
             or task.source_contract_revision != contract.revision
             or task.source_mission_id != mission.mission_id
             or task.source_mission_revision != mission.mission_revision
         ):
             raise ValueError("task provenance does not match active Contract/Mission")
-        desired = thaw_json(mission.desired_outcome)
-        target_key = "technology" if mission.scope == "research" else "civic"
-        if task.arguments.get("tech_or_civic") != desired[target_key]:
-            raise ValueError("task target does not match the active Mission outcome")
         return task
 
     def save_authoritative_research_plan_bundle(
@@ -9958,6 +10097,12 @@ class WorkflowStore:
             ):
                 raise ValueError(
                     "legacy opening strategy writes are closed after authority cutover"
+                )
+            if "settler" in owned_scopes and self._bundle_contains_settler_write(
+                bundle
+            ):
+                raise ValueError(
+                    "legacy settler plan writes are closed after authority cutover"
                 )
             if "opening_strategy" in owned_scopes and bundle.tasks:
                 incoming_task_ids = {task.task_id for task in bundle.tasks}
@@ -10757,14 +10902,13 @@ class WorkflowStore:
                         "ActionAttempt source Observation does not match TurnActionGraph"
                     )
             if task is not None and task.plan_id.startswith("turn_action_graph_"):
-                expected_category = (
-                    "civic" if task.action_type == "set_civic" else "tech"
-                )
+                expected_arguments = resolve_action_spec(
+                    task.action_type
+                ).build_arguments(task)
                 if (
                     task.status is not TaskStatus.READY
                     or (task.requires_confirmation and task.approved_by is None)
-                    or dict(attempt.normalized_arguments)
-                    != {**task.arguments, "category": expected_category}
+                    or dict(attempt.normalized_arguments) != expected_arguments
                 ):
                     raise ValueError(
                         "TurnActionNode is not approved and ready for this Attempt"
@@ -11588,6 +11732,33 @@ class WorkflowStore:
             if node_row is None:
                 raise KeyError(f"unknown TurnActionNode: {attempt.task_id}")
             node = TurnActionNode.model_validate_json(str(node_row["node_json"]))
+            if (
+                node.action_type == "unit_move"
+                and TurnActionNodeStatus(str(node_row["status"]))
+                is TurnActionNodeStatus.SUCCEEDED
+            ):
+                stored_attempt = conn.execute(
+                    "SELECT attempt_json FROM action_attempts "
+                    "WHERE action_attempt_id=?",
+                    (attempt.action_attempt_id,),
+                ).fetchone()
+                stored_tick = conn.execute(
+                    "SELECT * FROM workflow_ticks WHERE tick_id=?",
+                    (tick.tick_id,),
+                ).fetchone()
+                if (
+                    stored_attempt is None
+                    or ActionAttempt.model_validate_json(
+                        str(stored_attempt["attempt_json"])
+                    )
+                    != attempt
+                    or stored_tick is None
+                    or self._workflow_tick_from_row(dict(stored_tick)) != tick
+                ):
+                    raise ValueError(
+                        "TurnActionNode movement idempotency evidence disagrees"
+                    )
+                return
             commit_id = (
                 "turn_action_commit_"
                 + hashlib.sha256(attempt.action_attempt_id.encode("utf-8")).hexdigest()[
@@ -11682,8 +11853,51 @@ class WorkflowStore:
                 source_mission is None
                 or source_mission.mission_revision != node.source_mission_revision
                 or source_mission.status is not MissionStatus.ACTIVE
+                or not self._mission_action_matches(
+                    source_mission,
+                    node.action_type,
+                    node.arguments,
+                    node.entity_id,
+                )
             ):
                 raise ValueError("TurnActionNode source Mission is stale")
+            if source_mission.scope == "settler" and node.action_type == "unit_move":
+                conn.execute(
+                    "UPDATE turn_action_nodes SET status=?, updated_at=? "
+                    "WHERE graph_id=? AND status IN (?, ?, ?, ?)",
+                    (
+                        TurnActionNodeStatus.EXPIRED.value,
+                        tick.completed_at.isoformat(),
+                        graph.graph_id,
+                        TurnActionNodeStatus.AWAITING_APPROVAL.value,
+                        TurnActionNodeStatus.READY.value,
+                        TurnActionNodeStatus.EXECUTING.value,
+                        TurnActionNodeStatus.FAILED.value,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE turn_action_nodes "
+                    "SET status=?, last_error=NULL, updated_at=? WHERE node_id=?",
+                    (
+                        TurnActionNodeStatus.SUCCEEDED.value,
+                        tick.completed_at.isoformat(),
+                        node.node_id,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM active_turn_action_graphs WHERE game_id=?",
+                    (attempt.game_session_id,),
+                )
+                self._save_runtime_state_in_connection(
+                    conn, attempt.game_session_id, tick.ending_runtime_state, None
+                )
+                self._persist_human_wait_context_in_connection(
+                    conn, attempt.game_session_id, tick.ending_runtime_state, None
+                )
+                self._insert_workflow_tick_in_connection(conn, tick)
+                self._validate_phase1c_v11(conn)
+                self._validate_phase3_v13(conn)
+                return
             completed_mission = source_mission.model_copy(
                 update={
                     "mission_revision": source_mission.mission_revision + 1,
@@ -11898,7 +12112,7 @@ class WorkflowStore:
             else set(active[0].authority_scope_set.mission_graph_scopes)
         )
         for scope in owned_scopes.intersection(
-            {"research", "civic", "opening_strategy"}
+            {"research", "civic", "opening_strategy", "settler"}
         ):
             if cls._decision_gap_targets_scope(gap, scope):
                 raise ValueError(f"legacy {scope} DecisionGap writes are closed")
@@ -12112,7 +12326,7 @@ class WorkflowStore:
             else set(active[0].authority_scope_set.mission_graph_scopes)
         )
         for scope in owned_scopes.intersection(
-            {"research", "civic", "opening_strategy"}
+            {"research", "civic", "opening_strategy", "settler"}
         ):
             if cls._plan_lease_targets_scope_in_connection(conn, lease, scope):
                 raise ValueError(f"legacy {scope} PlanLease writes are closed")
@@ -12161,7 +12375,7 @@ class WorkflowStore:
                 else set(active[0].authority_scope_set.mission_graph_scopes)
             )
             for scope in owned_scopes.intersection(
-                {"research", "civic", "opening_strategy"}
+                {"research", "civic", "opening_strategy", "settler"}
             ):
                 if self._legacy_approval_targets_scope_in_connection(
                     conn, game_id, record, scope

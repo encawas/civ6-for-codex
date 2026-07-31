@@ -401,10 +401,19 @@ class WorkflowEngine:
                     ),
                 )
             ctx.resuming_human_wait = True
+        active_execution = self.store.active_execution_missions(snapshot.game_id)
+        active_contract = None if active_execution is None else active_execution[0]
+        execution_missions = () if active_execution is None else active_execution[1]
+        owned_execution_scopes = (
+            set()
+            if active_contract is None
+            else set(active_contract.authority_scope_set.mission_graph_scopes)
+        )
         existing_due = self.store.due_tasks(snapshot.game_id, snapshot.turn)
         need_units = (
             observation.canonical.unit_summary.detail_required
             or self.rules.needs_units(snapshot.game_id)
+            or "settler" in owned_execution_scopes
             or any(task.entity_type in {"unit", "builder"} for task in existing_due)
         )
         if need_units and snapshot.units is None:
@@ -424,14 +433,6 @@ class WorkflowEngine:
         before = self.store.task_ids(snapshot.game_id)
         materialization_started = self._monotonic()
         rule_compilation = self.rules.compile(observation)
-        active_execution = self.store.active_execution_missions(snapshot.game_id)
-        active_contract = None if active_execution is None else active_execution[0]
-        execution_missions = () if active_execution is None else active_execution[1]
-        owned_execution_scopes = (
-            set()
-            if active_contract is None
-            else set(active_contract.authority_scope_set.mission_graph_scopes)
-        )
         progression_compilation = self.progression.compile(
             observation,
             include_research="research" not in owned_execution_scopes,
@@ -441,6 +442,36 @@ class WorkflowEngine:
         if active_contract is not None:
             for mission in execution_missions:
                 scope = mission.scope
+                if scope == "settler":
+                    unavailable_target = self.turn_compiler.unavailable_target(
+                        observation.canonical, mission
+                    )
+                    if unavailable_target is None:
+                        continue
+                    authoritative_mission_events.append(
+                        GameEvent(
+                            event_type="settler_mission_target_unavailable",
+                            turn=snapshot.turn,
+                            entity_type="settler",
+                            entity_id=unavailable_target,
+                            level=EventLevel.L3,
+                            risk=RiskLevel.MEDIUM,
+                            blocking=True,
+                            payload={
+                                "contract_id": active_contract.contract_id,
+                                "contract_revision": active_contract.revision,
+                                "mission_id": mission.mission_id,
+                                "mission_revision": mission.mission_revision,
+                                "target": unavailable_target,
+                            },
+                            dedupe_key=(
+                                "settler_mission_target_unavailable:"
+                                f"{active_contract.revision}:"
+                                f"{mission.mission_revision}:{unavailable_target}"
+                            ),
+                        )
+                    )
+                    continue
                 target_key = "technology" if scope == "research" else "civic"
                 available_ids = (
                     observation.canonical.progression.available_research_ids
@@ -1380,6 +1411,7 @@ class WorkflowEngine:
         research_authoritative = "research" in owned_scopes
         civic_authoritative = "civic" in owned_scopes
         opening_authoritative = "opening_strategy" in owned_scopes
+        settler_authoritative = "settler" in owned_scopes
         if research_authoritative or civic_authoritative:
             context = dict(context)
             strategy = context.get("strategy")
@@ -1405,6 +1437,8 @@ class WorkflowEngine:
             allowed_action_types.discard("set_research")
         if civic_authoritative:
             allowed_action_types.discard("set_civic")
+        if settler_authoritative:
+            allowed_action_types.difference_update({"unit_move", "unit_found_city"})
         argument_contracts = action_argument_contracts(allowed_action_types)
         entity_type_contracts = action_entity_type_contracts(allowed_action_types)
         entity_id_contracts = entity_id_argument_contracts(entity_type_contracts)

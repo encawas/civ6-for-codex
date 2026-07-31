@@ -69,6 +69,8 @@ class TurnActionNode(DomainModel):
         expected_entity_type = {
             "set_research": "research",
             "set_civic": "civic",
+            "unit_move": "unit",
+            "unit_found_city": "unit",
         }.get(self.action_type)
         if expected_entity_type is None or self.entity_type != expected_entity_type:
             raise ValueError(

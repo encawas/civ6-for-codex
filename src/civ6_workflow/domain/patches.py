@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import Field
 
 from .base import DomainModel
-from .contracts import Mission, MissionStatus, strategic_mission_action
+from .contracts import Mission, MissionStatus, validate_scope_activation_mission
 
 
 class MissionGraphPatch(DomainModel):
@@ -48,7 +48,7 @@ class MissionGraphPatch(DomainModel):
                 raise ValueError("MissionGraphPatch Mission aggregate identity differs")
             if mission.status is not MissionStatus.ACTIVE:
                 raise ValueError("MissionGraph repair Mission must remain ACTIVE")
-            strategic_mission_action(mission)
+            validate_scope_activation_mission(mission, mission.scope)
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("MissionGraphPatch created_at must include a timezone")
         if self.patch_id != build_mission_graph_patch_id(

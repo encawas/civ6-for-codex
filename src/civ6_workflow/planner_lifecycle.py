@@ -158,7 +158,7 @@ class PlannerLifecycleCoordinator:
             return None
         owned_scopes = set(
             active_contract.authority_scope_set.mission_graph_scopes
-        ).intersection({"research", "civic"})
+        ).intersection({"research", "civic", "settler"})
         if not owned_scopes:
             return None
 
@@ -266,13 +266,11 @@ class PlannerLifecycleCoordinator:
                         {"approval": "not-required"}
                     ),
                     allowed_actions_hash=canonical_json_hash(
-                        [
-                            (
-                                "set_research"
-                                if repair_scope == "research"
-                                else "set_civic"
-                            )
-                        ]
+                        {
+                            "research": ["set_research"],
+                            "civic": ["set_civic"],
+                            "settler": ["unit_found_city", "unit_move"],
+                        }[repair_scope]
                     ),
                     model_settings={"provider": type(engine.planner).__name__},
                     status=PlannerRequestStatus.PENDING,
@@ -943,6 +941,21 @@ class PlannerLifecycleCoordinator:
         snapshot = observation.snapshot
         context = engine.store.current_context(snapshot.game_id)
         context["execution_mode"] = engine.config.execution_mode.value
+        active_contract = engine.store.get_active_strategic_contract(snapshot.game_id)
+        owned_scopes = (
+            set()
+            if active_contract is None
+            else set(active_contract.authority_scope_set.mission_graph_scopes)
+        )
+        if (
+            gap.gap_type
+            in {
+                "settler_site_selection_required",
+                "settler_plan_requires_review",
+            }
+            and "settler" in owned_scopes
+        ):
+            return None
         matching = None
         for event in current_events:
             if event.event_type not in STRATEGIC_GAP_TYPES:
@@ -1438,7 +1451,7 @@ class PlannerLifecycleCoordinator:
         self, logical_request: PlannerRequest, *, observation=None
     ) -> tuple[str, int]:
         target = logical_request.target
-        if target.strategic_scope not in {"research", "civic"}:
+        if target.strategic_scope not in {"research", "civic", "settler"}:
             raise ValueError("strategic request scope is unsupported")
         active = self.engine.store.get_active_strategic_contract(
             logical_request.game_session_id
