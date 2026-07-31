@@ -51,6 +51,9 @@ ACTION_ENTITY_TYPES = {
     "unit_fortify": {"unit"},
     "unit_skip": {"unit"},
     "unit_found_city": {"unit"},
+    "tactical_unit_move": {"unit"},
+    "tactical_unit_fortify": {"unit"},
+    "tactical_unit_skip": {"unit"},
 }
 
 ENTITY_ID_ARGUMENTS: Mapping[str, str] = MappingProxyType(
@@ -174,10 +177,7 @@ def condition_contracts(
 
 def _stable_contract_copy(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {
-            key: _stable_contract_copy(value[key])
-            for key in sorted(value)
-        }
+        return {key: _stable_contract_copy(value[key]) for key in sorted(value)}
     if isinstance(value, (list, tuple)):
         return [_stable_contract_copy(item) for item in value]
     return deepcopy(value)
@@ -367,8 +367,7 @@ def _render_contract_value(value: Any, arguments: Mapping[str, Any]) -> Any:
         return deepcopy(arguments[argument_name])
     if isinstance(value, Mapping):
         return {
-            key: _render_contract_value(item, arguments)
-            for key, item in value.items()
+            key: _render_contract_value(item, arguments) for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
         return [_render_contract_value(item, arguments) for item in value]

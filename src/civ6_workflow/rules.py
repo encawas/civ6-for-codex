@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .conditions import find_entity
+from .domain import MissionStatus, tactical_emergency_mission_order
 from .domain.observations import SlotState, UnitDetailReason
 from .models import (
     EventLevel,
@@ -61,17 +62,25 @@ class DeterministicRuleCompiler:
         include_city_roles: bool | None = None,
     ) -> RuleCompilation:
         snapshot = observation.snapshot
+        active_contract = self.store.get_active_strategic_contract(snapshot.game_id)
+        owned_scopes = (
+            set()
+            if active_contract is None
+            else set(active_contract.authority_scope_set.mission_graph_scopes)
+        )
         if include_settler is None or include_city_roles is None:
-            active_contract = self.store.get_active_strategic_contract(snapshot.game_id)
-            owned_scopes = (
-                set()
-                if active_contract is None
-                else set(active_contract.authority_scope_set.mission_graph_scopes)
-            )
             if include_settler is None:
                 include_settler = "settler" not in owned_scopes
             if include_city_roles is None:
                 include_city_roles = "city_roles" not in owned_scopes
+        tactical_unit_ids = set()
+        if active_contract is not None and "tactical_emergency" in owned_scopes:
+            tactical_unit_ids = {
+                str(tactical_emergency_mission_order(mission)["unit_id"])
+                for mission in active_contract.mission_graph.missions
+                if mission.scope == "tactical_emergency"
+                and mission.status is MissionStatus.ACTIVE
+            }
         context = self.store.current_context(snapshot.game_id)
         tasks: list[ProposedTask] = []
         events: list[GameEvent] = []
@@ -108,6 +117,7 @@ class DeterministicRuleCompiler:
                 unit_context,
                 unit_blocker_present=has_unit_blocker,
                 include_settler=include_settler,
+                excluded_unit_ids=tactical_unit_ids,
             )
             tasks.extend(unit_tasks)
             events.extend(unit_events)
@@ -144,11 +154,13 @@ class DeterministicRuleCompiler:
         *,
         unit_blocker_present: bool,
         include_settler: bool,
+        excluded_unit_ids: set[str],
     ) -> tuple[list[ProposedTask], list[GameEvent]]:
         tasks, events = self._compile_standard_unit_blocker(
             snapshot,
             context,
             unit_blocker_present=unit_blocker_present,
+            excluded_unit_ids=excluded_unit_ids,
         )
         unit_plans = context.get("units", {})
         if not isinstance(unit_plans, dict):
@@ -380,6 +392,7 @@ class DeterministicRuleCompiler:
         context: dict[str, Any],
         *,
         unit_blocker_present: bool,
+        excluded_unit_ids: set[str],
     ) -> tuple[list[ProposedTask], list[GameEvent]]:
         active_units = {
             str(task.entity_id)
@@ -401,6 +414,8 @@ class DeterministicRuleCompiler:
             if raw_id is None:
                 continue
             unit_id = str(raw_id)
+            if unit_id in excluded_unit_ids:
+                continue
             if not unit_blocker_present and not self._route_unit_without_blocker(unit):
                 continue
             if unit_id in active_units or unit_id in builder_units:

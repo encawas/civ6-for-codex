@@ -53,6 +53,7 @@ from .contracts import (
     settler_mission_plan,
     strategic_mission_action,
     strategic_mission_action_types,
+    tactical_emergency_mission_order,
     validate_scope_activation_mission,
 )
 from .decisions import (
@@ -220,6 +221,7 @@ __all__ = [
     "settler_mission_plan",
     "strategic_mission_action",
     "strategic_mission_action_types",
+    "tactical_emergency_mission_order",
     "validate_scope_activation_mission",
     "ACTIVE_TASK_STATUSES",
     "ProviderAttemptStatus",

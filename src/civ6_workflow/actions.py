@@ -123,6 +123,21 @@ ACTION_REGISTRY: Mapping[str, ActionSpec] = MappingProxyType(
             required_arguments=frozenset({"unit_id"}),
             fixed_arguments={"action": "skip"},
         ),
+        "tactical_unit_move": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id", "target_x", "target_y"}),
+            fixed_arguments={"action": "move"},
+        ),
+        "tactical_unit_fortify": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id"}),
+            fixed_arguments={"action": "fortify"},
+        ),
+        "tactical_unit_skip": ActionSpec(
+            tool_name="unit_action",
+            required_arguments=frozenset({"unit_id"}),
+            fixed_arguments={"action": "skip"},
+        ),
     }
 )
 

@@ -545,6 +545,53 @@ def diplomacy_trade_mission_policy(mission: Mission) -> dict[str, object]:
     return policy
 
 
+def tactical_emergency_mission_order(mission: Mission) -> dict[str, object]:
+    """Validate one closed, turn-bounded tactical unit order."""
+
+    if mission.scope != "tactical_emergency":
+        raise ValueError("tactical/emergency Mission scope must be tactical_emergency")
+    if mission.status is not MissionStatus.ACTIVE:
+        raise ValueError("tactical/emergency Mission must be ACTIVE")
+    desired_outcome = thaw_json(mission.desired_outcome)
+    if set(desired_outcome) != {"tactical_emergency"}:
+        raise ValueError(
+            "tactical/emergency Mission desired_outcome must contain only "
+            "tactical_emergency"
+        )
+    plan = desired_outcome["tactical_emergency"]
+    if not isinstance(plan, dict) or set(plan) != {
+        "unit_id",
+        "response_kind",
+        "target_turn",
+        "order",
+    }:
+        raise ValueError(
+            "tactical/emergency Mission plan fields do not match the contract"
+        )
+    unit_id = plan["unit_id"]
+    if not isinstance(unit_id, (str, int)) or not str(unit_id).strip():
+        raise ValueError("tactical/emergency Mission requires a unit identity")
+    if mission.subject.subject_type != "unit" or mission.subject.subject_id != str(
+        unit_id
+    ):
+        raise ValueError("tactical/emergency Mission subject must match its unit")
+    if plan["response_kind"] not in {"tactical", "emergency"}:
+        raise ValueError("tactical/emergency response_kind is invalid")
+    if type(plan["target_turn"]) is not int or int(plan["target_turn"]) < 0:
+        raise ValueError("tactical/emergency target_turn must be non-negative")
+    order = plan["order"]
+    if not isinstance(order, dict):
+        raise ValueError("tactical/emergency Mission requires one unit order")
+    kind = order.get("kind")
+    expected_fields = {"kind", "target_x", "target_y"} if kind == "move" else {"kind"}
+    if set(order) != expected_fields or kind not in {"move", "fortify", "skip"}:
+        raise ValueError("tactical/emergency unit order is outside the closed contract")
+    for key in ("target_x", "target_y"):
+        if key in order and type(order[key]) is not int:
+            raise ValueError(f"tactical/emergency {key} must be an integer")
+    return plan
+
+
 def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
     """Return the closed action set permitted by one executable Mission scope."""
 
@@ -563,6 +610,13 @@ def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
     if mission.scope == "diplomacy_trade":
         diplomacy_trade_mission_policy(mission)
         return ()
+    if mission.scope == "tactical_emergency":
+        tactical_emergency_mission_order(mission)
+        return (
+            "tactical_unit_fortify",
+            "tactical_unit_move",
+            "tactical_unit_skip",
+        )
     raise ValueError(f"scope has no Phase 5 execution contract: {mission.scope}")
 
 

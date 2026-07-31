@@ -85,7 +85,7 @@ def evaluate_action_verification(
             f"{action_type} slot contains a different selection: {slot.value}",
         )
 
-    if action_type == "unit_move":
+    if action_type in {"unit_move", "tactical_unit_move"}:
         unit_id = attempt.normalized_arguments.get("unit_id", task.entity_id)
         if observation.canonical.units is None:
             return ActionVerificationDecision(

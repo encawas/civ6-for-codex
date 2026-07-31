@@ -159,7 +159,14 @@ class PlannerLifecycleCoordinator:
         owned_scopes = set(
             active_contract.authority_scope_set.mission_graph_scopes
         ).intersection(
-            {"research", "civic", "settler", "city_roles", "diplomacy_trade"}
+            {
+                "research",
+                "civic",
+                "settler",
+                "city_roles",
+                "diplomacy_trade",
+                "tactical_emergency",
+            }
         )
         if not owned_scopes:
             return None
@@ -274,6 +281,11 @@ class PlannerLifecycleCoordinator:
                             "settler": ["unit_found_city", "unit_move"],
                             "city_roles": ["city_set_production"],
                             "diplomacy_trade": [],
+                            "tactical_emergency": [
+                                "tactical_unit_fortify",
+                                "tactical_unit_move",
+                                "tactical_unit_skip",
+                            ],
                         }[repair_scope]
                     ),
                     model_settings={"provider": type(engine.planner).__name__},
@@ -969,6 +981,26 @@ class PlannerLifecycleCoordinator:
             and "city_roles" in owned_scopes
         ):
             return None
+        if (
+            gap.gap_type
+            in {
+                "pending_diplomacy",
+                "pending_trade_offer",
+                "war_posture_required",
+            }
+            and "diplomacy_trade" in owned_scopes
+        ):
+            return None
+        if (
+            gap.gap_type
+            in {
+                "tactical_attack_opportunity",
+                "emergency_defense_required",
+                "emergency_response_window",
+            }
+            and "tactical_emergency" in owned_scopes
+        ):
+            return None
         matching = None
         for event in current_events:
             if event.event_type not in STRATEGIC_GAP_TYPES:
@@ -1470,6 +1502,7 @@ class PlannerLifecycleCoordinator:
             "settler",
             "city_roles",
             "diplomacy_trade",
+            "tactical_emergency",
         }:
             raise ValueError("strategic request scope is unsupported")
         active = self.engine.store.get_active_strategic_contract(

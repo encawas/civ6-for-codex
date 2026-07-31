@@ -18,6 +18,7 @@ from .domain import (
     diplomacy_trade_mission_policy,
     settler_mission_plan,
     strategic_mission_action,
+    tactical_emergency_mission_order,
     thaw_json,
 )
 from .models import ExecutionMode, RiskLevel, StoredTask, TaskStatus
@@ -59,6 +60,34 @@ class TurnCompiler:
             return None
         if mission.scope == "diplomacy_trade":
             diplomacy_trade_mission_policy(mission)
+            return None
+        if mission.scope == "tactical_emergency":
+            plan = tactical_emergency_mission_order(mission)
+            unit = observation.unit(str(plan["unit_id"]))
+            if unit is None:
+                return f"unit:{plan['unit_id']}"
+            if plan["target_turn"] < observation.turn_number:
+                return f"turn:{plan['target_turn']}"
+            if plan["target_turn"] > observation.turn_number:
+                return None
+            if unit.moves_remaining is None or unit.moves_remaining <= 0:
+                return f"unit:{plan['unit_id']}:no-moves"
+            if plan["order"]["kind"] == "move":
+                values = thaw_json(unit.values)
+                if type(values.get("x")) is not int or type(values.get("y")) is not int:
+                    return f"unit:{plan['unit_id']}:position-unknown"
+                targets = values.get("targets", ())
+                if not isinstance(targets, list) or not any(
+                    isinstance(target, dict)
+                    and target.get("x") == plan["order"]["target_x"]
+                    and target.get("y") == plan["order"]["target_y"]
+                    and target.get("legal", True) is True
+                    and target.get("reachable", True) is True
+                    for target in targets
+                ):
+                    return (
+                        f"tile:{plan['order']['target_x']}:{plan['order']['target_y']}"
+                    )
             return None
         strategic_mission_action(mission)
         desired = thaw_json(mission.desired_outcome)
@@ -184,6 +213,14 @@ class TurnCompiler:
         if mission.scope == "diplomacy_trade":
             diplomacy_trade_mission_policy(mission)
             return None, None
+        if mission.scope == "tactical_emergency":
+            return self._compile_tactical_emergency_node(
+                observation,
+                contract,
+                mission,
+                mode=mode,
+                auto_action_types=auto_action_types,
+            )
         action_type = strategic_mission_action(mission)
         desired = thaw_json(mission.desired_outcome)
         target_key = "technology" if mission.scope == "research" else "civic"
@@ -434,6 +471,96 @@ class TurnCompiler:
             )
             return node, None
         return None, None
+
+    def _compile_tactical_emergency_node(
+        self,
+        observation: NormalizedObservation,
+        contract: StrategicContract,
+        mission: Mission,
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+    ) -> tuple[TurnActionNode | None, str | None]:
+        plan = tactical_emergency_mission_order(mission)
+        unavailable = self.unavailable_target(observation, mission)
+        if unavailable is not None:
+            return None, unavailable
+        if plan["target_turn"] > observation.turn_number:
+            return None, None
+        unit = observation.unit(str(plan["unit_id"]))
+        if unit is None or unit.moves_remaining is None or unit.moves_remaining <= 0:
+            return None, f"unit:{plan['unit_id']}:no-moves"
+        values = thaw_json(unit.values)
+        order = plan["order"]
+        kind = order["kind"]
+        action_type = {
+            "move": "tactical_unit_move",
+            "fortify": "tactical_unit_fortify",
+            "skip": "tactical_unit_skip",
+        }[kind]
+        arguments = {"unit_id": plan["unit_id"]}
+        if kind == "move":
+            arguments.update(
+                {"target_x": order["target_x"], "target_y": order["target_y"]}
+            )
+        preconditions = [
+            {
+                "type": "entity_exists",
+                "entity_type": "unit",
+                "entity_id": plan["unit_id"],
+            },
+            {"type": "unit_has_moves", "unit_id": plan["unit_id"]},
+        ]
+        if kind == "move":
+            preconditions.append(
+                {
+                    "type": "unit_at",
+                    "unit_id": plan["unit_id"],
+                    "x": values.get("x"),
+                    "y": values.get("y"),
+                }
+            )
+            postconditions = [
+                {
+                    "type": "unit_at",
+                    "unit_id": plan["unit_id"],
+                    "x": order["target_x"],
+                    "y": order["target_y"],
+                }
+            ]
+        else:
+            postconditions = [{"type": "unit_no_moves", "unit_id": plan["unit_id"]}]
+        node_identity = {
+            "game_session_id": observation.game_session_id,
+            "turn_number": observation.turn_number,
+            "source_observation_id": observation.observation_id,
+            "source_contract_id": contract.contract_id,
+            "source_contract_revision": contract.revision,
+            "source_mission_id": mission.mission_id,
+            "source_mission_revision": mission.mission_revision,
+            "action_type": action_type,
+            "entity_id": str(plan["unit_id"]),
+            "arguments": arguments,
+            "target_turn": int(plan["target_turn"]),
+        }
+        node_id = build_turn_action_node_id(**node_identity)
+        node = TurnActionNode(
+            node_id=node_id,
+            graph_id="pending",
+            source_observation_projection_hash=observation.projection_hash,
+            entity_type="unit",
+            preconditions=tuple(preconditions),
+            postconditions=tuple(postconditions),
+            risk=RiskLevel.HIGH.value,
+            requires_confirmation=True,
+            reason=(
+                "Execute the reviewed tactical/emergency unit response for "
+                f"turn {plan['target_turn']}."
+            ),
+            idempotency_key=f"turn-action:{node_id}",
+            **node_identity,
+        )
+        return node, None
 
     @staticmethod
     def _settler_target_is_safe(values, plan) -> bool:

@@ -79,6 +79,7 @@ from .domain import (
     research_mission_action,
     settler_mission_plan,
     strategic_mission_action_types,
+    tactical_emergency_mission_order,
     validate_scope_activation_mission,
     RuntimeState,
     ScopeAuthorityActivatedTick,
@@ -1902,7 +1903,14 @@ class WorkflowStore:
                 for mission in contract.mission_graph.missions
                 if mission.scope in contract.authority_scope_set.mission_graph_scopes
                 and mission.status is MissionStatus.ACTIVE
-                and mission.scope in {"research", "civic", "settler", "city_roles"}
+                and mission.scope
+                in {
+                    "research",
+                    "civic",
+                    "settler",
+                    "city_roles",
+                    "tactical_emergency",
+                }
             )
             if len({mission.scope for mission in missions}) != len(missions):
                 raise ValueError(
@@ -4658,6 +4666,7 @@ class WorkflowStore:
                     "settler",
                     "city_roles",
                     "diplomacy_trade",
+                    "tactical_emergency",
                 }
                 or scope in base.authority_scope_set.mission_graph_scopes
                 or commit.contract.authority_scope_set.mission_graph_scopes
@@ -4752,6 +4761,7 @@ class WorkflowStore:
                     "settler",
                     "city_roles",
                     "diplomacy_trade",
+                    "tactical_emergency",
                 }
             )
             for scope in owned_migration_scopes:
@@ -4789,7 +4799,11 @@ class WorkflowStore:
                             f"active {scope} authority retains a nonterminal "
                             "legacy PlanLease"
                         )
-                if scope in {"opening_strategy", "diplomacy_trade"}:
+                if scope in {
+                    "opening_strategy",
+                    "diplomacy_trade",
+                    "tactical_emergency",
+                }:
                     for lease in targeted_leases:
                         for task_id in lease.task_ids:
                             task = stored_tasks.get((game_id, task_id))
@@ -5264,6 +5278,7 @@ class WorkflowStore:
                 "settler",
                 "city_roles",
                 "diplomacy_trade",
+                "tactical_emergency",
             }
             if unsupported_scopes:
                 raise ValueError("active Contract contains an unsupported scope")
@@ -5277,6 +5292,7 @@ class WorkflowStore:
                     "settler",
                     "city_roles",
                     "diplomacy_trade",
+                    "tactical_emergency",
                 }
             )
             if not owned_scopes:
@@ -5342,6 +5358,11 @@ class WorkflowStore:
                     "civic": {"set_civic"},
                     "settler": {"unit_move", "unit_found_city"},
                     "city_roles": {"city_set_production"},
+                    "tactical_emergency": {
+                        "tactical_unit_move",
+                        "tactical_unit_fortify",
+                        "tactical_unit_skip",
+                    },
                 }[scope]
                 legacy_tasks = {
                     task_id: task
@@ -6587,6 +6608,28 @@ class WorkflowStore:
             activated_at=activated_at,
         )
 
+    def activate_tactical_emergency_authority(
+        self,
+        *,
+        game_session_id: str,
+        expected_base_revision: int,
+        mission: Mission,
+        activation_id: str,
+        observation_id: str,
+        turn_number: int,
+        activated_at: datetime,
+    ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]:
+        return self._activate_scope_authority(
+            scope="tactical_emergency",
+            game_session_id=game_session_id,
+            expected_base_revision=expected_base_revision,
+            mission=mission,
+            activation_id=activation_id,
+            observation_id=observation_id,
+            turn_number=turn_number,
+            activated_at=activated_at,
+        )
+
     def _activate_scope_authority(
         self,
         *,
@@ -6607,6 +6650,7 @@ class WorkflowStore:
             "settler",
             "city_roles",
             "diplomacy_trade",
+            "tactical_emergency",
         }:
             raise ValueError(f"scope authority activation is unsupported: {scope}")
         validate_scope_activation_mission(mission, scope)
@@ -6751,6 +6795,62 @@ class WorkflowStore:
                         "city roles activation requires matching canonical city "
                         "ownership evidence"
                     )
+            elif scope == "tactical_emergency":
+                plan = tactical_emergency_mission_order(mission)
+                unit = observation.unit(str(plan["unit_id"]))
+                civilian_markers = (
+                    "SETTLER",
+                    "BUILDER",
+                    "GREAT_",
+                    "SPY",
+                    "TRADER",
+                    "MISSIONARY",
+                    "APOSTLE",
+                    "GURU",
+                    "INQUISITOR",
+                    "ARCHAEOLOGIST",
+                    "NATURALIST",
+                    "ROCK_BAND",
+                )
+                if (
+                    unit is None
+                    or plan["target_turn"] < observation.turn_number
+                    or unit.moves_remaining is None
+                    or unit.moves_remaining <= 0
+                    or any(
+                        marker in unit.unit_type.upper() for marker in civilian_markers
+                    )
+                    or any(
+                        item.status is MissionStatus.ACTIVE
+                        and item.subject.subject_type == "unit"
+                        and item.subject.subject_id == str(plan["unit_id"])
+                        for item in base.mission_graph.missions
+                    )
+                ):
+                    raise ValueError(
+                        "tactical/emergency activation requires one unclaimed current "
+                        "actionable military unit and non-stale target turn"
+                    )
+                if plan["order"]["kind"] == "move":
+                    values = thaw_json(unit.values)
+                    targets = values.get("targets", ())
+                    if (
+                        type(values.get("x")) is not int
+                        or type(values.get("y")) is not int
+                        or not isinstance(targets, list)
+                        or not any(
+                            isinstance(target, dict)
+                            and target.get("x") == plan["order"]["target_x"]
+                            and target.get("y") == plan["order"]["target_y"]
+                            and target.get("legal", True) is True
+                            and target.get("reachable", True) is True
+                            for target in targets
+                        )
+                    ):
+                        raise ValueError(
+                            "tactical/emergency move requires a known current position "
+                            "and current legal reachable target"
+                        )
 
             active_request_statuses = {
                 PlannerRequestStatus.PENDING.value,
@@ -7236,6 +7336,7 @@ class WorkflowStore:
                     "settler",
                     "city_roles",
                     "diplomacy_trade",
+                    "tactical_emergency",
                 }
                 or patch_scope
                 not in base_contract.authority_scope_set.mission_graph_scopes
@@ -9011,6 +9112,7 @@ class WorkflowStore:
                     "settler",
                     "city_roles",
                     "diplomacy_trade",
+                    "tactical_emergency",
                 }
             ):
                 if self._plan_lease_targets_scope_in_connection(conn, lease, scope):
@@ -9308,6 +9410,27 @@ class WorkflowStore:
                 if key in expected:
                     expected_arguments[key] = expected[key]
             return dict(arguments) == expected_arguments
+        if mission.scope == "tactical_emergency":
+            plan = tactical_emergency_mission_order(mission)
+            if str(plan["unit_id"]) != str(entity_id):
+                return False
+            kind = plan["order"]["kind"]
+            expected_action = {
+                "move": "tactical_unit_move",
+                "fortify": "tactical_unit_fortify",
+                "skip": "tactical_unit_skip",
+            }[kind]
+            expected_arguments = {"unit_id": plan["unit_id"]}
+            if kind == "move":
+                expected_arguments.update(
+                    {
+                        "target_x": plan["order"]["target_x"],
+                        "target_y": plan["order"]["target_y"],
+                    }
+                )
+            return (
+                action_type == expected_action and dict(arguments) == expected_arguments
+            )
         return False
 
     @classmethod
@@ -9436,7 +9559,14 @@ class WorkflowStore:
             mission
             for mission in missions
             if mission.scope
-            in {"research", "civic", "settler", "city_roles", "diplomacy_trade"}
+            in {
+                "research",
+                "civic",
+                "settler",
+                "city_roles",
+                "diplomacy_trade",
+                "tactical_emergency",
+            }
         )
         if not executable:
             return None
@@ -9994,6 +10124,18 @@ class WorkflowStore:
             task.action_type == "city_set_production" for task in bundle.tasks
         )
 
+    @staticmethod
+    def _bundle_contains_tactical_emergency_write(bundle: PlanBundle) -> bool:
+        return any(
+            task.action_type
+            in {
+                "tactical_unit_move",
+                "tactical_unit_fortify",
+                "tactical_unit_skip",
+            }
+            for task in bundle.tasks
+        )
+
     @classmethod
     def _validate_research_task_authority_in_connection(
         cls,
@@ -10010,6 +10152,9 @@ class WorkflowStore:
             "unit_move": "settler",
             "unit_found_city": "settler",
             "city_set_production": "city_roles",
+            "tactical_unit_move": "tactical_emergency",
+            "tactical_unit_fortify": "tactical_emergency",
+            "tactical_unit_skip": "tactical_emergency",
         }
         active = cls._active_execution_missions_in_connection(conn, game_id)
         contract = None if active is None else active[0]
@@ -10317,6 +10462,14 @@ class WorkflowStore:
             ):
                 raise ValueError(
                     "legacy city roles plan writes are closed after authority cutover"
+                )
+            if (
+                "tactical_emergency" in owned_scopes
+                and self._bundle_contains_tactical_emergency_write(bundle)
+            ):
+                raise ValueError(
+                    "legacy tactical/emergency plan writes are closed after "
+                    "authority cutover"
                 )
             if "opening_strategy" in owned_scopes and bundle.tasks:
                 incoming_task_ids = {task.task_id for task in bundle.tasks}
@@ -12328,6 +12481,7 @@ class WorkflowStore:
                 "settler",
                 "city_roles",
                 "diplomacy_trade",
+                "tactical_emergency",
             }
         ):
             if cls._decision_gap_targets_scope(gap, scope):
@@ -12424,7 +12578,8 @@ class WorkflowStore:
             "research": ("tech", "technology"),
             "opening_strategy": ("opening",),
             "city_roles": ("city", "production"),
-            "diplomacy_trade": ("diplomacy", "trade"),
+            "diplomacy_trade": ("diplomacy", "trade", "war"),
+            "tactical_emergency": ("tactical", "emergency"),
         }.get(scope, ())
         return {scope, *aliases}
 
@@ -12548,6 +12703,7 @@ class WorkflowStore:
                 "settler",
                 "city_roles",
                 "diplomacy_trade",
+                "tactical_emergency",
             }
         ):
             if cls._plan_lease_targets_scope_in_connection(conn, lease, scope):
@@ -12604,6 +12760,7 @@ class WorkflowStore:
                     "settler",
                     "city_roles",
                     "diplomacy_trade",
+                    "tactical_emergency",
                 }
             ):
                 if self._legacy_approval_targets_scope_in_connection(

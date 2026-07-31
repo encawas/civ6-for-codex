@@ -684,7 +684,7 @@ def test_settler_state_delta_tracks_complete_facts_but_not_unknown_deletions():
     assert result.kind is ObservationComparisonKind.STATE_DELTA
     assert result.state_delta is not None
     assert any(
-        change.scope == "settler"
+        change.scope == "unit"
         and change.field_path == f"units.{UNIT_ID}"
         and change.change_kind is StateDeltaChangeKind.FIELD_CHANGED
         for change in result.state_delta.changes
@@ -696,7 +696,7 @@ def test_settler_state_delta_tracks_complete_facts_but_not_unknown_deletions():
     )
     unknown = StateDeltaBuilder().compare(baseline, incomplete)
     assert unknown.state_delta is None or not any(
-        change.scope == "settler"
+        change.scope == "unit"
         and change.change_kind is StateDeltaChangeKind.ENTITY_DELETED
         for change in unknown.state_delta.changes
     )

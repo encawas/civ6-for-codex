@@ -146,6 +146,8 @@ class ObservationCompleteness(DomainModel):
             return self.cities
         if scope == "diplomacy_trade":
             return self.blockers
+        if scope == "tactical_emergency":
+            return self.units and self.blockers
         return False
 
 

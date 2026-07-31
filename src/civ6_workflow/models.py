@@ -241,4 +241,7 @@ ActionType = Literal[
     "unit_heal",
     "unit_fortify",
     "unit_skip",
+    "tactical_unit_move",
+    "tactical_unit_fortify",
+    "tactical_unit_skip",
 ]

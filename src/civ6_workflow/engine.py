@@ -402,8 +402,16 @@ class WorkflowEngine:
                 )
             ctx.resuming_human_wait = True
         active_execution = self.store.active_execution_missions(snapshot.game_id)
-        active_contract = None if active_execution is None else active_execution[0]
+        active_contract = self.store.get_active_strategic_contract(snapshot.game_id)
         execution_missions = () if active_execution is None else active_execution[1]
+        if (
+            active_execution is not None
+            and active_contract is not None
+            and active_execution[0] != active_contract
+        ):
+            raise RuntimeError(
+                "execution Mission projection disagrees with active Contract"
+            )
         owned_execution_scopes = (
             set()
             if active_contract is None
@@ -414,6 +422,7 @@ class WorkflowEngine:
             observation.canonical.unit_summary.detail_required
             or self.rules.needs_units(snapshot.game_id)
             or "settler" in owned_execution_scopes
+            or "tactical_emergency" in owned_execution_scopes
             or any(task.entity_type in {"unit", "builder"} for task in existing_due)
         )
         if need_units and snapshot.units is None:
@@ -442,7 +451,7 @@ class WorkflowEngine:
         if active_contract is not None:
             for mission in execution_missions:
                 scope = mission.scope
-                if scope in {"settler", "city_roles"}:
+                if scope in {"settler", "city_roles", "tactical_emergency"}:
                     unavailable_target = self.turn_compiler.unavailable_target(
                         observation.canonical, mission
                     )
@@ -534,16 +543,22 @@ class WorkflowEngine:
             )
         )
         snapshot_events = events_from_snapshot(snapshot)
-        diplomacy_trade_human_events = [
-            event
-            for event in snapshot_events
-            if event.event_type in {"pending_diplomacy", "pending_trade_offer"}
-        ]
         current_events = [
             *rule_compilation.events,
             *progression_compilation.events,
             *authoritative_mission_events,
             *snapshot_events,
+        ]
+        diplomacy_trade_human_events = [
+            event
+            for event in current_events
+            if event.event_type
+            in {"pending_diplomacy", "pending_trade_offer", "war_posture_required"}
+        ]
+        tactical_unavailable_events = [
+            event
+            for event in authoritative_mission_events
+            if event.event_type == "tactical_emergency_mission_target_unavailable"
         ]
         if "city_roles" in owned_execution_scopes:
             current_events = [
@@ -556,7 +571,24 @@ class WorkflowEngine:
             current_events = [
                 event
                 for event in current_events
-                if event.event_type not in {"pending_diplomacy", "pending_trade_offer"}
+                if event.event_type
+                not in {
+                    "pending_diplomacy",
+                    "pending_trade_offer",
+                    "war_posture_required",
+                }
+            ]
+        if "tactical_emergency" in owned_execution_scopes:
+            current_events = [
+                event
+                for event in current_events
+                if event.event_type
+                not in {
+                    "tactical_attack_opportunity",
+                    "emergency_defense_required",
+                    "emergency_response_window",
+                    "tactical_emergency_mission_target_unavailable",
+                }
             ]
         lease_tick = await self._pre_route_decision_runtime(
             ctx, observation, current_events
@@ -613,6 +645,28 @@ class WorkflowEngine:
                 compatibility=human_wait,
                 blocking_reason=human_wait.pause_reason,
             )
+        if (
+            "tactical_emergency" in owned_execution_scopes
+            and tactical_unavailable_events
+        ):
+            gate = self.gate.ingest(snapshot.game_id, tactical_unavailable_events)
+            human_wait = TickResult(
+                turn=snapshot.turn,
+                metrics=ctx.metrics,
+                events=gate.emitted,
+                paused=True,
+                pause_reason=(
+                    "The active tactical/emergency Mission is no longer safely "
+                    "executable and requires explicit human review."
+                ),
+            )
+            return self._finish(
+                ctx,
+                snapshot,
+                AwaitingHumanTick,
+                compatibility=human_wait,
+                blocking_reason=human_wait.pause_reason,
+            )
 
         due_tasks = [
             *self.store.due_turn_action_nodes(
@@ -656,7 +710,24 @@ class WorkflowEngine:
             events = [
                 event
                 for event in events
-                if event.event_type not in {"pending_diplomacy", "pending_trade_offer"}
+                if event.event_type
+                not in {
+                    "pending_diplomacy",
+                    "pending_trade_offer",
+                    "war_posture_required",
+                }
+            ]
+        if "tactical_emergency" in owned_execution_scopes:
+            events = [
+                event
+                for event in events
+                if event.event_type
+                not in {
+                    "tactical_attack_opportunity",
+                    "emergency_defense_required",
+                    "emergency_response_window",
+                    "tactical_emergency_mission_target_unavailable",
+                }
             ]
         gate = self.gate.ingest(snapshot.game_id, events)
         compat = TickResult(

@@ -72,6 +72,9 @@ class TurnActionNode(DomainModel):
             "set_civic": "civic",
             "unit_move": "unit",
             "unit_found_city": "unit",
+            "tactical_unit_move": "unit",
+            "tactical_unit_fortify": "unit",
+            "tactical_unit_skip": "unit",
         }.get(self.action_type)
         if expected_entity_type is None or self.entity_type != expected_entity_type:
             raise ValueError(

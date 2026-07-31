@@ -117,6 +117,18 @@ class WorkflowStorePort(Protocol):
         activated_at: datetime,
     ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]: ...
 
+    def activate_tactical_emergency_authority(
+        self,
+        *,
+        game_session_id: str,
+        expected_base_revision: int,
+        mission: Mission,
+        activation_id: str,
+        observation_id: str,
+        turn_number: int,
+        activated_at: datetime,
+    ) -> tuple[StrategicContract, ScopeAuthorityActivatedTick]: ...
+
     def save_strategic_research_proposal(
         self, proposal: StrategicResearchProposal
     ) -> StrategicResearchProposal: ...

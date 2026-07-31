@@ -188,7 +188,7 @@ class StateDeltaBuilder:
             }
             self._append_entity_changes(
                 changes,
-                scope="settler",
+                scope="unit",
                 collection="units",
                 before=before_units,
                 after=after_units,
@@ -291,7 +291,7 @@ class StateDeltaBuilder:
 
 
 class MissionImpactAnalyzer:
-    """Expand direct research impacts to a deterministic Mission closure."""
+    """Expand directly changed scopes and entities to a Mission closure."""
 
     def affected_mission_ids(
         self,
@@ -304,6 +304,17 @@ class MissionImpactAnalyzer:
             for mission in mission_graph.missions
             if mission.scope in changed_scopes
         }
+        changed_unit_ids = {
+            item.field_path.split(".", 1)[1]
+            for item in state_delta.changes
+            if item.scope == "unit" and item.field_path.startswith("units.")
+        }
+        direct.update(
+            mission.mission_id
+            for mission in mission_graph.missions
+            if mission.subject.subject_type == "unit"
+            and mission.subject.subject_id in changed_unit_ids
+        )
         if not direct:
             return ()
 
