@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from .models import EventLevel, GameEvent, RiskLevel, RuntimeSnapshot
 from .ports import WorkflowStorePort
 
 
 def recover_turn_rewind(
-    store: WorkflowStorePort, snapshot: RuntimeSnapshot
+    store: WorkflowStorePort,
+    snapshot: RuntimeSnapshot,
+    *,
+    previous_game_id: object | None = None,
+    previous_turn: object | None = None,
+    recovered_at: datetime,
 ) -> GameEvent | None:
     """Clear future-derived workflow state when a loaded save moves backwards.
 
@@ -15,36 +22,18 @@ def recover_turn_rewind(
     and metric rows before the loaded turn remain available for inspection.
     """
 
-    previous_game_id = store.get_meta("last_game_id")
-    previous_turn = store.get_meta("last_observed_turn")
+    if previous_game_id is None:
+        previous_game_id = store.get_meta("last_game_id")
+    if previous_turn is None:
+        previous_turn = store.get_meta("last_observed_turn")
     if previous_game_id != snapshot.game_id or not isinstance(previous_turn, int):
         return None
     if snapshot.turn >= previous_turn:
         return None
 
-    with store._connect() as conn:  # package-internal recovery transaction
-        for table in (
-            "strategy_state",
-            "city_plans",
-            "unit_plans",
-            "builder_plans",
-            "workflow_tasks",
-            "event_log",
-            "unit_observations",
-        ):
-            conn.execute(f"DELETE FROM {table} WHERE game_id=?", (snapshot.game_id,))
-        conn.execute(
-            "DELETE FROM agent_runs WHERE game_id=? AND turn>=?",
-            (snapshot.game_id, snapshot.turn),
-        )
-        conn.execute(
-            "DELETE FROM turn_metrics WHERE game_id=? AND turn>=?",
-            (snapshot.game_id, snapshot.turn),
-        )
-        conn.execute(
-            "DELETE FROM workflow_meta WHERE key=?",
-            (f"unit_observations_initialized:{snapshot.game_id}",),
-        )
+    store.recover_turn_rewind(
+        snapshot.game_id, snapshot.turn, recovered_at=recovered_at
+    )
 
     return GameEvent(
         event_type="turn_rewind_detected",

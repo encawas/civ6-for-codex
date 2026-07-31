@@ -267,8 +267,16 @@ class WorkflowRuntime:
         self._active_observation_id = observation_id
         ctx.observation_ids.append(observation_id)
         ctx.starting_state = self.store.load_runtime_state(snapshot.game_id)
-        self.store.set_meta("last_game_id", snapshot.game_id)
-        self.store.set_meta("last_observed_turn", snapshot.turn)
+        previous_game_id = self.store.get_meta("last_game_id")
+        previous_turn = self.store.get_meta("last_observed_turn")
+        rewind_pending = (
+            previous_game_id == snapshot.game_id
+            and isinstance(previous_turn, int)
+            and snapshot.turn < previous_turn
+        )
+        if not rewind_pending:
+            self.store.set_meta("last_game_id", snapshot.game_id)
+            self.store.set_meta("last_observed_turn", snapshot.turn)
         await self._verify_tool_surface()
 
         unresolved = self.store.unresolved_action_attempt(snapshot.game_id)
@@ -437,7 +445,13 @@ class WorkflowRuntime:
         if execution is not None:
             return self._finish_execution_transition(ctx, snapshot, execution)
 
-        rewind_event = recover_turn_rewind(self.store, snapshot)
+        rewind_event = recover_turn_rewind(
+            self.store,
+            snapshot,
+            previous_game_id=previous_game_id,
+            previous_turn=previous_turn,
+            recovered_at=observation.canonical.observed_at,
+        )
         events = [] if rewind_event is None else [rewind_event]
         events.extend(projection.current_events)
         gate = self.gate.ingest(snapshot.game_id, events)

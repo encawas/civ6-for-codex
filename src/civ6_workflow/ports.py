@@ -214,6 +214,10 @@ class WorkflowStorePort(Protocol):
         source_observation_id: str,
     ) -> list[TurnActionExecution]: ...
 
+    def recover_turn_rewind(
+        self, game_id: str, loaded_turn: int, *, recovered_at: datetime
+    ) -> None: ...
+
     def save_normalized_observation(
         self, observation: NormalizedObservation
     ) -> NormalizedObservation: ...

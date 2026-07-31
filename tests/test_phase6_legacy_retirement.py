@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -15,6 +16,8 @@ from civ6_workflow.domain import (
     PlannerRequestTargetKind,
 )
 from civ6_workflow.models import TaskStatus
+from civ6_workflow.models import RuntimeSnapshot
+from civ6_workflow.recovery import recover_turn_rewind
 from civ6_workflow.store import PHASE5_REPLAY_STATE_TABLES, SCHEMA, WorkflowStore
 
 
@@ -139,6 +142,39 @@ def test_public_legacy_authority_writes_fail_closed(tmp_path):
     assert store.list_plan_leases("game-1") == []
 
 
+def test_current_activation_and_recovery_paths_have_no_legacy_authority_writes():
+    for retired_helper in (
+        "_save_decision_gap_in_connection",
+        "_save_plan_lease_in_connection",
+        "_invalidate_plan_projection_in_connection",
+        "_plan_lease_targets_scope_in_connection",
+        "_upsert_entity_plans",
+        "bind_builder_plan",
+        "record_planner_suppression",
+    ):
+        assert not hasattr(WorkflowStore, retired_helper)
+
+    current_sources = (
+        inspect.getsource(WorkflowStore._activate_scope_authority),
+        inspect.getsource(WorkflowStore.activate_turn_action_graph),
+        inspect.getsource(WorkflowStore.recover_turn_rewind),
+    )
+    forbidden_writes = (
+        "INSERT INTO decision_gaps",
+        "UPDATE decision_gaps",
+        "INSERT INTO plan_leases",
+        "UPDATE plan_leases",
+        "UPDATE workflow_tasks",
+        "DELETE FROM workflow_tasks",
+        "DELETE FROM strategy_state",
+        "DELETE FROM city_plans",
+        "DELETE FROM unit_plans",
+        "DELETE FROM builder_plans",
+    )
+    for source in current_sources:
+        assert all(statement not in source for statement in forbidden_writes)
+
+
 def test_v13_terminal_legacy_state_is_hash_archived_and_tables_are_dropped(tmp_path):
     path = tmp_path / "terminal-v13.sqlite3"
     _seed_v13_task(path, TaskStatus.DONE)
@@ -196,6 +232,48 @@ def test_tampered_legacy_archive_fails_startup(tmp_path):
 
     with pytest.raises(ValueError, match="record hash does not match"):
         WorkflowStore(path)
+
+
+def test_v14_turn_rewind_uses_only_current_runtime_tables(tmp_path):
+    path = tmp_path / "rewind-v14.sqlite3"
+    store = WorkflowStore(path)
+    store.set_meta("last_game_id", "game-1")
+    store.set_meta("last_observed_turn", 12)
+
+    event = recover_turn_rewind(
+        store,
+        RuntimeSnapshot(turn=7, game_id="game-1", overview={"turn": 7}),
+        recovered_at=datetime(2026, 7, 31, tzinfo=UTC),
+    )
+
+    assert event is not None
+    assert event.event_type == "turn_rewind_detected"
+    assert event.payload == {"previous_turn": 12, "loaded_turn": 7}
+    assert LEGACY_TABLES.isdisjoint(_table_names(path))
+    assert store.get_meta("last_observed_turn") == 7
+    assert store.planner_metrics("game-1")["duplicate_request_suppressions"] == 0
+    WorkflowStore(path)
+
+
+def test_v14_turn_rewind_failure_rolls_back_observed_turn(tmp_path, monkeypatch):
+    store = WorkflowStore(tmp_path / "rewind-rollback.sqlite3")
+    store.set_meta("last_game_id", "game-1")
+    store.set_meta("last_observed_turn", 12)
+
+    def fail_validation(_connection):
+        raise RuntimeError("injected rewind validation failure")
+
+    monkeypatch.setattr(
+        WorkflowStore, "_validate_phase3_v13", staticmethod(fail_validation)
+    )
+    with pytest.raises(RuntimeError, match="injected rewind validation failure"):
+        store.recover_turn_rewind(
+            "game-1",
+            7,
+            recovered_at=datetime(2026, 7, 31, tzinfo=UTC),
+        )
+
+    assert store.get_meta("last_observed_turn") == 12
 
 
 def test_v13_replay_is_migrated_before_canonical_import(tmp_path):

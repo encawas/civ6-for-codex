@@ -301,7 +301,6 @@ class PlannerLifecycleCoordinator:
         active: PlannerRequest,
         compatibility: TickResult,
     ):
-        runtime = self.runtime
         snapshot = observation.snapshot
         try:
             proposal_context = self._strategic_proposal_context(
@@ -317,12 +316,6 @@ class PlannerLifecycleCoordinator:
             )
         backoff = self._active_backoff(active)
         if active.status is PlannerRequestStatus.BACKOFF and backoff:
-            runtime.store.record_planner_suppression(
-                snapshot.game_id,
-                snapshot.turn,
-                reason="provider_backoff",
-                relevant_input_hash=active.input_projection_hash,
-            )
             return self._finish(
                 ctx,
                 snapshot,
