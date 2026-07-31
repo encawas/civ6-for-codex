@@ -533,11 +533,17 @@ class WorkflowEngine:
                 compiled_at=observation.canonical.observed_at,
             )
         )
+        snapshot_events = events_from_snapshot(snapshot)
+        diplomacy_trade_human_events = [
+            event
+            for event in snapshot_events
+            if event.event_type in {"pending_diplomacy", "pending_trade_offer"}
+        ]
         current_events = [
             *rule_compilation.events,
             *progression_compilation.events,
             *authoritative_mission_events,
-            *events_from_snapshot(snapshot),
+            *snapshot_events,
         ]
         if "city_roles" in owned_execution_scopes:
             current_events = [
@@ -545,6 +551,12 @@ class WorkflowEngine:
                 for event in current_events
                 if event.event_type
                 not in {"city_role_required", "invalid_city_plan_item"}
+            ]
+        if "diplomacy_trade" in owned_execution_scopes:
+            current_events = [
+                event
+                for event in current_events
+                if event.event_type not in {"pending_diplomacy", "pending_trade_offer"}
             ]
         lease_tick = await self._pre_route_decision_runtime(
             ctx, observation, current_events
@@ -583,6 +595,25 @@ class WorkflowEngine:
         if created:
             return self._finish(ctx, snapshot, TaskCreatedTick, task_id=created[0])
 
+        if "diplomacy_trade" in owned_execution_scopes and diplomacy_trade_human_events:
+            gate = self.gate.ingest(snapshot.game_id, diplomacy_trade_human_events)
+            human_wait = TickResult(
+                turn=snapshot.turn,
+                metrics=ctx.metrics,
+                events=gate.emitted,
+                paused=True,
+                pause_reason=(
+                    "Diplomacy and trade responses require explicit human review."
+                ),
+            )
+            return self._finish(
+                ctx,
+                snapshot,
+                AwaitingHumanTick,
+                compatibility=human_wait,
+                blocking_reason=human_wait.pause_reason,
+            )
+
         due_tasks = [
             *self.store.due_turn_action_nodes(
                 snapshot.game_id,
@@ -620,7 +651,13 @@ class WorkflowEngine:
         events.extend(rule_compilation.events)
         events.extend(progression_compilation.events)
         events.extend(authoritative_mission_events)
-        events.extend(events_from_snapshot(snapshot))
+        events.extend(snapshot_events)
+        if "diplomacy_trade" in owned_execution_scopes:
+            events = [
+                event
+                for event in events
+                if event.event_type not in {"pending_diplomacy", "pending_trade_offer"}
+            ]
         gate = self.gate.ingest(snapshot.game_id, events)
         compat = TickResult(
             turn=snapshot.turn, metrics=ctx.metrics, events=gate.emitted

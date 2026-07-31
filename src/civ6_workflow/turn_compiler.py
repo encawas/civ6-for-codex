@@ -15,6 +15,7 @@ from .domain import (
     build_turn_action_graph_id,
     build_turn_action_node_id,
     city_roles_mission_plan,
+    diplomacy_trade_mission_policy,
     settler_mission_plan,
     strategic_mission_action,
     thaw_json,
@@ -55,6 +56,9 @@ class TurnCompiler:
             for city_plan in policy["cities"]:
                 if observation.city(str(city_plan["city_id"])) is None:
                     return f"city:{city_plan['city_id']}"
+            return None
+        if mission.scope == "diplomacy_trade":
+            diplomacy_trade_mission_policy(mission)
             return None
         strategic_mission_action(mission)
         desired = thaw_json(mission.desired_outcome)
@@ -177,6 +181,9 @@ class TurnCompiler:
                 mode=mode,
                 auto_action_types=auto_action_types,
             )
+        if mission.scope == "diplomacy_trade":
+            diplomacy_trade_mission_policy(mission)
+            return None, None
         action_type = strategic_mission_action(mission)
         desired = thaw_json(mission.desired_outcome)
         target_key = "technology" if mission.scope == "research" else "civic"

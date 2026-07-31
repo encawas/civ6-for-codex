@@ -158,7 +158,9 @@ class PlannerLifecycleCoordinator:
             return None
         owned_scopes = set(
             active_contract.authority_scope_set.mission_graph_scopes
-        ).intersection({"research", "civic", "settler", "city_roles"})
+        ).intersection(
+            {"research", "civic", "settler", "city_roles", "diplomacy_trade"}
+        )
         if not owned_scopes:
             return None
 
@@ -271,6 +273,7 @@ class PlannerLifecycleCoordinator:
                             "civic": ["set_civic"],
                             "settler": ["unit_found_city", "unit_move"],
                             "city_roles": ["city_set_production"],
+                            "diplomacy_trade": [],
                         }[repair_scope]
                     ),
                     model_settings={"provider": type(engine.planner).__name__},
@@ -1466,6 +1469,7 @@ class PlannerLifecycleCoordinator:
             "civic",
             "settler",
             "city_roles",
+            "diplomacy_trade",
         }:
             raise ValueError("strategic request scope is unsupported")
         active = self.engine.store.get_active_strategic_contract(

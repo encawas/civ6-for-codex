@@ -516,6 +516,35 @@ def city_roles_mission_plan(mission: Mission) -> dict[str, object]:
     return policy
 
 
+def diplomacy_trade_mission_policy(mission: Mission) -> dict[str, object]:
+    """Validate the closed human-only policy for diplomacy and trade responses."""
+
+    if mission.scope != "diplomacy_trade":
+        raise ValueError("diplomacy/trade Mission scope must be diplomacy_trade")
+    if mission.status is not MissionStatus.ACTIVE:
+        raise ValueError("diplomacy/trade Mission must be ACTIVE")
+    desired_outcome = thaw_json(mission.desired_outcome)
+    if set(desired_outcome) != {"diplomacy_trade"}:
+        raise ValueError(
+            "diplomacy/trade Mission desired_outcome must contain only diplomacy_trade"
+        )
+    policy = desired_outcome["diplomacy_trade"]
+    if not isinstance(policy, dict) or set(policy) != {"owner", "handling"}:
+        raise ValueError(
+            "diplomacy/trade Mission policy fields do not match the contract"
+        )
+    owner = policy["owner"]
+    if not isinstance(owner, (str, int)) or not str(owner).strip():
+        raise ValueError("diplomacy/trade Mission requires an owner identity")
+    if mission.subject.subject_type != "player" or mission.subject.subject_id != str(
+        owner
+    ):
+        raise ValueError("diplomacy/trade Mission subject must match its owner")
+    if policy["handling"] != "human_review":
+        raise ValueError("diplomacy/trade responses must remain human-only")
+    return policy
+
+
 def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
     """Return the closed action set permitted by one executable Mission scope."""
 
@@ -531,6 +560,9 @@ def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
             raise ValueError("city roles execution Mission must be ACTIVE")
         city_roles_mission_plan(mission)
         return ("city_set_production",)
+    if mission.scope == "diplomacy_trade":
+        diplomacy_trade_mission_policy(mission)
+        return ()
     raise ValueError(f"scope has no Phase 5 execution contract: {mission.scope}")
 
 
@@ -539,8 +571,12 @@ def validate_scope_activation_mission(mission: Mission, scope: str) -> None:
 
     if mission.scope != scope:
         raise ValueError("scope activation Mission belongs to another scope")
-    if scope == "opening_strategy":
-        opening_strategy_mission_policy(mission)
+    if scope in {"opening_strategy", "diplomacy_trade"}:
+        (
+            opening_strategy_mission_policy(mission)
+            if scope == "opening_strategy"
+            else diplomacy_trade_mission_policy(mission)
+        )
         return
     strategic_mission_action_types(mission)
 
