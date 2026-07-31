@@ -44,39 +44,29 @@ After research becomes MissionGraph-owned, every legacy path that could create o
 - **WHEN** an application version that lacks MissionGraph research authority encounters an already switched game
 - **THEN** it fails closed rather than resume legacy research writes
 
-### Requirement: Legacy research execution is quiescent at activation
+### Requirement: Legacy research execution is quiescent before retirement
 
-While holding the BEGIN IMMEDIATE writer lock and before committing the research AuthorityScopeSet transfer, approval activation SHALL re-read every legacy research StoredTask, all associated ActionAttempts, and any pending task-confirmation state. The same transaction SHALL leave no claimable, in-flight, verifying, uncertain, or otherwise revivable legacy research work. If quiescence cannot be proved, the entire activation SHALL roll back.
+Phase 6 migration SHALL archive and remove legacy execution authority only after every legacy StoredTask is permanently terminal and every associated ActionAttempt is resolved. Current schema databases SHALL contain no workflow_tasks table and no current activation or recovery path SHALL recreate or mutate legacy execution.
 
-#### Scenario: Safely disposable work is cancelled atomically
+#### Scenario: Terminal legacy execution is archived
 
-- **WHEN** legacy research tasks are PENDING, READY, BLOCKED, FAILED, ESCALATED, or AWAITING_CONFIRMATION when approval holds the writer lock
-- **THEN** the activation transaction moves them to the permanently non-revivable CANCELLED state, records their previous state and authority-switch reason in activation audit, and closes any legacy confirmation without treating it as Contract approval
+- **WHEN** a pre-v14 database contains only DONE, CANCELLED, or EXPIRED legacy tasks with no unresolved ActionAttempt
+- **THEN** migration writes hash-verified audit archive records and removes the legacy authority tables
 
-#### Scenario: In-flight or unresolved work blocks activation
+#### Scenario: Unresolved legacy execution blocks migration
 
-- **WHEN** a legacy research task is RUNNING, VERIFYING, or UNCERTAIN, or any associated ActionAttempt is PREPARED, VERIFYING, or UNCERTAIN
-- **THEN** activation rolls back before Approval, Contract, MissionGraph authority, Runtime, or wait state changes
+- **WHEN** a pre-v14 database contains claimable, in-flight, verifying, uncertain, or otherwise recoverable legacy execution
+- **THEN** migration fails closed and leaves the pre-v14 database unchanged
 
-#### Scenario: Permanent terminal history remains unchanged
+#### Scenario: Replay migration fails before target deletion
 
-- **WHEN** a legacy research task is DONE, CANCELLED, or EXPIRED and has no unresolved ActionAttempt
-- **THEN** activation preserves that task and its execution evidence as inert history
+- **WHEN** a legacy replay contains execution that cannot be safely retired
+- **THEN** replay preflight rejects it before deleting any target-game state
 
-#### Scenario: Task appears after preflight
+#### Scenario: Current runtime cannot reopen legacy execution
 
-- **WHEN** preflight found no claimable task but legacy routing commits a READY research task before approval acquires BEGIN IMMEDIATE
-- **THEN** the locked re-read observes and cancels that task in the activation transaction or blocks activation
-
-#### Scenario: Forged switched history retains legacy execution
-
-- **WHEN** startup or replay contains MissionGraph research authority together with claimable, in-flight, verifying, uncertain, or revivable legacy research work
-- **THEN** aggregate validation fails closed and replay rejects the import before deleting target data
-
-#### Scenario: Quiescence creates no replacement task
-
-- **WHEN** the activation transaction disposes legacy research execution
-- **THEN** it creates no Mission-derived StoredTask and later Routing remains the only path to a new revision-bound Planner lifecycle
+- **WHEN** scope activation, graph activation, retry, confirmation, or rewind recovery runs on a current database
+- **THEN** it reads and writes only TurnActionGraph execution state and cannot create or mutate a legacy StoredTask
 
 ### Requirement: Non-research scopes remain unchanged
 
@@ -140,9 +130,9 @@ After cutover, research routing SHALL read the active StrategicContract revision
 - **WHEN** the process restarts after research activation
 - **THEN** routing derives research ownership and content from the persisted active Contract and AuthorityScopeSet
 
-### Requirement: StoredTask projection has durable Mission provenance
+### Requirement: TurnActionNode projection has durable Mission provenance
 
-The existing StoredTask and workflow_tasks representation SHALL gain the following optional, grouped source fields without introducing a second task model or table:
+Every TurnActionNode SHALL carry the following source fields:
 
 ```text
 source_contract_id
@@ -151,82 +141,77 @@ source_mission_id
 source_mission_revision
 ```
 
-The four fields SHALL be either all null or all present. PR 1C-1 SHALL add the domain contract, nullable SQLite columns, all-null legacy migration, canonical serialization, replay import/export, and ordinary-save/startup/replay validation. It SHALL NOT change current research routing. A Mission-derived research StoredTask SHALL carry all four fields and they SHALL identify the active Contract revision and the same ACTIVE Mission with scope research that is bound by Proposal, ContractCommit, and AppliedTick for the same game. Its action_type SHALL be exactly set_research. The action SHALL come from the closed research -> set_research mapping and SHALL NOT be selected from desired_outcome, a tool-name string, or free JSON.
+The fields SHALL identify the active Contract revision and the same ACTIVE Mission for the same game. A research node's action_type SHALL be exactly set_research. The action SHALL come from the closed research -> set_research mapping and SHALL NOT be selected from a tool-name string or free JSON. Legacy task provenance remains available only in the immutable migration archive and cannot become execution authority.
 
-#### Scenario: Existing task remains explicitly legacy
+#### Scenario: Mission-derived research node has complete provenance
 
-- **WHEN** an existing or migrated StoredTask has action_type set_research and all four source fields are null before the first research authority cutover
-- **THEN** it is classified as a legacy research StoredTask rather than being assigned inferred provenance
-
-#### Scenario: Mission-derived research task has complete provenance
-
-- **WHEN** post-activation Routing projects a set_research task from the ACTIVE research Mission bound by Proposal, ContractCommit, and AppliedTick
+- **WHEN** Routing projects a set_research node from the ACTIVE research Mission bound by the active Contract revision
 - **THEN** all four source fields are present and match the active Contract and Mission identities and revisions
 
 #### Scenario: Non-research or non-ACTIVE provenance is rejected
 
-- **WHEN** routing or a task mutation binds civic, production, unit, city, PAUSED, BLOCKED, COMPLETED, FAILED, CANCELLED, INVALIDATED, or any other Mission not exactly ACTIVE research
-- **THEN** no Mission-derived research task becomes claimable and non-research authority remains unchanged
+- **WHEN** routing or a node mutation binds civic, production, unit, city, PAUSED, BLOCKED, COMPLETED, FAILED, CANCELLED, INVALIDATED, or any other Mission not exactly ACTIVE research
+- **THEN** no Mission-derived research node becomes claimable and non-research authority remains unchanged
 
 #### Scenario: Wrong action semantic is rejected
 
-- **WHEN** provenance is complete but action_type is not set_research, or desired_outcome/free JSON attempts to select another tool
-- **THEN** routing and every task mutation fail closed
+- **WHEN** provenance is complete but action_type is not set_research, or free JSON attempts to select another tool
+- **THEN** routing and every node mutation fail closed
 
 #### Scenario: Partial provenance is rejected
 
-- **WHEN** ordinary persistence, startup, or replay observes only part of the four-field provenance group
+- **WHEN** ordinary persistence, startup, or replay observes missing or mismatched source provenance
 - **THEN** validation fails closed and replay rejects before deleting target data
 
-#### Scenario: Legacy task cannot become claimable after cutover
+#### Scenario: Archived legacy task cannot become claimable
 
-- **WHEN** research is MissionGraph-owned and a set_research task has null provenance
-- **THEN** claim, retry, confirmation release, and recovery reject it as legacy execution
+- **WHEN** historical replay or migration data contains a legacy set_research StoredTask
+- **THEN** it remains archive-only and cannot enter current graph claim, retry, confirmation, or recovery
 
 #### Scenario: Stale projected task cannot become claimable
 
-- **WHEN** claim, retry, confirmation release, or recovery sees a Mission-derived research task whose source Contract or Mission identity or revision differs from the active aggregate
-- **THEN** that write transaction fails closed or makes the task permanently unclaimable before execution
+- **WHEN** claim, retry, confirmation release, or recovery sees a research node whose source Contract or Mission identity or revision differs from the active aggregate
+- **THEN** that write transaction fails closed or makes the node permanently unclaimable before execution
 
 #### Scenario: Current projected task is eligible
 
-- **WHEN** a Mission-derived set_research task has complete provenance matching the active Contract and Mission revision
-- **THEN** the normal task lifecycle may evaluate it without reopening a legacy research write path
+- **WHEN** a set_research node has complete provenance matching the active Contract and Mission revision
+- **THEN** the TurnActionGraph lifecycle may evaluate it without reopening a legacy research write path
 
-### Requirement: Proposal application does not create StoredTask
+### Requirement: Proposal application does not create executable nodes
 
-The decision and activation transaction SHALL NOT directly create a StoredTask. Executable work SHALL be produced only by a later deterministic projection from the active Contract and authoritative MissionGraph through the existing PlanBundle/StoredTask persistence and execution lifecycle. This projection SHALL NOT create another PlannerRequest or recall the Provider.
+The decision and activation transaction SHALL NOT directly create a TurnActionNode. Executable work SHALL be produced only by a later deterministic projection from the active Contract and authoritative MissionGraph through the current-turn TurnActionGraph/TurnActionNode persistence and execution lifecycle. This projection SHALL NOT create another PlannerRequest or recall the Provider.
 
-#### Scenario: Approval commits no StoredTask
+#### Scenario: Approval commits no executable node
 
 - **WHEN** a Proposal is approved
-- **THEN** no StoredTask is created in the approval transaction
+- **THEN** no TurnActionNode is created in the approval transaction
 
 #### Scenario: Routing projects later work
 
 - **WHEN** a later routing step consumes the active research Mission
-- **THEN** the revision-bound deterministic projection enters the existing PlanBundle/StoredTask persistence and execution lifecycle before a StoredTask can exist, without creating another PlannerRequest or recalling the Provider
+- **THEN** the revision-bound deterministic projection activates a current-turn TurnActionGraph before a TurnActionNode can become claimable, without creating another PlannerRequest or recalling the Provider
 
 #### Scenario: Proposal identity alone cannot create work
 
 - **WHEN** a caller presents only a Proposal or Applied Tick without the active matching Contract revision
 - **THEN** no claimable task is produced
 
-### Requirement: Activation remains dormant until final enablement
+### Requirement: Activation uses the dedicated enabled decision path
 
-Protocol and dormant activation components MAY be deployed before user entry and Engine integration, but no production path SHALL invoke research decision or authority activation until PR 1C-3 explicitly enables it.
+Production composition SHALL enable research decision and authority activation only through the dedicated APPROVE, REJECT, and system invalidation aggregate transactions. Generic Human Wait resume, ordinary Tick persistence, and direct record saves SHALL NOT substitute for a Proposal decision.
 
-#### Scenario: PR 1C-1 deployment
+#### Scenario: User approves or rejects
 
-- **WHEN** protocol and persistence foundations are deployed
-- **THEN** existing Phase 1B Proposal waits and legacy research authority behave unchanged
+- **WHEN** a user decides an OPEN Proposal through the control surface
+- **THEN** the corresponding dedicated aggregate transaction records the sole terminal decision and transition Tick
 
-#### Scenario: PR 1C-2 deployment
+#### Scenario: Generic resume targets Proposal wait
 
-- **WHEN** atomic activation and routing projection are present behind a dormant gate
-- **THEN** production users cannot invoke them and legacy research remains authoritative
+- **WHEN** generic Human Wait resume is requested for a Proposal-ready wait
+- **THEN** it is rejected without changing Proposal, Contract, authority, or Runtime state
 
-#### Scenario: PR 1C-3 enablement
+#### Scenario: Direct terminal evidence is attempted
 
-- **WHEN** the user entry point, Engine integration, and end-to-end gates pass
-- **THEN** research decision and activation may be enabled without changing non-research scopes
+- **WHEN** a caller attempts to save ApprovalRecord or a terminal Proposal Tick outside the aggregate transaction
+- **THEN** the Store rejects the standalone write

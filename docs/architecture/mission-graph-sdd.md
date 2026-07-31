@@ -1,7 +1,7 @@
 # MissionGraph Runtime Software Design Description
 
-Status: Proposed
-Date: 2026-07-23
+Status: Implemented
+Date: 2026-07-31
 
 Related documents:
 
@@ -49,34 +49,28 @@ StrategicContract
 | `StrategicResearchProposal` | Immutable research candidate bound to Request, Attempt, Contract base, and Observation | Retain |
 | `Plan` / `PlanLease` | Historical migration/replay records only | Retain compatibility reader; no production write authority |
 | `models.PlanBundle` | Legacy Planner response compatibility DTO | Keep outside current Planner routing until legacy replay compatibility retires |
-| `models.StoredTask` | Current production execution task | Retain through Phase 2, including after Phase 1C research activation; retire in Phase 3 |
-| `domain.Task` | New domain task model | Evolve into the canonical TurnActionGraph node contract |
+| Legacy `StoredTask` | Historical migration/replay record only | Retain only in the hash-verified legacy archive |
+| `TurnActionGraph` / `TurnActionNode` | Current-turn execution authority | Retain as the sole claimable action model |
 | `ActionAttempt` | Action delivery, recovery, and verification audit | Retain |
-| Rules / Progression | Compile deterministic tasks and events | Retain; never make them a new state authority |
-| `strategy_state` and legacy plan tables | Legacy planning state | Stop writes by scope, migrate data, then delete |
-| `workflow_tasks` | Legacy execution task table | Retire as execution authority after Phase 3 |
+| Legacy Rules / Progression | Retired deterministic legacy planner | Deleted; current compilation reads Contract, Mission, and Observation |
+| `strategy_state` and legacy plan tables | Hash-verified migration archive input | Deleted from schema v14 current databases |
+| `workflow_tasks` | Hash-verified migration archive input | Deleted from schema v14 current databases |
 | `workflow_ticks` | Tick audit | Retain |
 
 The repository currently contains legacy types in `models.py` and newer types
 in `domain/`. MissionGraph migration must converge those types. It must not
 add a third long-lived Plan, Task, or Runtime state model.
 
-The implemented baseline is now Phase 1A plus Phase 1B. Phase 1A generalized
-PlannerRequest targets without replacing ProviderAttempt or InformationRound.
-Phase 1B established the one-Contract persistence root and durable replay, then
-added immutable StrategicResearchProposal generation and explicit-only Human
-Wait recovery. It deliberately did not approve or apply a Proposal, persist a
-non-empty Authority Scope Set or MissionGraph, switch research authority, or
-project Mission-derived StoredTask. Legacy research planning and execution
-remain authoritative until Phase 1C atomically changes that ownership.
-
-PR 1C-1 now supplies the version 11 terminal-evidence and grouped StoredTask
-provenance foundation. PR 1C-2 supplies dormant atomic approve, reject, and
-invalidate transactions, research authority activation, legacy research write
-closure, and a revision-bound set_research projection. These capabilities have
-no Engine, bootstrap, or user caller. Therefore the deployed behavior remains
-Phase 1B until PR 1C-3 performs compatibility migration and deliberately
-enables the existing Runtime lineage.
+The implemented baseline now includes Phase 1A through Phase 7. PlannerRequest,
+ProviderAttempt, InformationRound, immutable Proposal decisions, Contract
+revision activation, StateDelta repair, deterministic TurnActionGraph
+compilation, BatchExecutor, and ActionAttempt recovery all share one
+WorkflowStore and one WorkflowRuntime lineage. Schema v14 archives terminal
+legacy authority records with hashes and removes the old strategy, plan,
+DecisionGap, PlanLease, suppression, and workflow_tasks tables. Current
+Planner routing accepts only strategic creation or Mission repair targets.
+Scopes absent from the active Authority Scope Set have no fallback legacy
+writer; blocking work is routed to explicit migration or human review.
 
 ## 3. System Invariants
 
@@ -104,17 +98,10 @@ StrategicContract is the logical strategic root aggregate for one
 `settler`, `city`, and later areas are Strategic Scopes inside that root,
 not separate Contract roots.
 
-During migration the active Contract carries a persistent, auditable
-Authority Scope Set. Phase 1B persists this structure but requires it to remain
-empty, so every Scope is still legacy-owned. After Phase 1C atomically
-activates research, the mixed-ownership state is:
-
-```text
-research -> MissionGraph authority
-civic    -> legacy authority
-settler  -> legacy authority
-city     -> legacy authority
-```
+The active Contract carries a persistent, auditable Authority Scope Set.
+Every listed Scope is MissionGraph-owned. A Scope not listed has no production
+legacy writer and cannot create strategic or executable work until an atomic
+Scope activation commits its Mission and ownership in one new revision.
 
 Before deterministic validation accepts a `StrategicContractProposal` or
 `MissionGraphPatch`, it derives the writable Scope set from the current
@@ -352,7 +339,7 @@ writer lock before ordinary work can run. The control panel exposes explicit
 APPROVE and REJECT commands bound to the persisted Proposal-ready context.
 Approval performs the existing atomic activation transaction; only a later
 Runtime routing Tick reads the active Contract/Mission revision and projects a
-revision-bound set_research StoredTask. Rejection and stale invalidation append
+revision-bound set_research TurnActionNode. Rejection and stale invalidation append
 their dedicated terminal evidence without changing Contract or authority.
 Generic non-Proposal Human Wait recovery and every non-research scope retain
 their previous behavior.
@@ -362,10 +349,10 @@ are transition or interaction evidence. None substitutes for ApprovalRecord.
 Ordinary work begins only after the dedicated decision or activation Tick
 completes.
 
-Proposal application does not directly create StoredTask. Later routing reads
+Proposal application does not directly create executable work. Later routing reads
 the active Contract and authoritative MissionGraph revision, performs a
-separate deterministic projection, and enters the normal PlanBundle/StoredTask
-persistence and execution lifecycle without another Provider call.
+separate deterministic projection, and activates the current-turn
+TurnActionGraph/TurnActionNode execution lifecycle without another Provider call.
 Proposal or transition-Tick identity alone cannot create claimable work.
 
 ## 7. Planner Boundary
@@ -644,11 +631,11 @@ before lock acquisition is therefore observed and cancelled or blocks the
 transaction.
 
 The authority-switch or Proposal-application transaction never creates a
-Mission-derived StoredTask. After activation and the dedicated
+Mission-derived TurnActionNode. After activation and the dedicated
 Decision/Activation Tick complete, a later Routing step reads the active
 Contract and Mission, performs a separate deterministic revision-bound
-projection, and enters the normal PlanBundle/StoredTask persistence and
-execution lifecycle before a replacement StoredTask may be created. Old execution provenance remains auditable and at
+projection, and activates the current-turn TurnActionGraph before a replacement
+TurnActionNode may become claimable. Old execution provenance remains auditable and at
 most one equivalent action may be claimable.
 
 After cutover, every research claim, retry, confirmation release, and recovery

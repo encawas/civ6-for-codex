@@ -546,11 +546,11 @@ is invalid.
 - CANCELLED is permanently non-revivable for this cutover. After authority
   transfer, legacy task creation, retry, release, and confirmation paths fail
   closed from the persisted AuthorityScopeSet.
-- Proposal decision and activation do not directly create StoredTask.
+- Proposal decision and activation do not directly create executable nodes.
 - After activation and the Decision/Activation Tick complete, later Routing
   reads the active Contract/Mission revision, performs a separate deterministic
-  projection, and enters the existing PlanBundle/StoredTask persistence and
-  execution lifecycle before a replacement StoredTask may be created. It does
+  projection, and activates the current-turn TurnActionGraph before a
+  replacement TurnActionNode may become claimable. It does
   not create another PlannerRequest or recall the Provider.
 - Before first cutover, set_research with all four provenance fields NULL is
   legacy. After cutover, a valid Mission-derived set_research task has all four

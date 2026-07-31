@@ -1,6 +1,6 @@
 # ADR 0005: Atomic Strategic Proposal Decision and Research Authority Activation
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-30
 - Scope: StrategicResearchProposal terminal authority, Contract activation, research scope cutover
 
@@ -8,13 +8,13 @@ Related documents:
 
 - [MissionGraph Runtime SDD](../architecture/mission-graph-sdd.md)
 - [MissionGraph Runtime Migration Plan](../plans/2026-07-23-mission-graph-migration.md)
-- [Phase 1C OpenSpec Change](../../openspec/changes/activate-research-authority-from-strategic-proposal/proposal.md)
+- [Archived Phase 1C OpenSpec Change](../../openspec/changes/archive/2026-07-30-activate-research-authority-from-strategic-proposal/proposal.md)
 
 ## Context
 
-Phase 1A generalized PlannerRequest targets while preserving ProviderAttempt and InformationRound audit. Phase 1B then added the single StrategicContract persistence foundation and durable StrategicResearchProposal generation. A valid Proposal is currently an immutable candidate bound to its source Request, final ProviderAttempt, expected Contract base, and Proposal Ready Tick. Runtime enters an explicit-only Human Wait that survives ordinary waiting Ticks, restart, and replay.
+Phase 1A generalized PlannerRequest targets while preserving ProviderAttempt and InformationRound audit. Phase 1B then added the single StrategicContract persistence foundation and durable StrategicResearchProposal generation. At the time of this decision, a valid Proposal was an immutable candidate bound to its source Request, final ProviderAttempt, expected Contract base, and Proposal Ready Tick. Runtime entered an explicit-only Human Wait that survived ordinary waiting Ticks, restart, and replay.
 
-That boundary is intentionally incomplete. Explicit resume releases the wait but does not approve or reject the Proposal, append a Contract revision, populate MissionGraph, transfer research authority, or create StoredTask. The Contract foundation also rejects non-empty AuthorityScopeSet and MissionGraph state until a later controlled activation path exists. Legacy DecisionGap, PlanLease, and StoredTask paths therefore remain authoritative for research.
+That Phase 1B boundary was intentionally incomplete. Explicit resume released the wait but did not approve or reject the Proposal, append a Contract revision, populate MissionGraph, transfer research authority, or create executable work. The later Phase 1C implementation resolved this boundary through the atomic decision transactions defined below.
 
 Phase 1C needs one durable answer to five separate questions:
 
@@ -139,11 +139,11 @@ Ordinary persistence, startup, and replay resolve the bound records and recomput
 
 Startup and replay can read the pre-enable history only as migration input. Enabled ordinary work cannot begin while an OPEN Proposal already has a WaitResumedTick.
 
-### Proposal application creates no StoredTask
+### Proposal application creates no executable node
 
-The approval transaction establishes effective strategy and research write authority only. It does not create StoredTask.
+The approval transaction establishes effective strategy and research write authority only. It does not create a TurnActionNode.
 
-Later Routing reads the active approved Contract and authoritative research Mission, performs a separate deterministic revision-bound projection, and enters the existing PlanBundle/StoredTask persistence and execution lifecycle before executable work can exist. It does not create another PlannerRequest or recall the Provider. Proposal or Applied Tick identity alone cannot produce claimable work.
+Later Routing reads the active approved Contract and authoritative research Mission, performs a separate deterministic revision-bound projection, and activates a current-turn TurnActionGraph before executable work can exist. It does not create another PlannerRequest or recall the Provider. Proposal or Applied Tick identity alone cannot produce claimable work.
 
 PR 1C-1 adds one optional all-or-none provenance group to the existing StoredTask and workflow_tasks representation:
 
@@ -244,7 +244,7 @@ Repository, or composition root was introduced.
 Reviewed implementation deviation: earlier Phase 1C wording required the later
 deterministic projection to enter a PlannerRequest lifecycle. The enabled
 implementation instead uses the existing deterministic progression compiler
-and PlanBundle/StoredTask persistence path. It creates no new PlannerRequest and
+and TurnActionGraph/TurnActionNode persistence path. It creates no new PlannerRequest and
 does not recall the Provider. This keeps action selection inside the closed
 research-to-set_research mapping and matches PRD 3.0; Planner-driven
 MissionGraph repair remains Phase 2 work.
