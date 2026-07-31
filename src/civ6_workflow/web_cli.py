@@ -23,7 +23,7 @@ async def _run_tick(config: AppConfig, config_path: Path):
         planner_base_directory=config_path.parent,
     ) as runtime:
         return await asyncio.wait_for(
-            runtime.engine.tick(), timeout=config.runtime.max_turn_seconds
+            runtime.runtime.tick(), timeout=config.runtime.max_turn_seconds
         )
 
 

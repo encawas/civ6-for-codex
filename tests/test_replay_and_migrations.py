@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from civ6_workflow.bootstrap import build_runtime_services
-from civ6_workflow.engine import EngineConfig, WorkflowEngine
+from civ6_workflow.runtime import RuntimeConfig, WorkflowRuntime
 from civ6_workflow.models import ExecutionMode, RuntimeSnapshot
 from civ6_workflow.replay import (
     ReplayDataError,
@@ -57,12 +57,12 @@ def test_recorded_real_blocker_prevents_automatic_end_turn(tmp_path: Path):
         frames=[ReplayFrame(snapshot=blocked)],
     )
     game = ReplayGamePort(tape)
-    engine = WorkflowEngine(
+    engine = WorkflowRuntime(
         service_factory=build_runtime_services,
         store=WorkflowStore(tmp_path / "blocked.sqlite3"),
         game=game,
         planner=ReplayPlanner(tape),
-        config=EngineConfig(
+        config=RuntimeConfig(
             execution_mode=ExecutionMode.AUTO,
             auto_end_turn=True,
             max_agent_calls_per_turn=0,

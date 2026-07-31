@@ -69,7 +69,7 @@ _TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 
 
 @dataclass(slots=True)
-class EngineConfig:
+class RuntimeConfig:
     execution_mode: ExecutionMode = ExecutionMode.CONFIRM
     auto_end_turn: bool = False
     max_agent_calls_per_turn: int = 1
@@ -171,7 +171,7 @@ class _TickFileLock:
             handle.close()
 
 
-class WorkflowEngine:
+class WorkflowRuntime:
     """Canonical bounded runtime; TickResult is only a compatibility envelope."""
 
     def __init__(
@@ -180,15 +180,15 @@ class WorkflowEngine:
         store: WorkflowStorePort,
         game: GamePort,
         planner: Planner,
-        config: EngineConfig | None = None,
+        config: RuntimeConfig | None = None,
         clock: Any | None = None,
         crash_injector: Any | None = None,
-        service_factory: Callable[[WorkflowEngine], RuntimeServices],
+        service_factory: Callable[[WorkflowRuntime], RuntimeServices],
     ):
         self.store = store
         self.game = game
         self.planner = planner
-        self.config = config or EngineConfig()
+        self.config = config or RuntimeConfig()
         self.clock = clock
         self.crash_injector = crash_injector
         self._available_tools: set[str] | None = None

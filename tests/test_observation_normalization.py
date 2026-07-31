@@ -11,7 +11,7 @@ from civ6_workflow.domain import (
     UnitActionState,
     UnitDetailReason,
 )
-from civ6_workflow.engine import EngineConfig, WorkflowEngine
+from civ6_workflow.runtime import RuntimeConfig, WorkflowRuntime
 from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
@@ -169,12 +169,12 @@ class _ReadPolicyGame:
 
 def _policy_engine(tmp_path: Path, snapshot: RuntimeSnapshot):
     game = _ReadPolicyGame(snapshot)
-    engine = WorkflowEngine(
+    engine = WorkflowRuntime(
         service_factory=build_runtime_services,
         store=WorkflowStore(tmp_path / "workflow.sqlite3"),
         game=game,
         planner=_NoPlanner(),
-        config=EngineConfig(
+        config=RuntimeConfig(
             execution_mode=ExecutionMode.READONLY,
             auto_end_turn=False,
             max_agent_calls_per_turn=0,

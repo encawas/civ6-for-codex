@@ -10,7 +10,7 @@ from civ6_workflow import (
     actions,
     codex_planner,
     conditions,
-    engine,
+    runtime,
     mcp_port,
     models,
     replay,
@@ -19,7 +19,7 @@ from civ6_workflow import (
     workflow_prompt,
 )
 from civ6_workflow.bootstrap import compose_runtime
-from civ6_workflow.engine import EngineConfig, WorkflowEngine
+from civ6_workflow.runtime import RuntimeConfig, WorkflowRuntime
 from civ6_workflow.store import WorkflowStore
 
 
@@ -41,9 +41,9 @@ def _identity(value) -> str:
 
 def _composition_snapshot() -> dict:
     return {
-        "package.WorkflowEngine": _identity(civ6_workflow.WorkflowEngine),
-        "engine.WorkflowEngine": _identity(engine.WorkflowEngine),
-        "engine.EngineConfig": _identity(engine.EngineConfig),
+        "package.WorkflowRuntime": _identity(civ6_workflow.WorkflowRuntime),
+        "runtime.WorkflowRuntime": _identity(runtime.WorkflowRuntime),
+        "runtime.RuntimeConfig": _identity(runtime.RuntimeConfig),
         "store.WorkflowStore": _identity(store.WorkflowStore),
         "mcp_port.Civ6GamePort": _identity(mcp_port.Civ6GamePort),
         "conditions.ConditionEvaluator": _identity(conditions.ConditionEvaluator),
@@ -74,13 +74,13 @@ def _composition_snapshot() -> dict:
     }
 
 
-def test_imp_001_public_engine_is_the_canonical_engine():
-    """IMP-001 (MIGRATED): public and source Engine identities are identical."""
+def test_imp_001_public_runtime_is_the_canonical_runtime():
+    """IMP-001 (MIGRATED): public and source Runtime identities are identical."""
 
-    assert civ6_workflow.WorkflowEngine is WorkflowEngine
-    assert engine.WorkflowEngine is WorkflowEngine
-    assert WorkflowEngine.__module__ == "civ6_workflow.engine"
-    assert WorkflowEngine.__mro__ == (WorkflowEngine, object)
+    assert civ6_workflow.WorkflowRuntime is WorkflowRuntime
+    assert runtime.WorkflowRuntime is WorkflowRuntime
+    assert WorkflowRuntime.__module__ == "civ6_workflow.runtime"
+    assert WorkflowRuntime.__mro__ == (WorkflowRuntime, object)
 
 
 def test_imp_002_bootstrap_constructs_the_explicit_runtime_graph(tmp_path: Path):
@@ -94,16 +94,16 @@ def test_imp_002_bootstrap_constructs_the_explicit_runtime_graph(tmp_path: Path)
         store=workflow_store,
         game=game,
         planner=planner,
-        engine_config=EngineConfig(auto_end_turn=False),
+        runtime_config=RuntimeConfig(auto_end_turn=False),
     )
 
     assert composition.store is workflow_store
     assert composition.game is game
     assert composition.planner is planner
-    assert composition.engine.store is workflow_store
-    assert composition.engine.game is game
-    assert composition.engine.planner is planner
-    assert type(composition.engine) is WorkflowEngine
+    assert composition.runtime.store is workflow_store
+    assert composition.runtime.game is game
+    assert composition.runtime.planner is planner
+    assert type(composition.runtime) is WorkflowRuntime
 
 
 def test_imp_003_canonical_composition_matches_fixture():
@@ -125,9 +125,9 @@ def test_imp_004_import_order_does_not_mutate_runtime_identity():
     program = """
 import json
 {imports}
-from civ6_workflow import actions, conditions, engine, mcp_port, replay, store, web_ui
+from civ6_workflow import actions, conditions, mcp_port, replay, runtime, store, web_ui
 before = {{
-    "engine": id(engine.WorkflowEngine),
+    "runtime": id(runtime.WorkflowRuntime),
     "store": id(store.WorkflowStore),
     "mcp": id(mcp_port.Civ6GamePort),
     "conditions": id(conditions.ConditionEvaluator),
@@ -138,7 +138,7 @@ before = {{
 }}
 import civ6_workflow
 after = {{
-    "engine": id(engine.WorkflowEngine),
+    "runtime": id(runtime.WorkflowRuntime),
     "store": id(store.WorkflowStore),
     "mcp": id(mcp_port.Civ6GamePort),
     "conditions": id(conditions.ConditionEvaluator),
@@ -148,7 +148,7 @@ after = {{
     "actions": tuple(sorted(actions.ACTION_REGISTRY)),
 }}
 print(json.dumps({{"stable": before == after, "modules": [
-    engine.WorkflowEngine.__module__,
+    runtime.WorkflowRuntime.__module__,
     store.WorkflowStore.__module__,
     mcp_port.Civ6GamePort.__module__,
 ]}}))
@@ -157,7 +157,7 @@ print(json.dumps({{"stable": before == after, "modules": [
     env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
     outputs = []
     for imports in (
-        "import civ6_workflow.engine\nimport civ6_workflow.store",
+        "import civ6_workflow.runtime\nimport civ6_workflow.store",
         "import civ6_workflow\nimport civ6_workflow.bootstrap",
     ):
         process = subprocess.run(
@@ -174,7 +174,7 @@ print(json.dumps({{"stable": before == after, "modules": [
         {
             "stable": True,
             "modules": [
-                "civ6_workflow.engine",
+                "civ6_workflow.runtime",
                 "civ6_workflow.store",
                 "civ6_workflow.mcp_port",
             ],
@@ -182,7 +182,7 @@ print(json.dumps({{"stable": before == after, "modules": [
         {
             "stable": True,
             "modules": [
-                "civ6_workflow.engine",
+                "civ6_workflow.runtime",
                 "civ6_workflow.store",
                 "civ6_workflow.mcp_port",
             ],

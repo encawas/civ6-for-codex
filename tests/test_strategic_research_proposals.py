@@ -53,7 +53,7 @@ from civ6_workflow.domain import (
     build_strategic_research_proposal_id,
     canonical_json_hash,
 )
-from civ6_workflow.engine import EngineConfig, InjectedCrashBoundary, WorkflowEngine
+from civ6_workflow.runtime import RuntimeConfig, InjectedCrashBoundary, WorkflowRuntime
 from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
@@ -277,12 +277,12 @@ def _request(
 
 
 def _engine(store, game, planner):
-    return WorkflowEngine(
+    return WorkflowRuntime(
         service_factory=build_runtime_services,
         store=store,
         game=game,
         planner=planner,
-        config=EngineConfig(
+        config=RuntimeConfig(
             execution_mode=ExecutionMode.AUTO,
             auto_end_turn=False,
             max_agent_calls_per_turn=0,
@@ -5979,12 +5979,12 @@ def test_turn_action_graph_approval_survives_equivalent_observation(tmp_path):
 
     game = ConfirmedResearchGame(proposal.game_session_id)
     game.snapshot = _research_ready_game(proposal.game_session_id).snapshot
-    engine = WorkflowEngine(
+    engine = WorkflowRuntime(
         service_factory=build_runtime_services,
         store=enabled,
         game=game,
         planner=_Planner(),
-        config=EngineConfig(
+        config=RuntimeConfig(
             execution_mode=ExecutionMode.CONFIRM,
             auto_end_turn=False,
             max_agent_calls_per_turn=0,
@@ -6024,12 +6024,12 @@ def test_turn_change_expires_old_graph_before_any_node_can_be_claimed(tmp_path):
         approval,
     )
     game = _research_ready_game(proposal.game_session_id)
-    engine = WorkflowEngine(
+    engine = WorkflowRuntime(
         service_factory=build_runtime_services,
         store=enabled,
         game=game,
         planner=_Planner(),
-        config=EngineConfig(
+        config=RuntimeConfig(
             execution_mode=ExecutionMode.CONFIRM,
             auto_end_turn=False,
             max_agent_calls_per_turn=0,

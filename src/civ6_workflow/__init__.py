@@ -13,7 +13,7 @@ from .domain import (
     TurnActionGraph,
     TurnActionNode,
 )
-from .engine import WorkflowEngine
+from .runtime import WorkflowRuntime
 
 __all__ = [
     "AuthorityScopeSet",
@@ -23,5 +23,5 @@ __all__ = [
     "StrategicContract",
     "TurnActionGraph",
     "TurnActionNode",
-    "WorkflowEngine",
+    "WorkflowRuntime",
 ]

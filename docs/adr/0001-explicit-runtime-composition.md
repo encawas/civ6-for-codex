@@ -83,14 +83,14 @@ The retained behavior from the former shadow layers now lives in these modules:
 
 | Former layer | Canonical destination |
 |---|---|
-| `safe_engine`, `workflow_engine`, `runtime_safety` | `engine.WorkflowEngine` and `EngineConfig` |
-| `safe_rules`, `settler_rules` | `rules.DeterministicRuleCompiler` |
+| `safe_engine`, `workflow_engine`, `runtime_safety` | `runtime.WorkflowRuntime` and `RuntimeConfig` |
+| `safe_rules`, `settler_rules` | Retired after MissionGraph scope migration |
 | `workflow_conditions` | `conditions.ConditionEvaluator` |
 | `safe_store` | `store.WorkflowStore` |
 | `safe_mcp_port` | `mcp_port.Civ6GamePort` |
 | `safe_replay` | `replay.RecordingGamePort` and `ReplayGamePort` |
 | `safe_web_ui` | `web_ui.ControlPanelState`, handler, server, and HTML |
-| package registry/model/prompt replacement | definitions or explicit imports in `actions`, `validation`, `workflow_protocol`, and `codex_planner` |
+| package registry/model/prompt replacement | definitions or explicit imports in `actions`, `workflow_protocol`, and Planner adapters |
 
 Those shadow modules are deleted. The package initializer is a passive public
 re-export and performs no module assignment or registry mutation.

@@ -1084,13 +1084,13 @@ no loss of audit records required for recovery.
 
 ### Goal
 
-Complete in-place convergence of WorkflowEngine into a small
-WorkflowRuntime orchestrator.
+Complete in-place convergence into a small WorkflowRuntime orchestrator.
 
 ### Current authority
 
-New strategic and execution authorities are active, but transitional
-coordination may remain in the large Engine.
+New strategic and execution authorities are active. Planner lifecycle,
+TurnCompiler, BatchExecutor, and recovery are explicit application services
+composed around one WorkflowRuntime.
 
 ### Target authority
 
@@ -1139,7 +1139,7 @@ and persisted domain representation.
 
 ### Deletion criteria
 
-Delete old WorkflowEngine methods only after production entry points and
+Delete retired orchestration methods only after production entry points and
 replay use the converged Runtime and characterization tests pass.
 
 ### Explicitly not done

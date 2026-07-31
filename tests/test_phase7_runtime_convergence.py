@@ -28,10 +28,10 @@ def test_planner_lifecycle_uses_a_narrow_runtime_service_container(tmp_path):
         game=game,
         planner=planner,
     )
-    services = composition.engine.planner_lifecycle.runtime
+    services = composition.runtime.planner_lifecycle.runtime
 
     assert isinstance(services, PlannerLifecycleRuntime)
-    assert services is not composition.engine
+    assert services is not composition.runtime
     assert services.store is store
     assert services.game is game
     assert services.planner is planner
@@ -45,13 +45,13 @@ def test_planner_lifecycle_uses_a_narrow_runtime_service_container(tmp_path):
 
 
 def test_planner_and_runtime_modules_have_one_way_dependencies():
-    import civ6_workflow.engine as engine_module
+    import civ6_workflow.runtime as engine_module
     import civ6_workflow.planner_lifecycle as planner_module
 
     engine_source = inspect.getsource(engine_module)
     planner_source = inspect.getsource(planner_module)
 
-    assert "from .engine import" not in planner_source
+    assert "from .runtime import" not in planner_source
     assert "from .store import" not in planner_source
     assert "from .store import" not in engine_source
     assert "from .mcp_port import" not in engine_source
@@ -69,4 +69,4 @@ def test_all_runtime_factories_delegate_to_the_canonical_composition_root(factor
     source = inspect.getsource(factory)
 
     assert "compose_runtime(" in source
-    assert "WorkflowEngine(" not in source
+    assert "WorkflowRuntime(" not in source

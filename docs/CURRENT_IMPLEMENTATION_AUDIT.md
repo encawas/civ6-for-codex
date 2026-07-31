@@ -1,5 +1,9 @@
 # Current Implementation Audit
 
+> Historical Phase 0 baseline. The import-time replacement chain described
+> below has been removed; current composition is documented in ADR 0001 and
+> `bootstrap.py`.
+
 ## 1. Purpose
 
 This document records what the repository **actually executes today** before the architectural refactor begins.

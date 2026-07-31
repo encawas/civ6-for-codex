@@ -110,15 +110,19 @@ During migration, do not delete these tests merely because their imports or clas
 
 **Disposition:** MIGRATE
 
-Assert the class currently exposed as `civ6_workflow.engine.WorkflowEngine` resolves to the commit-safe workflow implementation after package import.
+Assert that `civ6_workflow.WorkflowRuntime` and
+`civ6_workflow.runtime.WorkflowRuntime` are the same class and that every
+production entry point receives it from `bootstrap.py`.
 
-Purpose: record the hidden composition behavior before removing it.
+Purpose: prevent import order or compatibility modules from replacing the
+explicit runtime composition.
 
 ### IMP-002 — direct base engine remains different
 
 **Disposition:** REPLACE
 
-Record that the source-defined base engine and the package-exposed engine are not semantically identical.
+Assert that Store, GamePort, Planner, application services, and
+WorkflowRuntime are composed once by `bootstrap.py`.
 
 The replacement target is explicit bootstrap wiring, after which this test should be deleted and replaced by bootstrap composition tests.
 

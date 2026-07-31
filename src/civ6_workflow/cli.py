@@ -37,7 +37,7 @@ def _engine(
     client: Civ6McpClient,
     state_api: Civ6StateApi,
 ):
-    return compose_live_runtime(config, config_path, client, state_api).engine
+    return compose_live_runtime(config, config_path, client, state_api).runtime
 
 
 async def _run_tick(config: AppConfig, config_path: Path):
@@ -209,7 +209,7 @@ def record(
     """Record live workflow snapshots and results into a replayable JSON file."""
 
     loaded = load_config(config)
-    recorded_config = loaded.engine_config()
+    recorded_config = loaded.runtime_config()
     tape = SnapshotRecording(
         engine_settings=ReplayEngineSettings(
             execution_mode=recorded_config.execution_mode,
@@ -238,7 +238,7 @@ def record(
                     tape,
                     store=store,
                     on_first_snapshot=capture_store_state,
-                ).engine
+                ).runtime
                 for _ in range(max_ticks):
                     result = await asyncio.wait_for(
                         engine.tick(), timeout=loaded.runtime.max_turn_seconds
@@ -285,7 +285,7 @@ def replay(
     )
     game = composition.game
     planner = composition.planner
-    engine = composition.engine
+    engine = composition.runtime
 
     async def loop() -> list[dict]:
         results: list[dict] = []

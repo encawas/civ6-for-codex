@@ -10,7 +10,7 @@ import civ6_workflow.batch_executor as batch_executor_module
 from civ6_workflow.batch_executor import BatchExecutor, BarrierKind
 from civ6_workflow.conditions import ConditionEvaluator
 from civ6_workflow.domain import AttemptStatus, MutationSentTick, RuntimeState
-from civ6_workflow.engine import WorkflowEngine
+from civ6_workflow.runtime import WorkflowRuntime
 from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
@@ -277,11 +277,11 @@ def test_batch_executor_has_no_planner_dependency():
 
 
 def test_runtime_routes_task_execution_only_through_batch_executor():
-    source = inspect.getsource(WorkflowEngine._run_tick)
+    source = inspect.getsource(WorkflowRuntime._run_tick)
     assert "batch_executor.advance" in source
     assert "batch_executor.reconcile" in source
     assert "batch_executor.send_end_turn" in source
-    assert not hasattr(WorkflowEngine, "_send_task")
-    assert not hasattr(WorkflowEngine, "_reconcile_attempt")
-    assert not hasattr(WorkflowEngine, "_send_end_turn")
-    assert not hasattr(WorkflowEngine, "_reconcile_end_turn")
+    assert not hasattr(WorkflowRuntime, "_send_task")
+    assert not hasattr(WorkflowRuntime, "_reconcile_attempt")
+    assert not hasattr(WorkflowRuntime, "_send_end_turn")
+    assert not hasattr(WorkflowRuntime, "_reconcile_end_turn")

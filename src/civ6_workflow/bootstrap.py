@@ -11,7 +11,7 @@ from .batch_executor import BatchExecutor
 from .codex_planner import CodexPlanner
 from .conditions import ConditionEvaluator
 from .config import AppConfig
-from .engine import EngineConfig, RuntimeServices, WorkflowEngine
+from .runtime import RuntimeConfig, RuntimeServices, WorkflowRuntime
 from .gate import EventGate, GateConfig
 from .mcp_port import Civ6GamePort, Civ6McpClient
 from .planner_lifecycle import PlannerLifecycleCoordinator, PlannerLifecycleRuntime
@@ -39,7 +39,7 @@ class RuntimeComposition:
     store: WorkflowStore
     game: GamePort
     planner: Planner
-    engine: WorkflowEngine
+    runtime: WorkflowRuntime
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,43 +63,43 @@ def build_store(config: AppConfig, config_path: str | Path) -> WorkflowStore:
     )
 
 
-def build_runtime_services(engine: WorkflowEngine) -> RuntimeServices:
+def build_runtime_services(runtime: WorkflowRuntime) -> RuntimeServices:
     """Build the one application-service graph used by every Runtime entry point."""
 
     conditions = ConditionEvaluator()
-    information_queries = InformationQueryRouter(engine.game)
+    information_queries = InformationQueryRouter(runtime.game)
     return RuntimeServices(
         gate=EventGate(
-            engine.store,
+            runtime.store,
             GateConfig(
-                default_cooldown_turns=max(0, int(engine.config.default_cooldown_turns))
+                default_cooldown_turns=max(0, int(runtime.config.default_cooldown_turns))
             ),
         ),
         conditions=conditions,
         batch_executor=BatchExecutor(
-            store=engine.store,
-            game=engine.game,
+            store=runtime.store,
+            game=runtime.game,
             conditions=conditions,
-            verification_attempts=engine.config.verification_attempts,
-            now=lambda: engine._now(),
-            monotonic=lambda: engine._monotonic(),
-            checkpoint=lambda name: engine._checkpoint(name),
+            verification_attempts=runtime.config.verification_attempts,
+            now=lambda: runtime._now(),
+            monotonic=lambda: runtime._monotonic(),
+            checkpoint=lambda name: runtime._checkpoint(name),
         ),
         turn_compiler=TurnCompiler(),
         information_queries=information_queries,
         planner_lifecycle=PlannerLifecycleCoordinator(
             PlannerLifecycleRuntime(
-                store=engine.store,
-                game=engine.game,
-                planner=engine.planner,
-                config=engine.config,
+                store=runtime.store,
+                game=runtime.game,
+                planner=runtime.planner,
+                config=runtime.config,
                 conditions=conditions,
                 information_queries=information_queries,
-                now=lambda: engine._now(),
-                monotonic=lambda: engine._monotonic(),
-                checkpoint=lambda name: engine._checkpoint(name),
-                observation_id=lambda: engine._active_observation_id,
-                human_wait_context=lambda snapshot: engine._human_wait_context(
+                now=lambda: runtime._now(),
+                monotonic=lambda: runtime._monotonic(),
+                checkpoint=lambda name: runtime._checkpoint(name),
+                observation_id=lambda: runtime._active_observation_id,
+                human_wait_context=lambda snapshot: runtime._human_wait_context(
                     snapshot
                 ),
             )
@@ -112,20 +112,20 @@ def compose_runtime(
     store: WorkflowStore,
     game: GamePort,
     planner: Planner,
-    engine_config: EngineConfig | None = None,
+    runtime_config: RuntimeConfig | None = None,
     clock: Any | None = None,
     crash_injector: Any | None = None,
 ) -> RuntimeComposition:
-    engine = WorkflowEngine(
+    runtime = WorkflowRuntime(
         store=store,
         game=game,
         planner=planner,
-        config=engine_config,
+        config=runtime_config,
         clock=clock,
         crash_injector=crash_injector,
         service_factory=build_runtime_services,
     )
-    return RuntimeComposition(store=store, game=game, planner=planner, engine=engine)
+    return RuntimeComposition(store=store, game=game, planner=planner, runtime=runtime)
 
 
 def compose_live_runtime(
@@ -148,7 +148,7 @@ def compose_live_runtime(
         store=store,
         game=game,
         planner=planner,
-        engine_config=config.engine_config(),
+        runtime_config=config.runtime_config(),
     )
 
 
@@ -199,15 +199,15 @@ def compose_recording_runtime(
         store=live.store,
         game=game,
         planner=planner,
-        engine_config=config.engine_config(),
+        runtime_config=config.runtime_config(),
     )
 
 
-def replay_engine_config(
+def replay_runtime_config(
     recording: SnapshotRecording,
     *,
     auto_end_turn: bool,
-) -> EngineConfig:
+) -> RuntimeConfig:
     settings: ReplayEngineSettings | None = recording.engine_settings
     action_types = (
         set(settings.allowed_action_types) if settings else set(ACTION_REGISTRY)
@@ -215,7 +215,7 @@ def replay_engine_config(
     auto_action_types = (
         set(settings.auto_action_types) if settings else set(ACTION_REGISTRY)
     )
-    return EngineConfig(
+    return RuntimeConfig(
         execution_mode=settings.execution_mode if settings else ExecutionMode.AUTO,
         auto_end_turn=auto_end_turn,
         max_agent_calls_per_turn=(settings.max_agent_calls_per_turn if settings else 1),
@@ -241,7 +241,7 @@ def compose_replay_runtime(
     store = WorkflowStore(database, enable_phase1c_decisions=True)
     if recording.store_state is not None:
         store.import_replay_state(recording.store_state)
-    config = replay_engine_config(recording, auto_end_turn=auto_end_turn)
+    config = replay_runtime_config(recording, auto_end_turn=auto_end_turn)
     if recording.seed_plans:
         raise ValueError(
             "legacy replay seed plans require migration to persisted "
@@ -253,7 +253,7 @@ def compose_replay_runtime(
         store=store,
         game=game,
         planner=planner,
-        engine_config=config,
+        runtime_config=config,
     )
 
 

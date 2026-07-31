@@ -235,15 +235,6 @@ class RuntimeSnapshot(StrictModel):
     blockers: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class RuntimeConfig(StrictModel):
-    database_path: str = "state/civ6-workflow.sqlite3"
-    execution_mode: ExecutionMode = ExecutionMode.CONFIRM
-    auto_end_turn: bool = False
-    poll_interval_seconds: float = Field(default=1.0, gt=0)
-    max_agent_calls_per_turn: int = Field(default=1, ge=0, le=2)
-    max_turn_seconds: int = Field(default=300, ge=10)
-
-
 ActionType = Literal[
     "city_set_production",
     "set_research",

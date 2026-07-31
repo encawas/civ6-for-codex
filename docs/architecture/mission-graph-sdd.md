@@ -40,15 +40,15 @@ StrategicContract
 | Current component | Current responsibility | Target disposition |
 | --- | --- | --- |
 | `bootstrap.py` | Sole production composition root | Retain |
-| `WorkflowEngine` | Coordinates Ticks, rules, planning, execution, and recovery | Incrementally shrink in place into `WorkflowRuntime` |
-| `DecisionGap` | Durable unresolved strategic question | Migrate by Strategic Scope, then retire as strategic authority |
-| `PlannerRequest` | Durable logical planning request with legacy and strategic targets | Generalized in Phase 1A; retain |
+| `WorkflowRuntime` | Sole orchestrator composed by `bootstrap.py` | Retain |
+| `DecisionGap` | Historical migration/replay record only | Retain compatibility reader; no production write authority |
+| `PlannerRequest` | Durable logical strategic planning request | Retain |
 | `ProviderAttempt` | Audit of calls across the model boundary | Retain |
 | `InformationRound` | Declarative information-gathering continuation | Retain |
-| `StrategicContract` / `MissionGraph` | One revisioned aggregate root; Phase 1B persistence currently permits only empty scope and Mission state | Retain and activate by reviewed scope |
-| `StrategicResearchProposal` | Immutable research candidate bound to Request, Attempt, Contract base, and Observation | Retain; add terminal decision and activation evidence in Phase 1C |
-| `Plan` / `PlanLease` | Current durable intent and validity | Replace by scope with StrategicContract/MissionGraph |
-| `models.PlanBundle` | Legacy Planner output and task collection | Delete after migration adapters retire |
+| `StrategicContract` / `MissionGraph` | One revisioned aggregate root and current strategic authority | Retain |
+| `StrategicResearchProposal` | Immutable research candidate bound to Request, Attempt, Contract base, and Observation | Retain |
+| `Plan` / `PlanLease` | Historical migration/replay records only | Retain compatibility reader; no production write authority |
+| `models.PlanBundle` | Legacy Planner response compatibility DTO | Keep outside current Planner routing until legacy replay compatibility retires |
 | `models.StoredTask` | Current production execution task | Retain through Phase 2, including after Phase 1C research activation; retire in Phase 3 |
 | `domain.Task` | New domain task model | Evolve into the canonical TurnActionGraph node contract |
 | `ActionAttempt` | Action delivery, recovery, and verification audit | Retain |

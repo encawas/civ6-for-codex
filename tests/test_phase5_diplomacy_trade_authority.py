@@ -29,7 +29,7 @@ from civ6_workflow.domain.legacy_plans import (
     PlanLease,
     PlanLeaseStatus,
 )
-from civ6_workflow.engine import EngineConfig, WorkflowEngine
+from civ6_workflow.runtime import RuntimeConfig, WorkflowRuntime
 from civ6_workflow.models import ExecutionMode, RuntimeSnapshot
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
@@ -232,12 +232,12 @@ def test_runtime_compiles_empty_graph_and_waits_without_legacy_planning(tmp_path
         base = _foundation(store)
         _activate(store, base)
         planner = _Planner()
-        engine = WorkflowEngine(
+        engine = WorkflowRuntime(
             service_factory=build_runtime_services,
             store=store,
             game=_Game(_snapshot()),
             planner=planner,
-            config=EngineConfig(
+            config=RuntimeConfig(
                 execution_mode=ExecutionMode.AUTO,
                 auto_end_turn=True,
                 verification_delay_seconds=0,
@@ -263,12 +263,12 @@ def test_runtime_compiles_empty_graph_and_waits_without_legacy_planning(tmp_path
         restored = WorkflowStore(tmp_path / "restored.sqlite3")
         restored.import_replay_state(replay)
         restored_planner = _Planner()
-        restored_engine = WorkflowEngine(
+        restored_engine = WorkflowRuntime(
             service_factory=build_runtime_services,
             store=restored,
             game=_Game(_snapshot()),
             planner=restored_planner,
-            config=EngineConfig(
+            config=RuntimeConfig(
                 execution_mode=ExecutionMode.AUTO,
                 auto_end_turn=True,
                 verification_delay_seconds=0,

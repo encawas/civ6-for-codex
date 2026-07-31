@@ -4,7 +4,7 @@ from pathlib import Path
 
 from civ6_workflow.bootstrap import build_runtime_services
 from civ6_workflow.domain import AttemptStatus, TickOutcomeKind
-from civ6_workflow.engine import EngineConfig, WorkflowEngine
+from civ6_workflow.runtime import RuntimeConfig, WorkflowRuntime
 from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
@@ -74,12 +74,12 @@ def snapshot(*, production="UNIT_BUILDER", turn=10, blockers=None):
 
 
 def engine(store, game, planner=None, **config):
-    return WorkflowEngine(
+    return WorkflowRuntime(
         service_factory=build_runtime_services,
         store=store,
         game=game,
         planner=planner or Planner(),
-        config=EngineConfig(
+        config=RuntimeConfig(
             execution_mode=ExecutionMode.AUTO,
             auto_end_turn=True,
             max_agent_calls_per_turn=0,

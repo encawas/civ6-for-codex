@@ -1,7 +1,7 @@
 {
-  "package.WorkflowEngine": "civ6_workflow.engine.WorkflowEngine",
-  "engine.WorkflowEngine": "civ6_workflow.engine.WorkflowEngine",
-  "engine.EngineConfig": "civ6_workflow.engine.EngineConfig",
+  "package.WorkflowRuntime": "civ6_workflow.runtime.WorkflowRuntime",
+  "runtime.WorkflowRuntime": "civ6_workflow.runtime.WorkflowRuntime",
+  "runtime.RuntimeConfig": "civ6_workflow.runtime.RuntimeConfig",
   "store.WorkflowStore": "civ6_workflow.store.WorkflowStore",
   "mcp_port.Civ6GamePort": "civ6_workflow.mcp_port.Civ6GamePort",
   "conditions.ConditionEvaluator": "civ6_workflow.conditions.ConditionEvaluator",

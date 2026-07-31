@@ -8,7 +8,7 @@ from pydantic import Field, field_validator
 
 from .actions import ACTION_REGISTRY
 from .codex_planner import CodexPlannerConfig
-from .engine import EngineConfig
+from .runtime import RuntimeConfig
 from .mcp_port import McpServerConfig
 from .models import ExecutionMode, StrictModel
 from .state_api import StateApiConfig
@@ -96,7 +96,7 @@ class AppConfig(StrictModel):
     gate: GateSection = Field(default_factory=GateSection)
     safety: SafetySection = Field(default_factory=SafetySection)
 
-    def engine_config(self) -> EngineConfig:
+    def runtime_config(self) -> RuntimeConfig:
         auto_actions = set(self.safety.auto_action_types)
         allowed_actions = set(self.safety.allowed_action_types) or set(ACTION_REGISTRY)
         if not auto_actions <= allowed_actions:
@@ -106,7 +106,7 @@ class AppConfig(StrictModel):
                 f"safety.allowed_action_types; extra={extra}"
             )
         allowed_tools = set(self.safety.allowed_tools)
-        return EngineConfig(
+        return RuntimeConfig(
             execution_mode=self.runtime.execution_mode,
             auto_end_turn=self.runtime.auto_end_turn,
             max_agent_calls_per_turn=self.runtime.max_agent_calls_per_turn,
@@ -179,5 +179,5 @@ def load_config(path: str | Path) -> AppConfig:
         raise ValueError("safety.auto_action_types must not be empty")
     if not config.safety.allowed_tools:
         raise ValueError("safety.allowed_tools must not be empty")
-    config.engine_config()  # validate cross-field safety invariants eagerly
+    config.runtime_config()  # validate cross-field safety invariants eagerly
     return config
