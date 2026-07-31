@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from .conditions import extract_known_entities, find_entity
@@ -92,7 +93,8 @@ from .workflow_protocol import (
     validate_global_resolution_structure,
     validate_information_request,
 )
-from .store import StaleStrategicContractBaseError
+from .ports import GamePort, Planner, StaleStrategicContractBaseError, WorkflowStorePort
+from .runtime_errors import InjectedCrashBoundary
 
 
 PLANNER_CALL_POLICY_REVISION = "planner-call-policy/v1"
@@ -103,11 +105,55 @@ PLANNER_REQUEST_POLICY_REVISION = (
 _TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 
 
+@dataclass(slots=True)
+class PlannerLifecycleRuntime:
+    """Narrow runtime services used by the planner application service."""
+
+    store: WorkflowStorePort
+    game: GamePort
+    planner: Planner
+    config: Any
+    conditions: Any
+    information_queries: Any
+    now: Callable[[], Any]
+    monotonic: Callable[[], float]
+    checkpoint: Callable[[str], None]
+    observation_id: Callable[[], str | None]
+    human_wait_context: Callable[[Any], dict[str, Any]]
+
+    @property
+    def _active_observation_id(self) -> str | None:
+        return self.observation_id()
+
+    def _now(self):
+        return self.now()
+
+    def _monotonic(self) -> float:
+        return self.monotonic()
+
+    def _checkpoint(self, name: str) -> None:
+        self.checkpoint(name)
+
+    def _human_wait_context(self, snapshot) -> dict[str, Any]:
+        return self.human_wait_context(snapshot)
+
+    @staticmethod
+    def _retired_legacy_planner_path(*_args, **_kwargs):
+        raise RuntimeError("legacy PlanBundle planner path is retired")
+
+    _build_agent_request = _retired_legacy_planner_path
+    _plan_once = _retired_legacy_planner_path
+    _validate_planner_bundle = _retired_legacy_planner_path
+    _classify_planner_failure = _retired_legacy_planner_path
+    _set_backoff = _retired_legacy_planner_path
+    _clear_backoff = _retired_legacy_planner_path
+
+
 class PlannerLifecycleCoordinator:
     """Advance durable planning state without owning the workflow Tick loop."""
 
-    def __init__(self, engine: Any):
-        self.engine = engine
+    def __init__(self, runtime: PlannerLifecycleRuntime):
+        self.engine = runtime
 
     def validate_before_routing(self, ctx, observation, current_events, compatibility):
         if (
@@ -1745,8 +1791,6 @@ class PlannerLifecycleCoordinator:
             with scope:
                 raw_response = await self._plan_once(provider_request, ctx.metrics)
         except Exception as exc:
-            from .engine import InjectedCrashBoundary
-
             if isinstance(exc, InjectedCrashBoundary):
                 raise
             error = exc
@@ -2445,8 +2489,6 @@ class PlannerLifecycleCoordinator:
             with scope:
                 raw_bundle = await engine._plan_once(provider_request, ctx.metrics)
         except Exception as exc:
-            from .engine import InjectedCrashBoundary
-
             if isinstance(exc, InjectedCrashBoundary):
                 raise
             error = exc

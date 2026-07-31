@@ -59,8 +59,9 @@ from .observation_normalization import (
     NormalizedRuntimeObservation,
     normalize_runtime_snapshot,
 )
-from .planner_lifecycle import PlannerLifecycleCoordinator
+from .planner_lifecycle import PlannerLifecycleCoordinator, PlannerLifecycleRuntime
 from .recovery import recover_turn_rewind
+from .runtime_errors import FatalTickPersistenceError, InjectedCrashBoundary
 from .turn_compiler import TurnCompiler
 from .validation import (
     PlanValidationContext,
@@ -117,14 +118,6 @@ class _TickContext:
     starting_state: RuntimeState = RuntimeState.OBSERVING
     observation_ids: list[str] = field(default_factory=list)
     resuming_human_wait: bool = False
-
-
-class InjectedCrashBoundary(RuntimeError):
-    """Crash-injection signal that must escape the Tick error boundary."""
-
-
-class FatalTickPersistenceError(RuntimeError):
-    """The runtime could not persist even a SYSTEM_ERROR audit Tick."""
 
 
 class _TickFileLock:
@@ -221,7 +214,21 @@ class WorkflowEngine:
         )
         self.turn_compiler = TurnCompiler()
         self.information_queries = InformationQueryRouter(self.game)
-        self.planner_lifecycle = PlannerLifecycleCoordinator(self)
+        self.planner_lifecycle = PlannerLifecycleCoordinator(
+            PlannerLifecycleRuntime(
+                store=self.store,
+                game=self.game,
+                planner=self.planner,
+                config=self.config,
+                conditions=self.conditions,
+                information_queries=self.information_queries,
+                now=lambda: self._now(),
+                monotonic=lambda: self._monotonic(),
+                checkpoint=lambda name: self._checkpoint(name),
+                observation_id=lambda: self._active_observation_id,
+                human_wait_context=lambda snapshot: self._human_wait_context(snapshot),
+            )
+        )
         self._available_tools: set[str] | None = None
         self._active_observation_id: str | None = None
 

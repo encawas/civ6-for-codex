@@ -29,6 +29,10 @@ from .domain import (
 from .models import ActionResult, ExecutionMode, PlanBundle, RuntimeSnapshot, StoredTask
 
 
+class StaleStrategicContractBaseError(ValueError):
+    """Raised when Proposal persistence loses its frozen Contract base."""
+
+
 class WorkflowStorePort(Protocol):
     """Application-facing persistence boundary implemented by WorkflowStore."""
 

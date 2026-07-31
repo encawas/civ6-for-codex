@@ -98,6 +98,7 @@ from .domain import (
 )
 from .turn_compiler import turn_action_node_as_stored_task
 from .domain.planner import TERMINAL_PLANNER_STATUSES
+from .ports import StaleStrategicContractBaseError
 from .models import (
     AgentRequest,
     EventLevel,
@@ -125,10 +126,6 @@ _STICKY_EVENT_TYPES = {
 
 class TaskIdentityConflictError(ValueError):
     """Raised when an existing task ID is reused for different semantics."""
-
-
-class StaleStrategicContractBaseError(ValueError):
-    """Raised when Proposal persistence loses its frozen Contract base."""
 
 
 class _PlannerResponseFacts(StrEnum):
