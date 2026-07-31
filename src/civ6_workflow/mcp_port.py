@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .actions import ActionValidationError, resolve_action
@@ -61,10 +67,183 @@ class McpToolRejectedError(RuntimeError):
         self.rejection_code = rejection_code
 
 
+def _windows_civ_mcp_process_ids() -> set[int]:
+    if sys.platform != "win32":
+        return set()
+    command = (
+        "$OutputEncoding=[Console]::OutputEncoding="
+        "[Text.UTF8Encoding]::new();"
+        "$rows=@(Get-CimInstance Win32_Process | Where-Object { "
+        "($_.Name -like 'python*.exe' -or $_.Name -like 'civ-mcp*.exe') "
+        "-and $_.CommandLine -match "
+        "'(?i)(-m\\s+civ_mcp|civ-mcp(?:\\.exe)?)' } | "
+        "Select-Object -ExpandProperty ProcessId);"
+        "$rows | ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("unable to inspect existing civ6-mcp sidecar processes")
+    if not result.stdout.strip():
+        return set()
+    payload = json.loads(result.stdout)
+    values = payload if isinstance(payload, list) else [payload]
+    return {int(value) for value in values}
+
+
+def _terminate_windows_civ_mcp_processes(process_ids: set[int]) -> None:
+    remaining = set(process_ids) & _windows_civ_mcp_process_ids()
+    for process_id in sorted(remaining):
+        subprocess.run(
+            ["taskkill", "/PID", str(process_id), "/T", "/F"],
+            capture_output=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    if process_ids & _windows_civ_mcp_process_ids():
+        raise RuntimeError("unable to terminate owned civ6-mcp sidecar processes")
+
+
+async def _wait_for_windows_civ_mcp_process_ids() -> set[int]:
+    for _ in range(20):
+        process_ids = await asyncio.to_thread(_windows_civ_mcp_process_ids)
+        if process_ids:
+            return process_ids
+        await asyncio.sleep(0.1)
+    return set()
+
+
+class _McpSidecarGuard:
+    def __init__(
+        self,
+        identity: str,
+        *,
+        state_directory: Path | None = None,
+        windows: bool | None = None,
+    ):
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        directory = state_directory or Path(tempfile.gettempdir())
+        self.lock_path = directory / f"civ6-workflow-mcp-{digest}.lock"
+        self.owner_path = directory / f"civ6-workflow-mcp-{digest}.json"
+        self.windows = sys.platform == "win32" if windows is None else windows
+        self._handle: Any | None = None
+        self._owned_process_ids: set[int] = set()
+
+    def __enter__(self) -> "_McpSidecarGuard":
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle: Any | None = None
+        try:
+            handle = self.lock_path.open("a+b")
+            handle.seek(0)
+            if handle.read(1) != b"\0":
+                handle.seek(0)
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if handle is not None:
+                handle.close()
+            raise RuntimeError("another Civ6 MCP sidecar owner is active") from exc
+        self._handle = handle
+        try:
+            self._reclaim_stale_owner()
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def _reclaim_stale_owner(self) -> None:
+        if not self.windows:
+            return
+        existing = _windows_civ_mcp_process_ids()
+        recorded: set[int] = set()
+        if self.owner_path.exists():
+            try:
+                payload = json.loads(self.owner_path.read_text(encoding="utf-8"))
+                recorded = {int(value) for value in payload.get("process_ids", [])}
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "civ6-mcp sidecar ownership record is invalid"
+                ) from exc
+        reclaimable = existing & recorded
+        if reclaimable:
+            _terminate_windows_civ_mcp_processes(reclaimable)
+            existing = _windows_civ_mcp_process_ids()
+        if existing:
+            raise RuntimeError(
+                "an unowned civ6-mcp sidecar is already running; stop it before "
+                "starting the Workflow Runtime"
+            )
+        self.owner_path.unlink(missing_ok=True)
+
+    def record_started(self, process_ids: set[int]) -> None:
+        if not self.windows:
+            return
+        if not process_ids:
+            raise RuntimeError("started civ6-mcp sidecar process was not discoverable")
+        self._owned_process_ids = set(process_ids)
+        temporary = self.owner_path.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(
+                {"owner_pid": os.getpid(), "process_ids": sorted(process_ids)},
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(self.owner_path)
+
+    def close(self) -> None:
+        error: BaseException | None = None
+        try:
+            if self.windows and self._owned_process_ids:
+                _terminate_windows_civ_mcp_processes(self._owned_process_ids)
+            self.owner_path.unlink(missing_ok=True)
+        except BaseException as exc:
+            error = exc
+        finally:
+            handle, self._handle = self._handle, None
+            if handle is not None:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+        if error is not None:
+            raise error
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
 class Civ6McpClient:
     def __init__(self, config: McpServerConfig):
         self.config = config
         self._stack: AsyncExitStack | None = None
+        self._sidecar_guard: _McpSidecarGuard | None = None
         self.session: Any | None = None
         self.call_count = 0
 
@@ -76,22 +255,40 @@ class Civ6McpClient:
             raise RuntimeError(
                 "The optional mcp package is required for a live Civ6 connection"
             ) from exc
+        identity = "\0".join((self.config.command, *self.config.args))
+        self._sidecar_guard = _McpSidecarGuard(identity)
+        self._sidecar_guard.__enter__()
         self._stack = AsyncExitStack()
         params = StdioServerParameters(
             command=self.config.command,
             args=self.config.args,
             env={**os.environ, **self.config.env},
         )
-        read, write = await self._stack.enter_async_context(stdio_client(params))
-        self.session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self.session.initialize()
-        return self
+        try:
+            read, write = await self._stack.enter_async_context(stdio_client(params))
+            if sys.platform == "win32":
+                self._sidecar_guard.record_started(
+                    await _wait_for_windows_civ_mcp_process_ids()
+                )
+            self.session = await self._stack.enter_async_context(
+                ClientSession(read, write)
+            )
+            await self.session.initialize()
+            return self
+        except BaseException:
+            await self.__aexit__(None, None, None)
+            raise
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._stack is not None:
-            await self._stack.aclose()
-        self.session = None
-        self._stack = None
+        try:
+            if self._stack is not None:
+                await self._stack.aclose()
+        finally:
+            self.session = None
+            self._stack = None
+            guard, self._sidecar_guard = self._sidecar_guard, None
+            if guard is not None:
+                guard.close()
 
     def _require_session(self) -> Any:
         if self.session is None:

@@ -13,12 +13,12 @@ MOUNT_LINE = "    mount_workflow_routes(app)\n\n"
 IMPORT_ANCHOR = "from civ_mcp.game_state import GameState\n"
 RETURN_ANCHOR = "    return app\n"
 UVICORN_CONFIG_PATTERN = re.compile(
-    r'(?m)^    uvi_config = uvicorn\.Config\('
+    r"(?m)^    uvi_config = uvicorn\.Config\("
     r'web_app, host=(?P<host>"(?:0\.0\.0\.0|127\.0\.0\.1)"), '
     r'port=8000, log_level="info"\)\r?\n'
 )
 UVICORN_LOG_ISOLATION_MARKER = "access_log=False,\n        log_config=None,"
-UVICORN_PATCH = '''    # MCP stdio stdout must contain JSON-RPC only. Keep the upstream bind
+UVICORN_PATCH = """    # MCP stdio stdout must contain JSON-RPC only. Keep the upstream bind
     # address, route framework logging through stderr, and suppress access logs.
     uvi_config = uvicorn.Config(
         web_app,
@@ -28,12 +28,14 @@ UVICORN_PATCH = '''    # MCP stdio stdout must contain JSON-RPC only. Keep the u
         access_log=False,
         log_config=None,
     )
-'''
+"""
 LOGGING_ANCHOR = "    logging.basicConfig(level=logging.INFO)\n"
-LOGGING_PATCH = '''    # JSON-RPC owns stdout. Force all application/framework logging to stderr
+LOGGING_PATCH = """    # JSON-RPC owns stdout. Force all application/framework logging to stderr
     # even if a dependency configured the root logger before main() runs.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
-'''
+"""
+GAME_RUNNING_ANCHOR = "            if name.lower() in r.stdout.lower():\n"
+GAME_RUNNING_PATCH = '            if name.lower() in (r.stdout or "").lower():\n'
 
 
 def _patch_uvicorn_logging(server_text: str) -> str:
@@ -42,9 +44,11 @@ def _patch_uvicorn_logging(server_text: str) -> str:
     match = UVICORN_CONFIG_PATTERN.search(server_text)
     if match is None:
         raise AssertionError("validated Uvicorn configuration anchor disappeared")
-    return server_text[: match.start()] + UVICORN_PATCH.format(
-        host=match.group("host")
-    ) + server_text[match.end() :]
+    return (
+        server_text[: match.start()]
+        + UVICORN_PATCH.format(host=match.group("host"))
+        + server_text[match.end() :]
+    )
 
 
 def _patch_root_logging(server_text: str) -> str:
@@ -53,6 +57,14 @@ def _patch_root_logging(server_text: str) -> str:
     if LOGGING_ANCHOR not in server_text:
         raise AssertionError("validated logging configuration anchor disappeared")
     return server_text.replace(LOGGING_ANCHOR, LOGGING_PATCH, 1)
+
+
+def _patch_windows_game_running(launcher_text: str) -> str:
+    if GAME_RUNNING_PATCH in launcher_text:
+        return launcher_text
+    if GAME_RUNNING_ANCHOR not in launcher_text:
+        raise AssertionError("validated Windows process-check anchor disappeared")
+    return launcher_text.replace(GAME_RUNNING_ANCHOR, GAME_RUNNING_PATCH, 1)
 
 
 def _upstream_head(upstream_root: Path) -> str | None:
@@ -82,6 +94,7 @@ def apply_overlay(
     source_root = upstream_root / "src" / "civ_mcp"
     web_api = source_root / "web_api.py"
     server_module = source_root / "server.py"
+    launcher_module = source_root / "game_launcher.py"
     target_module = source_root / "workflow_api.py"
     overlay_module = (
         Path(__file__).resolve().parents[1]
@@ -95,6 +108,8 @@ def apply_overlay(
         raise SystemExit(f"not a civ6-mcp checkout: missing {web_api}")
     if not server_module.exists():
         raise SystemExit(f"not a civ6-mcp checkout: missing {server_module}")
+    if not launcher_module.exists():
+        raise SystemExit(f"not a civ6-mcp checkout: missing {launcher_module}")
     if not overlay_module.exists():
         raise SystemExit(f"overlay source is missing: {overlay_module}")
 
@@ -145,10 +160,21 @@ def apply_overlay(
         )
     patched_server = _patch_uvicorn_logging(server_text)
     patched_server = _patch_root_logging(patched_server)
+    launcher_text = launcher_module.read_text(encoding="utf-8")
+    if (
+        GAME_RUNNING_PATCH not in launcher_text
+        and GAME_RUNNING_ANCHOR not in launcher_text
+    ):
+        raise SystemExit(
+            "upstream game_launcher.py changed: Windows process-check anchor was "
+            "not found; review recovery compatibility before applying the overlay"
+        )
+    patched_launcher = _patch_windows_game_running(launcher_text)
     if check_only:
         if (
             patched_web != web_text
             or patched_server != server_text
+            or patched_launcher != launcher_text
             or not target_module.exists()
         ):
             raise SystemExit("overlay is not installed")
@@ -164,14 +190,20 @@ def apply_overlay(
     server_backup = server_module.with_suffix(".py.workflow-backup")
     if not server_backup.exists():
         shutil.copy2(server_module, server_backup)
+    launcher_backup = launcher_module.with_suffix(".py.workflow-backup")
+    if not launcher_backup.exists():
+        shutil.copy2(launcher_module, launcher_backup)
     shutil.copy2(overlay_module, target_module)
     web_api.write_text(patched_web, encoding="utf-8")
     server_module.write_text(patched_server, encoding="utf-8")
+    launcher_module.write_text(patched_launcher, encoding="utf-8")
     print(f"installed {target_module}")
     print(f"patched {web_api}")
     print(f"patched {server_module} (stdout JSON-RPC only; logs to stderr)")
+    print(f"patched {launcher_module} (null-safe Windows process check)")
     print(f"backup {web_backup}")
     print(f"backup {server_backup}")
+    print(f"backup {launcher_backup}")
     if head is not None:
         print(f"verified upstream commit {head}")
 
