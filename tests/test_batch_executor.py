@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from datetime import UTC, datetime
 from types import SimpleNamespace
-
-import pytest
 
 import civ6_workflow.batch_executor as batch_executor_module
 from civ6_workflow.batch_executor import BatchExecutor, BarrierKind
@@ -246,19 +245,20 @@ class _ExecutionGame:
         )
 
 
-@pytest.mark.asyncio
-async def test_executor_persists_attempt_before_one_deterministic_mutation():
+def test_executor_persists_attempt_before_one_deterministic_mutation():
     store = _ExecutionStore()
     game = _ExecutionGame(store)
     budget = MutationBudget()
 
-    transition = await _executor(store, game).advance(
-        _observation(),
-        source_observation_id="obs_7",
-        mode=ExecutionMode.AUTO,
-        available_tools={"set_research"},
-        metrics=TickMetrics(),
-        budget=budget,
+    transition = asyncio.run(
+        _executor(store, game).advance(
+            _observation(),
+            source_observation_id="obs_7",
+            mode=ExecutionMode.AUTO,
+            available_tools={"set_research"},
+            metrics=TickMetrics(),
+            budget=budget,
+        )
     )
 
     assert transition is not None
