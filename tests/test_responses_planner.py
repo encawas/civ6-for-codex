@@ -257,3 +257,14 @@ def test_responses_planner_uses_target_specific_strategic_schema(monkeypatch):
     properties = payload["text"]["format"]["schema"]["properties"]
     assert "proposal_candidates" in properties
     assert "tasks" not in properties
+    mission = payload["text"]["format"]["schema"]["$defs"]["Mission"]
+    mission_properties = mission["properties"]
+    assert mission_properties["mission_revision"]["const"] == 1
+    assert mission_properties["scope"]["const"] == "research"
+    assert mission_properties["subject"]["properties"]["subject_type"]["const"] == (
+        "player"
+    )
+    assert mission_properties["slot"]["const"] == "player:research"
+    assert mission_properties["desired_outcome"]["required"] == ["technology"]
+    assert mission_properties["desired_outcome"]["additionalProperties"] is False
+    assert mission_properties["status"]["const"] == "ACTIVE"

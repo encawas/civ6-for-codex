@@ -377,7 +377,15 @@ class Civ6GamePort:
     @staticmethod
     def _normalize_action_result(raw: Any) -> ActionResult:
         if isinstance(raw, dict):
-            text = str(raw.get("text", "")).strip()
+            text = str(raw.get("text") or raw.get("result") or "").strip()
+            if text.startswith("Cannot connect to Civ 6"):
+                return ActionResult(
+                    success=False,
+                    blocked=True,
+                    message=text,
+                    details=raw,
+                    delivery_status=MutationDeliveryStatus.PROVEN_NOT_SENT,
+                )
             if raw.get("success") is False or raw.get("error"):
                 return ActionResult(
                     success=False,

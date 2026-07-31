@@ -351,6 +351,49 @@ def planner_response_model_for_request(
     )
 
 
+def planner_response_json_schema_for_request(
+    request: "WorkflowAgentRequest",
+) -> dict[str, Any]:
+    """Return the transport schema with target-specific domain constraints."""
+
+    response_model = planner_response_model_for_request(request)
+    schema = response_model.model_json_schema()
+    if (
+        request.constraints.get("planner_request_target_kind")
+        != PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value
+    ):
+        return schema
+
+    mission = schema["$defs"]["Mission"]
+    properties = mission["properties"]
+    properties["mission_revision"] = {"const": 1, "type": "integer"}
+    properties["scope"] = {"const": "research", "type": "string"}
+    properties["subject"] = {
+        "additionalProperties": False,
+        "properties": {
+            "subject_type": {"const": "player", "type": "string"},
+            "subject_id": {"minLength": 1, "type": "string"},
+        },
+        "required": ["subject_type", "subject_id"],
+        "type": "object",
+    }
+    properties["slot"] = {"const": "player:research", "type": "string"}
+    properties["desired_outcome"] = {
+        "additionalProperties": False,
+        "properties": {
+            "technology": {"minLength": 1, "type": "string"},
+        },
+        "required": ["technology"],
+        "type": "object",
+    }
+    properties["status"] = {
+        "const": "ACTIVE",
+        "default": "ACTIVE",
+        "type": "string",
+    }
+    return schema
+
+
 class WorkflowAgentRequest(BaseAgentRequest):
     information_results: dict[str, Any] = Field(default_factory=dict)
 

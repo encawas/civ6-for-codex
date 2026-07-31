@@ -90,6 +90,11 @@ ACTION_REGISTRY: Mapping[str, ActionSpec] = MappingProxyType(
             required_arguments=frozenset({"tech_or_civic"}),
             fixed_arguments={"category": "civic"},
         ),
+        "send_envoy": ActionSpec(
+            tool_name="send_envoy",
+            required_arguments=frozenset({"player_id"}),
+            retry_classification=RetryClassification.NEVER_BLIND_RETRY,
+        ),
         "unit_move": ActionSpec(
             tool_name="unit_action",
             required_arguments=frozenset({"unit_id", "target_x", "target_y"}),

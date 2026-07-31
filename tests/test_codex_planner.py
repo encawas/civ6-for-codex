@@ -500,3 +500,53 @@ def test_codex_cli_uses_target_specific_strategic_schema(tmp_path, monkeypatch):
         == "mission-graph-patch-response/v1"
     )
     assert "tasks" not in schema["properties"]
+
+
+def test_codex_cli_creation_schema_constrains_research_mission(tmp_path, monkeypatch):
+    state_directory = tmp_path / "creation-schema"
+    planner = CodexPlanner(
+        CodexPlannerConfig(
+            backend="codex_cli",
+            command=str(Path(__file__).resolve()),
+            state_directory=state_directory,
+            use_output_schema=True,
+        )
+    )
+    request = AgentRequest(
+        request_id="req_creation_schema",
+        turn=1,
+        execution_mode=ExecutionMode.READONLY,
+        trigger_events=[],
+        constraints={"planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"},
+    )
+
+    class CreationOutputProcess:
+        returncode = 0
+
+        async def communicate(self, payload: bytes):
+            request_directory = state_directory / "requests" / request.request_id
+            (request_directory / "plan.json").write_text(
+                "not-json-yet", encoding="utf-8"
+            )
+            return b"", b""
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        return CreationOutputProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    assert asyncio.run(planner.plan(request)) == "not-json-yet"
+    schema_path = state_directory / "requests" / request.request_id / "plan.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    mission = schema["$defs"]["Mission"]["properties"]
+    assert mission["scope"]["const"] == "research"
+    assert mission["subject"]["properties"]["subject_type"]["const"] == "player"
+    assert mission["slot"]["const"] == "player:research"
+    assert mission["desired_outcome"]["required"] == ["technology"]
+    assert mission["status"]["const"] == "ACTIVE"

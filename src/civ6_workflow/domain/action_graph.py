@@ -70,6 +70,7 @@ class TurnActionNode(DomainModel):
             "city_set_production": "city",
             "set_research": "research",
             "set_civic": "civic",
+            "send_envoy": "city_state",
             "unit_move": "unit",
             "unit_found_city": "unit",
             "tactical_unit_move": "unit",

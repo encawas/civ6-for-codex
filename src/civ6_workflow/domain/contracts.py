@@ -517,7 +517,7 @@ def city_roles_mission_plan(mission: Mission) -> dict[str, object]:
 
 
 def diplomacy_trade_mission_policy(mission: Mission) -> dict[str, object]:
-    """Validate the closed human-only policy for diplomacy and trade responses."""
+    """Validate human-only responses plus an optional reviewed envoy target."""
 
     if mission.scope != "diplomacy_trade":
         raise ValueError("diplomacy/trade Mission scope must be diplomacy_trade")
@@ -529,7 +529,11 @@ def diplomacy_trade_mission_policy(mission: Mission) -> dict[str, object]:
             "diplomacy/trade Mission desired_outcome must contain only diplomacy_trade"
         )
     policy = desired_outcome["diplomacy_trade"]
-    if not isinstance(policy, dict) or set(policy) != {"owner", "handling"}:
+    if not isinstance(policy, dict) or not {"owner", "handling"} <= set(policy):
+        raise ValueError(
+            "diplomacy/trade Mission policy fields do not match the contract"
+        )
+    if set(policy) - {"owner", "handling", "envoy_player_id"}:
         raise ValueError(
             "diplomacy/trade Mission policy fields do not match the contract"
         )
@@ -542,6 +546,10 @@ def diplomacy_trade_mission_policy(mission: Mission) -> dict[str, object]:
         raise ValueError("diplomacy/trade Mission subject must match its owner")
     if policy["handling"] != "human_review":
         raise ValueError("diplomacy/trade responses must remain human-only")
+    if "envoy_player_id" in policy and (
+        type(policy["envoy_player_id"]) is not int or int(policy["envoy_player_id"]) < 0
+    ):
+        raise ValueError("envoy target player_id must be a non-negative integer")
     return policy
 
 
@@ -608,8 +616,8 @@ def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
         city_roles_mission_plan(mission)
         return ("city_set_production",)
     if mission.scope == "diplomacy_trade":
-        diplomacy_trade_mission_policy(mission)
-        return ()
+        policy = diplomacy_trade_mission_policy(mission)
+        return ("send_envoy",) if "envoy_player_id" in policy else ()
     if mission.scope == "tactical_emergency":
         tactical_emergency_mission_order(mission)
         return (

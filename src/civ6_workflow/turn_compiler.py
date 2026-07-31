@@ -211,8 +211,13 @@ class TurnCompiler:
                 auto_action_types=auto_action_types,
             )
         if mission.scope == "diplomacy_trade":
-            diplomacy_trade_mission_policy(mission)
-            return None, None
+            return self._compile_diplomacy_trade_node(
+                observation,
+                contract,
+                mission,
+                mode=mode,
+                auto_action_types=auto_action_types,
+            )
         if mission.scope == "tactical_emergency":
             return self._compile_tactical_emergency_node(
                 observation,
@@ -557,6 +562,57 @@ class TurnCompiler:
                 "Execute the reviewed tactical/emergency unit response for "
                 f"turn {plan['target_turn']}."
             ),
+            idempotency_key=f"turn-action:{node_id}",
+            **node_identity,
+        )
+        return node, None
+
+    def _compile_diplomacy_trade_node(
+        self,
+        observation: NormalizedObservation,
+        contract: StrategicContract,
+        mission: Mission,
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+    ) -> tuple[TurnActionNode | None, str | None]:
+        policy = diplomacy_trade_mission_policy(mission)
+        target_player_id = policy.get("envoy_player_id")
+        if target_player_id is None:
+            return None, None
+        blocker_kind = "ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN"
+        if not any(
+            blocker.blocker_type == blocker_kind for blocker in observation.blockers
+        ):
+            return None, None
+        node_identity = {
+            "game_session_id": observation.game_session_id,
+            "turn_number": observation.turn_number,
+            "source_observation_id": observation.observation_id,
+            "source_contract_id": contract.contract_id,
+            "source_contract_revision": contract.revision,
+            "source_mission_id": mission.mission_id,
+            "source_mission_revision": mission.mission_revision,
+            "action_type": "send_envoy",
+            "entity_id": str(target_player_id),
+            "arguments": {"player_id": target_player_id},
+            "target_turn": observation.turn_number,
+        }
+        node_id = build_turn_action_node_id(**node_identity)
+        node = TurnActionNode(
+            node_id=node_id,
+            graph_id="pending",
+            source_observation_projection_hash=observation.projection_hash,
+            entity_type="city_state",
+            preconditions=(
+                {"type": "blocker_kind_present", "blocker_kind": blocker_kind},
+            ),
+            postconditions=({"type": "no_blocker_kind", "blocker_kind": blocker_kind},),
+            risk=RiskLevel.HIGH.value,
+            requires_confirmation=(
+                mode is not ExecutionMode.AUTO or "send_envoy" not in auto_action_types
+            ),
+            reason="Send one reviewed envoy to clear the current turn blocker.",
             idempotency_key=f"turn-action:{node_id}",
             **node_identity,
         )

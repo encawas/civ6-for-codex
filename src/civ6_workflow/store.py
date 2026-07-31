@@ -68,6 +68,7 @@ from .domain import (
     build_strategic_proposal_wait_resume_request,
     build_strategic_contract_id,
     city_roles_mission_plan,
+    diplomacy_trade_mission_policy,
     StrategicContractCommit,
     opening_strategy_mission_policy,
     research_mission_action,
@@ -2513,6 +2514,7 @@ class WorkflowStore:
                     "civic",
                     "settler",
                     "city_roles",
+                    "diplomacy_trade",
                     "tactical_emergency",
                 }
             )
@@ -9603,6 +9605,15 @@ class WorkflowStore:
                 if key in expected:
                     expected_arguments[key] = expected[key]
             return dict(arguments) == expected_arguments
+        if mission.scope == "diplomacy_trade":
+            policy = diplomacy_trade_mission_policy(mission)
+            target_player_id = policy.get("envoy_player_id")
+            return (
+                action_type == "send_envoy"
+                and target_player_id is not None
+                and str(entity_id) == str(target_player_id)
+                and dict(arguments) == {"player_id": target_player_id}
+            )
         if mission.scope == "tactical_emergency":
             plan = tactical_emergency_mission_order(mission)
             if str(plan["unit_id"]) != str(entity_id):
@@ -10246,6 +10257,7 @@ class WorkflowStore:
             "unit_move": "settler",
             "unit_found_city": "settler",
             "city_set_production": "city_roles",
+            "send_envoy": "diplomacy_trade",
             "tactical_unit_move": "tactical_emergency",
             "tactical_unit_fortify": "tactical_emergency",
             "tactical_unit_skip": "tactical_emergency",

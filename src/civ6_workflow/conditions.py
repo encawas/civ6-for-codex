@@ -108,6 +108,21 @@ class ConditionEvaluator:
             return ConditionResult(
                 not present, f"blocker {blocker_type} is currently present"
             )
+        if kind in {"blocker_kind_present", "no_blocker_kind"}:
+            blocker_kind = str(condition["blocker_kind"]).strip().upper()
+            present = any(
+                blocker.blocker_type == blocker_kind
+                for blocker in observation.canonical.blockers
+            )
+            expected = kind == "blocker_kind_present"
+            return ConditionResult(
+                present is expected,
+                (
+                    f"blocker kind {blocker_kind} is not present"
+                    if expected
+                    else f"blocker kind {blocker_kind} is still present"
+                ),
+            )
         if kind == "field_equals":
             path = str(condition["path"])
             expected = condition.get("value")

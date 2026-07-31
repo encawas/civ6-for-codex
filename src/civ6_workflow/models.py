@@ -208,6 +208,7 @@ ActionType = Literal[
     "city_set_production",
     "set_research",
     "set_civic",
+    "send_envoy",
     "unit_move",
     "unit_found_city",
     "builder_improve",

@@ -73,6 +73,7 @@ auto_action_types = [
   "city_set_production",
   "set_research",
   "set_civic",
+  "send_envoy",
   "unit_move",
   "builder_improve",
   "unit_heal",
@@ -83,6 +84,7 @@ auto_action_types = [
 allowed_tools = [
   "set_city_production",
   "set_research",
+  "send_envoy",
   "unit_action",
   "end_turn",
 ]

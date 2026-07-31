@@ -8,7 +8,8 @@ from civ6_workflow.actions import (
     action_argument_contracts,
     resolve_action,
 )
-from civ6_workflow.models import TurnActionExecution
+from civ6_workflow.mcp_port import Civ6GamePort
+from civ6_workflow.models import MutationDeliveryStatus, TurnActionExecution
 
 
 def _task(action_type, arguments):
@@ -62,6 +63,34 @@ def test_research_and_civic_share_upstream_tool_with_fixed_category():
         "tech_or_civic": "CIVIC_CRAFTSMANSHIP",
         "category": "civic",
     }
+
+
+def test_envoy_uses_closed_player_id_contract_and_is_never_blind_retry():
+    tool, arguments = resolve_action(
+        _task("send_envoy", {"player_id": 8}),
+        {"send_envoy"},
+    )
+
+    assert tool == "send_envoy"
+    assert arguments == {"player_id": 8}
+    assert (
+        ACTION_REGISTRY["send_envoy"].retry_classification.value == "NEVER_BLIND_RETRY"
+    )
+
+
+def test_mcp_connection_failure_result_is_proven_not_sent():
+    result = Civ6GamePort._normalize_action_result(
+        {
+            "result": (
+                "Cannot connect to Civ 6 at 127.0.0.1:4318. "
+                "Is the game running with EnableTuner=1?"
+            )
+        }
+    )
+
+    assert result.success is False
+    assert result.blocked is True
+    assert result.delivery_status is MutationDeliveryStatus.PROVEN_NOT_SENT
 
 
 def test_action_argument_contracts_are_stable_and_match_registry():
