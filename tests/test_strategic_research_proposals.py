@@ -307,7 +307,7 @@ def _assert_proposal_wait(store, request, proposal):
     assert "resume_requested_at" not in wait
 
 
-def test_creation_uses_isolated_lifecycle_and_persists_proposal(tmp_path, monkeypatch):
+def test_creation_uses_isolated_lifecycle_and_persists_proposal(tmp_path):
     async def scenario():
         store = WorkflowStore(tmp_path / "creation.sqlite3")
         game = _Game()
@@ -317,16 +317,13 @@ def test_creation_uses_isolated_lifecycle_and_persists_proposal(tmp_path, monkey
         request = _request("game-1")
         store.save_planner_request(request)
 
-        def legacy_path(*args, **kwargs):
-            raise AssertionError("strategic target entered legacy lifecycle")
-
         for name in (
             "_supersede_stale_request",
             "_request_gaps",
             "_partition_bundle",
             "_resolve_gaps",
         ):
-            monkeypatch.setattr(engine.planner_lifecycle, name, legacy_path)
+            assert not hasattr(engine.planner_lifecycle, name)
 
         result = await engine.tick()
 
@@ -2381,7 +2378,7 @@ def test_strategic_backoff_derives_failure_count_from_attempt_history(tmp_path):
             attempts[-1].provider_attempt_id
         )
         assert result.workflow_tick["provider_attempt_count"] == 2
-        assert engine._active_backoff(stored)["failure_count"] == 2
+        assert engine.planner_lifecycle._active_backoff(stored)["failure_count"] == 2
         assert stored.next_retry_at >= attempts[-1].completed_at + timedelta(seconds=9)
         _assert_replay_round_trip(tmp_path, store, "strategic-backoff-retry")
 
@@ -2444,7 +2441,7 @@ def test_strategic_backoff_is_atomic_durable_and_replay_stable(tmp_path):
         waiting_planner = _Planner()
         waiting_engine = _engine(restored, _Game(), waiting_planner)
         waiting_engine._now = lambda: stored.next_retry_at - timedelta(seconds=1)
-        backoff = waiting_engine._active_backoff(restored_request)
+        backoff = waiting_engine.planner_lifecycle._active_backoff(restored_request)
         assert backoff["until"] == stored.next_retry_at.isoformat()
         waiting = await waiting_engine.tick()
         assert waiting.workflow_tick["outcome"] == TickOutcomeKind.PLANNER_BACKOFF
@@ -6053,32 +6050,7 @@ def test_turn_action_graph_approval_survives_equivalent_observation(tmp_path):
     graph, nodes = graph_state
     assert len(nodes) == 1
     assert game.calls == 0
-    with pytest.raises(
-        ValueError,
-        match="StoredTask research projection is closed",
-    ):
-        enabled.save_authoritative_research_plan_bundle(
-            proposal.game_session_id,
-            1,
-            PlanBundle(
-                plan_id="forged-second-research-authority",
-                summary="Must not coexist with the active graph.",
-                tasks=[
-                    ProposedTask(
-                        task_id="forged-research-task",
-                        action_type="set_research",
-                        entity_type="research",
-                        entity_id="TECH_WRITING",
-                        due_turn=1,
-                        arguments={"tech_or_civic": "TECH_WRITING"},
-                        reason="forged duplicate authority",
-                    )
-                ],
-            ),
-            mode=ExecutionMode.CONFIRM,
-            auto_action_types={"set_research"},
-            observation_id=graph.source_observation_id,
-        )
+    assert not hasattr(enabled, "save_authoritative_research_plan_bundle")
     assert enabled.approve_task(
         proposal.game_session_id, nodes[0].task_id, approved_by="operator"
     )

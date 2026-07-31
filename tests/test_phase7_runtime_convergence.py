@@ -28,15 +28,20 @@ def test_planner_lifecycle_uses_a_narrow_runtime_service_container(tmp_path):
         game=game,
         planner=planner,
     )
-    services = composition.engine.planner_lifecycle.engine
+    services = composition.engine.planner_lifecycle.runtime
 
     assert isinstance(services, PlannerLifecycleRuntime)
     assert services is not composition.engine
     assert services.store is store
     assert services.game is game
     assert services.planner is planner
-    with pytest.raises(RuntimeError, match="legacy PlanBundle planner path is retired"):
-        services._build_agent_request()
+    for retired_name in (
+        "_build_agent_request",
+        "_validate_planner_bundle",
+        "_set_backoff",
+        "_clear_backoff",
+    ):
+        assert not hasattr(services, retired_name)
 
 
 def test_planner_and_runtime_modules_have_one_way_dependencies():

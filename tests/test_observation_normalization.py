@@ -61,44 +61,6 @@ def _city_snapshot(production, *, turn: int = 10) -> RuntimeSnapshot:
     )
 
 
-def _save_city_plan(store: WorkflowStore) -> None:
-    store.save_plan_bundle(
-        "game-1",
-        10,
-        PlanBundle(
-            plan_id="city-plan",
-            summary="continue city production",
-            city_plan_updates=[
-                {
-                    "city_id": 1,
-                    "followup_queue": [
-                        {
-                            "item_type": "BUILDING",
-                            "item_name": "BUILDING_MONUMENT",
-                        }
-                    ],
-                }
-            ],
-        ),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"city_set_production"},
-    )
-
-
-def _save_research_plan(store: WorkflowStore) -> None:
-    store.save_plan_bundle(
-        "game-1",
-        10,
-        PlanBundle(
-            plan_id="research-plan",
-            summary="continue research queue",
-            strategy_updates={"research_queue": ["TECH_POTTERY"]},
-        ),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"set_research"},
-    )
-
-
 def test_obs_003_raw_payload_is_audit_only_and_rules_have_no_empty_spelling_list():
     """OBS-003: representation quirks are owned only by the boundary."""
 

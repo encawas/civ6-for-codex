@@ -10,7 +10,6 @@ from uuid import uuid4
 
 from pydantic import Field, field_validator, model_validator
 
-from .decisioning import SETTLER_GAP_TYPES, STRATEGIC_GAP_TYPES
 from .domain import ContinuationPolicy, Mission, PlannerRequestTargetKind, thaw_json
 
 from .models import (
@@ -20,6 +19,34 @@ from .models import (
     PlanBundle as BasePlanBundle,
     StrictModel,
     TickMetrics as BaseTickMetrics,
+)
+
+_LEGACY_STRATEGIC_EVENT_TYPES = frozenset(
+    {
+        "opening_strategy_required",
+        "settler_site_selection_required",
+        "settler_plan_requires_review",
+        "research_direction_required",
+        "civic_direction_required",
+        "research_unavailable",
+        "civic_unavailable",
+        "invalid_city_plan_item",
+        "city_role_required",
+        "district_placement_required",
+        "war_posture_required",
+        "emergency_defense_required",
+        "pending_diplomacy",
+        "pending_trade_offer",
+        "world_congress_vote_required",
+        "tactical_attack_opportunity",
+        "emergency_response_window",
+    }
+)
+_LEGACY_SETTLER_EVENT_TYPES = frozenset(
+    {
+        "settler_site_selection_required",
+        "settler_plan_requires_review",
+    }
 )
 
 _LEASE_CONDITION_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
@@ -512,7 +539,7 @@ def validate_event_resolution_contract(
                     f"{sorted(unknown_tasks)}"
                 )
             requires_lease = bool(resolution.decision_gap_ids) or (
-                trigger_by_key[key].event_type in STRATEGIC_GAP_TYPES
+                trigger_by_key[key].event_type in _LEGACY_STRATEGIC_EVENT_TYPES
             )
             if requires_lease and resolution.lease_contract is None:
                 errors.append(f"task resolution for {key} has no lease contract")
@@ -526,7 +553,7 @@ def validate_event_resolution_contract(
                     f"{sorted(unknown_refs)}"
                 )
             requires_lease = bool(resolution.decision_gap_ids) or (
-                trigger_by_key[key].event_type in STRATEGIC_GAP_TYPES
+                trigger_by_key[key].event_type in _LEGACY_STRATEGIC_EVENT_TYPES
             )
             if requires_lease and resolution.lease_contract is None:
                 errors.append(f"plan_update resolution for {key} has no lease contract")
@@ -622,7 +649,7 @@ def validate_event_resolution_contract(
 
 
 def _validate_lease_contract_for_event(resolution, event, errors):
-    if event is None or event.event_type not in SETTLER_GAP_TYPES:
+    if event is None or event.event_type not in _LEGACY_SETTLER_EVENT_TYPES:
         return
     contract = resolution.lease_contract
     precondition_types = {item.get("type") for item in contract.preconditions}

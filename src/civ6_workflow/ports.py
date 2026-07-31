@@ -26,7 +26,7 @@ from .domain import (
     TurnActionGraph,
     TurnActionNode,
 )
-from .models import ActionResult, ExecutionMode, PlanBundle, RuntimeSnapshot, StoredTask
+from .models import ActionResult, RuntimeSnapshot, StoredTask
 
 
 class StaleStrategicContractBaseError(ValueError):
@@ -185,17 +185,6 @@ class WorkflowStorePort(Protocol):
         proposal_id: str,
         **kwargs: Any,
     ) -> StrategicProposalInvalidatedTick: ...
-
-    def save_authoritative_research_plan_bundle(
-        self,
-        game_id: str,
-        turn: int,
-        bundle: PlanBundle,
-        *,
-        mode: ExecutionMode,
-        auto_action_types: set[str],
-        observation_id: str,
-    ) -> None: ...
 
     def active_research_mission(
         self, game_id: str

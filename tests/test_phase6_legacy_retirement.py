@@ -14,7 +14,7 @@ from civ6_workflow.domain import (
     PlannerRequestTarget,
     PlannerRequestTargetKind,
 )
-from civ6_workflow.models import ExecutionMode, PlanBundle, TaskStatus
+from civ6_workflow.models import TaskStatus
 from civ6_workflow.store import PHASE5_REPLAY_STATE_TABLES, SCHEMA, WorkflowStore
 
 
@@ -129,16 +129,10 @@ def _raw_v13_replay(path) -> dict:
 def test_public_legacy_authority_writes_fail_closed(tmp_path):
     store = WorkflowStore(tmp_path / "public-writes.sqlite3")
 
-    with pytest.raises(ValueError, match="PlanBundle writes are retired"):
-        store.save_plan_bundle(
-            "game-1",
-            4,
-            PlanBundle(plan_id="legacy-plan", summary="legacy plan"),
-            mode=ExecutionMode.AUTO,
-            auto_action_types=set(),
-        )
     with pytest.raises(ValueError, match="PlannerRequest writes are retired"):
         store.save_planner_request(_legacy_request())
+
+    assert not hasattr(store, "save_plan_bundle")
 
     assert store.list_tasks("game-1") == []
     assert store.list_decision_gaps("game-1") == []

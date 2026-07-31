@@ -28,7 +28,6 @@ from .domain import (
     AttemptStatus,
     DecisionGap,
     DecisionGapStatus,
-    DecisionGroup,
     InformationCollectedTick,
     InformationRound,
     InformationRoundStatus,
@@ -9444,132 +9443,6 @@ class WorkflowStore:
                 return changed
             raise ValueError("legacy StoredTask confirmation writes are retired")
 
-    def record_lease_approval(
-        self,
-        game_id: str,
-        plan_lease_id: str,
-        *,
-        approved: bool,
-        actor: str = "control-panel-user",
-    ) -> tuple[bool, str]:
-        """Persist one lease approval decision without activating it in the UI path."""
-
-        raise ValueError("legacy PlanLease approvals are retired")
-
-        turn = int(self.get_meta("last_observed_turn", 0) or 0)
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT lease_json FROM plan_leases WHERE game_id=? AND plan_lease_id=?",
-                (game_id, plan_lease_id),
-            ).fetchone()
-            if row is None:
-                return False, "plan lease was not found for this game"
-            lease = PlanLease.model_validate_json(row["lease_json"])
-            active = self._active_scope_missions_in_connection(conn, game_id)
-            owned_scopes = (
-                set()
-                if active is None
-                else set(active[0].authority_scope_set.mission_graph_scopes)
-            )
-            for scope in owned_scopes.intersection(
-                {
-                    "research",
-                    "civic",
-                    "opening_strategy",
-                    "settler",
-                    "city_roles",
-                    "diplomacy_trade",
-                    "tactical_emergency",
-                }
-            ):
-                if self._plan_lease_targets_scope_in_connection(conn, lease, scope):
-                    raise ValueError(f"legacy {scope} PlanLease writes are closed")
-            if lease.status is not PlanLeaseStatus.AWAITING_APPROVAL:
-                return False, "plan lease is not awaiting approval"
-
-            decision = (
-                ApprovalDecision.APPROVED if approved else ApprovalDecision.REJECTED
-            )
-            record = ApprovalRecord(
-                approval_id=f"approval_{uuid4().hex}",
-                proposal_type="decision_gap",
-                proposal_id=lease.decision_gap_ids[0],
-                proposal_revision=lease.plan_revision,
-                decision=decision,
-                actor=actor,
-                created_at=datetime.now(UTC),
-                reason=(
-                    "approved from local control panel"
-                    if approved
-                    else "rejected from local control panel"
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO approval_records(
-                    approval_id, game_id, proposal_type, proposal_id,
-                    proposal_revision, decision, record_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.approval_id,
-                    game_id,
-                    record.proposal_type,
-                    record.proposal_id,
-                    record.proposal_revision,
-                    record.decision.value,
-                    record.model_dump_json(),
-                    record.created_at.isoformat(),
-                ),
-            )
-            if approved:
-                return True, "approval recorded; the next tick will revalidate it"
-
-            rejected = lease.model_copy(
-                update={
-                    "status": PlanLeaseStatus.INVALIDATED,
-                    "approval_status": ApprovalStatus.REJECTED,
-                    "invalidation_reason": "plan lease rejected by user",
-                }
-            )
-            self._save_plan_lease_in_connection(conn, rejected)
-            self._invalidate_plan_projection_in_connection(conn, rejected)
-            for task_id in rejected.task_ids:
-                conn.execute(
-                    """
-                    UPDATE workflow_tasks SET
-                        status=?, last_error=?, updated_at=CURRENT_TIMESTAMP
-                    WHERE game_id=? AND task_id=?
-                      AND status IN (?, ?, ?)
-                    """,
-                    (
-                        TaskStatus.CANCELLED.value,
-                        "dependent plan lease rejected by user",
-                        game_id,
-                        task_id,
-                        TaskStatus.PENDING.value,
-                        TaskStatus.READY.value,
-                        TaskStatus.AWAITING_CONFIRMATION.value,
-                    ),
-                )
-            for gap_id in rejected.decision_gap_ids:
-                gap_row = conn.execute(
-                    "SELECT gap_json FROM decision_gaps WHERE game_id=? AND decision_gap_id=?",
-                    (game_id, gap_id),
-                ).fetchone()
-                if gap_row is None:
-                    continue
-                gap = DecisionGap.model_validate_json(gap_row["gap_json"])
-                invalidated_gap = gap.model_copy(
-                    update={
-                        "status": DecisionGapStatus.INVALIDATED,
-                        "resolution_reason": "plan lease rejected by user",
-                        "invalidation_reason": "plan lease rejected by user",
-                    }
-                )
-                self._save_decision_gap_in_connection(conn, invalidated_gap, turn)
-            return True, "rejection recorded; dependent tasks were cancelled"
-
     def retry_failed_attempt_if_safe(
         self,
         game_id: str,
@@ -10439,74 +10312,6 @@ class WorkflowStore:
             )
         return graph, tasks
 
-    @staticmethod
-    def _bundle_contains_research_write(bundle: PlanBundle) -> bool:
-        research_strategy_keys = {
-            "research",
-            "research_queue",
-            "tech",
-            "tech_queue",
-            "technology",
-            "current_research",
-        }
-        return any(task.action_type == "set_research" for task in bundle.tasks) or any(
-            str(key).strip().lower() in research_strategy_keys
-            for key in bundle.strategy_updates
-        )
-
-    @staticmethod
-    def _bundle_contains_civic_write(bundle: PlanBundle) -> bool:
-        return any(task.action_type == "set_civic" for task in bundle.tasks) or any(
-            str(key).strip().lower() in {"civic", "civic_queue", "current_civic"}
-            for key in bundle.strategy_updates
-        )
-
-    @staticmethod
-    def _bundle_contains_opening_strategy_write(bundle: PlanBundle) -> bool:
-        opening_keys = {
-            "opening",
-            "opening_strategy",
-            "victory_focus",
-            "stage",
-            "expansion_target",
-            "military_posture",
-        }
-        return any(
-            str(key).strip().lower() in opening_keys for key in bundle.strategy_updates
-        )
-
-    @staticmethod
-    def _bundle_contains_settler_write(bundle: PlanBundle) -> bool:
-        if any(
-            task.action_type in {"unit_move", "unit_found_city"}
-            for task in bundle.tasks
-        ):
-            return True
-        return any(
-            isinstance(update, dict)
-            and str(update.get("goal", "")).strip().lower() == "found_city"
-            for update in bundle.unit_plan_updates
-        )
-
-    @staticmethod
-    def _bundle_contains_city_roles_write(bundle: PlanBundle) -> bool:
-        return bool(bundle.city_plan_updates) or any(
-            task.action_type == "city_set_production" for task in bundle.tasks
-        )
-
-    @staticmethod
-    def _bundle_contains_tactical_emergency_write(bundle: PlanBundle) -> bool:
-        return any(
-            task.action_type
-            in {
-                "tactical_unit_move",
-                "tactical_unit_fortify",
-                "tactical_unit_skip",
-            }
-            for task in bundle.tasks
-        )
-
-    @classmethod
     def _validate_research_task_authority_in_connection(
         cls,
         conn: sqlite3.Connection,
@@ -10633,384 +10438,6 @@ class WorkflowStore:
         ):
             raise ValueError("task provenance does not match active Contract/Mission")
         return task
-
-    def save_authoritative_research_plan_bundle(
-        self,
-        game_id: str,
-        turn: int,
-        bundle: PlanBundle,
-        *,
-        mode: ExecutionMode,
-        auto_action_types: set[str],
-        observation_id: str,
-    ) -> None:
-        raise ValueError("StoredTask research projection is closed")
-        self._require_phase1c_dormant_activation()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if (
-                conn.execute(
-                    "SELECT 1 FROM active_turn_action_graphs WHERE game_id=?",
-                    (game_id,),
-                ).fetchone()
-                is not None
-            ):
-                raise ValueError(
-                    "StoredTask research projection is closed after graph activation"
-                )
-            active = self._active_research_mission_in_connection(conn, game_id)
-            if active is None:
-                raise ValueError("research authority is not active")
-            contract, mission = active
-            if (
-                bundle.strategy_updates
-                or bundle.city_plan_updates
-                or bundle.unit_plan_updates
-                or bundle.builder_plan_updates
-                or bundle.cancel_task_ids
-                or not bundle.tasks
-            ):
-                raise ValueError(
-                    "authoritative research projection accepts only research tasks"
-                )
-            desired = thaw_json(mission.desired_outcome)
-            for task in bundle.tasks:
-                if (
-                    task.action_type != research_mission_action(mission)
-                    or task.arguments.get("tech_or_civic") != desired["technology"]
-                ):
-                    raise ValueError(
-                        "authoritative research projection must match set_research Mission"
-                    )
-                existing = conn.execute(
-                    "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
-                    (game_id, task.task_id),
-                ).fetchone()
-                if existing is not None:
-                    stored = self._row_to_task(existing)
-                    if (
-                        stored.source_contract_id != contract.contract_id
-                        or stored.source_contract_revision != contract.revision
-                        or stored.source_mission_id != mission.mission_id
-                        or stored.source_mission_revision != mission.mission_revision
-                    ):
-                        raise ValueError(
-                            "authoritative research task identity has stale provenance"
-                        )
-            self._save_plan_bundle_in_connection(
-                conn,
-                game_id,
-                turn,
-                bundle,
-                mode=mode,
-                auto_action_types=(
-                    set(auto_action_types) if mode is ExecutionMode.AUTO else set()
-                ),
-                observation_id=observation_id,
-                source_contract_id=contract.contract_id,
-                source_contract_revision=contract.revision,
-                source_mission_id=mission.mission_id,
-                source_mission_revision=mission.mission_revision,
-            )
-            self._validate_phase1b_proposals_v10(conn)
-            self._validate_phase3_v13(conn)
-
-    def save_plan_bundle(
-        self,
-        game_id: str,
-        turn: int,
-        bundle: PlanBundle,
-        *,
-        mode: ExecutionMode,
-        auto_action_types: set[str],
-        observation_id: str | None = None,
-    ) -> None:
-        raise ValueError("legacy PlanBundle writes are retired")
-
-        self._reject_task_id_reuse(game_id, bundle)
-        effective_auto_actions = (
-            set(auto_action_types) if mode is ExecutionMode.AUTO else set()
-        )
-        with self._connect() as conn:
-            self._save_plan_bundle_in_connection(
-                conn,
-                game_id,
-                turn,
-                bundle,
-                mode=mode,
-                auto_action_types=effective_auto_actions,
-                observation_id=observation_id,
-            )
-
-    def _reject_task_id_reuse(self, game_id: str, bundle: PlanBundle) -> None:
-        if not bundle.tasks:
-            return
-        with self._connect() as conn:
-            for proposed in bundle.tasks:
-                row = conn.execute(
-                    "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
-                    (game_id, proposed.task_id),
-                ).fetchone()
-                if row is None:
-                    continue
-                existing = {
-                    "action_type": row["action_type"],
-                    "entity_type": row["entity_type"],
-                    "entity_id": str(row["entity_id"]),
-                    "due_turn": int(row["due_turn"]),
-                    "expires_turn": row["expires_turn"],
-                    "arguments": self._load(row["arguments_json"]),
-                    "preconditions": self._load(row["preconditions_json"]),
-                    "postconditions": self._load(row["postconditions_json"]),
-                    "invalidators": self._load(row["invalidators_json"]),
-                    "risk": row["risk"],
-                    "requires_confirmation": bool(row["requires_confirmation"]),
-                }
-                incoming: dict[str, Any] = {
-                    "action_type": proposed.action_type,
-                    "entity_type": proposed.entity_type,
-                    "entity_id": str(proposed.entity_id),
-                    "due_turn": proposed.due_turn,
-                    "expires_turn": proposed.expires_turn,
-                    "arguments": proposed.arguments,
-                    "preconditions": proposed.preconditions,
-                    "postconditions": proposed.postconditions,
-                    "invalidators": proposed.invalidators,
-                    "risk": proposed.risk.value,
-                    "requires_confirmation": proposed.requires_confirmation,
-                }
-                if existing != incoming:
-                    raise TaskIdentityConflictError(
-                        f"task_id {proposed.task_id!r} already exists with different "
-                        "action semantics; create a new stable task_id instead"
-                    )
-
-    def _save_plan_bundle_in_connection(
-        self,
-        conn: sqlite3.Connection,
-        game_id: str,
-        turn: int,
-        bundle: PlanBundle,
-        *,
-        mode: ExecutionMode,
-        auto_action_types: set[str],
-        observation_id: str | None = None,
-        source_contract_id: str | None = None,
-        source_contract_revision: int | None = None,
-        source_mission_id: str | None = None,
-        source_mission_revision: int | None = None,
-    ) -> None:
-        provenance = (
-            source_contract_id,
-            source_contract_revision,
-            source_mission_id,
-            source_mission_revision,
-        )
-        if any(value is not None for value in provenance) and not all(
-            value is not None for value in provenance
-        ):
-            raise ValueError("task Contract/Mission provenance must be complete")
-        active = self._active_scope_missions_in_connection(conn, game_id)
-        if active is not None and source_contract_id is None:
-            owned_scopes = set(active[0].authority_scope_set.mission_graph_scopes)
-            if "research" in owned_scopes and self._bundle_contains_research_write(
-                bundle
-            ):
-                raise ValueError(
-                    "legacy research plan writes are closed after authority cutover"
-                )
-            if "civic" in owned_scopes and self._bundle_contains_civic_write(bundle):
-                raise ValueError(
-                    "legacy civic plan writes are closed after authority cutover"
-                )
-            if (
-                "opening_strategy" in owned_scopes
-                and self._bundle_contains_opening_strategy_write(bundle)
-            ):
-                raise ValueError(
-                    "legacy opening strategy writes are closed after authority cutover"
-                )
-            if "settler" in owned_scopes and self._bundle_contains_settler_write(
-                bundle
-            ):
-                raise ValueError(
-                    "legacy settler plan writes are closed after authority cutover"
-                )
-            if "city_roles" in owned_scopes and self._bundle_contains_city_roles_write(
-                bundle
-            ):
-                raise ValueError(
-                    "legacy city roles plan writes are closed after authority cutover"
-                )
-            if (
-                "tactical_emergency" in owned_scopes
-                and self._bundle_contains_tactical_emergency_write(bundle)
-            ):
-                raise ValueError(
-                    "legacy tactical/emergency plan writes are closed after "
-                    "authority cutover"
-                )
-            if "opening_strategy" in owned_scopes and bundle.tasks:
-                incoming_task_ids = {task.task_id for task in bundle.tasks}
-                lease_rows = conn.execute(
-                    "SELECT lease_json FROM plan_leases WHERE game_id=?",
-                    (game_id,),
-                ).fetchall()
-                protected_task_ids = {
-                    task_id
-                    for row in lease_rows
-                    for lease in (
-                        PlanLease.model_validate_json(str(row["lease_json"])),
-                    )
-                    if self._plan_lease_targets_scope_in_connection(
-                        conn, lease, "opening_strategy"
-                    )
-                    for task_id in lease.task_ids
-                }
-                if incoming_task_ids.intersection(protected_task_ids):
-                    raise ValueError(
-                        "legacy opening strategy task identities cannot be revived"
-                    )
-        created_from_observation_id = (
-            observation_id or f"legacy:{game_id}:{turn}:{bundle.plan_id}"
-        )
-        if bundle.strategy_updates:
-            current = conn.execute(
-                "SELECT state_json FROM strategy_state WHERE game_id=?", (game_id,)
-            ).fetchone()
-            merged = {} if current is None else self._load(current["state_json"])
-            merged.update(bundle.strategy_updates)
-            conn.execute(
-                """
-                INSERT INTO strategy_state(game_id, state_json, plan_id, updated_turn)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(game_id) DO UPDATE SET
-                    state_json=excluded.state_json,
-                    plan_id=excluded.plan_id,
-                    updated_turn=excluded.updated_turn,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (game_id, self._dump(merged), bundle.plan_id, turn),
-            )
-
-        self._upsert_entity_plans(
-            conn,
-            "city_plans",
-            "city_id",
-            game_id,
-            bundle.plan_id,
-            turn,
-            bundle.city_plan_updates,
-        )
-        self._upsert_entity_plans(
-            conn,
-            "unit_plans",
-            "unit_id",
-            game_id,
-            bundle.plan_id,
-            turn,
-            bundle.unit_plan_updates,
-        )
-        self._upsert_entity_plans(
-            conn,
-            "builder_plans",
-            "builder_key",
-            game_id,
-            bundle.plan_id,
-            turn,
-            bundle.builder_plan_updates,
-        )
-
-        for task_id in bundle.cancel_task_ids:
-            conn.execute(
-                """
-                UPDATE workflow_tasks SET status=?, updated_at=CURRENT_TIMESTAMP
-                WHERE game_id=? AND task_id=? AND status NOT IN (?, ?)
-                """,
-                (
-                    TaskStatus.CANCELLED.value,
-                    game_id,
-                    task_id,
-                    TaskStatus.DONE.value,
-                    TaskStatus.CANCELLED.value,
-                ),
-            )
-
-        for proposed in bundle.tasks:
-            if mode is ExecutionMode.READONLY:
-                status = TaskStatus.AWAITING_CONFIRMATION
-            elif (
-                proposed.requires_confirmation
-                or proposed.action_type not in auto_action_types
-            ):
-                status = TaskStatus.AWAITING_CONFIRMATION
-            elif proposed.due_turn <= turn:
-                status = TaskStatus.READY
-            else:
-                status = TaskStatus.PENDING
-
-            conn.execute(
-                """
-                INSERT INTO workflow_tasks(
-                    game_id, task_id, plan_id, action_type, entity_type,
-                    entity_id, due_turn, expires_turn, arguments_json,
-                    preconditions_json, postconditions_json, invalidators_json,
-                    risk, requires_confirmation, reason, status, created_turn,
-                    created_from_observation_id, source_contract_id,
-                    source_contract_revision, source_mission_id,
-                    source_mission_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(game_id, task_id) DO UPDATE SET
-                    plan_id=excluded.plan_id,
-                    action_type=excluded.action_type,
-                    entity_type=excluded.entity_type,
-                    entity_id=excluded.entity_id,
-                    due_turn=excluded.due_turn,
-                    expires_turn=excluded.expires_turn,
-                    arguments_json=excluded.arguments_json,
-                    preconditions_json=excluded.preconditions_json,
-                    postconditions_json=excluded.postconditions_json,
-                    invalidators_json=excluded.invalidators_json,
-                    risk=excluded.risk,
-                    requires_confirmation=excluded.requires_confirmation,
-                    source_contract_id=excluded.source_contract_id,
-                    source_contract_revision=excluded.source_contract_revision,
-                    source_mission_id=excluded.source_mission_id,
-                    source_mission_revision=excluded.source_mission_revision,
-                    reason=excluded.reason,
-                    status=CASE
-                        WHEN workflow_tasks.status IN (
-                            'done', 'failed', 'escalated'
-                        ) THEN workflow_tasks.status
-                        ELSE excluded.status
-                    END,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (
-                    game_id,
-                    proposed.task_id,
-                    bundle.plan_id,
-                    proposed.action_type,
-                    proposed.entity_type,
-                    str(proposed.entity_id),
-                    proposed.due_turn,
-                    proposed.expires_turn,
-                    self._dump(proposed.arguments),
-                    self._dump(proposed.preconditions),
-                    self._dump(proposed.postconditions),
-                    self._dump(proposed.invalidators),
-                    proposed.risk.value,
-                    int(proposed.requires_confirmation),
-                    proposed.reason,
-                    status.value,
-                    turn,
-                    created_from_observation_id,
-                    source_contract_id,
-                    source_contract_revision,
-                    source_mission_id,
-                    source_mission_revision,
-                ),
-            )
 
     def _upsert_entity_plans(
         self,
@@ -12811,10 +12238,6 @@ class WorkflowStore:
             ),
         )
 
-    def save_decision_gap(self, gap: DecisionGap, *, turn: int) -> None:
-        del gap, turn
-        raise ValueError("legacy DecisionGap writes are retired")
-
     def decision_gap_by_identity(
         self, game_id: str, stable_identity: str
     ) -> DecisionGap | None:
@@ -12933,43 +12356,6 @@ class WorkflowStore:
         )
 
     @classmethod
-    def _legacy_approval_targets_scope_in_connection(
-        cls,
-        conn: sqlite3.Connection,
-        game_id: str,
-        record: ApprovalRecord,
-        scope: str,
-    ) -> bool:
-        if record.proposal_type != "decision_gap":
-            return False
-        gap = conn.execute(
-            "SELECT scope, gap_type FROM decision_gaps "
-            "WHERE game_id=? AND decision_gap_id=?",
-            (game_id, record.proposal_id),
-        ).fetchone()
-        aliases = cls._scope_aliases(scope)
-        if gap is not None and any(
-            alias in token
-            for alias in aliases
-            for token in (
-                str(gap["scope"]).strip().lower(),
-                str(gap["gap_type"]).strip().lower(),
-            )
-        ):
-            return True
-        rows = conn.execute(
-            "SELECT lease_json FROM plan_leases WHERE game_id=?", (game_id,)
-        ).fetchall()
-        for row in rows:
-            lease = PlanLease.model_validate_json(row["lease_json"])
-            if (
-                record.proposal_id in lease.decision_gap_ids
-                and cls._plan_lease_targets_scope_in_connection(conn, lease, scope)
-            ):
-                return True
-        return False
-
-    @classmethod
     def _save_plan_lease_in_connection(
         cls, conn: sqlite3.Connection, lease: PlanLease
     ) -> None:
@@ -13019,58 +12405,14 @@ class WorkflowStore:
             ),
         )
 
-    def save_plan_lease(self, lease: PlanLease) -> None:
-        del lease
-        raise ValueError("legacy PlanLease writes are retired")
-
     def save_approval_record(self, game_id: str, record: ApprovalRecord) -> None:
+        del game_id
         if record.proposal_type == STRATEGIC_RESEARCH_PROPOSAL_TYPE:
             raise ValueError(
                 "Strategic Proposal Approval requires the Phase 1C aggregate "
                 "decision transaction"
             )
         raise ValueError("legacy ApprovalRecord writes are retired")
-        with self._connect() as conn:
-            active = self._active_scope_missions_in_connection(conn, game_id)
-            owned_scopes = (
-                set()
-                if active is None
-                else set(active[0].authority_scope_set.mission_graph_scopes)
-            )
-            for scope in owned_scopes.intersection(
-                {
-                    "research",
-                    "civic",
-                    "opening_strategy",
-                    "settler",
-                    "city_roles",
-                    "diplomacy_trade",
-                    "tactical_emergency",
-                }
-            ):
-                if self._legacy_approval_targets_scope_in_connection(
-                    conn, game_id, record, scope
-                ):
-                    raise ValueError(f"legacy {scope} approval writes are closed")
-            conn.execute(
-                """
-                INSERT INTO approval_records(
-                    approval_id, game_id, proposal_type, proposal_id,
-                    proposal_revision, decision, record_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(approval_id) DO NOTHING
-                """,
-                (
-                    record.approval_id,
-                    game_id,
-                    record.proposal_type,
-                    record.proposal_id,
-                    record.proposal_revision,
-                    record.decision.value,
-                    record.model_dump_json(),
-                    record.created_at.isoformat(),
-                ),
-            )
 
     def strategic_proposal_approval_record(
         self, game_id: str, proposal_id: str
@@ -14657,31 +13999,15 @@ class WorkflowStore:
         self,
         tick: WorkflowTick,
         *,
-        decision_gaps: Sequence[DecisionGap] = (),
-        decision_group: DecisionGroup | None = None,
-        plan_leases: Sequence[PlanLease] = (),
         planner_request: PlannerRequest | None = None,
         strategic_research_proposal: StrategicResearchProposal | None = None,
         provider_attempts: Sequence[ProviderAttempt] = (),
         information_round: InformationRound | None = None,
-        plan_bundle: PlanBundle | None = None,
-        plan_bundle_mode: ExecutionMode | None = None,
-        plan_bundle_auto_action_types: Sequence[str] = (),
-        plan_bundle_observation_id: str | None = None,
         active_attempt_id: str | None = None,
-        cancel_task_ids: Sequence[str] = (),
         human_wait_context: dict[str, Any] | None = None,
     ) -> None:
         tick = validate_workflow_tick(tick)
         self._reject_public_strategic_terminal_tick(tick)
-        if (
-            decision_gaps
-            or decision_group is not None
-            or plan_leases
-            or plan_bundle is not None
-            or cancel_task_ids
-        ):
-            raise ValueError("legacy Phase 4 aggregate writes are retired")
         if (
             planner_request is not None
             and planner_request.target.kind
@@ -14714,42 +14040,6 @@ class WorkflowStore:
                 provider_attempts,
                 information_round,
             )
-            if plan_bundle is not None:
-                if plan_bundle_mode is None:
-                    raise ValueError("plan bundle persistence requires execution mode")
-                self._save_plan_bundle_in_connection(
-                    conn,
-                    tick.game_session_id,
-                    tick.turn_number,
-                    plan_bundle,
-                    mode=plan_bundle_mode,
-                    auto_action_types=set(plan_bundle_auto_action_types),
-                    observation_id=plan_bundle_observation_id,
-                )
-            for gap in decision_gaps:
-                if gap.game_session_id != tick.game_session_id:
-                    raise ValueError("decision gap and Tick must belong to one game")
-                self._save_decision_gap_in_connection(conn, gap, tick.turn_number)
-            if decision_group is not None:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO decision_groups(
-                        decision_group_id, game_id, observation_id,
-                        decision_gap_ids_json, input_projection_hash,
-                        input_projection_version, group_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        decision_group.decision_group_id,
-                        decision_group.game_session_id,
-                        decision_group.observation_id,
-                        self._dump(list(decision_group.decision_gap_ids)),
-                        decision_group.input_projection_hash,
-                        decision_group.input_projection_version,
-                        decision_group.model_dump_json(),
-                        decision_group.created_at.isoformat(),
-                    ),
-                )
             for provider_attempt in provider_attempts:
                 self._save_provider_attempt_in_connection(
                     conn,
@@ -14770,34 +14060,6 @@ class WorkflowStore:
             if information_round is not None:
                 self._save_information_round_in_connection(
                     conn, tick.game_session_id, information_round
-                )
-            for lease in plan_leases:
-                if lease.game_session_id != tick.game_session_id:
-                    raise ValueError("plan lease and Tick must belong to one game")
-                self._save_plan_lease_in_connection(conn, lease)
-                if lease.status in {
-                    PlanLeaseStatus.COMPLETED,
-                    PlanLeaseStatus.EXPIRED,
-                    PlanLeaseStatus.INVALIDATED,
-                }:
-                    self._invalidate_plan_projection_in_connection(conn, lease)
-            for task_id in cancel_task_ids:
-                conn.execute(
-                    """
-                    UPDATE workflow_tasks
-                    SET status=?, last_error=?, updated_at=CURRENT_TIMESTAMP
-                    WHERE game_id=? AND task_id=?
-                      AND status IN (?, ?, ?)
-                    """,
-                    (
-                        TaskStatus.CANCELLED.value,
-                        "dependent plan lease is no longer executable",
-                        tick.game_session_id,
-                        task_id,
-                        TaskStatus.PENDING.value,
-                        TaskStatus.READY.value,
-                        TaskStatus.AWAITING_CONFIRMATION.value,
-                    ),
                 )
             human_wait_context = (
                 self._preserve_concurrent_strategic_resume_context_in_connection(
