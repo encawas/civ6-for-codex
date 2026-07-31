@@ -28,13 +28,16 @@ def test_planner_lifecycle_uses_a_narrow_runtime_service_container(tmp_path):
         game=game,
         planner=planner,
     )
-    services = composition.runtime.planner_lifecycle.runtime
+    coordinator = composition.runtime.strategic_workflow
+    services = coordinator.planner_lifecycle.runtime
 
     assert isinstance(services, PlannerLifecycleRuntime)
     assert services is not composition.runtime
     assert services.store is store
     assert services.game is game
     assert services.planner is planner
+    assert not hasattr(composition.runtime, "planner_lifecycle")
+    assert not hasattr(composition.runtime, "turn_compiler")
     for retired_name in (
         "_build_agent_request",
         "_validate_planner_bundle",
@@ -55,6 +58,9 @@ def test_planner_and_runtime_modules_have_one_way_dependencies():
     assert "from .store import" not in planner_source
     assert "from .store import" not in engine_source
     assert "from .mcp_port import" not in engine_source
+    assert ".compile_missions(" not in engine_source
+    assert ".activate_turn_action_graph(" not in engine_source
+    assert ".advance_mission_repair(" not in engine_source
 
 
 @pytest.mark.parametrize(

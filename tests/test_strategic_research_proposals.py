@@ -321,7 +321,7 @@ def test_creation_uses_isolated_lifecycle_and_persists_proposal(tmp_path):
             "_partition_bundle",
             "_resolve_gaps",
         ):
-            assert not hasattr(engine.planner_lifecycle, name)
+            assert not hasattr(engine.strategic_workflow.planner_lifecycle, name)
 
         result = await engine.tick()
 
@@ -2376,7 +2376,12 @@ def test_strategic_backoff_derives_failure_count_from_attempt_history(tmp_path):
             attempts[-1].provider_attempt_id
         )
         assert result.workflow_tick["provider_attempt_count"] == 2
-        assert engine.planner_lifecycle._active_backoff(stored)["failure_count"] == 2
+        assert (
+            engine.strategic_workflow.planner_lifecycle._active_backoff(stored)[
+                "failure_count"
+            ]
+            == 2
+        )
         assert stored.next_retry_at >= attempts[-1].completed_at + timedelta(seconds=9)
         _assert_replay_round_trip(tmp_path, store, "strategic-backoff-retry")
 
@@ -2439,7 +2444,9 @@ def test_strategic_backoff_is_atomic_durable_and_replay_stable(tmp_path):
         waiting_planner = _Planner()
         waiting_engine = _engine(restored, _Game(), waiting_planner)
         waiting_engine._now = lambda: stored.next_retry_at - timedelta(seconds=1)
-        backoff = waiting_engine.planner_lifecycle._active_backoff(restored_request)
+        backoff = waiting_engine.strategic_workflow.planner_lifecycle._active_backoff(
+            restored_request
+        )
         assert backoff["until"] == stored.next_retry_at.isoformat()
         waiting = await waiting_engine.tick()
         assert waiting.workflow_tick["outcome"] == TickOutcomeKind.PLANNER_BACKOFF

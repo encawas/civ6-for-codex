@@ -27,6 +27,7 @@ from .replay import (
 )
 from .state_api import Civ6StateApi
 from .store import WorkflowStore
+from .strategic_workflow import StrategicWorkflowCoordinator
 from .turn_compiler import TurnCompiler
 from .web_ui import ControlPanelHTTPServer, ControlPanelState
 from .workflow_queries import InformationQueryRouter
@@ -68,11 +69,28 @@ def build_runtime_services(runtime: WorkflowRuntime) -> RuntimeServices:
 
     conditions = ConditionEvaluator()
     information_queries = InformationQueryRouter(runtime.game)
+    planner_lifecycle = PlannerLifecycleCoordinator(
+        PlannerLifecycleRuntime(
+            store=runtime.store,
+            game=runtime.game,
+            planner=runtime.planner,
+            config=runtime.config,
+            conditions=conditions,
+            information_queries=information_queries,
+            now=lambda: runtime._now(),
+            monotonic=lambda: runtime._monotonic(),
+            checkpoint=lambda name: runtime._checkpoint(name),
+            observation_id=lambda: runtime._active_observation_id,
+            human_wait_context=lambda snapshot: runtime._human_wait_context(snapshot),
+        )
+    )
     return RuntimeServices(
         gate=EventGate(
             runtime.store,
             GateConfig(
-                default_cooldown_turns=max(0, int(runtime.config.default_cooldown_turns))
+                default_cooldown_turns=max(
+                    0, int(runtime.config.default_cooldown_turns)
+                )
             ),
         ),
         conditions=conditions,
@@ -85,24 +103,11 @@ def build_runtime_services(runtime: WorkflowRuntime) -> RuntimeServices:
             monotonic=lambda: runtime._monotonic(),
             checkpoint=lambda name: runtime._checkpoint(name),
         ),
-        turn_compiler=TurnCompiler(),
         information_queries=information_queries,
-        planner_lifecycle=PlannerLifecycleCoordinator(
-            PlannerLifecycleRuntime(
-                store=runtime.store,
-                game=runtime.game,
-                planner=runtime.planner,
-                config=runtime.config,
-                conditions=conditions,
-                information_queries=information_queries,
-                now=lambda: runtime._now(),
-                monotonic=lambda: runtime._monotonic(),
-                checkpoint=lambda name: runtime._checkpoint(name),
-                observation_id=lambda: runtime._active_observation_id,
-                human_wait_context=lambda snapshot: runtime._human_wait_context(
-                    snapshot
-                ),
-            )
+        strategic_workflow=StrategicWorkflowCoordinator(
+            store=runtime.store,
+            planner_lifecycle=planner_lifecycle,
+            turn_compiler=TurnCompiler(),
         ),
     )
 

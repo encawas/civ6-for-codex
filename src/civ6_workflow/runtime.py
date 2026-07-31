@@ -41,9 +41,7 @@ from .ports import (
 from .models import (
     EventLevel,
     ExecutionMode,
-    GameEvent,
     MutationDeliveryStatus,
-    RiskLevel,
     RuntimeSnapshot,
     TurnActionExecution,
     TaskStatus,
@@ -53,10 +51,9 @@ from .observation_normalization import (
     NormalizedRuntimeObservation,
     normalize_runtime_snapshot,
 )
-from .planner_lifecycle import PlannerLifecycleCoordinator
 from .recovery import recover_turn_rewind
 from .runtime_errors import FatalTickPersistenceError, InjectedCrashBoundary
-from .turn_compiler import TurnCompiler
+from .strategic_workflow import StrategicWorkflowCoordinator
 from .workflow_protocol import (
     WorkflowTickMetrics as TickMetrics,
 )
@@ -96,9 +93,8 @@ class RuntimeServices:
     gate: EventGate
     conditions: ConditionEvaluator
     batch_executor: BatchExecutor
-    turn_compiler: TurnCompiler
     information_queries: InformationQueryRouter
-    planner_lifecycle: PlannerLifecycleCoordinator
+    strategic_workflow: StrategicWorkflowCoordinator
 
 
 @dataclass(slots=True)
@@ -197,9 +193,8 @@ class WorkflowRuntime:
         self.gate = services.gate
         self.conditions = services.conditions
         self.batch_executor = services.batch_executor
-        self.turn_compiler = services.turn_compiler
         self.information_queries = services.information_queries
-        self.planner_lifecycle = services.planner_lifecycle
+        self.strategic_workflow = services.strategic_workflow
 
     def request_end_turn_retry(self, game_id: str, turn: int) -> None:
         """Persist explicit authorization to retry the latest rejected end turn."""
@@ -371,26 +366,9 @@ class WorkflowRuntime:
                     ),
                 )
             ctx.resuming_human_wait = True
-        active_execution = self.store.active_execution_missions(snapshot.game_id)
-        active_contract = self.store.get_active_strategic_contract(snapshot.game_id)
-        execution_missions = () if active_execution is None else active_execution[1]
-        if (
-            active_execution is not None
-            and active_contract is not None
-            and active_execution[0] != active_contract
-        ):
-            raise RuntimeError(
-                "execution Mission projection disagrees with active Contract"
-            )
-        owned_execution_scopes = (
-            set()
-            if active_contract is None
-            else set(active_contract.authority_scope_set.mission_graph_scopes)
-        )
         need_units = (
             observation.canonical.unit_summary.detail_required
-            or "settler" in owned_execution_scopes
-            or "tactical_emergency" in owned_execution_scopes
+            or self.strategic_workflow.requires_unit_details(snapshot.game_id)
         )
         if need_units and snapshot.units is None:
             raw = await self._read_snapshot(ctx.metrics, include_units=True)
@@ -400,197 +378,25 @@ class WorkflowRuntime:
             self._active_observation_id = observation_id
             ctx.observation_ids.append(observation_id)
 
-        mission_repair_tick = await self.planner_lifecycle.advance_mission_repair(
-            ctx, observation
+        projection = await self.strategic_workflow.prepare_projection(
+            ctx,
+            observation,
+            snapshot_events=tuple(events_from_snapshot(snapshot)),
+            mode=self.config.execution_mode,
+            auto_action_types=self.config.auto_action_types,
         )
-        if mission_repair_tick is not None:
-            return mission_repair_tick
-
-        authoritative_mission_events: list[GameEvent] = []
-        if active_contract is not None:
-            for mission in execution_missions:
-                scope = mission.scope
-                if scope in {"settler", "city_roles", "tactical_emergency"}:
-                    unavailable_target = self.turn_compiler.unavailable_target(
-                        observation.canonical, mission
-                    )
-                    if unavailable_target is None:
-                        continue
-                    authoritative_mission_events.append(
-                        GameEvent(
-                            event_type=f"{scope}_mission_target_unavailable",
-                            turn=snapshot.turn,
-                            entity_type=scope,
-                            entity_id=unavailable_target,
-                            level=EventLevel.L3,
-                            risk=RiskLevel.MEDIUM,
-                            blocking=True,
-                            payload={
-                                "contract_id": active_contract.contract_id,
-                                "contract_revision": active_contract.revision,
-                                "mission_id": mission.mission_id,
-                                "mission_revision": mission.mission_revision,
-                                "target": unavailable_target,
-                            },
-                            dedupe_key=(
-                                f"{scope}_mission_target_unavailable:"
-                                f"{active_contract.revision}:"
-                                f"{mission.mission_revision}:{unavailable_target}"
-                            ),
-                        )
-                    )
-                    continue
-                target_key = "technology" if scope == "research" else "civic"
-                available_ids = (
-                    observation.canonical.progression.available_research_ids
-                    if scope == "research"
-                    else observation.canonical.progression.available_civic_ids
-                )
-                unavailable_target = self.turn_compiler.unavailable_target(
-                    observation.canonical, mission
-                )
-                if unavailable_target is None:
-                    continue
-                available = sorted(item.value for item in available_ids)
-                authoritative_mission_events.append(
-                    GameEvent(
-                        event_type=f"{scope}_mission_target_unavailable",
-                        turn=snapshot.turn,
-                        entity_type=scope,
-                        entity_id=unavailable_target,
-                        level=EventLevel.L3,
-                        risk=RiskLevel.MEDIUM,
-                        blocking=True,
-                        payload={
-                            "contract_id": active_contract.contract_id,
-                            "contract_revision": active_contract.revision,
-                            "mission_id": mission.mission_id,
-                            "mission_revision": mission.mission_revision,
-                            target_key: unavailable_target,
-                            "available": available,
-                        },
-                        dedupe_key=(
-                            f"{scope}_mission_target_unavailable:"
-                            f"{active_contract.revision}:{mission.mission_revision}:"
-                            f"{unavailable_target}"
-                        ),
-                    )
-                )
-        existing_graph_state = self.store.active_turn_action_graph(snapshot.game_id)
-        reusable_graph = (
-            active_contract is not None
-            and bool(execution_missions)
-            and existing_graph_state is not None
-            and existing_graph_state[0].turn_number == snapshot.turn
-            and existing_graph_state[0].source_observation_projection_hash
-            == observation.canonical.projection_hash
-            and existing_graph_state[0].source_contract_id
-            == active_contract.contract_id
-            and existing_graph_state[0].source_contract_revision
-            == active_contract.revision
-        )
-        turn_compilation = (
-            None
-            if active_contract is None or not execution_missions or reusable_graph
-            else self.turn_compiler.compile_missions(
-                observation.canonical,
-                active_contract,
-                execution_missions,
-                mode=self.config.execution_mode,
-                auto_action_types=self.config.auto_action_types,
-                compiled_at=observation.canonical.observed_at,
+        if projection.lifecycle_tick is not None:
+            return projection.lifecycle_tick
+        if projection.human_wait_reason is not None:
+            gate = self.gate.ingest(
+                snapshot.game_id, list(projection.human_wait_events)
             )
-        )
-        snapshot_events = events_from_snapshot(snapshot)
-        current_events = [
-            *authoritative_mission_events,
-            *snapshot_events,
-        ]
-        diplomacy_trade_human_events = [
-            event
-            for event in current_events
-            if event.event_type
-            in {"pending_diplomacy", "pending_trade_offer", "war_posture_required"}
-        ]
-        tactical_unavailable_events = [
-            event
-            for event in authoritative_mission_events
-            if event.event_type == "tactical_emergency_mission_target_unavailable"
-        ]
-        if "city_roles" in owned_execution_scopes:
-            current_events = [
-                event
-                for event in current_events
-                if event.event_type
-                not in {"city_role_required", "invalid_city_plan_item"}
-            ]
-        if "settler" in owned_execution_scopes:
-            current_events = [
-                event
-                for event in current_events
-                if event.event_type != "settler_site_selection_required"
-            ]
-        if "diplomacy_trade" in owned_execution_scopes:
-            current_events = [
-                event
-                for event in current_events
-                if event.event_type
-                not in {
-                    "pending_diplomacy",
-                    "pending_trade_offer",
-                    "war_posture_required",
-                }
-            ]
-        if "tactical_emergency" in owned_execution_scopes:
-            current_events = [
-                event
-                for event in current_events
-                if event.event_type
-                not in {
-                    "tactical_attack_opportunity",
-                    "emergency_defense_required",
-                    "emergency_response_window",
-                    "tactical_emergency_mission_target_unavailable",
-                }
-            ]
-        if turn_compilation is not None:
-            self.store.activate_turn_action_graph(
-                turn_compilation.graph,
-                turn_compilation.nodes,
-                activated_at=observation.canonical.observed_at,
-            )
-        if "diplomacy_trade" in owned_execution_scopes and diplomacy_trade_human_events:
-            gate = self.gate.ingest(snapshot.game_id, diplomacy_trade_human_events)
             human_wait = TickResult(
                 turn=snapshot.turn,
                 metrics=ctx.metrics,
                 events=gate.emitted,
                 paused=True,
-                pause_reason=(
-                    "Diplomacy and trade responses require explicit human review."
-                ),
-            )
-            return self._finish(
-                ctx,
-                snapshot,
-                AwaitingHumanTick,
-                compatibility=human_wait,
-                blocking_reason=human_wait.pause_reason,
-            )
-        if (
-            "tactical_emergency" in owned_execution_scopes
-            and tactical_unavailable_events
-        ):
-            gate = self.gate.ingest(snapshot.game_id, tactical_unavailable_events)
-            human_wait = TickResult(
-                turn=snapshot.turn,
-                metrics=ctx.metrics,
-                events=gate.emitted,
-                paused=True,
-                pause_reason=(
-                    "The active tactical/emergency Mission is no longer safely "
-                    "executable and requires explicit human review."
-                ),
+                pause_reason=projection.human_wait_reason,
             )
             return self._finish(
                 ctx,
@@ -633,37 +439,7 @@ class WorkflowRuntime:
 
         rewind_event = recover_turn_rewind(self.store, snapshot)
         events = [] if rewind_event is None else [rewind_event]
-        events.extend(authoritative_mission_events)
-        events.extend(snapshot_events)
-        if "diplomacy_trade" in owned_execution_scopes:
-            events = [
-                event
-                for event in events
-                if event.event_type
-                not in {
-                    "pending_diplomacy",
-                    "pending_trade_offer",
-                    "war_posture_required",
-                }
-            ]
-        if "tactical_emergency" in owned_execution_scopes:
-            events = [
-                event
-                for event in events
-                if event.event_type
-                not in {
-                    "tactical_attack_opportunity",
-                    "emergency_defense_required",
-                    "emergency_response_window",
-                    "tactical_emergency_mission_target_unavailable",
-                }
-            ]
-        if "settler" in owned_execution_scopes:
-            events = [
-                event
-                for event in events
-                if event.event_type != "settler_site_selection_required"
-            ]
+        events.extend(projection.current_events)
         gate = self.gate.ingest(snapshot.game_id, events)
         compat = TickResult(
             turn=snapshot.turn, metrics=ctx.metrics, events=gate.emitted
@@ -674,7 +450,7 @@ class WorkflowRuntime:
             for event in gate.by_level[EventLevel.L2]
             if event.blocking and event not in agent_events
         )
-        agent_events, planning_tick = await self._advance_decision_runtime(
+        agent_events, planning_tick = await self.strategic_workflow.advance_planning(
             ctx,
             observation,
             agent_events,
@@ -1011,22 +787,6 @@ class WorkflowRuntime:
         if self.clock is not None:
             return float(self.clock.monotonic())
         return time.perf_counter()
-
-    async def _advance_decision_runtime(
-        self,
-        ctx,
-        observation,
-        agent_events,
-        compatibility,
-        current_events=None,
-    ):
-        return await self.planner_lifecycle.advance(
-            ctx,
-            observation,
-            agent_events,
-            compatibility,
-            current_events=current_events,
-        )
 
     @staticmethod
     def _normalize_snapshot(
