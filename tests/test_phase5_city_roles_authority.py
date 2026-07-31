@@ -42,7 +42,6 @@ from civ6_workflow.models import (
     RuntimeSnapshot,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
-from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.turn_compiler import TurnCompiler
 
@@ -315,135 +314,6 @@ def _finalize(store, task, observation_id: str, suffix: str):
     return succeeded, tick
 
 
-def test_city_roles_cutover_disposes_legacy_state_and_is_replay_stable(tmp_path):
-    store = WorkflowStore(tmp_path / "source.sqlite3")
-    base = _foundation(store)
-    observation = _observation("obs-activation")
-    store.save_normalized_observation(observation)
-    gap = _legacy_gap()
-    store.save_decision_gap(gap, turn=12)
-    store.save_plan_lease(_legacy_lease(gap))
-    store.save_plan_bundle(
-        GAME_ID,
-        12,
-        _legacy_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"city_set_production"},
-        observation_id=observation.observation_id,
-    )
-
-    contract, tick = store.activate_city_roles_authority(
-        game_session_id=GAME_ID,
-        expected_base_revision=base.revision,
-        mission=_mission(base.contract_id),
-        activation_id="activate-with-legacy-city-state",
-        observation_id=observation.observation_id,
-        turn_number=observation.turn_number,
-        activated_at=NOW + timedelta(minutes=1),
-    )
-
-    assert contract.authority_scope_set.mission_graph_scopes == ("city_roles",)
-    assert store.get_decision_gap(GAME_ID, gap.decision_gap_id).status is (
-        DecisionGapStatus.SUPERSEDED
-    )
-    assert store.get_task(GAME_ID, "legacy-city-task").status.value == "cancelled"
-    assert {
-        (item.object_kind, item.object_id, item.final_status)
-        for item in tick.legacy_dispositions
-    } == {
-        ("decision_gap", gap.decision_gap_id, "SUPERSEDED"),
-        ("plan_lease", "legacy-city-lease", "INVALIDATED"),
-        ("stored_task", "legacy-city-task", "cancelled"),
-    }
-    replay = store.export_replay_state(GAME_ID)
-    restored = WorkflowStore(tmp_path / "restored.sqlite3")
-    restored.import_replay_state(replay)
-    assert restored.export_replay_state(GAME_ID) == replay
-
-
-def test_city_roles_closes_legacy_writes_but_not_settler(tmp_path):
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    base = _foundation(store)
-    observation = _observation("obs-activation")
-    _activate(store, base, observation)
-
-    with pytest.raises(ValueError, match="legacy city roles plan writes"):
-        store.save_plan_bundle(
-            GAME_ID,
-            12,
-            _legacy_bundle(),
-            mode=ExecutionMode.AUTO,
-            auto_action_types={"city_set_production"},
-            observation_id=observation.observation_id,
-        )
-    store.save_plan_bundle(
-        GAME_ID,
-        12,
-        PlanBundle(
-            plan_id="unrelated-unit-plan",
-            summary="settler remains independently owned",
-            unit_plan_updates=[
-                {
-                    "unit_id": 99,
-                    "goal": "found_city",
-                    "target": {"x": 5, "y": 5},
-                }
-            ],
-        ),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"unit_move"},
-        observation_id=observation.observation_id,
-    )
-
-
-def test_unresolved_legacy_city_attempt_blocks_cutover(tmp_path):
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    base = _foundation(store)
-    observation = _observation("obs-activation")
-    store.save_normalized_observation(observation)
-    store.save_plan_bundle(
-        GAME_ID,
-        12,
-        _legacy_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"city_set_production"},
-        observation_id=observation.observation_id,
-    )
-    task = store.get_task(GAME_ID, "legacy-city-task")
-    spec = resolve_action_spec(task.action_type)
-    store.save_action_attempt(
-        ActionAttempt(
-            action_attempt_id="legacy-city-attempt",
-            game_session_id=GAME_ID,
-            task_id=task.task_id,
-            action_type=task.action_type,
-            attempt_number=1,
-            request_id="legacy-city-request",
-            idempotency_key="legacy-city-attempt",
-            prepared_from_observation_id=observation.observation_id,
-            prepared_at=NOW,
-            status=AttemptStatus.PREPARED,
-            retry_classification=spec.retry_classification,
-            normalized_arguments=spec.build_arguments(task),
-            postconditions=tuple(task.postconditions),
-        )
-    )
-    before = store.export_replay_state(GAME_ID)
-
-    with pytest.raises(ValueError, match="unresolved legacy execution"):
-        store.activate_city_roles_authority(
-            game_session_id=GAME_ID,
-            expected_base_revision=base.revision,
-            mission=_mission(base.contract_id),
-            activation_id="blocked-city-activation",
-            observation_id=observation.observation_id,
-            turn_number=observation.turn_number,
-            activated_at=NOW + timedelta(minutes=1),
-        )
-
-    assert store.export_replay_state(GAME_ID) == before
-
-
 def test_city_role_actions_consume_queue_via_contract_revisions(tmp_path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     base = _foundation(store)
@@ -530,50 +400,6 @@ def test_city_role_actions_consume_queue_via_contract_revisions(tmp_path):
     with pytest.raises(ValueError, match="unrelated strategy facts"):
         target.import_replay_state(tampered)
     assert target.export_replay_state(GAME_ID) == before_import
-
-
-def test_legacy_rule_compiler_emits_no_city_work_after_cutover(tmp_path):
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    base = _foundation(store)
-    observation = _observation("obs-activation")
-    store.save_normalized_observation(observation)
-    store.save_plan_bundle(
-        GAME_ID,
-        12,
-        PlanBundle(
-            plan_id="historical-city-plan",
-            summary="historical city context",
-            city_plan_updates=[
-                {
-                    "city_id": CITY_ID,
-                    "role": "production",
-                    "followup_queue": ["BUILDING_MONUMENT"],
-                }
-            ],
-        ),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"city_set_production"},
-        observation_id=observation.observation_id,
-    )
-    _activate(store, base, observation)
-    normalized = normalize_runtime_snapshot(
-        RuntimeSnapshot(
-            game_id=GAME_ID,
-            turn=12,
-            cities=[
-                {
-                    "city_id": CITY_ID,
-                    "owner": "player-1",
-                    "production": None,
-                }
-            ],
-        )
-    )
-
-    compiled = DeterministicRuleCompiler(store).compile(normalized)
-
-    assert compiled.bundle is None
-    assert not any("city" in event.event_type for event in compiled.events)
 
 
 def test_city_roles_activation_requires_same_owner_and_rolls_back(tmp_path):

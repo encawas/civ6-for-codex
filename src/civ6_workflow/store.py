@@ -148,6 +148,20 @@ CREATE TABLE IF NOT EXISTS workflow_meta (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS legacy_workflow_archive (
+    archive_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL,
+    source_table TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    record_hash TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    UNIQUE (source_table, source_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_legacy_workflow_archive_game
+ON legacy_workflow_archive (game_id, source_table, source_key);
+
 CREATE TABLE IF NOT EXISTS strategic_contract_roots (
     game_id TEXT PRIMARY KEY,
     contract_id TEXT NOT NULL UNIQUE,
@@ -672,6 +686,35 @@ CREATE TABLE IF NOT EXISTS turn_action_legacy_dispositions (
 """
 
 REPLAY_STATE_TABLES = (
+    "legacy_workflow_archive",
+    "strategic_contract_roots",
+    "strategic_contract_revisions",
+    "strategic_contract_commits",
+    "normalized_observations",
+    "turn_action_graphs",
+    "turn_action_nodes",
+    "active_turn_action_graphs",
+    "turn_action_legacy_dispositions",
+    "observation_baseline_acceptances",
+    "state_deltas",
+    "event_log",
+    "approval_records",
+    "logical_planner_requests",
+    "provider_attempts",
+    "strategic_research_proposals",
+    "information_rounds",
+    "mission_graph_patches",
+    "agent_runs",
+    "turn_metrics",
+    "unit_observations",
+    "action_attempts",
+    "action_attempt_transitions",
+    "runtime_state",
+    "workflow_ticks",
+    "strategic_proposal_wait_resume_requests",
+)
+
+PHASE5_REPLAY_STATE_TABLES = (
     "strategic_contract_roots",
     "strategic_contract_revisions",
     "strategic_contract_commits",
@@ -708,8 +751,34 @@ REPLAY_STATE_TABLES = (
     "strategic_proposal_wait_resume_requests",
 )
 
+PHASE6_DROPPED_REPLAY_TABLES = frozenset(
+    {
+        "strategy_state",
+        "city_plans",
+        "unit_plans",
+        "builder_plans",
+        "workflow_tasks",
+        "decision_gaps",
+        "decision_groups",
+        "plan_leases",
+        "planner_suppressions",
+    }
+)
+
 
 class WorkflowStore:
+    _MAX_SCHEMA_VERSION = 14
+    _LEGACY_AUTHORITY_TABLES = (
+        "strategy_state",
+        "city_plans",
+        "unit_plans",
+        "builder_plans",
+        "workflow_tasks",
+        "decision_gaps",
+        "decision_groups",
+        "plan_leases",
+        "planner_suppressions",
+    )
     _PATCH_COMMIT_FIELDS = (
         "source_patch_id",
         "source_state_delta_id",
@@ -743,13 +812,16 @@ class WorkflowStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > 13:
+            if version > self._MAX_SCHEMA_VERSION:
                 raise ValueError(
                     f"unsupported workflow database version {version}; "
-                    "maximum supported version is 13"
+                    f"maximum supported version is {self._MAX_SCHEMA_VERSION}"
                 )
-            conn.executescript(SCHEMA)
-            self._migrate(conn)
+            if version < self._MAX_SCHEMA_VERSION:
+                conn.executescript(SCHEMA)
+                self._migrate(conn)
+            else:
+                self._validate_phase6_v14(conn)
             if self._phase1c_decisions_enabled:
                 conn.commit()
                 conn.execute("BEGIN IMMEDIATE")
@@ -954,10 +1026,11 @@ class WorkflowStore:
         )
         WorkflowStore._repair_terminal_attempt_audits(conn)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > 13:
+        if version > WorkflowStore._MAX_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported workflow database version {version}; "
-                "maximum supported version is 13"
+                "maximum supported version is "
+                f"{WorkflowStore._MAX_SCHEMA_VERSION}"
             )
         upgraded_from_pre_v7 = version < 7
         if upgraded_from_pre_v7:
@@ -1018,6 +1091,13 @@ class WorkflowStore:
         else:
             WorkflowStore._validate_phase3_v13(conn)
 
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < 14:
+            WorkflowStore._migrate_phase6_v14(conn)
+            conn.execute("PRAGMA user_version=14")
+        else:
+            WorkflowStore._validate_phase6_v14(conn)
+
     @classmethod
     def _migrate_phase1b_v9(cls, conn: sqlite3.Connection) -> None:
         """Add the empty Contract aggregate tables without changing legacy authority."""
@@ -1034,6 +1114,319 @@ class WorkflowStore:
     def _migrate_phase3_v13(cls, conn: sqlite3.Connection) -> None:
         """Add empty TurnActionGraph execution authority tables."""
 
+        cls._validate_phase3_v13(conn)
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            is not None
+        )
+
+    @classmethod
+    def _optional_table_rows(
+        cls,
+        conn: sqlite3.Connection,
+        table: str,
+        *,
+        order_by: str,
+    ) -> list[dict[str, Any]]:
+        if not cls._table_exists(conn, table):
+            return []
+        return [
+            dict(row)
+            for row in conn.execute(
+                f"SELECT * FROM {table} ORDER BY {order_by}"
+            ).fetchall()
+        ]
+
+    @classmethod
+    def _archive_legacy_rows(
+        cls,
+        conn: sqlite3.Connection,
+        table: str,
+        key_columns: Sequence[str],
+        *,
+        where: str = "",
+        values: Sequence[Any] = (),
+    ) -> None:
+        if not cls._table_exists(conn, table):
+            return
+        rows = conn.execute(
+            f"SELECT * FROM {table}" + (f" WHERE {where}" if where else ""),
+            tuple(values),
+        ).fetchall()
+        for source in rows:
+            row = dict(source)
+            game_id = str(row.get("game_id") or "")
+            if not game_id:
+                raise ValueError(f"legacy {table} row has no game_id")
+            source_key = canonical_json([row.get(column) for column in key_columns])
+            record_json = canonical_json(row)
+            record_hash = hashlib.sha256(record_json.encode("utf-8")).hexdigest()
+            archive_id = hashlib.sha256(
+                f"{table}:{source_key}".encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO legacy_workflow_archive(
+                    archive_id, game_id, source_table, source_key,
+                    record_json, record_hash, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_table, source_key) DO NOTHING
+                """,
+                (
+                    f"legacy_{archive_id}",
+                    game_id,
+                    table,
+                    source_key,
+                    record_json,
+                    record_hash,
+                    "1970-01-01T00:00:00+00:00",
+                ),
+            )
+
+    @staticmethod
+    def _legacy_archive_records_in_connection(
+        conn: sqlite3.Connection,
+        game_id: str,
+        source_table: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            json.loads(str(row["record_json"]))
+            for row in conn.execute(
+                """
+                SELECT record_json FROM legacy_workflow_archive
+                WHERE game_id=? AND source_table=?
+                ORDER BY source_key
+                """,
+                (game_id, source_table),
+            ).fetchall()
+        ]
+
+    @classmethod
+    def _validate_phase6_migration_preconditions(cls, conn: sqlite3.Connection) -> None:
+        if conn.execute(
+            """
+            SELECT 1 FROM workflow_tasks
+            WHERE status NOT IN (?, ?, ?)
+            LIMIT 1
+            """,
+            (
+                TaskStatus.DONE.value,
+                TaskStatus.CANCELLED.value,
+                TaskStatus.EXPIRED.value,
+            ),
+        ).fetchone():
+            raise ValueError(
+                "Phase 6 migration requires every legacy StoredTask to be terminal"
+            )
+        if conn.execute(
+            """
+            SELECT 1 FROM action_attempts AS attempts
+            JOIN workflow_tasks AS tasks
+              ON tasks.game_id=attempts.game_id AND tasks.task_id=attempts.task_id
+            WHERE attempts.status IN (?, ?, ?)
+            LIMIT 1
+            """,
+            (
+                AttemptStatus.PREPARED.value,
+                AttemptStatus.VERIFYING.value,
+                AttemptStatus.UNCERTAIN.value,
+            ),
+        ).fetchone():
+            raise ValueError(
+                "Phase 6 migration cannot archive unresolved legacy execution"
+            )
+        terminal_gaps = tuple(
+            status.value
+            for status in (
+                DecisionGapStatus.RULE_RESOLVED,
+                DecisionGapStatus.PLAN_COVERED,
+                DecisionGapStatus.RESOLVED,
+                DecisionGapStatus.INVALIDATED,
+                DecisionGapStatus.CANCELLED,
+                DecisionGapStatus.SUPERSEDED,
+            )
+        )
+        gap_placeholders = ",".join("?" for _ in terminal_gaps)
+        if conn.execute(
+            f"SELECT 1 FROM decision_gaps "
+            f"WHERE status NOT IN ({gap_placeholders}) LIMIT 1",
+            terminal_gaps,
+        ).fetchone():
+            raise ValueError(
+                "Phase 6 migration requires every DecisionGap to be terminal"
+            )
+        terminal_leases = tuple(
+            status.value
+            for status in (
+                PlanLeaseStatus.COMPLETED,
+                PlanLeaseStatus.EXPIRED,
+                PlanLeaseStatus.INVALIDATED,
+            )
+        )
+        lease_placeholders = ",".join("?" for _ in terminal_leases)
+        if conn.execute(
+            f"SELECT 1 FROM plan_leases "
+            f"WHERE status NOT IN ({lease_placeholders}) LIMIT 1",
+            terminal_leases,
+        ).fetchone():
+            raise ValueError(
+                "Phase 6 migration requires every PlanLease to be terminal"
+            )
+        terminal_requests = tuple(status.value for status in TERMINAL_PLANNER_STATUSES)
+        request_placeholders = ",".join("?" for _ in terminal_requests)
+        if conn.execute(
+            f"""
+            SELECT 1 FROM logical_planner_requests
+            WHERE request_target_kind=?
+              AND status NOT IN ({request_placeholders})
+            LIMIT 1
+            """,
+            (
+                PlannerRequestTargetKind.LEGACY_DECISION_GROUP.value,
+                *terminal_requests,
+            ),
+        ).fetchone():
+            raise ValueError(
+                "Phase 6 migration requires every legacy PlannerRequest to be terminal"
+            )
+
+    @classmethod
+    def _migrate_phase6_v14(cls, conn: sqlite3.Connection) -> None:
+        cls._validate_phase6_migration_preconditions(conn)
+        legacy_request_ids = tuple(
+            str(row["planner_request_id"])
+            for row in conn.execute(
+                """
+                SELECT planner_request_id FROM logical_planner_requests
+                WHERE request_target_kind=?
+                """,
+                (PlannerRequestTargetKind.LEGACY_DECISION_GROUP.value,),
+            ).fetchall()
+        )
+        if legacy_request_ids:
+            placeholders = ",".join("?" for _ in legacy_request_ids)
+            cls._archive_legacy_rows(
+                conn,
+                "plan_leases",
+                ("plan_lease_id",),
+                where=f"source_planner_request_id IN ({placeholders})",
+                values=legacy_request_ids,
+            )
+            cls._archive_legacy_rows(
+                conn,
+                "provider_attempts",
+                ("provider_attempt_id",),
+                where=f"planner_request_id IN ({placeholders})",
+                values=legacy_request_ids,
+            )
+            cls._archive_legacy_rows(
+                conn,
+                "information_rounds",
+                ("information_round_id",),
+                where=f"planner_request_id IN ({placeholders})",
+                values=legacy_request_ids,
+            )
+            cls._archive_legacy_rows(
+                conn,
+                "logical_planner_requests",
+                ("planner_request_id",),
+                where=f"planner_request_id IN ({placeholders})",
+                values=legacy_request_ids,
+            )
+            conn.execute(
+                f"DELETE FROM information_rounds "
+                f"WHERE planner_request_id IN ({placeholders})",
+                legacy_request_ids,
+            )
+            conn.execute(
+                f"DELETE FROM plan_leases "
+                f"WHERE source_planner_request_id IN ({placeholders})",
+                legacy_request_ids,
+            )
+            conn.execute(
+                f"DELETE FROM provider_attempts "
+                f"WHERE planner_request_id IN ({placeholders})",
+                legacy_request_ids,
+            )
+            conn.execute(
+                f"DELETE FROM logical_planner_requests "
+                f"WHERE planner_request_id IN ({placeholders})",
+                legacy_request_ids,
+            )
+
+        cls._archive_legacy_rows(
+            conn,
+            "approval_records",
+            ("approval_id",),
+            where="proposal_type<>?",
+            values=(STRATEGIC_RESEARCH_PROPOSAL_TYPE,),
+        )
+        conn.execute(
+            "DELETE FROM approval_records WHERE proposal_type<>?",
+            (STRATEGIC_RESEARCH_PROPOSAL_TYPE,),
+        )
+        archive_specs = (
+            ("strategy_state", ("game_id",)),
+            ("city_plans", ("game_id", "city_id")),
+            ("unit_plans", ("game_id", "unit_id")),
+            ("builder_plans", ("game_id", "builder_key")),
+            ("workflow_tasks", ("game_id", "task_id")),
+            ("decision_gaps", ("decision_gap_id",)),
+            ("decision_groups", ("decision_group_id",)),
+            ("plan_leases", ("plan_lease_id",)),
+            ("planner_suppressions", ("suppression_id",)),
+        )
+        for table, keys in archive_specs:
+            cls._archive_legacy_rows(conn, table, keys)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            for table in reversed(cls._LEGACY_AUTHORITY_TABLES):
+                conn.execute(f"DROP TABLE {table}")
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
+        cls._validate_phase6_v14(conn)
+
+    @classmethod
+    def _validate_phase6_v14(cls, conn: sqlite3.Connection) -> None:
+        for table in cls._LEGACY_AUTHORITY_TABLES:
+            if cls._table_exists(conn, table):
+                raise ValueError(f"legacy authority table still exists: {table}")
+        for row in conn.execute(
+            "SELECT * FROM legacy_workflow_archive ORDER BY archive_id"
+        ).fetchall():
+            record_json = str(row["record_json"])
+            try:
+                normalized = canonical_json(json.loads(record_json))
+            except Exception as exc:
+                raise ValueError("legacy archive contains invalid JSON") from exc
+            if normalized != record_json:
+                raise ValueError("legacy archive record is not canonical")
+            if hashlib.sha256(record_json.encode("utf-8")).hexdigest() != str(
+                row["record_hash"]
+            ):
+                raise ValueError("legacy archive record hash does not match")
+        if conn.execute(
+            """
+            SELECT 1 FROM logical_planner_requests
+            WHERE request_target_kind=?
+            LIMIT 1
+            """,
+            (PlannerRequestTargetKind.LEGACY_DECISION_GROUP.value,),
+        ).fetchone():
+            raise ValueError("legacy PlannerRequest survived Phase 6 migration")
+        if conn.execute(
+            "SELECT 1 FROM approval_records WHERE proposal_type<>? LIMIT 1",
+            (STRATEGIC_RESEARCH_PROPOSAL_TYPE,),
+        ).fetchone():
+            raise ValueError("legacy ApprovalRecord survived Phase 6 migration")
+        cls._validate_phase1c_v11(conn)
+        cls._validate_phase2_v12(conn)
         cls._validate_phase3_v13(conn)
 
     @classmethod
@@ -1155,12 +1548,11 @@ class WorkflowStore:
                     "ORDER BY game_id, task_id, attempt_number"
                 ).fetchall()
             ],
-            [
-                dict(row)
-                for row in conn.execute(
-                    "SELECT * FROM workflow_tasks ORDER BY game_id, task_id"
-                ).fetchall()
-            ],
+            cls._optional_table_rows(
+                conn,
+                "workflow_tasks",
+                order_by="game_id, task_id",
+            ),
             require_canonical=True,
         )
         active_rows = conn.execute(
@@ -1229,24 +1621,28 @@ class WorkflowStore:
             for mission in missions:
                 action_types = strategic_mission_action_types(mission)
                 placeholders = ",".join("?" for _ in action_types)
-                duplicate = conn.execute(
-                    f"""
-                    SELECT task_id FROM workflow_tasks
-                    WHERE game_id=? AND action_type IN ({placeholders})
-                      AND status IN (?, ?, ?, ?, ?, ?)
-                    LIMIT 1
-                    """,
-                    (
-                        graph.game_session_id,
-                        *action_types,
-                        TaskStatus.PENDING.value,
-                        TaskStatus.AWAITING_CONFIRMATION.value,
-                        TaskStatus.READY.value,
-                        TaskStatus.RUNNING.value,
-                        TaskStatus.VERIFYING.value,
-                        TaskStatus.UNCERTAIN.value,
-                    ),
-                ).fetchone()
+                duplicate = (
+                    conn.execute(
+                        f"""
+                        SELECT task_id FROM workflow_tasks
+                        WHERE game_id=? AND action_type IN ({placeholders})
+                          AND status IN (?, ?, ?, ?, ?, ?)
+                        LIMIT 1
+                        """,
+                        (
+                            graph.game_session_id,
+                            *action_types,
+                            TaskStatus.PENDING.value,
+                            TaskStatus.AWAITING_CONFIRMATION.value,
+                            TaskStatus.READY.value,
+                            TaskStatus.RUNNING.value,
+                            TaskStatus.VERIFYING.value,
+                            TaskStatus.UNCERTAIN.value,
+                        ),
+                    ).fetchone()
+                    if cls._table_exists(conn, "workflow_tasks")
+                    else None
+                )
                 if duplicate is not None:
                     raise ValueError(
                         "StoredTask and TurnActionGraph expose duplicate scope authority"
@@ -1568,24 +1964,21 @@ class WorkflowStore:
                     "SELECT * FROM approval_records ORDER BY created_at, approval_id"
                 ).fetchall()
             ],
-            [
-                dict(row)
-                for row in conn.execute(
-                    "SELECT * FROM decision_gaps ORDER BY game_id, decision_gap_id"
-                ).fetchall()
-            ],
-            [
-                dict(row)
-                for row in conn.execute(
-                    "SELECT * FROM plan_leases ORDER BY game_id, plan_lease_id"
-                ).fetchall()
-            ],
-            [
-                dict(row)
-                for row in conn.execute(
-                    "SELECT * FROM workflow_tasks ORDER BY game_id, task_id"
-                ).fetchall()
-            ],
+            cls._optional_table_rows(
+                conn,
+                "decision_gaps",
+                order_by="game_id, decision_gap_id",
+            ),
+            cls._optional_table_rows(
+                conn,
+                "plan_leases",
+                order_by="game_id, plan_lease_id",
+            ),
+            cls._optional_table_rows(
+                conn,
+                "workflow_tasks",
+                order_by="game_id, task_id",
+            ),
             [
                 dict(row)
                 for row in conn.execute(
@@ -6860,10 +7253,14 @@ class WorkflowStore:
                 PlannerRequestStatus.BACKOFF.value,
             }
             dispositions: list[LegacyScopeObjectDisposition] = []
-            gap_rows = conn.execute(
-                "SELECT * FROM decision_gaps WHERE game_id=?",
-                (game_session_id,),
-            ).fetchall()
+            gap_rows = (
+                conn.execute(
+                    "SELECT * FROM decision_gaps WHERE game_id=?",
+                    (game_session_id,),
+                ).fetchall()
+                if self._table_exists(conn, "decision_gaps")
+                else ()
+            )
             for row in gap_rows:
                 gap = DecisionGap.model_validate_json(str(row["gap_json"]))
                 if not self._decision_gap_targets_scope(gap, scope):
@@ -6910,10 +7307,14 @@ class WorkflowStore:
                     )
 
             scope_lease_task_ids: set[str] = set()
-            lease_rows = conn.execute(
-                "SELECT * FROM plan_leases WHERE game_id=?",
-                (game_session_id,),
-            ).fetchall()
+            lease_rows = (
+                conn.execute(
+                    "SELECT * FROM plan_leases WHERE game_id=?",
+                    (game_session_id,),
+                ).fetchall()
+                if self._table_exists(conn, "plan_leases")
+                else ()
+            )
             for row in lease_rows:
                 lease = PlanLease.model_validate_json(str(row["lease_json"]))
                 if not self._plan_lease_targets_scope_in_connection(conn, lease, scope):
@@ -6944,7 +7345,9 @@ class WorkflowStore:
                         )
                     )
 
-            if scope == "civic":
+            if not self._table_exists(conn, "workflow_tasks"):
+                task_rows = ()
+            elif scope == "civic":
                 task_rows = conn.execute(
                     "SELECT * FROM workflow_tasks WHERE game_id=? AND action_type=?",
                     (game_session_id, "set_civic"),
@@ -8076,6 +8479,8 @@ class WorkflowStore:
         conn: sqlite3.Connection,
         proposal: StrategicResearchProposal,
     ) -> tuple[LegacyResearchTaskDisposition, ...]:
+        if not cls._table_exists(conn, "workflow_tasks"):
+            return ()
         rows = conn.execute(
             "SELECT * FROM workflow_tasks WHERE game_id=? AND action_type=? "
             "ORDER BY task_id",
@@ -8997,28 +9402,6 @@ class WorkflowStore:
         if mode is ExecutionMode.AUTO:
             return
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT game_id, task_id FROM workflow_tasks "
-                "WHERE status=? AND approved_by IS NULL",
-                (TaskStatus.READY.value,),
-            ).fetchall()
-            for row in rows:
-                self._validate_research_task_authority_in_connection(
-                    conn,
-                    str(row["game_id"]),
-                    str(row["task_id"]),
-                )
-            conn.execute(
-                """
-                UPDATE workflow_tasks
-                SET status=?, updated_at=CURRENT_TIMESTAMP
-                WHERE status=? AND approved_by IS NULL
-                """,
-                (
-                    TaskStatus.AWAITING_CONFIRMATION.value,
-                    TaskStatus.READY.value,
-                ),
-            )
             conn.execute(
                 """
                 UPDATE turn_action_nodes
@@ -9062,22 +9445,7 @@ class WorkflowStore:
                 )
                 self._validate_phase3_v13(conn)
                 return changed
-            cursor = conn.execute(
-                """
-                UPDATE workflow_tasks SET
-                    status=?, approved_by=?, last_error=?, updated_at=CURRENT_TIMESTAMP
-                WHERE game_id=? AND task_id=? AND status=?
-                """,
-                (
-                    TaskStatus.CANCELLED.value,
-                    rejected_by,
-                    "confirmation rejected by user",
-                    game_id,
-                    task_id,
-                    TaskStatus.AWAITING_CONFIRMATION.value,
-                ),
-            )
-            return cursor.rowcount == 1
+            raise ValueError("legacy StoredTask confirmation writes are retired")
 
     def record_lease_approval(
         self,
@@ -9088,6 +9456,8 @@ class WorkflowStore:
         actor: str = "control-panel-user",
     ) -> tuple[bool, str]:
         """Persist one lease approval decision without activating it in the UI path."""
+
+        raise ValueError("legacy PlanLease approvals are retired")
 
         turn = int(self.get_meta("last_observed_turn", 0) or 0)
         with self._connect() as conn:
@@ -9216,8 +9586,8 @@ class WorkflowStore:
                 SELECT attempts.attempt_json, tasks.retry_count, tasks.max_retries,
                        tasks.status
                 FROM action_attempts AS attempts
-                JOIN workflow_tasks AS tasks
-                  ON tasks.game_id=attempts.game_id AND tasks.task_id=attempts.task_id
+                JOIN turn_action_nodes AS tasks
+                  ON tasks.game_id=attempts.game_id AND tasks.node_id=attempts.task_id
                 WHERE attempts.game_id=? AND attempts.action_attempt_id=?
                   AND NOT EXISTS (
                       SELECT 1 FROM action_attempts AS newer
@@ -9250,9 +9620,9 @@ class WorkflowStore:
                 return False, "task is not waiting for a manual retry"
             conn.execute(
                 """
-                UPDATE workflow_tasks SET
+                UPDATE turn_action_nodes SET
                     status=?, retry_count=?, last_error=?, updated_at=CURRENT_TIMESTAMP
-                WHERE game_id=? AND task_id=?
+                WHERE game_id=? AND node_id=?
                 """,
                 (
                     TaskStatus.READY.value,
@@ -9892,7 +10262,10 @@ class WorkflowStore:
             placeholders = ", ".join("?" for _item in active_action_types)
             legacy_rows = (
                 []
-                if not active_action_types
+                if (
+                    not active_action_types
+                    or not self._table_exists(conn, "workflow_tasks")
+                )
                 else conn.execute(
                     "SELECT * FROM workflow_tasks "
                     f"WHERE game_id=? AND action_type IN ({placeholders})",
@@ -10197,6 +10570,13 @@ class WorkflowStore:
                     "TurnActionNode provenance does not match active Contract/Mission"
                 )
             return graph_task
+        if not cls._table_exists(conn, "workflow_tasks"):
+            requested_scope = action_scopes.get(str(action_type))
+            if requested_scope is not None and requested_scope in owned_scopes:
+                raise ValueError(
+                    "strategic Attempt requires a current Mission-derived task"
+                )
+            return None
         row = conn.execute(
             "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
             (game_id, task_id),
@@ -10267,8 +10647,8 @@ class WorkflowStore:
         auto_action_types: set[str],
         observation_id: str,
     ) -> None:
+        raise ValueError("StoredTask research projection is closed")
         self._require_phase1c_dormant_activation()
-        self._reject_task_id_reuse(game_id, bundle)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if (
@@ -10348,6 +10728,8 @@ class WorkflowStore:
         auto_action_types: set[str],
         observation_id: str | None = None,
     ) -> None:
+        raise ValueError("legacy PlanBundle writes are retired")
+
         self._reject_task_id_reuse(game_id, bundle)
         effective_auto_actions = (
             set(auto_action_types) if mode is ExecutionMode.AUTO else set()
@@ -10667,38 +11049,9 @@ class WorkflowStore:
             )
 
     def refresh_due_statuses(self, game_id: str, turn: int) -> None:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT task_id FROM workflow_tasks "
-                "WHERE game_id=? AND status=? AND due_turn<=?",
-                (game_id, TaskStatus.PENDING.value, turn),
-            ).fetchall()
-            for row in rows:
-                self._validate_research_task_authority_in_connection(
-                    conn, game_id, str(row["task_id"])
-                )
-            conn.execute(
-                """
-                UPDATE workflow_tasks SET status=?, updated_at=CURRENT_TIMESTAMP
-                WHERE game_id=? AND status=? AND due_turn<=?
-                """,
-                (TaskStatus.READY.value, game_id, TaskStatus.PENDING.value, turn),
-            )
-            conn.execute(
-                """
-                UPDATE workflow_tasks SET status=?, updated_at=CURRENT_TIMESTAMP
-                WHERE game_id=? AND expires_turn IS NOT NULL AND expires_turn<?
-                  AND status IN (?, ?, ?)
-                """,
-                (
-                    TaskStatus.EXPIRED.value,
-                    game_id,
-                    turn,
-                    TaskStatus.PENDING.value,
-                    TaskStatus.READY.value,
-                    TaskStatus.BLOCKED.value,
-                ),
-            )
+        # Legacy StoredTask scheduling is retired. TurnActionGraph nodes are the
+        # only executable projection after the v14 migration.
+        return None
 
     def observe_units(self, game_id: str, turn: int, units: Any) -> dict[str, int]:
         """Persist first-seen state and return bindable units in this snapshot.
@@ -10797,21 +11150,7 @@ class WorkflowStore:
             return cursor.rowcount == 1
 
     def due_tasks(self, game_id: str, turn: int) -> list[StoredTask]:
-        self.refresh_due_statuses(game_id, turn)
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM workflow_tasks
-                WHERE game_id=? AND status=? AND due_turn<=?
-                ORDER BY due_turn, task_id
-                """,
-                (game_id, TaskStatus.READY.value, turn),
-            ).fetchall()
-            for row in rows:
-                self._validate_research_task_authority_in_connection(
-                    conn, game_id, str(row["task_id"])
-                )
-            return [self._row_to_task(row) for row in rows]
+        return []
 
     def due_turn_action_nodes(
         self,
@@ -11000,6 +11339,12 @@ class WorkflowStore:
         increment_retry: bool = False,
     ) -> None:
         with self._connect() as conn:
+            node = conn.execute(
+                "SELECT 1 FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+                (game_id, task_id),
+            ).fetchone()
+            if node is None:
+                raise ValueError("legacy StoredTask status writes are retired")
             self._validate_research_task_authority_in_connection(
                 conn,
                 game_id,
@@ -11040,49 +11385,21 @@ class WorkflowStore:
                 )
                 self._validate_phase3_v13(conn)
                 return changed
-            cursor = conn.execute(
-                "UPDATE workflow_tasks SET status=?, approved_by=?, "
-                "updated_at=CURRENT_TIMESTAMP "
-                "WHERE game_id=? AND task_id=? AND status=?",
-                (
-                    TaskStatus.READY.value,
-                    approved_by,
-                    game_id,
-                    task_id,
-                    TaskStatus.AWAITING_CONFIRMATION.value,
-                ),
-            )
-            return cursor.rowcount == 1
+            raise ValueError("legacy StoredTask approval writes are retired")
 
     def list_tasks(
         self, game_id: str, statuses: Sequence[TaskStatus] | None = None
     ) -> list[StoredTask]:
         with self._connect() as conn:
-            if statuses:
-                placeholders = ",".join("?" for _ in statuses)
-                rows = conn.execute(
-                    f"""
-                    SELECT * FROM workflow_tasks
-                    WHERE game_id=? AND status IN ({placeholders})
-                    ORDER BY due_turn, task_id
-                    """,
-                    (game_id, *(status.value for status in statuses)),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM workflow_tasks WHERE game_id=? ORDER BY due_turn, task_id",
-                    (game_id,),
-                ).fetchall()
             graph_rows = conn.execute(
                 "SELECT * FROM turn_action_nodes WHERE game_id=? ORDER BY node_id",
                 (game_id,),
             ).fetchall()
-        tasks = [self._row_to_task(row) for row in rows]
         graph_tasks = [self._turn_action_task_from_row(row) for row in graph_rows]
         if statuses:
             allowed = set(statuses)
             graph_tasks = [task for task in graph_tasks if task.status in allowed]
-        return [*tasks, *graph_tasks]
+        return graph_tasks
 
     def task_status(self, game_id: str, task_id: str) -> TaskStatus | None:
         with self._connect() as conn:
@@ -11092,34 +11409,14 @@ class WorkflowStore:
             ).fetchone()
             if node is not None:
                 return TaskStatus(str(node["status"]))
-            row = conn.execute(
-                "SELECT status FROM workflow_tasks WHERE game_id=? AND task_id=?",
-                (game_id, task_id),
-            ).fetchone()
-        return None if row is None else TaskStatus(row["status"])
+        return None
 
     def current_context(self, game_id: str) -> dict[str, Any]:
         with self._connect() as conn:
-            strategy = conn.execute(
-                "SELECT state_json FROM strategy_state WHERE game_id=?", (game_id,)
-            ).fetchone()
-            cities = conn.execute(
-                "SELECT city_id, plan_json, plan_id FROM city_plans WHERE game_id=?",
-                (game_id,),
-            ).fetchall()
-            units = conn.execute(
-                "SELECT unit_id, plan_json, plan_id FROM unit_plans WHERE game_id=?",
-                (game_id,),
-            ).fetchall()
-            builders = conn.execute(
-                """
-                SELECT builder_key, plan_json, plan_id, updated_turn
-                FROM builder_plans WHERE game_id=?
-                """,
-                (game_id,),
-            ).fetchall()
             active = self._active_scope_missions_in_connection(conn, game_id)
-        strategy_value = {} if strategy is None else self._load(strategy["state_json"])
+        strategy_value: dict[str, Any] = {}
+        cities: dict[str, dict[str, Any]] = {}
+        units: dict[str, dict[str, Any]] = {}
         if active is not None:
             opening_missions = tuple(
                 mission for mission in active[1] if mission.scope == "opening_strategy"
@@ -11130,57 +11427,46 @@ class WorkflowStore:
                 )
             if opening_missions:
                 strategy_value = opening_strategy_mission_policy(opening_missions[0])
+            for mission in active[1]:
+                if mission.scope == "city_roles":
+                    policy = city_roles_mission_plan(mission)
+                    cities.update(
+                        {
+                            str(city["city_id"]): {
+                                "role": city["role"],
+                                "production_queue": list(city["production_queue"]),
+                                "_mission_id": mission.mission_id,
+                            }
+                            for city in policy["cities"]
+                        }
+                    )
+                elif mission.scope == "settler":
+                    plan = settler_mission_plan(mission)
+                    units[str(plan["unit_id"])] = {
+                        **plan,
+                        "_mission_id": mission.mission_id,
+                    }
         return {
             "strategy": strategy_value,
-            "cities": {
-                row["city_id"]: {
-                    **self._load(row["plan_json"]),
-                    "_plan_id": row["plan_id"],
-                }
-                for row in cities
-            },
-            "units": {
-                row["unit_id"]: {
-                    **self._load(row["plan_json"]),
-                    "_plan_id": row["plan_id"],
-                }
-                for row in units
-            },
-            "builders": {
-                row["builder_key"]: {
-                    **self._load(row["plan_json"]),
-                    "_plan_id": row["plan_id"],
-                    "_updated_turn": int(row["updated_turn"]),
-                }
-                for row in builders
-            },
+            "cities": cities,
+            "units": units,
+            "builders": {},
         }
 
     def task_ids(self, game_id: str) -> set[str]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT task_id FROM workflow_tasks WHERE game_id=?",
-                (game_id,),
-            ).fetchall()
             node_rows = conn.execute(
                 "SELECT node_id FROM turn_action_nodes WHERE game_id=?",
                 (game_id,),
             ).fetchall()
-        return {
-            *(str(row["task_id"]) for row in rows),
-            *(str(row["node_id"]) for row in node_rows),
-        }
+        return {str(row["node_id"]) for row in node_rows}
 
     def get_task(self, game_id: str, task_id: str) -> StoredTask | None:
         with self._connect() as conn:
             node = self._turn_action_task_in_connection(conn, game_id, task_id)
             if node is not None:
                 return node
-            row = conn.execute(
-                "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
-                (game_id, task_id),
-            ).fetchone()
-        return None if row is None else self._row_to_task(row)
+        return None
 
     @staticmethod
     def _attempt_row_values(attempt: ActionAttempt) -> tuple[Any, ...]:
@@ -11965,16 +12251,16 @@ class WorkflowStore:
             if resolve_failed_task and attempt is not None:
                 task_row = conn.execute(
                     """
-                    SELECT retry_count, max_retries FROM workflow_tasks
-                    WHERE game_id=? AND task_id=?
+                    SELECT retry_count, max_retries FROM turn_action_nodes
+                    WHERE game_id=? AND node_id=?
                     """,
                     (tick.game_session_id, attempt.task_id),
                 ).fetchone()
-                if task_row is None:
+                if task_row is None and self._table_exists(conn, "workflow_tasks"):
                     task_row = conn.execute(
                         """
-                        SELECT retry_count, max_retries FROM turn_action_nodes
-                        WHERE game_id=? AND node_id=?
+                        SELECT retry_count, max_retries FROM workflow_tasks
+                        WHERE game_id=? AND task_id=?
                         """,
                         (tick.game_session_id, attempt.task_id),
                     ).fetchone()
@@ -12529,31 +12815,33 @@ class WorkflowStore:
         )
 
     def save_decision_gap(self, gap: DecisionGap, *, turn: int) -> None:
-        with self._connect() as conn:
-            self._save_decision_gap_in_connection(conn, gap, turn)
+        del gap, turn
+        raise ValueError("legacy DecisionGap writes are retired")
 
     def decision_gap_by_identity(
         self, game_id: str, stable_identity: str
     ) -> DecisionGap | None:
         with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT gap_json FROM decision_gaps
-                WHERE game_id=? AND stable_identity=?
-                """,
-                (game_id, stable_identity),
-            ).fetchone()
-        return None if row is None else DecisionGap.model_validate_json(row["gap_json"])
+            rows = self._legacy_archive_records_in_connection(
+                conn, game_id, "decision_gaps"
+            )
+        for row in rows:
+            gap = DecisionGap.model_validate_json(str(row["gap_json"]))
+            if gap.stable_identity == stable_identity:
+                return gap
+        return None
 
     def get_decision_gap(
         self, game_id: str, decision_gap_id: str
     ) -> DecisionGap | None:
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT gap_json FROM decision_gaps WHERE game_id=? AND decision_gap_id=?",
-                (game_id, decision_gap_id),
-            ).fetchone()
-        return None if row is None else DecisionGap.model_validate_json(row["gap_json"])
+            rows = self._legacy_archive_records_in_connection(
+                conn, game_id, "decision_gaps"
+            )
+        for row in rows:
+            if str(row["decision_gap_id"]) == decision_gap_id:
+                return DecisionGap.model_validate_json(str(row["gap_json"]))
+        return None
 
     def list_decision_gaps(
         self,
@@ -12561,16 +12849,15 @@ class WorkflowStore:
         *,
         statuses: Sequence[DecisionGapStatus] | None = None,
     ) -> list[DecisionGap]:
-        query = "SELECT gap_json FROM decision_gaps WHERE game_id=?"
-        values: list[Any] = [game_id]
-        if statuses:
-            placeholders = ",".join("?" for _ in statuses)
-            query += f" AND status IN ({placeholders})"
-            values.extend(status.value for status in statuses)
-        query += " ORDER BY created_at, decision_gap_id"
         with self._connect() as conn:
-            rows = conn.execute(query, values).fetchall()
-        return [DecisionGap.model_validate_json(row["gap_json"]) for row in rows]
+            rows = self._legacy_archive_records_in_connection(
+                conn, game_id, "decision_gaps"
+            )
+        gaps = [DecisionGap.model_validate_json(str(row["gap_json"])) for row in rows]
+        if statuses:
+            allowed = set(statuses)
+            gaps = [gap for gap in gaps if gap.status in allowed]
+        return sorted(gaps, key=lambda gap: (gap.created_at, gap.decision_gap_id))
 
     @staticmethod
     def _scope_aliases(scope: str) -> set[str]:
@@ -12736,8 +13023,8 @@ class WorkflowStore:
         )
 
     def save_plan_lease(self, lease: PlanLease) -> None:
-        with self._connect() as conn:
-            self._save_plan_lease_in_connection(conn, lease)
+        del lease
+        raise ValueError("legacy PlanLease writes are retired")
 
     def save_approval_record(self, game_id: str, record: ApprovalRecord) -> None:
         if record.proposal_type == STRATEGIC_RESEARCH_PROPOSAL_TYPE:
@@ -12745,6 +13032,7 @@ class WorkflowStore:
                 "Strategic Proposal Approval requires the Phase 1C aggregate "
                 "decision transaction"
             )
+        raise ValueError("legacy ApprovalRecord writes are retired")
         with self._connect() as conn:
             active = self._active_scope_missions_in_connection(conn, game_id)
             owned_scopes = (
@@ -12836,13 +13124,26 @@ class WorkflowStore:
 
     def list_plan_leases(self, game_id: str) -> list[PlanLease]:
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT lease_json FROM plan_leases
-                WHERE game_id=? ORDER BY scope, plan_lease_id
-                """,
-                (game_id,),
-            ).fetchall()
+            if self._table_exists(conn, "plan_leases"):
+                rows = conn.execute(
+                    """
+                    SELECT lease_json FROM plan_leases
+                    WHERE game_id=? ORDER BY scope, plan_lease_id
+                    """,
+                    (game_id,),
+                ).fetchall()
+            else:
+                rows = [
+                    {"lease_json": json.loads(str(row["record_json"]))["lease_json"]}
+                    for row in conn.execute(
+                        """
+                        SELECT record_json FROM legacy_workflow_archive
+                        WHERE game_id=? AND source_table='plan_leases'
+                        ORDER BY source_key
+                        """,
+                        (game_id,),
+                    ).fetchall()
+                ]
         return [PlanLease.model_validate_json(row["lease_json"]) for row in rows]
 
     @staticmethod
@@ -13173,6 +13474,8 @@ class WorkflowStore:
         )
 
     def save_planner_request(self, request: PlannerRequest) -> None:
+        if request.target.kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+            raise ValueError("legacy PlannerRequest writes are retired")
         with self._connect() as conn:
             existing_row = conn.execute(
                 "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
@@ -13568,6 +13871,8 @@ class WorkflowStore:
             if parent_row is None:
                 raise ValueError("ProviderAttempt parent PlannerRequest does not exist")
             parent = self._planner_request_from_row(parent_row)
+            if parent.target.kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+                raise ValueError("legacy ProviderAttempt writes are retired")
             if parent.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS:
                 existing_row = conn.execute(
                     "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
@@ -13612,6 +13917,12 @@ class WorkflowStore:
             if request_row is None:
                 raise ValueError("PlannerRequest does not exist")
             stored_request = self._planner_request_from_row(request_row)
+            if (
+                request.target.kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+                or stored_request.target.kind
+                is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+            ):
+                raise ValueError("legacy ProviderAttempt writes are retired")
             if (
                 request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
                 or stored_request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
@@ -13918,6 +14229,8 @@ class WorkflowStore:
                     "InformationRound parent PlannerRequest does not exist"
                 )
             parent = self._planner_request_from_row(parent_row)
+            if parent.target.kind is PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
+                raise ValueError("legacy InformationRound writes are retired")
             if parent.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS:
                 existing_row = conn.execute(
                     "SELECT * FROM information_rounds WHERE information_round_id=?",
@@ -14341,21 +14654,7 @@ class WorkflowStore:
         decision_gap_id: str | None = None,
         relevant_input_hash: str | None = None,
     ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO planner_suppressions(
-                    game_id, turn, decision_gap_id, reason, relevant_input_hash
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    game_id,
-                    turn,
-                    decision_gap_id,
-                    reason,
-                    relevant_input_hash,
-                ),
-            )
+        del game_id, turn, reason, decision_gap_id, relevant_input_hash
 
     def persist_phase4_tick(
         self,
@@ -14378,6 +14677,20 @@ class WorkflowStore:
     ) -> None:
         tick = validate_workflow_tick(tick)
         self._reject_public_strategic_terminal_tick(tick)
+        if (
+            decision_gaps
+            or decision_group is not None
+            or plan_leases
+            or plan_bundle is not None
+            or cancel_task_ids
+        ):
+            raise ValueError("legacy Phase 4 aggregate writes are retired")
+        if (
+            planner_request is not None
+            and planner_request.target.kind
+            is PlannerRequestTargetKind.LEGACY_DECISION_GROUP
+        ):
+            raise ValueError("legacy PlannerRequest writes are retired")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._validate_strategic_resume_transition_in_connection(
@@ -14661,6 +14974,102 @@ class WorkflowStore:
         return {"game_id": game_id, "tables": tables}
 
     @classmethod
+    def _upgrade_phase5_replay_tables(
+        cls,
+        game_id: str,
+        tables: Mapping[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not PHASE6_DROPPED_REPLAY_TABLES.intersection(tables):
+            return {str(table): rows for table, rows in tables.items()}
+
+        allowed = {
+            "legacy_workflow_archive",
+            "workflow_meta",
+            *PHASE5_REPLAY_STATE_TABLES,
+        }
+        unknown = set(tables) - allowed
+        if unknown:
+            raise ValueError(f"invalid replay state tables: {sorted(unknown)}")
+
+        source_order = ("legacy_workflow_archive", *PHASE5_REPLAY_STATE_TABLES)
+        meta_keys = {
+            "last_game_id",
+            "last_observed_turn",
+            f"unit_observations_initialized:{game_id}",
+            cls._human_wait_meta_key(game_id),
+        }
+        with sqlite3.connect(":memory:") as legacy:
+            legacy.row_factory = sqlite3.Row
+            legacy.executescript(SCHEMA)
+            for table in source_order:
+                rows = tables.get(table, [])
+                if not isinstance(rows, list):
+                    raise ValueError(f"invalid replay state table: {table!r}")
+                columns = {
+                    str(row["name"])
+                    for row in legacy.execute(f"PRAGMA table_info({table})")
+                }
+                for source_row in rows:
+                    if not isinstance(source_row, dict) or not source_row:
+                        raise ValueError(f"invalid replay row for {table}")
+                    unknown_columns = set(source_row) - columns
+                    if unknown_columns:
+                        raise ValueError(
+                            f"unknown replay columns for {table}: "
+                            f"{sorted(unknown_columns)}"
+                        )
+                    row = dict(source_row)
+                    if row.get("game_id") != game_id:
+                        raise ValueError(
+                            f"replay row for {table} belongs to another game"
+                        )
+                    names = sorted(row)
+                    legacy.execute(
+                        f"INSERT INTO {table} ({','.join(names)}) "
+                        f"VALUES ({','.join('?' for _ in names)})",
+                        tuple(row[name] for name in names),
+                    )
+
+            meta_rows = tables.get("workflow_meta", [])
+            if not isinstance(meta_rows, list):
+                raise ValueError("invalid replay state table: 'workflow_meta'")
+            for source_row in meta_rows:
+                if not isinstance(source_row, dict) or not source_row:
+                    raise ValueError("invalid replay row for workflow_meta")
+                row = dict(source_row)
+                if set(row) - {"key", "value_json", "updated_at"}:
+                    raise ValueError("unknown replay columns for workflow_meta")
+                if row.get("key") not in meta_keys:
+                    raise ValueError("replay workflow_meta key is outside game scope")
+                names = sorted(row)
+                legacy.execute(
+                    f"INSERT INTO workflow_meta ({','.join(names)}) "
+                    f"VALUES ({','.join('?' for _ in names)})",
+                    tuple(row[name] for name in names),
+                )
+
+            cls._migrate_phase6_v14(legacy)
+            upgraded = {
+                table: [
+                    dict(row)
+                    for row in legacy.execute(
+                        f"SELECT * FROM {table} WHERE game_id=?",
+                        (game_id,),
+                    )
+                ]
+                for table in REPLAY_STATE_TABLES
+            }
+            placeholders = ",".join("?" for _ in meta_keys)
+            upgraded["workflow_meta"] = [
+                dict(row)
+                for row in legacy.execute(
+                    f"SELECT * FROM workflow_meta WHERE key IN ({placeholders})",
+                    tuple(sorted(meta_keys)),
+                )
+            ]
+            return upgraded
+
+    @classmethod
     def _prepare_replay_state(
         cls,
         conn: sqlite3.Connection,
@@ -14894,27 +15303,6 @@ class WorkflowStore:
                 (game_id,),
             ).fetchall()
         ]
-        external_decision_gaps = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM decision_gaps WHERE game_id<>?",
-                (game_id,),
-            ).fetchall()
-        ]
-        external_plan_leases = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM plan_leases WHERE game_id<>?",
-                (game_id,),
-            ).fetchall()
-        ]
-        external_tasks = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM workflow_tasks WHERE game_id<>?",
-                (game_id,),
-            ).fetchall()
-        ]
         external_action_attempts = [
             dict(row)
             for row in conn.execute(
@@ -14973,9 +15361,9 @@ class WorkflowStore:
             [*external_revisions, *prepared["strategic_contract_revisions"]],
             [*external_commits, *prepared["strategic_contract_commits"]],
             [*external_approvals, *prepared["approval_records"]],
-            [*external_decision_gaps, *prepared["decision_gaps"]],
-            [*external_plan_leases, *prepared["plan_leases"]],
-            [*external_tasks, *prepared["workflow_tasks"]],
+            [],
+            [],
+            [],
             [*external_action_attempts, *prepared["action_attempts"]],
             require_canonical=True,
         )
@@ -15017,7 +15405,7 @@ class WorkflowStore:
             [*external_revisions, *prepared["strategic_contract_revisions"]],
             [*external_commits, *prepared["strategic_contract_commits"]],
             [*external_action_attempts, *prepared["action_attempts"]],
-            [*external_tasks, *prepared["workflow_tasks"]],
+            [],
             require_canonical=True,
         )
         for table in REPLAY_STATE_TABLES:
@@ -15048,6 +15436,7 @@ class WorkflowStore:
         game_id = state.get("game_id")
         if not isinstance(game_id, str) or not game_id:
             raise ValueError("replay store state must contain a game_id")
+        tables = self._upgrade_phase5_replay_tables(game_id, tables)
         allowed_tables = {*REPLAY_STATE_TABLES, "workflow_meta"}
         unknown_tables = set(tables) - allowed_tables
         if unknown_tables:

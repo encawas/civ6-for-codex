@@ -221,57 +221,6 @@ def _activate(store: WorkflowStore, base: StrategicContract):
     )
 
 
-def test_diplomacy_trade_cutover_is_atomic_idempotent_and_replay_stable(tmp_path):
-    store = WorkflowStore(tmp_path / "source.sqlite3")
-    base = _foundation(store)
-    observation = _observation()
-    store.save_normalized_observation(observation)
-    gaps = (_gap("pending_diplomacy"), _gap("pending_trade_offer"))
-    for gap in gaps:
-        store.save_decision_gap(gap, turn=observation.turn_number)
-    store.save_plan_lease(_lease(gaps))
-
-    contract, tick = store.activate_diplomacy_trade_authority(
-        game_session_id=GAME_ID,
-        expected_base_revision=base.revision,
-        mission=_mission(base.contract_id),
-        activation_id="activate-with-legacy-diplomacy",
-        observation_id=observation.observation_id,
-        turn_number=observation.turn_number,
-        activated_at=NOW + timedelta(minutes=1),
-    )
-
-    assert contract.authority_scope_set.mission_graph_scopes == ("diplomacy_trade",)
-    assert all(
-        store.get_decision_gap(GAME_ID, gap.decision_gap_id).status
-        is DecisionGapStatus.SUPERSEDED
-        for gap in gaps
-    )
-    assert {
-        (item.object_kind, item.object_id, item.final_status)
-        for item in tick.legacy_dispositions
-    } == {
-        ("decision_gap", gaps[0].decision_gap_id, "SUPERSEDED"),
-        ("decision_gap", gaps[1].decision_gap_id, "SUPERSEDED"),
-        ("plan_lease", "legacy-diplomacy-trade-lease", "INVALIDATED"),
-    }
-    repeated = store.activate_diplomacy_trade_authority(
-        game_session_id=GAME_ID,
-        expected_base_revision=base.revision,
-        mission=_mission(base.contract_id),
-        activation_id="activate-with-legacy-diplomacy",
-        observation_id=observation.observation_id,
-        turn_number=observation.turn_number,
-        activated_at=NOW + timedelta(minutes=1),
-    )
-    assert repeated == (contract, tick)
-
-    replay = store.export_replay_state(GAME_ID)
-    restored = WorkflowStore(tmp_path / "restored.sqlite3")
-    restored.import_replay_state(replay)
-    assert restored.export_replay_state(GAME_ID) == replay
-
-
 def test_runtime_compiles_empty_graph_and_waits_without_legacy_planning(tmp_path):
     async def scenario():
         store = WorkflowStore(tmp_path / "workflow.sqlite3")
@@ -324,32 +273,6 @@ def test_runtime_compiles_empty_graph_and_waits_without_legacy_planning(tmp_path
         assert restored.list_decision_gaps(GAME_ID) == []
 
     asyncio.run(scenario())
-
-
-def test_diplomacy_trade_cutover_closes_only_its_legacy_writes(tmp_path):
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    base = _foundation(store)
-    _activate(store, base)
-
-    with pytest.raises(ValueError, match="legacy diplomacy_trade DecisionGap"):
-        store.save_decision_gap(_gap("pending_diplomacy"), turn=15)
-    with pytest.raises(ValueError, match="legacy diplomacy_trade PlanLease"):
-        store.save_plan_lease(
-            _lease((_gap("pending_diplomacy"), _gap("pending_trade_offer")))
-        )
-
-    tactical = _gap("pending_diplomacy").model_copy(
-        update={
-            "decision_gap_id": "unmigrated-tactical-gap",
-            "stable_identity": "tactical:unit-7:turn-15",
-            "gap_type": "tactical_attack_opportunity",
-            "scope": "unit:7",
-            "subjects": (SubjectRef(subject_type="unit", subject_id="7"),),
-            "cooldown_key": "tactical:7",
-        }
-    )
-    store.save_decision_gap(tactical, turn=15)
-    assert store.get_decision_gap(GAME_ID, tactical.decision_gap_id) == tactical
 
 
 def test_diplomacy_trade_policy_cannot_select_an_automatic_response(tmp_path):

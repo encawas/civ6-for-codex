@@ -203,29 +203,13 @@ class BatchExecutor:
             observation,
             source_observation_id=source_observation_id,
         )
-        graph_node_ids = {
-            task.task_id
-            for task in (
-                self.store.active_turn_action_graph(snapshot.game_id) or (None, ())
-            )[1]
-        }
         graph_approval_ids = {
             node_id
             for barrier in wave.barriers
             if barrier.kind is BarrierKind.APPROVAL
             for node_id in barrier.node_ids
         }
-        legacy_awaiting = [
-            task
-            for task in self.store.list_tasks(
-                snapshot.game_id,
-                statuses=[TaskStatus.AWAITING_CONFIRMATION],
-            )
-            if task.task_id not in graph_node_ids and task.due_turn <= snapshot.turn
-        ]
-        awaiting_ids = sorted(
-            [*graph_approval_ids, *(task.task_id for task in legacy_awaiting)]
-        )
+        awaiting_ids = sorted(graph_approval_ids)
         if awaiting_ids:
             return ExecutionTransition(
                 tick_type=AwaitingApprovalTick,
@@ -237,10 +221,7 @@ class BatchExecutor:
         if mode is ExecutionMode.READONLY:
             return None
 
-        candidates = [
-            *wave.eligible,
-            *self.store.due_tasks(snapshot.game_id, snapshot.turn),
-        ]
+        candidates = list(wave.eligible)
         candidates.sort(key=lambda task: (task.due_turn, task.task_id))
         if not candidates:
             return None

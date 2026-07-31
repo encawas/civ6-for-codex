@@ -60,7 +60,7 @@ def test_new_database_uses_phase2_schema(tmp_path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
 
     with store._connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 14
         tables = {
             row["name"]
             for row in conn.execute(

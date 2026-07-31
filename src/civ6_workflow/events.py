@@ -116,6 +116,31 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
                     dedupe_key=f"{blocker_type}:{_stable_hash(blocker)}",
                 )
             )
+    city_count = len(snapshot.cities)
+    if snapshot.units is not None and city_count == 0:
+        for unit in snapshot.units:
+            unit_type = str(unit.get("unit_type", unit.get("type", ""))).upper()
+            if "SETTLER" not in unit_type:
+                continue
+            unit_id = unit.get("unit_id", unit.get("id", "unknown"))
+            events.append(
+                GameEvent(
+                    event_type="settler_site_selection_required",
+                    turn=snapshot.turn,
+                    entity_type="unit",
+                    entity_id=unit_id,
+                    level=EventLevel.L3,
+                    risk=RiskLevel.HIGH,
+                    blocking=True,
+                    payload={
+                        "reason": (
+                            "A settler needs an approved city site before it can move."
+                        ),
+                        "unit": unit,
+                    },
+                    dedupe_key=f"settler_site_selection_required:{unit_id}",
+                )
+            )
     return events
 
 

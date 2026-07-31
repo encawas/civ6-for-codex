@@ -198,7 +198,6 @@ class ControlPanelState:
             "runtime_state": None,
             "human_wait": None,
             "strategic_proposal": None,
-            "lease_approvals": [],
             "retryable_attempts": [],
         }
         if isinstance(game_id, str) and game_id:
@@ -225,17 +224,6 @@ class ControlPanelState:
                             proposal.proposed_research_mission.model_dump(mode="json")
                         ),
                     }
-            human_actions["lease_approvals"] = [
-                {
-                    "plan_lease_id": lease.plan_lease_id,
-                    "plan_id": lease.plan_id,
-                    "scope": lease.scope,
-                    "decision_gap_ids": list(lease.decision_gap_ids),
-                    "task_ids": list(lease.task_ids),
-                }
-                for lease in self.store.list_plan_leases(game_id)
-                if lease.status.value == "AWAITING_APPROVAL"
-            ]
             human_actions["retryable_attempts"] = self.store.retryable_failed_attempts(
                 game_id
             )
@@ -243,23 +231,22 @@ class ControlPanelState:
         return payload
 
     def confirm_task(self, game_id: str, task_id: str) -> tuple[bool, str]:
-        if self.store.approve_task(game_id, task_id, "control-panel-user"):
+        try:
+            approved = self.store.approve_task(game_id, task_id, "control-panel-user")
+        except ValueError:
+            approved = False
+        if approved:
             return True, "confirmation recorded; task is eligible for a later tick"
         return False, "task is not awaiting confirmation for this game"
 
     def reject_task(self, game_id: str, task_id: str) -> tuple[bool, str]:
-        if self.store.reject_task_confirmation(game_id, task_id):
+        try:
+            rejected = self.store.reject_task_confirmation(game_id, task_id)
+        except ValueError:
+            rejected = False
+        if rejected:
             return True, "confirmation rejected; the task was cancelled"
         return False, "task is not awaiting confirmation for this game"
-
-    def decide_lease(
-        self, game_id: str, plan_lease_id: str, *, approved: bool
-    ) -> tuple[bool, str]:
-        return self.store.record_lease_approval(
-            game_id,
-            plan_lease_id,
-            approved=approved,
-        )
 
     def retry_attempt(self, game_id: str, action_attempt_id: str) -> tuple[bool, str]:
         return self.store.retry_failed_attempt_if_safe(game_id, action_attempt_id)
@@ -468,22 +455,6 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._send_human_action(ok, reason, game_id=game_id, task_id=task_id)
-            return
-        if len(parts) == 6 and parts[:2] == ["api", "games"] and parts[3] == "leases":
-            if not self._authorized(parsed):
-                return
-            game_id, lease_id, decision = parts[2], parts[4], parts[5]
-            if decision not in {"approve", "reject"}:
-                self._send_json(
-                    {"error": "unknown lease decision"}, HTTPStatus.NOT_FOUND
-                )
-                return
-            ok, reason = self.server.control.decide_lease(
-                game_id,
-                lease_id,
-                approved=decision == "approve",
-            )
-            self._send_human_action(ok, reason, game_id=game_id, plan_lease_id=lease_id)
             return
         if len(parts) == 6 and parts[:2] == ["api", "games"] and parts[3] == "attempts":
             if not self._authorized(parsed):

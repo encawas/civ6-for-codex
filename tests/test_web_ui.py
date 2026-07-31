@@ -2,59 +2,46 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
+from civ6_workflow.actions import resolve_action_spec
 from civ6_workflow.config import AppConfig
 from civ6_workflow.domain import (
     ActionAttempt,
-    ApprovalStatus,
+    AuthorityScopeSet,
     AwaitingHumanTick,
     AttemptStatus,
-    ContinuationPolicy,
-    LeaseValidationResult,
-    PlanLease,
-    PlanLeaseStatus,
+    Mission,
+    MissionGraph,
+    MissionStatus,
     RetryClassification,
     RuntimeState,
+    StrategicContract,
+    StrategicContractCommit,
+    SubjectRef,
+    build_strategic_contract_id,
 )
 from civ6_workflow.models import (
     ExecutionMode,
     MutationDeliveryStatus,
-    PlanBundle,
-    ProposedTask,
+    RuntimeSnapshot,
     TaskStatus,
 )
+from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
+from civ6_workflow.turn_compiler import TurnCompiler
 from civ6_workflow.web_ui import ControlPanelHTTPServer, ControlPanelState
 
 
-def _task() -> ProposedTask:
-    return ProposedTask(
-        task_id="ui-production",
-        action_type="city_set_production",
-        entity_type="city",
-        entity_id=1,
-        due_turn=10,
-        arguments={
-            "city_id": 1,
-            "item_type": "UNIT",
-            "item_name": "UNIT_BUILDER",
-        },
-        preconditions=[{"type": "city_has_no_production", "city_id": 1}],
-        postconditions=[
-            {
-                "type": "city_production_equals",
-                "city_id": 1,
-                "item_name": "UNIT_BUILDER",
-            }
-        ],
-        reason="approve from the local control panel",
-    )
+def _task_id(panel: ControlPanelState) -> str:
+    value = panel.store.get_meta("test_turn_action_node_id")
+    assert isinstance(value, str)
+    return value
 
 
 def _panel(tmp_path: Path, *, tick_result=None) -> ControlPanelState:
@@ -75,13 +62,92 @@ def _panel(tmp_path: Path, *, tick_result=None) -> ControlPanelState:
     store = WorkflowStore(config.runtime.database_path)
     store.set_meta("last_game_id", "game-1")
     store.set_meta("last_observed_turn", 10)
-    store.save_plan_bundle(
-        "game-1",
-        10,
-        PlanBundle(summary="dashboard task", tasks=[_task()]),
+    now = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
+    observation = normalize_runtime_snapshot(
+        RuntimeSnapshot(
+            game_id="game-1",
+            turn=10,
+            overview={"turn": 10},
+            cities=[
+                {
+                    "city_id": 1,
+                    "owner": "player-1",
+                    "currently_building": None,
+                }
+            ],
+        )
+    ).canonical.model_copy(update={"observed_at": now})
+    store.save_normalized_observation(observation)
+    contract_id = build_strategic_contract_id("game-1")
+    foundation = store.commit_strategic_contract_revision(
+        StrategicContractCommit(
+            commit_id="ui-contract-foundation",
+            game_session_id="game-1",
+            contract_id=contract_id,
+            expected_base_revision=0,
+            contract=StrategicContract(
+                contract_id=contract_id,
+                game_session_id="game-1",
+                revision=1,
+                authority_scope_set=AuthorityScopeSet(),
+                mission_graph=MissionGraph(),
+                created_from_observation_id=observation.observation_id,
+            ),
+            committed_at=now,
+            reason="create control panel fixture Contract",
+        )
+    )
+    contract, _ = store.activate_city_roles_authority(
+        game_session_id="game-1",
+        expected_base_revision=foundation.revision,
+        mission=Mission(
+            mission_id="mission-ui-city-role",
+            game_session_id="game-1",
+            contract_id=contract_id,
+            mission_revision=1,
+            scope="city_roles",
+            subject=SubjectRef(subject_type="player", subject_id="player-1"),
+            slot="player:city_roles",
+            objective="Develop the capital",
+            desired_outcome={
+                "city_roles": {
+                    "owner": "player-1",
+                    "cities": [
+                        {
+                            "city_id": 1,
+                            "role": "production",
+                            "production_queue": [
+                                {
+                                    "item_type": "UNIT",
+                                    "item_name": "UNIT_BUILDER",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            status=MissionStatus.ACTIVE,
+        ),
+        activation_id="ui-city-role-activation",
+        observation_id=observation.observation_id,
+        turn_number=10,
+        activated_at=now + timedelta(seconds=1),
+    )
+    compilation = TurnCompiler().compile_missions(
+        observation,
+        contract,
+        contract.mission_graph.missions,
         mode=ExecutionMode.CONFIRM,
         auto_action_types={"city_set_production"},
+        compiled_at=now + timedelta(seconds=2),
     )
+    _, tasks = store.activate_turn_action_graph(
+        compilation.graph,
+        compilation.nodes,
+        activated_at=now + timedelta(seconds=2),
+    )
+    assert len(tasks) == 1
+    store.set_meta("test_turn_action_node_id", tasks[0].task_id)
     return ControlPanelState(
         config=config,
         store=store,
@@ -123,16 +189,17 @@ def test_dashboard_snapshot_and_approval(tmp_path: Path, monkeypatch):
     assert state["game"] == {"game_id": "game-1", "turn": 10, "observed": True}
     assert state["config"]["execution_mode"] == "confirm"
     assert state["task_counts"]["awaiting_confirmation"] == 1
-    assert state["waiting_tasks"][0]["task_id"] == "ui-production"
+    task_id = _task_id(panel)
+    assert state["waiting_tasks"][0]["task_id"] == task_id
     assert state["planner_connection"]["configured"] is True
     assert state["planner_connection"]["connection_owner"] == (
         "frontend_via_local_backend"
     )
     assert state["planner_connection"]["secret_exposed_to_browser"] is False
 
-    assert panel.approve("ui-production") is True
-    assert panel.store.task_status("game-1", "ui-production") is TaskStatus.READY
-    assert panel.approve("ui-production") is False
+    assert panel.approve(task_id) is True
+    assert panel.store.task_status("game-1", task_id) is TaskStatus.READY
+    assert panel.approve(task_id) is False
 
 
 def test_dashboard_records_tick_result_and_error(tmp_path: Path):
@@ -178,7 +245,8 @@ def test_http_api_requires_token_and_exposes_state(tmp_path: Path, monkeypatch):
         with urlopen(request, timeout=3) as response:
             payload = json.loads(response.read().decode("utf-8"))
         assert payload["game"]["game_id"] == "game-1"
-        assert payload["waiting_tasks"][0]["task_id"] == "ui-production"
+        task_id = _task_id(panel)
+        assert payload["waiting_tasks"][0]["task_id"] == task_id
         assert payload["planner_connection"]["model"] == "test-model"
 
         status_request = Request(
@@ -205,7 +273,7 @@ def test_http_api_requires_token_and_exposes_state(tmp_path: Path, monkeypatch):
         assert panel.store.get_meta("last_planner_probe")["ok"] is True
 
         approve = Request(
-            f"{base}/api/tasks/ui-production/approve",
+            f"{base}/api/tasks/{task_id}/approve",
             method="POST",
             data=b"{}",
             headers={
@@ -264,93 +332,27 @@ def _post(base: str, path: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _awaiting_lease(*, task_ids: tuple[str, ...] = ()) -> PlanLease:
-    return PlanLease(
-        plan_lease_id="lease-ui-approval",
-        plan_id="plan-ui-approval",
-        game_session_id="game-1",
-        decision_gap_ids=("gap-ui-approval",),
-        scope="city:1",
-        plan_revision=1,
-        task_ids=task_ids,
-        created_from_observation_id="obs-ui",
-        status=PlanLeaseStatus.AWAITING_APPROVAL,
-        approval_status=ApprovalStatus.REQUIRED,
-        valid_from_turn=10,
-        valid_until_turn=11,
-        continuation_policy=ContinuationPolicy.REQUIRE_REVIEW,
-        relevant_input_hash="ui-input",
-        last_validated_observation_id="obs-ui",
-        last_validation_result=LeaseValidationResult.VALID,
-    )
-
-
 def test_game_bound_task_confirmation_and_rejection(tmp_path: Path):
     panel = _panel(tmp_path)
+    task_id = _task_id(panel)
     server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
-        confirmed = _post(base, "/api/games/game-1/tasks/ui-production/confirm")
+        confirmed = _post(base, f"/api/games/game-1/tasks/{task_id}/confirm")
         assert confirmed["ok"] is True
         assert confirmed["game_id"] == "game-1"
-        assert panel.store.task_status("game-1", "ui-production") is TaskStatus.READY
+        assert panel.store.task_status("game-1", task_id) is TaskStatus.READY
 
-        panel.store.set_task_status(
-            "game-1", "ui-production", TaskStatus.AWAITING_CONFIRMATION
-        )
-        rejected = _post(base, "/api/games/game-1/tasks/ui-production/reject")
+        panel.store.set_task_status("game-1", task_id, TaskStatus.AWAITING_CONFIRMATION)
+        rejected = _post(base, f"/api/games/game-1/tasks/{task_id}/reject")
         assert rejected["ok"] is True
-        assert (
-            panel.store.task_status("game-1", "ui-production") is TaskStatus.CANCELLED
-        )
+        assert panel.store.task_status("game-1", task_id) is TaskStatus.CANCELLED
 
         with pytest.raises(HTTPError) as exc_info:
-            _post(base, "/api/games/other-game/tasks/ui-production/confirm")
+            _post(base, f"/api/games/other-game/tasks/{task_id}/confirm")
         assert exc_info.value.code == 409
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=3)
-
-
-def test_game_bound_lease_approval_and_rejection_are_durable(tmp_path: Path):
-    panel = _panel(tmp_path)
-    lease = _awaiting_lease(task_ids=("ui-production",))
-    panel.store.save_plan_lease(lease)
-    server = ControlPanelHTTPServer(("127.0.0.1", 0), panel)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{server.server_port}"
-    try:
-        approved = _post(base, "/api/games/game-1/leases/lease-ui-approval/approve")
-        assert approved["ok"] is True
-        record = panel.store.latest_approval_record(
-            "game-1",
-            proposal_type="decision_gap",
-            proposal_id="gap-ui-approval",
-            proposal_revision=1,
-        )
-        assert record is not None
-        assert record.decision.value == "APPROVED"
-
-        second_lease = _awaiting_lease(task_ids=("ui-production",)).model_copy(
-            update={
-                "plan_lease_id": "lease-ui-reject",
-                "decision_gap_ids": ("gap-ui-reject",),
-            }
-        )
-        panel.store.save_plan_lease(second_lease)
-        rejected = _post(base, "/api/games/game-1/leases/lease-ui-reject/reject")
-        assert rejected["ok"] is True
-        assert (
-            panel.store.list_plan_leases("game-1")[1].status
-            is PlanLeaseStatus.INVALIDATED
-        )
-        assert (
-            panel.store.task_status("game-1", "ui-production") is TaskStatus.CANCELLED
-        )
     finally:
         server.shutdown()
         server.server_close()
@@ -359,29 +361,50 @@ def test_game_bound_lease_approval_and_rejection_are_durable(tmp_path: Path):
 
 def test_retry_endpoint_only_requeues_proven_not_sent_attempts(tmp_path: Path):
     panel = _panel(tmp_path)
-    panel.store.set_task_status("game-1", "ui-production", TaskStatus.FAILED)
-    attempt = ActionAttempt(
+    task_id = _task_id(panel)
+    assert panel.store.approve_task("game-1", task_id)
+    task = panel.store.get_task("game-1", task_id)
+    assert task is not None
+    prepared = ActionAttempt(
         action_attempt_id="attempt-ui-retry",
-        task_id="ui-production",
+        task_id=task_id,
         attempt_number=1,
         request_id="request-ui-retry",
         idempotency_key="task-ui-retry",
-        prepared_from_observation_id="obs-ui",
+        prepared_from_observation_id=task.created_from_observation_id,
         prepared_at=datetime.now(UTC),
-        status=AttemptStatus.FAILED,
+        status=AttemptStatus.PREPARED,
         retry_classification=RetryClassification.SAFE_IF_PROVEN_NOT_SENT,
-        normalized_arguments={"city_id": 1},
-        transport_result={
-            "delivery_status": MutationDeliveryStatus.PROVEN_NOT_SENT.value
-        },
+        normalized_arguments=resolve_action_spec(task.action_type).build_arguments(
+            task
+        ),
+        postconditions=tuple(task.postconditions),
         game_session_id="game-1",
         action_type="city_set_production",
     )
-    panel.store.save_action_attempt(attempt)
+    panel.store.save_action_attempt(prepared)
+    uncertain = prepared.model_copy(
+        update={
+            "status": AttemptStatus.UNCERTAIN,
+            "sent_at": datetime.now(UTC),
+            "transport_result": {"delivery_status": "delivery_started"},
+        }
+    )
+    panel.store.update_action_attempt(uncertain)
+    failed = uncertain.model_copy(
+        update={
+            "status": AttemptStatus.FAILED,
+            "transport_result": {
+                "delivery_status": MutationDeliveryStatus.PROVEN_NOT_SENT.value
+            },
+        }
+    )
+    panel.store.update_action_attempt(failed)
+    panel.store.set_task_status("game-1", task_id, TaskStatus.FAILED)
     assert panel.snapshot()["human_actions"]["retryable_attempts"] == [
         {
             "action_attempt_id": "attempt-ui-retry",
-            "task_id": "ui-production",
+            "task_id": task_id,
             "action_type": "city_set_production",
             "reason": "attempt is proven not committed",
         }
@@ -394,7 +417,7 @@ def test_retry_endpoint_only_requeues_proven_not_sent_attempts(tmp_path: Path):
     try:
         retried = _post(base, "/api/games/game-1/attempts/attempt-ui-retry/retry")
         assert retried["ok"] is True
-        task = panel.store.get_task("game-1", "ui-production")
+        task = panel.store.get_task("game-1", task_id)
         assert task is not None
         assert task.status is TaskStatus.READY
         assert task.retry_count == 1

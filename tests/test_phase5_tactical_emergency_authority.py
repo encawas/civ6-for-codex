@@ -261,56 +261,6 @@ def _compile_and_activate(store, observation, contract):
     return graph, tasks[0]
 
 
-def test_tactical_cutover_is_atomic_idempotent_and_replay_stable(tmp_path):
-    store = WorkflowStore(tmp_path / "source.sqlite3")
-    base = _foundation(store)
-    observation = _observation("obs-activation")
-    store.save_normalized_observation(observation)
-    gap = _legacy_gap()
-    store.save_decision_gap(gap, turn=12)
-    store.save_plan_lease(_legacy_lease(gap))
-    store.save_plan_bundle(
-        GAME_ID,
-        12,
-        _legacy_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"unit_skip"},
-        observation_id=observation.observation_id,
-    )
-
-    contract, tick = _activate(
-        store,
-        base,
-        observation,
-        activation_id="activate-with-legacy-tactical-state",
-    )
-
-    assert contract.authority_scope_set.mission_graph_scopes == ("tactical_emergency",)
-    assert store.get_decision_gap(GAME_ID, gap.decision_gap_id).status is (
-        DecisionGapStatus.SUPERSEDED
-    )
-    assert store.get_task(GAME_ID, "legacy-unit-skip").status is TaskStatus.CANCELLED
-    assert {
-        (item.object_kind, item.object_id, item.final_status)
-        for item in tick.legacy_dispositions
-    } == {
-        ("decision_gap", gap.decision_gap_id, "SUPERSEDED"),
-        ("plan_lease", "legacy-tactical-lease", "INVALIDATED"),
-        ("stored_task", "legacy-unit-skip", "cancelled"),
-    }
-    assert _activate(
-        store,
-        base,
-        observation,
-        activation_id="activate-with-legacy-tactical-state",
-    ) == (contract, tick)
-
-    replay = store.export_replay_state(GAME_ID)
-    restored = WorkflowStore(tmp_path / "restored.sqlite3")
-    restored.import_replay_state(replay)
-    assert restored.export_replay_state(GAME_ID) == replay
-
-
 def test_tactical_graph_is_high_risk_and_suppresses_legacy_unit_skip(tmp_path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     base = _foundation(store)
@@ -476,57 +426,6 @@ def test_current_turn_tactical_mission_with_no_moves_is_unavailable(tmp_path):
     assert compilation.unavailable_targets == (
         ("tactical_emergency", f"unit:{UNIT_ID}:no-moves"),
     )
-
-
-def test_unresolved_legacy_tactical_attempt_blocks_cutover(tmp_path):
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    base = _foundation(store)
-    observation = _observation("obs-activation")
-    store.save_normalized_observation(observation)
-    gap = _legacy_gap()
-    store.save_decision_gap(gap, turn=12)
-    store.save_plan_lease(_legacy_lease(gap))
-    store.save_plan_bundle(
-        GAME_ID,
-        12,
-        _legacy_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"unit_skip"},
-        observation_id=observation.observation_id,
-    )
-    task = store.get_task(GAME_ID, "legacy-unit-skip")
-    spec = resolve_action_spec(task.action_type)
-    store.save_action_attempt(
-        ActionAttempt(
-            action_attempt_id="legacy-tactical-attempt",
-            game_session_id=GAME_ID,
-            task_id=task.task_id,
-            action_type=task.action_type,
-            attempt_number=1,
-            request_id="legacy-tactical-request",
-            idempotency_key="legacy-tactical-attempt",
-            prepared_from_observation_id=observation.observation_id,
-            prepared_at=NOW,
-            status=AttemptStatus.PREPARED,
-            retry_classification=spec.retry_classification,
-            normalized_arguments=spec.build_arguments(task),
-            postconditions=tuple(task.postconditions),
-        )
-    )
-    before = store.export_replay_state(GAME_ID)
-
-    with pytest.raises(ValueError, match="unresolved legacy execution"):
-        store.activate_tactical_emergency_authority(
-            game_session_id=GAME_ID,
-            expected_base_revision=base.revision,
-            mission=_mission(base.contract_id),
-            activation_id="blocked-tactical-activation",
-            observation_id=observation.observation_id,
-            turn_number=observation.turn_number,
-            activated_at=NOW + timedelta(minutes=1),
-        )
-
-    assert store.export_replay_state(GAME_ID) == before
 
 
 def test_unit_delta_impacts_only_the_matching_unit_mission():

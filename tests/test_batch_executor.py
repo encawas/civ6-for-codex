@@ -184,12 +184,28 @@ class _ExecutionStore:
         self.runtime_updates = []
 
     def active_turn_action_graph(self, _game_id: str):
-        return None
+        return (
+            SimpleNamespace(
+                graph_id="turn_action_graph_test",
+                turn_number=7,
+                source_observation_projection_hash=(
+                    _observation().canonical.projection_hash
+                ),
+            ),
+            tuple(self.tasks),
+        )
 
     def list_tasks(self, _game_id: str, statuses=None):
         return []
 
-    def due_tasks(self, _game_id: str, _turn: int):
+    def due_turn_action_nodes(
+        self,
+        _game_id: str,
+        _turn: int,
+        *,
+        source_observation_id: str,
+    ):
+        assert source_observation_id == "obs_7"
         return list(self.tasks)
 
     def latest_attempt_for_task(self, _game_id: str, _task_id: str):

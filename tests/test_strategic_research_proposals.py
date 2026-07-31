@@ -12,13 +12,11 @@ from civ6_workflow.config import AppConfig
 from civ6_workflow.domain import (
     AuthorityScopeSet,
     ApprovalDecision,
-    ApprovalRecord,
     ApprovalStatus,
     AwaitingHumanTick,
     InformationRequestedTick,
     InformationRound,
     InformationRoundStatus,
-    LeaseValidationResult,
     Mission,
     MissionGraph,
     MissionGraphPatchedTick,
@@ -31,9 +29,6 @@ from civ6_workflow.domain import (
     PlannerRequestStatus,
     PlannerRequestTarget,
     PlannerRequestTargetKind,
-    ContinuationPolicy,
-    PlanLease,
-    PlanLeaseStatus,
     RuntimeState,
     StrategicContract,
     StrategicContractCommit,
@@ -1122,7 +1117,7 @@ def test_v9_upgrade_creates_empty_proposal_table_without_changing_state(tmp_path
     )
     assert upgraded.list_strategic_research_proposals("game-1") == []
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 14
 
 
 @pytest.mark.parametrize("kind", ["creation", "repair"])
@@ -4611,91 +4606,6 @@ def test_migration_invalidated_wrong_time_fails_before_replay_delete(tmp_path):
     assert target.export_replay_state(proposal.game_session_id) == before
 
 
-def test_complete_mission_task_provenance_round_trips_without_enabling_routing(
-    tmp_path,
-):
-    source, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / "task-provenance-source.sqlite3")
-    )
-    state, _approval, _commit, _applied = _approved_terminal_replay(source, proposal)
-    state["tables"]["workflow_tasks"].append(_research_task_replay_row(proposal))
-    restored = WorkflowStore(tmp_path / "task-provenance-restored.sqlite3")
-
-    restored.import_replay_state(state)
-
-    task = restored.get_task(proposal.game_session_id, "phase1c-research-task")
-    assert task is not None
-    assert task.action_type == "set_research"
-    assert task.source_contract_id == proposal.target_contract_id
-    assert task.source_contract_revision == proposal.expected_base_revision + 1
-    assert task.source_mission_id == proposal.proposed_research_mission.mission_id
-    assert task.source_mission_revision == 1
-
-
-@pytest.mark.parametrize("forgery", ["partial", "wrong_action", "legacy_ready"])
-def test_replay_rejects_invalid_research_task_provenance_before_delete(
-    tmp_path, forgery
-):
-    source, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / f"task-forgery-{forgery}.sqlite3")
-    )
-    state, _approval, _commit, _applied = _approved_terminal_replay(source, proposal)
-    if forgery == "partial":
-        row = _research_task_replay_row(proposal)
-        row["source_mission_revision"] = None
-    elif forgery == "wrong_action":
-        row = _research_task_replay_row(proposal, action_type="set_civic")
-    else:
-        row = _research_task_replay_row(proposal, provenance=False)
-    state["tables"]["workflow_tasks"].append(row)
-    target = WorkflowStore(tmp_path / f"task-forgery-target-{forgery}.sqlite3")
-    target.set_meta("last_game_id", proposal.game_session_id)
-    before = target.export_replay_state(proposal.game_session_id)
-
-    with pytest.raises(ValueError):
-        target.import_replay_state(state)
-
-    assert target.export_replay_state(proposal.game_session_id) == before
-
-
-def test_replay_rejects_cross_game_task_provenance_before_delete(tmp_path):
-    source_a, _request_a, proposal_a, _attempt_a = asyncio.run(
-        _completed_proposal_state(
-            tmp_path / "cross-game-a.sqlite3",
-            game_id="game-a",
-            planner_request_id="request-cross-game-a",
-        )
-    )
-    state_a, _approval_a, _commit_a, _applied_a = _approved_terminal_replay(
-        source_a, proposal_a
-    )
-    source_b, _request_b, proposal_b, _attempt_b = asyncio.run(
-        _completed_proposal_state(
-            tmp_path / "cross-game-b.sqlite3",
-            game_id="game-b",
-            planner_request_id="request-cross-game-b",
-        )
-    )
-    state_b, _approval_b, _commit_b, _applied_b = _approved_terminal_replay(
-        source_b, proposal_b
-    )
-    row = _research_task_replay_row(proposal_a)
-    row["source_contract_id"] = proposal_b.target_contract_id
-    row["source_mission_id"] = proposal_b.proposed_research_mission.mission_id
-    state_a["tables"]["workflow_tasks"].append(row)
-    state_a["tables"]["agent_runs"] = []
-    target = WorkflowStore(tmp_path / "cross-game-target.sqlite3")
-    target.import_replay_state(state_b)
-    before_a = target.export_replay_state(proposal_a.game_session_id)
-    before_b = target.export_replay_state(proposal_b.game_session_id)
-
-    with pytest.raises(ValueError, match="same-game Contract"):
-        target.import_replay_state(state_a)
-
-    assert target.export_replay_state(proposal_a.game_session_id) == before_a
-    assert target.export_replay_state(proposal_b.game_session_id) == before_b
-
-
 def test_foundation_commit_cannot_remove_activated_research_authority(tmp_path):
     source, _request, proposal, _attempt = asyncio.run(
         _completed_proposal_state(tmp_path / "foundation-rollback-source.sqlite3")
@@ -4851,29 +4761,6 @@ def test_replay_rejects_duplicate_invalidation_fact_before_delete(tmp_path):
         target.import_replay_state(invalid)
 
     assert target.export_replay_state(proposal.game_session_id) == before
-
-
-def test_startup_rejects_partial_or_wrong_action_task_provenance(tmp_path):
-    source, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / "startup-task-source.sqlite3")
-    )
-    state, _approval, _commit, _applied = _approved_terminal_replay(source, proposal)
-    state["tables"]["workflow_tasks"].append(_research_task_replay_row(proposal))
-    path = tmp_path / "startup-task.sqlite3"
-    restored = WorkflowStore(path)
-    restored.import_replay_state(state)
-
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            """
-            UPDATE workflow_tasks SET action_type='set_civic'
-            WHERE game_id=? AND task_id='phase1c-research-task'
-            """,
-            (proposal.game_session_id,),
-        )
-
-    with pytest.raises(ValueError, match="set_research"):
-        WorkflowStore(path)
 
 
 def test_startup_rejects_noncanonical_migration_invalidation_time(tmp_path):
@@ -5660,55 +5547,6 @@ def _legacy_research_bundle(status=TaskStatus.READY):
     )
 
 
-def test_approval_cancels_disposable_legacy_research_without_replacement(tmp_path):
-    path = tmp_path / "legacy-disposition.sqlite3"
-    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
-    store.save_plan_bundle(
-        "game-1",
-        1,
-        _legacy_research_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"set_research"},
-        observation_id="obs-legacy",
-    )
-    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
-    store = _dormant_store(store)
-
-    applied = store.approve_strategic_research_proposal(
-        proposal.game_session_id, approval
-    )
-
-    task = store.get_task(proposal.game_session_id, "legacy-research-task")
-    assert task is not None and task.status is TaskStatus.CANCELLED
-    assert applied.legacy_task_dispositions[0].prior_status == TaskStatus.READY.value
-    assert applied.legacy_task_dispositions[0].final_status == (
-        TaskStatus.CANCELLED.value
-    )
-    assert len(store.list_tasks(proposal.game_session_id)) == 1
-
-
-def test_inflight_legacy_research_blocks_approval_and_rolls_back(tmp_path):
-    path = tmp_path / "legacy-inflight.sqlite3"
-    store, _request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
-    store.save_plan_bundle(
-        "game-1",
-        1,
-        _legacy_research_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"set_research"},
-        observation_id="obs-legacy",
-    )
-    store.set_task_status("game-1", "legacy-research-task", TaskStatus.RUNNING)
-    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
-    store = _dormant_store(store)
-    before = store.export_replay_state(proposal.game_session_id)
-
-    with pytest.raises(ValueError, match="not quiescent"):
-        store.approve_strategic_research_proposal(proposal.game_session_id, approval)
-
-    assert store.export_replay_state(proposal.game_session_id) == before
-
-
 def _authoritative_research_bundle(
     *,
     task_id: str = "mission-research-task",
@@ -5734,193 +5572,6 @@ def _authoritative_research_bundle(
             )
         ],
     )
-
-
-def test_dormant_authoritative_projection_emits_current_mission_provenance(tmp_path):
-    store, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / "authoritative-projection.sqlite3")
-    )
-    store = _dormant_store(store)
-    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
-    applied = store.approve_strategic_research_proposal(
-        proposal.game_session_id, approval
-    )
-
-    store.save_authoritative_research_plan_bundle(
-        proposal.game_session_id,
-        1,
-        _authoritative_research_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"set_research"},
-        observation_id=proposal.created_from_observation_id,
-    )
-
-    tasks = store.due_tasks(proposal.game_session_id, 1)
-    assert len(tasks) == 1
-    task = tasks[0]
-    assert task.source_contract_id == proposal.target_contract_id
-    assert task.source_contract_revision == applied.activated_contract_revision
-    assert task.source_mission_id == applied.source_mission_id
-    assert task.source_mission_revision == applied.source_mission_revision
-    restored = WorkflowStore(store.path)
-    assert restored.get_task(proposal.game_session_id, task.task_id) == task
-
-
-def test_dormant_authoritative_projection_wrong_target_rolls_back(tmp_path):
-    store, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / "wrong-projection.sqlite3")
-    )
-    store = _dormant_store(store)
-    store.approve_strategic_research_proposal(
-        proposal.game_session_id,
-        _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
-    )
-    before = store.export_replay_state(proposal.game_session_id)
-
-    with pytest.raises(ValueError, match="must match"):
-        store.save_authoritative_research_plan_bundle(
-            proposal.game_session_id,
-            1,
-            _authoritative_research_bundle(technology="TECH_POTTERY"),
-            mode=ExecutionMode.AUTO,
-            auto_action_types={"set_research"},
-            observation_id=proposal.created_from_observation_id,
-        )
-
-    assert store.export_replay_state(proposal.game_session_id) == before
-
-
-def test_cutover_closes_legacy_research_writes_and_claim_release(tmp_path):
-    store, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / "legacy-closed.sqlite3")
-    )
-    store.save_plan_bundle(
-        proposal.game_session_id,
-        1,
-        _legacy_research_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"set_research"},
-        observation_id="obs-legacy",
-    )
-    store = _dormant_store(store)
-    store.approve_strategic_research_proposal(
-        proposal.game_session_id,
-        _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
-    )
-    before = store.export_replay_state(proposal.game_session_id)
-
-    with pytest.raises(ValueError, match="legacy research plan writes"):
-        store.save_plan_bundle(
-            proposal.game_session_id,
-            1,
-            _legacy_research_bundle(),
-            mode=ExecutionMode.AUTO,
-            auto_action_types={"set_research"},
-            observation_id="obs-late-legacy",
-        )
-    with pytest.raises(ValueError, match="legacy provenance-free"):
-        store.set_task_status(
-            proposal.game_session_id,
-            "legacy-research-task",
-            TaskStatus.READY,
-        )
-
-    assert store.export_replay_state(proposal.game_session_id) == before
-
-
-def test_cutover_closes_legacy_research_lease_approval(tmp_path):
-    store, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / "legacy-lease-approval-closed.sqlite3")
-    )
-    lease = PlanLease(
-        plan_lease_id="legacy-research-lease",
-        plan_id="legacy-research-plan",
-        game_session_id=proposal.game_session_id,
-        decision_gap_ids=("legacy-research-gap",),
-        scope="research",
-        covered_slots=("research",),
-        plan_revision=1,
-        created_from_observation_id="obs-legacy-research-lease",
-        status=PlanLeaseStatus.AWAITING_APPROVAL,
-        approval_status=ApprovalStatus.REQUIRED,
-        valid_from_turn=1,
-        valid_until_turn=2,
-        continuation_policy=ContinuationPolicy.REQUIRE_REVIEW,
-        relevant_input_hash="legacy-research-input",
-        last_validated_observation_id="obs-legacy-research-lease",
-        last_validation_result=LeaseValidationResult.UNKNOWN,
-    )
-    store.save_plan_lease(lease)
-    store = _dormant_store(store)
-    store.approve_strategic_research_proposal(
-        proposal.game_session_id,
-        _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
-    )
-    before = store.export_replay_state(proposal.game_session_id)
-
-    with pytest.raises(ValueError, match="legacy research PlanLease writes"):
-        store.record_lease_approval(
-            proposal.game_session_id,
-            lease.plan_lease_id,
-            approved=True,
-        )
-
-    with pytest.raises(ValueError, match="legacy research approval writes"):
-        store.save_approval_record(
-            proposal.game_session_id,
-            ApprovalRecord(
-                approval_id="late-legacy-research-approval",
-                proposal_type="decision_gap",
-                proposal_id=lease.decision_gap_ids[0],
-                proposal_revision=lease.plan_revision,
-                decision=ApprovalDecision.APPROVED,
-                actor="test",
-                created_at=NOW,
-            ),
-        )
-
-    assert store.export_replay_state(proposal.game_session_id) == before
-
-
-def test_cutover_leaves_non_research_plan_and_task_behavior_unchanged(tmp_path):
-    store, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / "non-research-isolation.sqlite3")
-    )
-    store = _dormant_store(store)
-    store.approve_strategic_research_proposal(
-        proposal.game_session_id,
-        _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
-    )
-    civic_task = ProposedTask(
-        task_id="legacy-civic-task",
-        action_type="set_civic",
-        entity_type="player",
-        entity_id="player-1",
-        due_turn=1,
-        arguments={"tech_or_civic": "CIVIC_CODE_OF_LAWS"},
-        preconditions=[],
-        postconditions=[],
-        invalidators=[],
-        risk=RiskLevel.LOW,
-        requires_confirmation=False,
-        reason="legacy civic remains unchanged",
-    )
-
-    store.save_plan_bundle(
-        proposal.game_session_id,
-        1,
-        PlanBundle(
-            plan_id="legacy-civic-plan",
-            summary="legacy civic",
-            strategy_updates={"civic_queue": ["CIVIC_CODE_OF_LAWS"]},
-            tasks=[civic_task],
-        ),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"set_civic"},
-        observation_id="obs-civic",
-    )
-
-    assert store.due_tasks(proposal.game_session_id, 1)[0].task_id == civic_task.task_id
 
 
 def test_two_concurrent_identical_approvals_commit_one_revision(tmp_path):
@@ -5955,42 +5606,6 @@ def test_two_concurrent_identical_approvals_commit_one_revision(tmp_path):
     assert len(results) == 2 and results[0] == results[1]
     assert len(store.list_strategic_contract_revisions(proposal.game_session_id)) == 1
     assert len(store.list_strategic_contract_commits(proposal.game_session_id)) == 1
-
-
-def test_approval_rereads_ready_legacy_research_after_prelock_hook(tmp_path):
-    store, _request, proposal, _attempt = asyncio.run(
-        _completed_proposal_state(tmp_path / "prelock-research.sqlite3")
-    )
-    store = _dormant_store(store)
-    approval = _proposal_decision(store, proposal, ApprovalDecision.APPROVED)
-    inserted = False
-
-    def checkpoint(name):
-        nonlocal inserted
-        if name != "before_strategic_decision_lock" or inserted:
-            return
-        inserted = True
-        store.save_plan_bundle(
-            proposal.game_session_id,
-            1,
-            _legacy_research_bundle(),
-            mode=ExecutionMode.AUTO,
-            auto_action_types={"set_research"},
-            observation_id="obs-prelock",
-        )
-
-    applied = store.approve_strategic_research_proposal(
-        proposal.game_session_id,
-        approval,
-        checkpoint=checkpoint,
-    )
-
-    task = store.get_task(proposal.game_session_id, "legacy-research-task")
-    assert inserted is True
-    assert task is not None and task.status is TaskStatus.CANCELLED
-    assert tuple(item.task_id for item in applied.legacy_task_dispositions) == (
-        "legacy-research-task",
-    )
 
 
 def test_concurrent_approve_reject_race_persists_one_terminal_authority(tmp_path):
@@ -6204,60 +5819,6 @@ def test_phase1c_enabled_engine_does_not_consume_pending_legacy_resume(tmp_path)
         _proposal_decision(enabled, proposal, ApprovalDecision.APPROVED),
     )
     assert isinstance(applied, StrategicProposalAppliedTick)
-
-
-def test_phase1c_approval_routes_research_from_mission_and_preserves_civic(
-    tmp_path,
-):
-    path = tmp_path / "phase1c-authoritative-routing.sqlite3"
-    store, request, proposal, _attempt = asyncio.run(_completed_proposal_state(path))
-    store.save_plan_bundle(
-        proposal.game_session_id,
-        1,
-        PlanBundle(
-            plan_id="phase1c-civic-policy",
-            summary="Preserve legacy civic authority.",
-            strategy_updates={"civic_queue": ["CIVIC_CODE_OF_LAWS"]},
-        ),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"set_civic"},
-        observation_id="obs-civic-policy",
-    )
-    enabled = WorkflowStore(path, enable_phase1c_decisions=True)
-    ready = _proposal_ready_tick(enabled, proposal.proposal_id)
-    approval = _proposal_decision(
-        enabled, proposal, ApprovalDecision.APPROVED
-    ).model_copy(update={"created_at": max(datetime.now(UTC), ready.completed_at)})
-    applied = enabled.approve_strategic_research_proposal(
-        proposal.game_session_id,
-        approval,
-    )
-
-    assert enabled.list_tasks(proposal.game_session_id) == []
-    planner = _Planner()
-    result = asyncio.run(_engine(enabled, _research_ready_game(), planner).tick())
-
-    assert result.workflow_tick["outcome"] == TickOutcomeKind.TASK_CREATED
-    tasks = enabled.list_tasks(proposal.game_session_id)
-    assert {task.action_type for task in tasks} == {"set_research", "set_civic"}
-    research = next(task for task in tasks if task.action_type == "set_research")
-    civic = next(task for task in tasks if task.action_type == "set_civic")
-    assert research.arguments == {"tech_or_civic": "TECH_WRITING"}
-    assert research.preconditions == [
-        {"type": "research_unselected"},
-        {"type": "research_available", "tech_type": "TECH_WRITING"},
-    ]
-    assert research.postconditions == [
-        {"type": "research_equals", "tech_type": "TECH_WRITING"}
-    ]
-    assert research.source_contract_id == proposal.target_contract_id
-    assert research.source_contract_revision == applied.activated_contract_revision
-    assert research.source_mission_id == applied.source_mission_id
-    assert research.source_mission_revision == applied.source_mission_revision
-    assert civic.source_contract_id is None
-    assert civic.source_mission_id is None
-    assert planner.calls == 0
-    assert len(enabled.list_provider_attempts(request.planner_request_id)) == 1
 
 
 def test_turn_action_graph_verification_commits_mission_completion_once(tmp_path):
@@ -6561,9 +6122,10 @@ def test_turn_change_expires_old_graph_before_any_node_can_be_claimed(tmp_path):
             "overview": {**game.snapshot.overview, "turn": 2},
         }
     )
-
     second = asyncio.run(engine.tick())
-    assert second.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_APPROVAL
+    assert second.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_APPROVAL, (
+        second.workflow_tick
+    )
     new_graph, new_nodes = enabled.active_turn_action_graph(proposal.game_session_id)
     assert new_graph.turn_number == 2
     assert new_graph.graph_id != old_graph.graph_id

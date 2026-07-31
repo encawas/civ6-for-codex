@@ -100,6 +100,7 @@ PLANNER_INPUT_CONTRACT_REVISION = "planner-input-contract/v2"
 PLANNER_REQUEST_POLICY_REVISION = (
     f"{PLANNER_CALL_POLICY_REVISION}+{PLANNER_INPUT_CONTRACT_REVISION}"
 )
+_TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 
 
 class PlannerLifecycleCoordinator:
@@ -336,7 +337,7 @@ class PlannerLifecycleCoordinator:
             return await self._collect_information(
                 ctx, observation, active, compatibility
             )
-        backoff = engine._active_backoff(active)
+        backoff = self._active_backoff(active)
         if active.status is PlannerRequestStatus.BACKOFF and backoff:
             engine.store.record_planner_suppression(
                 snapshot.game_id,
@@ -392,44 +393,11 @@ class PlannerLifecycleCoordinator:
                 return [], await self._advance_active_strategic_request(
                     ctx, observation, active, compatibility
                 )
-            if active.target.kind is not PlannerRequestTargetKind.LEGACY_DECISION_GROUP:
-                raise RuntimeError("unsupported PlannerRequest target kind")
-            stale_tick = self._supersede_stale_request(
-                ctx,
-                observation,
-                active,
-                compatibility,
-                current_events=current_events or agent_events,
+            raise RuntimeError(
+                "legacy PlannerRequest authority must be migrated before Runtime starts"
             )
-            if stale_tick is not None:
-                return [], stale_tick
-            if active.status is PlannerRequestStatus.AWAITING_INFORMATION:
-                return [], await self._collect_information(
-                    ctx, observation, active, compatibility
-                )
-            backoff = engine._active_backoff()
-            if active.status is PlannerRequestStatus.BACKOFF and backoff:
-                engine.store.record_planner_suppression(
-                    game_id,
-                    snapshot.turn,
-                    reason="provider_backoff",
-                    relevant_input_hash=active.input_projection_hash,
-                )
-                return [], self._finish(
-                    ctx,
-                    snapshot,
-                    PlannerBackoffTick,
-                    compatibility=compatibility,
-                    planner_request=active,
-                    planner_request_id=active.planner_request_id,
-                    blocking_reason=(
-                        "planner provider backoff remains active for "
-                        f"{backoff['remaining_seconds']:.1f}s"
-                    ),
-                )
-            return [], await self._continue_request(
-                ctx, observation, active, compatibility
-            )
+
+        return list(agent_events), None
 
         decision_events = list(
             current_events if current_events is not None else agent_events
@@ -1775,7 +1743,7 @@ class PlannerLifecycleCoordinator:
         )
         try:
             with scope:
-                raw_response = await engine._plan_once(provider_request, ctx.metrics)
+                raw_response = await self._plan_once(provider_request, ctx.metrics)
         except Exception as exc:
             from .engine import InjectedCrashBoundary
 
@@ -2266,7 +2234,7 @@ class PlannerLifecycleCoordinator:
         error,
     ):
         engine = self.engine
-        failure = engine._classify_planner_failure(error)
+        failure = self._classify_planner_failure(error)
         transient = bool(failure["transient"])
         retry_at = None
         if transient:
@@ -3901,6 +3869,70 @@ class PlannerLifecycleCoordinator:
         if not isinstance(value, dict):
             return {}
         return json.loads(json.dumps(value, default=str))
+
+    async def _plan_once(self, request: AgentRequest, metrics) -> Any:
+        metrics.agent_attempt_count += 1
+        metrics.agent_call_count = metrics.agent_attempt_count
+        response = await self.engine.planner.plan(request)
+        metrics.agent_success_count += 1
+        return response
+
+    def _active_backoff(self, request: PlannerRequest) -> dict[str, Any] | None:
+        if request.status is not PlannerRequestStatus.BACKOFF:
+            return None
+        if request.next_retry_at is None:
+            raise ValueError("strategic BACKOFF request requires next_retry_at")
+        remaining = (request.next_retry_at - self.engine._now()).total_seconds()
+        if remaining <= 0:
+            return None
+        attempts = self.engine.store.list_provider_attempts(request.planner_request_id)
+        return {
+            "category": request.failure_category,
+            "failure_count": sum(
+                attempt.status is ProviderAttemptStatus.FAILED for attempt in attempts
+            ),
+            "until": request.next_retry_at.isoformat(),
+            "remaining_seconds": remaining,
+        }
+
+    def _classify_planner_failure(self, exc: Exception) -> dict[str, Any]:
+        diagnostics = getattr(self.engine.planner, "last_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        status = diagnostics.get("http_status")
+        try:
+            status = None if status is None else int(status)
+        except (TypeError, ValueError):
+            status = None
+        text = str(exc)
+        lowered = text.lower()
+        transient = status in _TRANSIENT_HTTP or any(
+            marker in lowered
+            for marker in (
+                "timeout",
+                "timed out",
+                "transport failed",
+                "connection reset",
+                "temporarily unavailable",
+            )
+        )
+        if transient:
+            category = "transient_provider_failure"
+        elif status in {401, 403}:
+            category = "authentication_failure"
+        elif status == 404:
+            category = "model_or_endpoint_not_found"
+        else:
+            category = "planner_failure"
+        return {
+            "category": category,
+            "transient": transient,
+            "provider": diagnostics.get("backend", "unknown"),
+            "http_status": status,
+            "request_id": diagnostics.get("request_id"),
+            "retry_count": diagnostics.get("attempt_count", 0),
+            "final_error": text[-1000:],
+        }
 
     @staticmethod
     def _provider_attempt_count(diagnostics):

@@ -18,7 +18,6 @@ from civ6_workflow.domain import (
     MissionStatus,
     PlanLease,
     PlanLeaseStatus,
-    ScopeAuthorityActivatedTick,
     StrategicContract,
     StrategicContractCommit,
     SubjectRef,
@@ -30,7 +29,6 @@ from civ6_workflow.models import (
     ProposedTask,
     RiskLevel,
     RuntimeSnapshot,
-    TaskStatus,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
@@ -212,89 +210,6 @@ def _activate(
     )
 
 
-def test_civic_cutover_is_atomic_idempotent_and_replay_stable(tmp_path):
-    store = WorkflowStore(tmp_path / "source.sqlite3")
-    base = _create_foundation(store)
-    observation = _observation(current_research=None)
-    store.save_normalized_observation(observation)
-    gap = _civic_gap(scope="empire")
-    store.save_decision_gap(gap, turn=8)
-    store.save_plan_lease(_civic_lease(gap, scope="empire"))
-    store.save_plan_bundle(
-        GAME_ID,
-        8,
-        _legacy_civic_bundle(),
-        mode=ExecutionMode.AUTO,
-        auto_action_types={"set_civic"},
-        observation_id=observation.observation_id,
-    )
-
-    contract, tick = _activate(store, base)
-
-    assert isinstance(tick, ScopeAuthorityActivatedTick)
-    assert contract.revision == 2
-    assert contract.authority_scope_set.mission_graph_scopes == ("civic",)
-    assert contract.mission_graph.missions == (_civic_mission(base.contract_id),)
-    assert store.get_strategic_contract_revision(GAME_ID, 1) == base
-    assert store.get_decision_gap(GAME_ID, gap.decision_gap_id).status is (
-        DecisionGapStatus.SUPERSEDED
-    )
-    assert store.get_task(GAME_ID, "legacy-civic-task").status is TaskStatus.CANCELLED
-    with store._connect() as conn:
-        lease = PlanLease.model_validate_json(
-            conn.execute(
-                "SELECT lease_json FROM plan_leases WHERE plan_lease_id='lease-civic'"
-            ).fetchone()["lease_json"]
-        )
-    assert lease.status is PlanLeaseStatus.INVALIDATED
-    assert {
-        (item.object_kind, item.object_id, item.final_status)
-        for item in tick.legacy_dispositions
-    } == {
-        ("decision_gap", gap.decision_gap_id, "SUPERSEDED"),
-        ("plan_lease", "lease-civic", "INVALIDATED"),
-        ("stored_task", "legacy-civic-task", "cancelled"),
-    }
-
-    assert _activate(store, base) == (contract, tick)
-    assert len(store.list_strategic_contract_revisions(GAME_ID)) == 2
-    first_export = store.export_replay_state(GAME_ID)
-    restored = WorkflowStore(tmp_path / "restored.sqlite3")
-    restored.import_replay_state(first_export)
-    assert restored.export_replay_state(GAME_ID) == first_export
-    assert WorkflowStore(restored.path).get_active_strategic_contract(GAME_ID) == (
-        contract
-    )
-
-
-def test_civic_cutover_closes_only_civic_legacy_writes(tmp_path):
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    base = _create_foundation(store)
-    store.save_normalized_observation(_observation())
-    _activate(store, base)
-
-    with pytest.raises(ValueError, match="legacy civic DecisionGap"):
-        store.save_decision_gap(_civic_gap(gap_id="late-civic-gap"), turn=8)
-    with pytest.raises(ValueError, match="legacy civic plan writes"):
-        store.save_plan_bundle(
-            GAME_ID,
-            8,
-            _legacy_civic_bundle(task_id="late-civic-task"),
-            mode=ExecutionMode.AUTO,
-            auto_action_types={"set_civic"},
-            observation_id="obs-civic",
-        )
-
-    research_gap = _civic_gap(gap_id="research-gap").model_copy(
-        update={
-            "gap_type": "research_direction_required",
-            "scope": "research",
-        }
-    )
-    store.save_decision_gap(research_gap, turn=8)
-    assert store.get_decision_gap(GAME_ID, research_gap.decision_gap_id) == research_gap
-
-
 def test_civic_turn_graph_is_the_only_claimable_execution_authority(tmp_path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     base = _create_foundation(store)
@@ -382,124 +297,3 @@ def test_scope_activation_audit_cannot_be_removed_during_replay(tmp_path):
         target.import_replay_state(state)
     assert target.export_replay_state(GAME_ID) == before
     assert target.get_active_strategic_contract(GAME_ID) == target_base
-
-
-@pytest.mark.parametrize("object_kind", ["decision_gap", "plan_lease"])
-def test_replay_rejects_nonterminal_legacy_civic_state_after_cutover(
-    tmp_path, object_kind
-):
-    source = WorkflowStore(tmp_path / f"source-{object_kind}.sqlite3")
-    base = _create_foundation(source)
-    source.save_normalized_observation(_observation(current_research=None))
-    gap = _civic_gap(scope="empire")
-    source.save_decision_gap(gap, turn=8)
-    source.save_plan_lease(_civic_lease(gap, scope="empire"))
-    _activate(source, base)
-    state = source.export_replay_state(GAME_ID)
-
-    if object_kind == "decision_gap":
-        row = state["tables"]["decision_gaps"][0]
-        restored_gap = DecisionGap.model_validate_json(row["gap_json"]).model_copy(
-            update={"status": DecisionGapStatus.OPEN}
-        )
-        row["status"] = DecisionGapStatus.OPEN.value
-        row["gap_json"] = restored_gap.model_dump_json()
-    else:
-        row = state["tables"]["plan_leases"][0]
-        restored_lease = PlanLease.model_validate_json(row["lease_json"]).model_copy(
-            update={"status": PlanLeaseStatus.ACTIVE}
-        )
-        row["status"] = PlanLeaseStatus.ACTIVE.value
-        row["lease_json"] = restored_lease.model_dump_json()
-    tick_row = next(
-        row
-        for row in state["tables"]["workflow_ticks"]
-        if row["outcome"] == "SCOPE_AUTHORITY_ACTIVATED"
-    )
-    activation_tick = ScopeAuthorityActivatedTick.model_validate_json(
-        tick_row["tick_json"]
-    )
-    tick_row["tick_json"] = activation_tick.model_copy(
-        update={
-            "legacy_dispositions": tuple(
-                disposition
-                for disposition in activation_tick.legacy_dispositions
-                if disposition.object_kind != object_kind
-            )
-        }
-    ).model_dump_json()
-
-    target = WorkflowStore(tmp_path / f"target-{object_kind}.sqlite3")
-    target_base = _create_foundation(target)
-    before = target.export_replay_state(GAME_ID)
-    with pytest.raises(ValueError, match="nonterminal legacy"):
-        target.import_replay_state(state)
-    assert target.export_replay_state(GAME_ID) == before
-    assert target.get_active_strategic_contract(GAME_ID) == target_base
-
-
-def test_startup_rejects_nonterminal_legacy_civic_gap_after_cutover(tmp_path):
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    base = _create_foundation(store)
-    store.save_normalized_observation(_observation(current_research=None))
-    gap = _civic_gap(scope="empire")
-    store.save_decision_gap(gap, turn=8)
-    _activate(store, base)
-
-    with store._connect() as conn:
-        tick_row = conn.execute(
-            "SELECT tick_json FROM workflow_ticks "
-            "WHERE game_id=? AND outcome='SCOPE_AUTHORITY_ACTIVATED'",
-            (GAME_ID,),
-        ).fetchone()
-        activation_tick = ScopeAuthorityActivatedTick.model_validate_json(
-            tick_row["tick_json"]
-        )
-        amended_tick = activation_tick.model_copy(
-            update={
-                "legacy_dispositions": tuple(
-                    disposition
-                    for disposition in activation_tick.legacy_dispositions
-                    if disposition.object_kind != "decision_gap"
-                )
-            }
-        )
-        conn.execute(
-            "UPDATE workflow_ticks SET tick_json=? WHERE tick_id=?",
-            (amended_tick.model_dump_json(), activation_tick.tick_id),
-        )
-        conn.execute(
-            "UPDATE decision_gaps SET status=?, gap_json=? "
-            "WHERE game_id=? AND decision_gap_id=?",
-            (
-                DecisionGapStatus.OPEN.value,
-                gap.model_dump_json(),
-                GAME_ID,
-                gap.decision_gap_id,
-            ),
-        )
-
-    with pytest.raises(ValueError, match="nonterminal legacy DecisionGap"):
-        WorkflowStore(store.path)
-
-
-def test_stale_civic_activation_rolls_back_every_legacy_object(tmp_path):
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    base = _create_foundation(store)
-    store.save_normalized_observation(_observation())
-    gap = _civic_gap()
-    store.save_decision_gap(gap, turn=8)
-    before = store.export_replay_state(GAME_ID)
-
-    with pytest.raises(ValueError, match="stale civic authority"):
-        store.activate_civic_authority(
-            game_session_id=GAME_ID,
-            expected_base_revision=base.revision + 1,
-            mission=_civic_mission(base.contract_id),
-            activation_id="stale-civic",
-            observation_id="obs-civic",
-            turn_number=8,
-            activated_at=NOW + timedelta(minutes=1),
-        )
-
-    assert store.export_replay_state(GAME_ID) == before

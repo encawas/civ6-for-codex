@@ -23,7 +23,6 @@ from .domain import (
     AttemptStatus,
     AwaitingHumanTick,
     NoSafeActionTick,
-    PlanRequestedTick,
     PlannerRequest,
     PlannerRequestStatus,
     ProviderAttemptStatus,
@@ -34,7 +33,6 @@ from .domain import (
     StrategicRequestWaitErrorTick,
     StrategicRequestWaitResumedTick,
     SystemErrorTick,
-    TaskCreatedTick,
     TickOutcomeKind,
     validate_workflow_tick,
 )
@@ -62,9 +60,7 @@ from .observation_normalization import (
     normalize_runtime_snapshot,
 )
 from .planner_lifecycle import PlannerLifecycleCoordinator
-from .progression import ProgressionRuleCompiler
 from .recovery import recover_turn_rewind
-from .rules import DeterministicRuleCompiler
 from .turn_compiler import TurnCompiler
 from .validation import (
     PlanValidationContext,
@@ -223,8 +219,6 @@ class WorkflowEngine:
             monotonic=self._monotonic,
             checkpoint=self._checkpoint,
         )
-        self.rules = DeterministicRuleCompiler(store)
-        self.progression = ProgressionRuleCompiler(store)
         self.turn_compiler = TurnCompiler()
         self.information_queries = InformationQueryRouter(self.game)
         self.planner_lifecycle = PlannerLifecycleCoordinator(self)
@@ -259,7 +253,7 @@ class WorkflowEngine:
                     no_safe_action
                     or self.store.agent_called_for_turn(game_id, result.turn)
                 )
-                and not self.store.due_tasks(game_id, result.turn)
+                and self.store.active_turn_action_graph(game_id) is None
             ):
                 result.paused = True
                 result.pause_reason = (
@@ -417,13 +411,10 @@ class WorkflowEngine:
             if active_contract is None
             else set(active_contract.authority_scope_set.mission_graph_scopes)
         )
-        existing_due = self.store.due_tasks(snapshot.game_id, snapshot.turn)
         need_units = (
             observation.canonical.unit_summary.detail_required
-            or self.rules.needs_units(snapshot.game_id)
             or "settler" in owned_execution_scopes
             or "tactical_emergency" in owned_execution_scopes
-            or any(task.entity_type in {"unit", "builder"} for task in existing_due)
         )
         if need_units and snapshot.units is None:
             raw = await self._read_snapshot(ctx.metrics, include_units=True)
@@ -439,14 +430,6 @@ class WorkflowEngine:
         if mission_repair_tick is not None:
             return mission_repair_tick
 
-        before = self.store.task_ids(snapshot.game_id)
-        materialization_started = self._monotonic()
-        rule_compilation = self.rules.compile(observation)
-        progression_compilation = self.progression.compile(
-            observation,
-            include_research="research" not in owned_execution_scopes,
-            include_civic="civic" not in owned_execution_scopes,
-        )
         authoritative_mission_events: list[GameEvent] = []
         if active_contract is not None:
             for mission in execution_missions:
@@ -544,8 +527,6 @@ class WorkflowEngine:
         )
         snapshot_events = events_from_snapshot(snapshot)
         current_events = [
-            *rule_compilation.events,
-            *progression_compilation.events,
             *authoritative_mission_events,
             *snapshot_events,
         ]
@@ -566,6 +547,12 @@ class WorkflowEngine:
                 for event in current_events
                 if event.event_type
                 not in {"city_role_required", "invalid_city_plan_item"}
+            ]
+        if "settler" in owned_execution_scopes:
+            current_events = [
+                event
+                for event in current_events
+                if event.event_type != "settler_site_selection_required"
             ]
         if "diplomacy_trade" in owned_execution_scopes:
             current_events = [
@@ -590,43 +577,12 @@ class WorkflowEngine:
                     "tactical_emergency_mission_target_unavailable",
                 }
             ]
-        lease_tick = await self._pre_route_decision_runtime(
-            ctx, observation, current_events
-        )
-        if lease_tick is not None:
-            return lease_tick
-
-        for compilation in (rule_compilation, progression_compilation):
-            if compilation.bundle is not None:
-                self.store.save_plan_bundle(
-                    snapshot.game_id,
-                    snapshot.turn,
-                    compilation.bundle,
-                    mode=self.config.execution_mode,
-                    auto_action_types=self.config.auto_action_types,
-                    observation_id=observation_id,
-                )
         if turn_compilation is not None:
             self.store.activate_turn_action_graph(
                 turn_compilation.graph,
                 turn_compilation.nodes,
                 activated_at=observation.canonical.observed_at,
             )
-        ctx.metrics.task_materialization_seconds += (
-            self._monotonic() - materialization_started
-        )
-        created = sorted(self.store.task_ids(snapshot.game_id) - before)
-        created = [
-            task_id
-            for task_id in created
-            if not (
-                (task := self.store.get_task(snapshot.game_id, task_id)) is not None
-                and task.plan_id.startswith("turn_action_graph_")
-            )
-        ]
-        if created:
-            return self._finish(ctx, snapshot, TaskCreatedTick, task_id=created[0])
-
         if "diplomacy_trade" in owned_execution_scopes and diplomacy_trade_human_events:
             gate = self.gate.ingest(snapshot.game_id, diplomacy_trade_human_events)
             human_wait = TickResult(
@@ -673,8 +629,7 @@ class WorkflowEngine:
                 snapshot.game_id,
                 snapshot.turn,
                 source_observation_id=observation_id,
-            ),
-            *self.store.due_tasks(snapshot.game_id, snapshot.turn),
+            )
         ]
         due_tasks.sort(key=lambda task: (task.due_turn, task.task_id))
         if (
@@ -702,8 +657,6 @@ class WorkflowEngine:
 
         rewind_event = recover_turn_rewind(self.store, snapshot)
         events = [] if rewind_event is None else [rewind_event]
-        events.extend(rule_compilation.events)
-        events.extend(progression_compilation.events)
         events.extend(authoritative_mission_events)
         events.extend(snapshot_events)
         if "diplomacy_trade" in owned_execution_scopes:
@@ -729,6 +682,12 @@ class WorkflowEngine:
                     "tactical_emergency_mission_target_unavailable",
                 }
             ]
+        if "settler" in owned_execution_scopes:
+            events = [
+                event
+                for event in events
+                if event.event_type != "settler_site_selection_required"
+            ]
         gate = self.gate.ingest(snapshot.game_id, events)
         compat = TickResult(
             turn=snapshot.turn, metrics=ctx.metrics, events=gate.emitted
@@ -748,35 +707,12 @@ class WorkflowEngine:
         )
         if planning_tick is not None:
             return planning_tick
-        already_called = self.store.agent_called_for_turn(
-            snapshot.game_id, snapshot.turn
-        )
-        if (
-            agent_events
-            and not already_called
-            and self.config.max_agent_calls_per_turn > 0
-        ):
-            tasks_before_planner = self.store.task_ids(snapshot.game_id)
-            await self._invoke_planner(snapshot, agent_events, compat, ctx.metrics)
-            planner_created = sorted(
-                self.store.task_ids(snapshot.game_id) - tasks_before_planner
+        if agent_events:
+            compat.paused = True
+            compat.pause_reason = (
+                "A blocking event has no current MissionGraph projection; "
+                "explicit migration or human review is required."
             )
-            if planner_created:
-                return self._finish(
-                    ctx,
-                    snapshot,
-                    TaskCreatedTick,
-                    compatibility=compat,
-                    task_id=planner_created[0],
-                )
-            if compat.planner_request_id is not None:
-                return self._finish(
-                    ctx,
-                    snapshot,
-                    PlanRequestedTick,
-                    compatibility=compat,
-                    planner_request_id=compat.planner_request_id,
-                )
         if compat.paused:
             return self._finish(
                 ctx,

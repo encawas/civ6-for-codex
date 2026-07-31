@@ -4,13 +4,11 @@ from pathlib import Path
 import pytest
 
 import civ6_workflow.conditions as conditions_module
-import civ6_workflow.engine as engine_module
 from civ6_workflow.domain import (
     NORMALIZATION_VERSION,
     SlotState,
     UnitActionState,
     UnitDetailReason,
-    thaw_json,
 )
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
 from civ6_workflow.models import (
@@ -98,57 +96,6 @@ def _save_research_plan(store: WorkflowStore) -> None:
         mode=ExecutionMode.AUTO,
         auto_action_types={"set_research"},
     )
-
-
-@pytest.mark.parametrize("raw_production", EMPTY_PRODUCTION_VALUES)
-def test_obs_001_empty_production_variants_use_one_vertical_boundary(
-    tmp_path: Path,
-    raw_production,
-):
-    """OBS-001: every upstream empty spelling materializes the same task."""
-
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    _save_city_plan(store)
-    raw_snapshot = _city_snapshot(raw_production)
-    observation = normalize_runtime_snapshot(raw_snapshot)
-
-    raw_audit = thaw_json(observation.canonical.raw_observation)
-    assert raw_audit["cities"][0]["currently_building"] == raw_production
-    assert observation.canonical.cities[0].production.state is SlotState.EMPTY
-    assert observation.snapshot.cities[0]["currently_building"] is None
-
-    compiled = DeterministicRuleCompiler(store).compile(observation)
-
-    assert compiled.bundle is not None
-    assert [task.action_type for task in compiled.bundle.tasks] == [
-        "city_set_production"
-    ]
-
-
-@pytest.mark.parametrize(
-    "production",
-    [
-        "UNIT_BUILDER",
-        "BUILDING_MONUMENT",
-        "DISTRICT_CAMPUS",
-        "PROJECT_CAMPUS_RESEARCH_GRANTS",
-        "BUILDING_PYRAMIDS",
-        "MODDED_VALID_PROJECT",
-    ],
-)
-def test_obs_002_occupied_production_is_never_classified_as_empty(
-    tmp_path: Path,
-    production: str,
-):
-    """OBS-002: any non-empty production identifier remains occupied."""
-
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    _save_city_plan(store)
-    observation = normalize_runtime_snapshot(_city_snapshot(production))
-
-    assert observation.canonical.cities[0].production.state is SlotState.OCCUPIED
-    assert observation.canonical.cities[0].production.value == production
-    assert DeterministicRuleCompiler(store).compile(observation).bundle is None
 
 
 def test_obs_003_raw_payload_is_audit_only_and_rules_have_no_empty_spelling_list():
@@ -240,78 +187,6 @@ def test_normalized_values_cover_progression_units_blockers_and_identifiers():
     assert observation.units[0].action_state is UnitActionState.ACTIONABLE
     assert observation.blockers[0].source_type == "end_turn_blocker"
     assert observation.blockers[0].blocker_type == "ENDTURN_BLOCKING_UNITS"
-
-
-@pytest.mark.parametrize(
-    "empty_research", [None, "", "  ", "none", "NONE", "NoThInG", {}, []]
-)
-def test_plan_002_empty_research_allows_queue_materialization(
-    tmp_path: Path,
-    empty_research,
-):
-    """PLAN-002: an empty normalized research slot permits queue continuation."""
-
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    _save_research_plan(store)
-    snapshot = _city_snapshot("UNIT_SCOUT")
-    snapshot.tech_civics["current_research"] = empty_research
-
-    compiled = ProgressionRuleCompiler(store).compile(
-        normalize_runtime_snapshot(snapshot)
-    )
-
-    assert compiled.bundle is not None
-    assert [task.action_type for task in compiled.bundle.tasks] == ["set_research"]
-
-
-@pytest.mark.parametrize(
-    "current_research",
-    ["TECH_MINING", "tech_mining", "Mining", " mining "],
-)
-def test_plan_002_occupied_research_suppresses_queue_materialization(
-    tmp_path: Path,
-    current_research: str,
-):
-    """PLAN-002: an occupied research slot cannot create a replacement task."""
-
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    _save_research_plan(store)
-    snapshot = _city_snapshot("UNIT_SCOUT")
-    snapshot.tech_civics["current_research"] = current_research
-
-    compiled = ProgressionRuleCompiler(store).compile(
-        normalize_runtime_snapshot(snapshot)
-    )
-
-    assert compiled.bundle is None
-    assert compiled.events == []
-
-
-def test_city_production_tick_uses_normalized_observation_boundary(
-    tmp_path: Path,
-):
-    store = WorkflowStore(tmp_path / "vertical.sqlite3")
-    _save_city_plan(store)
-    game = _ReadPolicyGame(_city_snapshot("nothing"))
-    engine = WorkflowEngine(
-        store=store,
-        game=game,
-        planner=_NoPlanner(),
-        config=EngineConfig(
-            execution_mode=ExecutionMode.CONFIRM,
-            auto_end_turn=False,
-            max_agent_calls_per_turn=0,
-            auto_action_types={"city_set_production"},
-            allowed_action_types={"city_set_production"},
-        ),
-    )
-
-    result = asyncio.run(engine.tick())
-
-    tasks = store.list_tasks("game-1")
-    assert [task.action_type for task in tasks] == ["city_set_production"]
-    assert result.metrics.normalization_seconds > 0
-    assert game.read_requests == [False]
 
 
 class _NoPlanner:
@@ -648,55 +523,3 @@ class _ExecutingGame(_ReadPolicyGame):
         self.call_count += 1
         self.snapshot.cities[0]["currently_building"] = task.arguments["item_name"]
         return ActionResult(success=True, message="production selected")
-
-
-def test_tick_counts_each_real_normalization_and_reuses_it_for_conditions(
-    tmp_path: Path,
-    monkeypatch,
-):
-    store = WorkflowStore(tmp_path / "normalization-metrics.sqlite3")
-    _save_city_plan(store)
-    game = _ExecutingGame(_city_snapshot("nothing"))
-    engine_calls = 0
-    original_engine_normalize = engine_module.normalize_runtime_snapshot
-
-    def counting_engine_normalize(snapshot):
-        nonlocal engine_calls
-        engine_calls += 1
-        return original_engine_normalize(snapshot)
-
-    def unexpected_condition_normalize(snapshot):
-        raise AssertionError("engine conditions must reuse the timed observation")
-
-    monkeypatch.setattr(
-        engine_module,
-        "normalize_runtime_snapshot",
-        counting_engine_normalize,
-    )
-    monkeypatch.setattr(
-        conditions_module,
-        "normalize_runtime_snapshot",
-        unexpected_condition_normalize,
-    )
-    engine = WorkflowEngine(
-        store=store,
-        game=game,
-        planner=_NoPlanner(),
-        config=EngineConfig(
-            execution_mode=ExecutionMode.AUTO,
-            auto_end_turn=False,
-            max_agent_calls_per_turn=0,
-            auto_action_types={"city_set_production"},
-            allowed_action_types={"city_set_production"},
-        ),
-    )
-
-    created = asyncio.run(engine.tick())
-    sent = asyncio.run(engine.tick())
-
-    assert created.workflow_tick["outcome"] == "TASK_CREATED"
-    assert sent.workflow_tick["outcome"] == "MUTATION_SENT"
-    assert game.read_requests == [False, False]
-    assert engine_calls == len(game.read_requests)
-    assert created.metrics.normalization_seconds > 0
-    assert sent.metrics.normalization_seconds > 0

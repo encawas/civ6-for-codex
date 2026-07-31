@@ -30,7 +30,7 @@ def test_standalone_project_entry_files_exist_at_repository_root():
         ".gitignore",
         ".github/workflows/tests.yml",
         "src/civ6_workflow/__init__.py",
-        "tests/test_engine.py",
+        "tests/test_batch_executor.py",
     ]
     missing = [path for path in required if not (PROJECT_ROOT / path).exists()]
     assert missing == []

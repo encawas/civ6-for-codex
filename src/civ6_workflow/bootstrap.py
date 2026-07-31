@@ -191,14 +191,10 @@ def compose_replay_runtime(
     if recording.store_state is not None:
         store.import_replay_state(recording.store_state)
     config = replay_engine_config(recording, auto_end_turn=auto_end_turn)
-    game_id = recording.frames[0].snapshot.game_id
-    for seed in recording.seed_plans:
-        store.save_plan_bundle(
-            game_id,
-            seed.turn,
-            seed.bundle,
-            mode=seed.mode,
-            auto_action_types=set(seed.auto_action_types) or config.auto_action_types,
+    if recording.seed_plans:
+        raise ValueError(
+            "legacy replay seed plans require migration to persisted "
+            "StrategicContract and TurnActionGraph state"
         )
     game = ReplayGamePort(recording)
     planner = ReplayPlanner(recording)
