@@ -56,13 +56,6 @@ from .contracts import (
     tactical_emergency_mission_order,
     validate_scope_activation_mission,
 )
-from .decisions import (
-    DECISION_INPUT_PROJECTION_VERSION,
-    DecisionGap,
-    DecisionGapStatus,
-    DecisionGroup,
-    DecisionRoute,
-)
 from .events import Event, EventRoute, EventStatus
 from .observations import (
     NORMALIZATION_VERSION,
@@ -110,15 +103,6 @@ from .patches import (
     build_mission_graph_patch,
     build_mission_graph_patch_id,
     mission_graph_patch_hash,
-)
-from .plans import (
-    ContinuationPolicy,
-    LeaseValidationResult,
-    Plan,
-    PlanLease,
-    PlanLeaseStatus,
-    PlanSource,
-    PlanStatus,
 )
 from .proposals import (
     STRATEGIC_PROPOSAL_TARGET_KINDS,
@@ -240,22 +224,16 @@ __all__ = [
     "StrategicProposalWaitErrorTick",
     "StrategicProposalWaitResumedTick",
     "LegacyResearchTaskDisposition",
-    "PlanLeaseStatus",
-    "PlanLease",
     "LogicalPlannerRequestCreatedTick",
     "MissionGraphPatchedTick",
     "LegacyScopeObjectDisposition",
     "ScopeAuthorityActivatedTick",
-    "LeaseValidationResult",
     "InformationRoundStatus",
     "InformationRound",
     "InformationRequestedTick",
     "InformationCollectedTick",
-    "DecisionGroup",
     "DecisionGapUpdatedTick",
     "DecisionGapCreatedTick",
-    "ContinuationPolicy",
-    "DECISION_INPUT_PROJECTION_VERSION",
     "WORKFLOW_TICK_ADAPTER",
     "ActionAttempt",
     "AttemptReconciledTick",
@@ -271,9 +249,6 @@ __all__ = [
     "AwaitingVerificationTick",
     "Condition",
     "ContextGatheredTick",
-    "DecisionGap",
-    "DecisionGapStatus",
-    "DecisionRoute",
     "DomainModel",
     "Event",
     "EventRoute",
@@ -298,10 +273,7 @@ __all__ = [
     "ObservationComparisonKind",
     "ObservationComparisonResult",
     "PausedTick",
-    "Plan",
     "PlanRequestedTick",
-    "PlanSource",
-    "PlanStatus",
     "PlannerBackoffTick",
     "ProgressionState",
     "PlannerRequest",

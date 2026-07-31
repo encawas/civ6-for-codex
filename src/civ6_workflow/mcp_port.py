@@ -13,7 +13,7 @@ from .models import (
     ActionResult,
     MutationDeliveryStatus,
     RuntimeSnapshot,
-    StoredTask,
+    TurnActionExecution,
 )
 from .ports import (
     BoundedGamePort as BoundedGamePort,
@@ -281,7 +281,7 @@ class Civ6GamePort:
         units = await self.state_api.get("/api/units")
         return snapshot.model_copy(update={"units": units})
 
-    async def execute_task(self, task: StoredTask) -> ActionResult:
+    async def execute_task(self, task: TurnActionExecution) -> ActionResult:
         try:
             tool_name, arguments = resolve_action(task, self.allowed_tools)
         except ActionValidationError as exc:

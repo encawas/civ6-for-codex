@@ -8,20 +8,24 @@ from civ6_workflow.domain import (
     ApprovalStatus,
     AuthorityScopeSet,
     Condition,
-    ContinuationPolicy,
-    DecisionGap,
-    DecisionGapStatus,
-    DecisionRoute,
-    LeaseValidationResult,
     Mission,
     MissionGraph,
     MissionStatus,
-    PlanLease,
-    PlanLeaseStatus,
     StrategicContract,
     StrategicContractCommit,
     SubjectRef,
     build_strategic_contract_id,
+)
+from civ6_workflow.domain.legacy_decisions import (
+    DecisionGap,
+    DecisionGapStatus,
+    DecisionRoute,
+)
+from civ6_workflow.domain.legacy_plans import (
+    ContinuationPolicy,
+    LeaseValidationResult,
+    PlanLease,
+    PlanLeaseStatus,
 )
 from civ6_workflow.models import (
     RuntimeSnapshot,

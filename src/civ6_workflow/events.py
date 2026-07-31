@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any
 
-from .models import EventLevel, GameEvent, RiskLevel, RuntimeSnapshot, StoredTask
+from .models import EventLevel, GameEvent, RiskLevel, RuntimeSnapshot, TurnActionExecution
 
 
 def _stable_hash(value: Any) -> str:
@@ -145,7 +145,7 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
 
 
 def task_failure_event(
-    task: StoredTask,
+    task: TurnActionExecution,
     *,
     turn: int,
     message: str,

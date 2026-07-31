@@ -14,10 +14,7 @@ from civ6_workflow.domain import (
     EventStatus,
     MutationSentTick,
     Observation,
-    Plan,
     PlanRequestedTick,
-    PlanSource,
-    PlanStatus,
     PlannerRequest,
     PlannerRequestStatus,
     RetryClassification,
@@ -368,40 +365,6 @@ def test_non_edit_approval_rejects_replacement_payload():
             created_at=NOW,
             edited_payload={"objective": "updated"},
             replacement_revision=3,
-        )
-
-
-def test_active_plan_requires_satisfied_approval():
-    with pytest.raises(ValidationError, match="must satisfy approval"):
-        Plan(
-            plan_id="plan-1",
-            game_session_id="game-1",
-            scope="research",
-            revision=1,
-            status=PlanStatus.ACTIVE,
-            source=PlanSource.PLANNER,
-            approval_status=ApprovalStatus.REQUIRED,
-            created_from_observation_id="obs-1",
-            valid_from_turn=12,
-            valid_until_turn=20,
-            objective="Research writing",
-        )
-
-
-def test_rejected_plan_and_approval_statuses_must_agree():
-    with pytest.raises(ValidationError, match="must agree"):
-        Plan(
-            plan_id="plan-1",
-            game_session_id="game-1",
-            scope="research",
-            revision=1,
-            status=PlanStatus.REJECTED,
-            source=PlanSource.PLANNER,
-            approval_status=ApprovalStatus.APPROVED,
-            created_from_observation_id="obs-1",
-            valid_from_turn=12,
-            valid_until_turn=20,
-            objective="Research writing",
         )
 
 

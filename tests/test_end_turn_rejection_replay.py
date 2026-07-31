@@ -9,7 +9,6 @@ from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
     MutationDeliveryStatus,
-    PlanBundle,
     RuntimeSnapshot,
 )
 from civ6_workflow.store import WorkflowStore
@@ -21,7 +20,7 @@ class Planner:
 
     async def plan(self, request):
         self.calls += 1
-        return PlanBundle(summary="no strategic change")
+        raise AssertionError("end-turn recovery must not call the planner")
 
 
 class Game:

@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Iterable, Iterator
 
-from .models import ActionResult, RuntimeSnapshot, StoredTask
-from .workflow_protocol import (
-    WorkflowAgentRequest as AgentRequest,
-    WorkflowPlanBundle as PlanBundle,
-)
+from .models import ActionResult, RuntimeSnapshot, TurnActionExecution
+from .workflow_protocol import WorkflowAgentRequest as AgentRequest
 
 
 class GameCallKind(StrEnum):
@@ -101,7 +99,7 @@ class RecordingGamePort:
         )
         return await self.delegate.read_snapshot(include_units=include_units)
 
-    async def execute_task(self, task: StoredTask) -> ActionResult:
+    async def execute_task(self, task: TurnActionExecution) -> ActionResult:
         self._record(
             GameCallKind.MUTATION,
             "execute_task",
@@ -179,7 +177,7 @@ class ScriptedSnapshotSource:
             )
         return frame.snapshot.model_copy(deep=True)
 
-    async def execute_task(self, task: StoredTask) -> ActionResult:
+    async def execute_task(self, task: TurnActionExecution) -> ActionResult:
         self.call_count += 1
         if self._action_results:
             return self._action_results.pop(0).model_copy(deep=True)
@@ -222,7 +220,7 @@ class RecordingPlanner:
         self._implicit_transaction_sequence = 0
         self.calls: list[RecordedPlannerCall] = []
         self.requests: list[AgentRequest] = []
-        self.responses: list[PlanBundle] = []
+        self.responses: list[Any] = []
 
     def set_provider_attempt_hook(self, hook: Any | None) -> bool:
         setter = getattr(self.delegate, "set_provider_attempt_hook", None)
@@ -256,7 +254,7 @@ class RecordingPlanner:
         finally:
             self._active_logical_transaction_id = None
 
-    async def plan(self, request: AgentRequest) -> PlanBundle:
+    async def plan(self, request: AgentRequest) -> Any:
         transaction_id = self._active_logical_transaction_id
         if transaction_id is None:
             self._implicit_transaction_sequence += 1
@@ -287,7 +285,7 @@ class RecordingPlanner:
                     provider_attempts=attempts,
                 )
             )
-        self.responses.append(response.model_copy(deep=True))
+        self.responses.append(copy.deepcopy(response))
         return response
 
     def _register_logical_transaction(self, transaction_id: str) -> None:
@@ -300,7 +298,7 @@ class RecordingPlanner:
 class ScriptedPlanner:
     def __init__(
         self,
-        responses: Iterable[PlanBundle],
+        responses: Iterable[Any],
         *,
         provider_attempts: Iterable[int] = (),
     ):
@@ -313,7 +311,7 @@ class ScriptedPlanner:
         self.provider_attempt_hook = hook
         return True
 
-    async def plan(self, request: AgentRequest) -> PlanBundle:
+    async def plan(self, request: AgentRequest) -> Any:
         self.last_diagnostics = None
         if not self._responses:
             raise AssertionError(
@@ -335,7 +333,7 @@ class ScriptedPlanner:
                         {"failure_category": "scripted_retry"},
                     )
         self.last_diagnostics = {"attempt_count": attempts}
-        return self._responses.pop(0).model_copy(deep=True)
+        return copy.deepcopy(self._responses.pop(0))
 
 
 class DeterministicClock:

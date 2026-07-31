@@ -26,7 +26,7 @@ from .domain import (
     TurnActionGraph,
     TurnActionNode,
 )
-from .models import ActionResult, RuntimeSnapshot, StoredTask
+from .models import ActionResult, RuntimeSnapshot, TurnActionExecution
 
 
 class StaleStrategicContractBaseError(ValueError):
@@ -200,11 +200,11 @@ class WorkflowStorePort(Protocol):
         nodes: tuple[TurnActionNode, ...],
         *,
         activated_at: datetime,
-    ) -> tuple[TurnActionGraph, tuple[StoredTask, ...]]: ...
+    ) -> tuple[TurnActionGraph, tuple[TurnActionExecution, ...]]: ...
 
     def active_turn_action_graph(
         self, game_id: str
-    ) -> tuple[TurnActionGraph, tuple[StoredTask, ...]] | None: ...
+    ) -> tuple[TurnActionGraph, tuple[TurnActionExecution, ...]] | None: ...
 
     def due_turn_action_nodes(
         self,
@@ -212,7 +212,7 @@ class WorkflowStorePort(Protocol):
         turn: int,
         *,
         source_observation_id: str,
-    ) -> list[StoredTask]: ...
+    ) -> list[TurnActionExecution]: ...
 
     def save_normalized_observation(
         self, observation: NormalizedObservation
@@ -265,7 +265,7 @@ class GamePort(Protocol):
         self, *, include_units: bool = False
     ) -> RuntimeSnapshot: ...
 
-    async def execute_task(self, task: StoredTask) -> ActionResult: ...
+    async def execute_task(self, task: TurnActionExecution) -> ActionResult: ...
 
     async def end_turn(self, reflections: dict[str, str]) -> ActionResult: ...
 
@@ -311,7 +311,7 @@ class BoundedGamePort:
     async def read_snapshot(self, *, include_units: bool = False) -> RuntimeSnapshot:
         return await self.delegate.read_snapshot(include_units=include_units)
 
-    async def execute_task(self, task: StoredTask) -> ActionResult:
+    async def execute_task(self, task: TurnActionExecution) -> ActionResult:
         self.budget.consume(task.action_type)
         return await self.delegate.execute_task(task)
 

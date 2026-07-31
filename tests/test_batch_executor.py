@@ -17,7 +17,7 @@ from civ6_workflow.models import (
     MutationDeliveryStatus,
     RiskLevel,
     RuntimeSnapshot,
-    StoredTask,
+    TurnActionExecution,
     TaskStatus,
     TickMetrics,
 )
@@ -33,8 +33,8 @@ def _task(
     *,
     status: TaskStatus = TaskStatus.READY,
     due_turn: int = 7,
-) -> StoredTask:
-    return StoredTask(
+) -> TurnActionExecution:
+    return TurnActionExecution(
         task_id=task_id,
         plan_id="turn_action_graph_test",
         action_type="set_research",
@@ -65,8 +65,8 @@ def _observation(*, turn: int = 7):
 class _WaveStore:
     def __init__(
         self,
-        tasks: list[StoredTask],
-        eligible: list[StoredTask],
+        tasks: list[TurnActionExecution],
+        eligible: list[TurnActionExecution],
         *,
         projection_hash: str,
     ):

@@ -11,8 +11,9 @@ import httpx
 
 from .credentials import CredentialError, resolve_api_credential
 from .workflow_protocol import (
+    MissionGraphPatchResponse,
+    StrategicResearchProposalResponse,
     WorkflowAgentRequest as AgentRequest,
-    WorkflowPlanBundle as PlanBundle,
     planner_response_model_for_request,
 )
 
@@ -74,11 +75,10 @@ class ResponsesPlanner:
 
         request_text = request.model_dump_json(exclude_none=True)
         response_model = planner_response_model_for_request(request)
-        response_name = (
-            "civ6_plan_bundle"
-            if response_model is PlanBundle
-            else "strategic_research_proposal"
-        )
+        response_name = {
+            StrategicResearchProposalResponse: "strategic_research_proposal",
+            MissionGraphPatchResponse: "mission_graph_patch",
+        }[response_model]
         payload: dict[str, Any] = {
             "model": self.config.model,
             "instructions": self.system_instructions,
@@ -246,30 +246,8 @@ class ResponsesPlanner:
                 f"request_id={diagnostics.request_id}"
             )
 
-        if response_model is not PlanBundle:
-            self._record(diagnostics)
-            return output_text
-
-        try:
-            bundle = PlanBundle.model_validate_json(output_text)
-        except Exception as exc:
-            diagnostics.error_body = output_text[-4000:]
-            self._record(diagnostics)
-            raise self.error_type(
-                "Responses API returned an invalid PlanBundle; "
-                f"request_id={diagnostics.request_id}: {exc}"
-            ) from exc
-
-        max_tasks = int(request.constraints.get("max_tasks", 8))
-        if len(bundle.tasks) > max_tasks:
-            diagnostics.error_body = (
-                f"planner returned {len(bundle.tasks)} tasks with max_tasks={max_tasks}"
-            )
-            self._record(diagnostics)
-            raise self.error_type(diagnostics.error_body)
-
         self._record(diagnostics)
-        return bundle
+        return output_text
 
     def _record(self, diagnostics: PlannerHttpDiagnostics) -> None:
         self.last_diagnostics = asdict(diagnostics)

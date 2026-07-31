@@ -12,17 +12,10 @@ from civ6_workflow.domain import (
     AttemptStatus,
     AuthorityScopeSet,
     Condition,
-    ContinuationPolicy,
-    DecisionGap,
-    DecisionGapStatus,
-    DecisionRoute,
-    LeaseValidationResult,
     Mission,
     MissionGraph,
     MissionStatus,
     ObservationComparisonKind,
-    PlanLease,
-    PlanLeaseStatus,
     RuntimeState,
     StateDeltaBuilder,
     StateDeltaChangeKind,
@@ -34,10 +27,18 @@ from civ6_workflow.domain import (
 )
 from civ6_workflow.models import (
     ExecutionMode,
-    PlanBundle,
-    ProposedTask,
-    RiskLevel,
     RuntimeSnapshot,
+)
+from civ6_workflow.domain.legacy_decisions import (
+    DecisionGap,
+    DecisionGapStatus,
+    DecisionRoute,
+)
+from civ6_workflow.domain.legacy_plans import (
+    ContinuationPolicy,
+    LeaseValidationResult,
+    PlanLease,
+    PlanLeaseStatus,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
@@ -210,37 +211,6 @@ def _legacy_lease(gap: DecisionGap) -> PlanLease:
         relevant_input_hash=gap.relevant_input_hash,
         last_validated_observation_id="obs-activation",
         last_validation_result=LeaseValidationResult.VALID,
-    )
-
-
-def _legacy_bundle() -> PlanBundle:
-    return PlanBundle(
-        plan_id="legacy-settler-plan",
-        summary="legacy settler projection",
-        tasks=[
-            ProposedTask(
-                task_id="legacy-settler-task",
-                action_type="unit_move",
-                entity_type="unit",
-                entity_id=UNIT_ID,
-                due_turn=9,
-                arguments={
-                    "unit_id": UNIT_ID,
-                    "target_x": TARGET[0],
-                    "target_y": TARGET[1],
-                },
-                postconditions=[
-                    {
-                        "type": "unit_moved_from",
-                        "unit_id": UNIT_ID,
-                        "x": 1,
-                        "y": 2,
-                    }
-                ],
-                risk=RiskLevel.HIGH,
-                reason="legacy settlement route",
-            )
-        ],
     )
 
 

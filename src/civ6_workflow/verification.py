@@ -6,7 +6,7 @@ from enum import StrEnum
 from .conditions import ConditionEvaluator
 from .domain import ActionAttempt
 from .domain.observations import SlotState
-from .models import StoredTask
+from .models import TurnActionExecution
 from .observation_normalization import NormalizedRuntimeObservation
 
 
@@ -26,7 +26,7 @@ class ActionVerificationDecision:
 
 def evaluate_action_verification(
     attempt: ActionAttempt,
-    task: StoredTask,
+    task: TurnActionExecution,
     observation: NormalizedRuntimeObservation,
     conditions: ConditionEvaluator,
 ) -> ActionVerificationDecision:

@@ -26,8 +26,6 @@ from .domain import (
     AttemptReconciledTick,
     AttemptRecoveredTick,
     AttemptStatus,
-    DecisionGap,
-    DecisionGapStatus,
     InformationCollectedTick,
     InformationRound,
     InformationRoundStatus,
@@ -44,8 +42,6 @@ from .domain import (
     ObservationComparisonResult,
     StateDelta,
     StateDeltaBuilder,
-    PlanLease,
-    PlanLeaseStatus,
     PlannerAttemptCompletedTick,
     PlannerBackoffTick,
     PlannerRequest,
@@ -95,7 +91,9 @@ from .domain import (
     canonical_json_hash,
     thaw_json,
 )
-from .turn_compiler import turn_action_node_as_stored_task
+from .domain.legacy_decisions import DecisionGap, DecisionGapStatus
+from .domain.legacy_plans import PlanLease, PlanLeaseStatus
+from .turn_compiler import turn_action_node_as_execution
 from .domain.planner import TERMINAL_PLANNER_STATUSES
 from .ports import StaleStrategicContractBaseError
 from .models import (
@@ -104,7 +102,7 @@ from .models import (
     ExecutionMode,
     GameEvent,
     PlanBundle,
-    StoredTask,
+    TurnActionExecution,
     TaskStatus,
     TickMetrics,
 )
@@ -5011,7 +5009,7 @@ class WorkflowStore:
             for row in plan_lease_rows
         }
         stored_tasks = {
-            (str(row["game_id"]), str(row["task_id"])): cls._row_to_task(row)
+            (str(row["game_id"]), str(row["task_id"])): cls._legacy_task_from_row(row)
             for row in task_rows
         }
         scope_ticks: dict[str, ScopeAuthorityActivatedTick] = {}
@@ -5588,7 +5586,7 @@ class WorkflowStore:
         *,
         require_canonical: bool,
     ) -> None:
-        tasks: dict[tuple[str, str], StoredTask] = {}
+        tasks: dict[tuple[str, str], TurnActionExecution] = {}
         for row in task_rows:
             normalized = cls._normalize_workflow_task_row(row)
             if (
@@ -5604,7 +5602,7 @@ class WorkflowStore:
             ):
                 raise ValueError("StoredTask row is not canonical")
             game_id = str(normalized["game_id"])
-            task = cls._row_to_task(normalized)
+            task = cls._legacy_task_from_row(normalized)
             tasks[(game_id, task.task_id)] = task
             if task.source_contract_id is None:
                 continue
@@ -7387,7 +7385,7 @@ class WorkflowStore:
                 TaskStatus.AWAITING_CONFIRMATION,
             }
             for row in task_rows:
-                task = self._row_to_task(row)
+                task = self._legacy_task_from_row(row)
                 attempt_rows = conn.execute(
                     "SELECT attempt_json FROM action_attempts "
                     "WHERE game_id=? AND task_id=?",
@@ -8470,89 +8468,6 @@ class WorkflowStore:
         )
 
     @classmethod
-    def _legacy_research_dispositions_in_connection(
-        cls,
-        conn: sqlite3.Connection,
-        proposal: StrategicResearchProposal,
-    ) -> tuple[LegacyResearchTaskDisposition, ...]:
-        if not cls._table_exists(conn, "workflow_tasks"):
-            return ()
-        rows = conn.execute(
-            "SELECT * FROM workflow_tasks WHERE game_id=? AND action_type=? "
-            "ORDER BY task_id",
-            (proposal.game_session_id, "set_research"),
-        ).fetchall()
-        disposable = {
-            TaskStatus.PENDING,
-            TaskStatus.READY,
-            TaskStatus.BLOCKED,
-            TaskStatus.FAILED,
-            TaskStatus.ESCALATED,
-            TaskStatus.AWAITING_CONFIRMATION,
-        }
-        blocking = {
-            TaskStatus.RUNNING,
-            TaskStatus.VERIFYING,
-            TaskStatus.UNCERTAIN,
-        }
-        unresolved_attempts = {
-            AttemptStatus.PREPARED,
-            AttemptStatus.VERIFYING,
-            AttemptStatus.UNCERTAIN,
-        }
-        dispositions: list[LegacyResearchTaskDisposition] = []
-        for row in rows:
-            task = cls._row_to_task(row)
-            if task.source_contract_id is not None:
-                continue
-            attempt_rows = conn.execute(
-                "SELECT attempt_json FROM action_attempts WHERE game_id=? "
-                "AND task_id=? ORDER BY attempt_number",
-                (proposal.game_session_id, task.task_id),
-            ).fetchall()
-            attempts = tuple(
-                ActionAttempt.model_validate_json(item["attempt_json"])
-                for item in attempt_rows
-            )
-            if task.status in blocking or any(
-                attempt.status in unresolved_attempts for attempt in attempts
-            ):
-                raise ValueError(
-                    "legacy research execution is not quiescent for activation"
-                )
-            confirmation_closed = task.status is TaskStatus.AWAITING_CONFIRMATION
-            final_status = task.status
-            if task.status in disposable:
-                final_status = TaskStatus.CANCELLED
-                conn.execute(
-                    "UPDATE workflow_tasks SET status=?, last_error=?, approved_by=?, "
-                    "updated_at=CURRENT_TIMESTAMP WHERE game_id=? AND task_id=?",
-                    (
-                        TaskStatus.CANCELLED.value,
-                        "cancelled by research authority activation",
-                        (
-                            "phase1c-authority-switch"
-                            if confirmation_closed
-                            else task.approved_by
-                        ),
-                        proposal.game_session_id,
-                        task.task_id,
-                    ),
-                )
-            dispositions.append(
-                LegacyResearchTaskDisposition(
-                    task_id=task.task_id,
-                    prior_status=task.status.value,
-                    final_status=final_status.value,
-                    action_attempt_ids=tuple(
-                        sorted(attempt.action_attempt_id for attempt in attempts)
-                    ),
-                    confirmation_closed=confirmation_closed,
-                )
-            )
-        return tuple(dispositions)
-
-    @classmethod
     def _insert_proposal_contract_activation_in_connection(
         cls,
         conn: sqlite3.Connection,
@@ -8810,9 +8725,7 @@ class WorkflowStore:
                 transition_started_at,
                 transition_completed_at,
             )
-            dispositions = self._legacy_research_dispositions_in_connection(
-                conn, proposal
-            )
+            dispositions: tuple[LegacyResearchTaskDisposition, ...] = ()
             if checkpoint is not None:
                 checkpoint("after_legacy_research_disposition")
             self._insert_strategic_proposal_approval_in_connection(
@@ -9674,7 +9587,9 @@ class WorkflowStore:
         return False
 
     @classmethod
-    def _mission_action_matches_task(cls, mission: Mission, task: StoredTask) -> bool:
+    def _mission_action_matches_task(
+        cls, mission: Mission, task: TurnActionExecution
+    ) -> bool:
         return cls._mission_action_matches(
             mission,
             task.action_type,
@@ -9848,10 +9763,12 @@ class WorkflowStore:
             return self._active_execution_missions_in_connection(conn, game_id)
 
     @classmethod
-    def _turn_action_task_from_row(cls, row: Mapping[str, Any]) -> StoredTask:
+    def _turn_action_task_from_row(
+        cls, row: Mapping[str, Any]
+    ) -> TurnActionExecution:
         normalized = cls._normalize_turn_action_node_row(row)
         node = TurnActionNode.model_validate_json(str(normalized["node_json"]))
-        return turn_action_node_as_stored_task(
+        return turn_action_node_as_execution(
             node,
             status=TaskStatus(str(normalized["status"])),
             retry_count=int(normalized["retry_count"]),
@@ -9873,7 +9790,7 @@ class WorkflowStore:
         conn: sqlite3.Connection,
         game_id: str,
         task_id: str,
-    ) -> StoredTask | None:
+    ) -> TurnActionExecution | None:
         row = conn.execute(
             "SELECT * FROM turn_action_nodes WHERE game_id=? AND node_id=?",
             (game_id, task_id),
@@ -9882,7 +9799,7 @@ class WorkflowStore:
 
     def active_turn_action_graph(
         self, game_id: str
-    ) -> tuple[TurnActionGraph, tuple[StoredTask, ...]] | None:
+    ) -> tuple[TurnActionGraph, tuple[TurnActionExecution, ...]] | None:
         with self._connect() as conn:
             graph_row = conn.execute(
                 """
@@ -10004,7 +9921,7 @@ class WorkflowStore:
         nodes: Sequence[TurnActionNode],
         *,
         activated_at: datetime,
-    ) -> tuple[TurnActionGraph, tuple[StoredTask, ...]]:
+    ) -> tuple[TurnActionGraph, tuple[TurnActionExecution, ...]]:
         if activated_at.tzinfo is None or activated_at.utcoffset() is None:
             raise ValueError("TurnActionGraph activated_at must include a timezone")
         if activated_at < graph.compiled_at:
@@ -10143,7 +10060,7 @@ class WorkflowStore:
                 ).fetchall()
             )
             for row in legacy_rows:
-                task = self._row_to_task(row)
+                task = self._legacy_task_from_row(row)
                 unresolved = conn.execute(
                     "SELECT 1 FROM action_attempts WHERE game_id=? AND task_id=? "
                     "AND status IN (?, ?, ?) LIMIT 1",
@@ -10231,7 +10148,7 @@ class WorkflowStore:
                 )
 
             for row in legacy_rows:
-                task = self._row_to_task(row)
+                task = self._legacy_task_from_row(row)
                 if task.status in {
                     TaskStatus.RUNNING,
                     TaskStatus.VERIFYING,
@@ -10320,7 +10237,7 @@ class WorkflowStore:
         *,
         allow_legacy_inert: bool = False,
         action_type: str | None = None,
-    ) -> StoredTask | None:
+    ) -> TurnActionExecution | None:
         action_scopes = {
             "set_research": "research",
             "set_civic": "civic",
@@ -10372,72 +10289,10 @@ class WorkflowStore:
                     "TurnActionNode provenance does not match active Contract/Mission"
                 )
             return graph_task
-        if not cls._table_exists(conn, "workflow_tasks"):
-            requested_scope = action_scopes.get(str(action_type))
-            if requested_scope is not None and requested_scope in owned_scopes:
-                raise ValueError(
-                    "strategic Attempt requires a current Mission-derived task"
-                )
-            return None
-        row = conn.execute(
-            "SELECT * FROM workflow_tasks WHERE game_id=? AND task_id=?",
-            (game_id, task_id),
-        ).fetchone()
-        if row is None:
-            requested_scope = action_scopes.get(str(action_type))
-            if requested_scope is not None and requested_scope in owned_scopes:
-                raise ValueError(
-                    "strategic Attempt requires a current Mission-derived task"
-                )
-            return None
-        task = cls._row_to_task(row)
-        task_scope = action_scopes.get(task.action_type)
-        if task_scope is None and task.source_contract_id is None:
-            return task
-        if task_scope not in owned_scopes:
-            if task.source_contract_id is not None:
-                raise ValueError(
-                    "Mission-derived task is not backed by active authority"
-                )
-            return task
-        active_graph = conn.execute(
-            "SELECT graph_id FROM active_turn_action_graphs WHERE game_id=?",
-            (game_id,),
-        ).fetchone()
-        if (
-            task_scope in owned_scopes
-            and active_graph is not None
-            and not (
-                allow_legacy_inert
-                and task.status
-                in {TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.EXPIRED}
-            )
-        ):
-            raise ValueError(
-                "StoredTask strategic execution is closed while a graph is active"
-            )
-        if task.source_contract_id is None:
-            if allow_legacy_inert and task.status in {
-                TaskStatus.DONE,
-                TaskStatus.CANCELLED,
-                TaskStatus.EXPIRED,
-            }:
-                return task
-            raise ValueError(
-                "legacy provenance-free task is closed after authority cutover"
-            )
-        mission = missions_by_id.get(str(task.source_mission_id))
-        if (
-            contract is None
-            or mission is None
-            or not cls._mission_action_matches_task(mission, task)
-            or task.source_contract_id != contract.contract_id
-            or task.source_contract_revision != contract.revision
-            or task.source_mission_id != mission.mission_id
-            or task.source_mission_revision != mission.mission_revision
-        ):
-            raise ValueError("task provenance does not match active Contract/Mission")
-        return task
+        requested_scope = action_scopes.get(str(action_type))
+        if requested_scope is not None and requested_scope in owned_scopes:
+            raise ValueError("strategic Attempt requires a current TurnActionNode")
+        return None
 
     def _upsert_entity_plans(
         self,
@@ -10471,11 +10326,6 @@ class WorkflowStore:
                 """,
                 (game_id, str(entity_id), self._dump(plan), plan_id, turn),
             )
-
-    def refresh_due_statuses(self, game_id: str, turn: int) -> None:
-        # Legacy StoredTask scheduling is retired. TurnActionGraph nodes are the
-        # only executable projection after the v14 migration.
-        return None
 
     def observe_units(self, game_id: str, turn: int, units: Any) -> dict[str, int]:
         """Persist first-seen state and return bindable units in this snapshot.
@@ -10573,16 +10423,13 @@ class WorkflowStore:
             )
             return cursor.rowcount == 1
 
-    def due_tasks(self, game_id: str, turn: int) -> list[StoredTask]:
-        return []
-
     def due_turn_action_nodes(
         self,
         game_id: str,
         turn: int,
         *,
         source_observation_id: str,
-    ) -> list[StoredTask]:
+    ) -> list[TurnActionExecution]:
         with self._connect() as conn:
             graph_row = conn.execute(
                 """
@@ -10687,28 +10534,12 @@ class WorkflowStore:
                 ),
             )
             return cursor.rowcount == 1
-        cursor = conn.execute(
-            """
-            UPDATE workflow_tasks SET
-                status=?, last_error=?, retry_count=retry_count+?,
-                approved_by=COALESCE(?, approved_by), updated_at=CURRENT_TIMESTAMP
-            WHERE game_id=? AND task_id=?
-            """,
-            (
-                status.value,
-                error,
-                int(increment_retry),
-                approved_by,
-                game_id,
-                task_id,
-            ),
-        )
-        return cursor.rowcount == 1
+        return False
 
     @classmethod
-    def _row_to_task(cls, row: Mapping[str, Any]) -> StoredTask:
+    def _legacy_task_from_row(cls, row: Mapping[str, Any]) -> TurnActionExecution:
         row = dict(row)
-        return StoredTask(
+        return TurnActionExecution(
             task_id=row["task_id"],
             plan_id=row["plan_id"],
             action_type=row["action_type"],
@@ -10746,7 +10577,7 @@ class WorkflowStore:
             "source_mission_revision",
         ):
             normalized.setdefault(column, None)
-        task = cls._row_to_task(normalized)
+        task = cls._legacy_task_from_row(normalized)
         normalized["source_contract_id"] = task.source_contract_id
         normalized["source_contract_revision"] = task.source_contract_revision
         normalized["source_mission_id"] = task.source_mission_id
@@ -10813,7 +10644,7 @@ class WorkflowStore:
 
     def list_tasks(
         self, game_id: str, statuses: Sequence[TaskStatus] | None = None
-    ) -> list[StoredTask]:
+    ) -> list[TurnActionExecution]:
         with self._connect() as conn:
             graph_rows = conn.execute(
                 "SELECT * FROM turn_action_nodes WHERE game_id=? ORDER BY node_id",
@@ -10885,7 +10716,9 @@ class WorkflowStore:
             ).fetchall()
         return {str(row["node_id"]) for row in node_rows}
 
-    def get_task(self, game_id: str, task_id: str) -> StoredTask | None:
+    def get_task(
+        self, game_id: str, task_id: str
+    ) -> TurnActionExecution | None:
         with self._connect() as conn:
             node = self._turn_action_task_in_connection(conn, game_id, task_id)
             if node is not None:
@@ -11680,14 +11513,6 @@ class WorkflowStore:
                     """,
                     (tick.game_session_id, attempt.task_id),
                 ).fetchone()
-                if task_row is None and self._table_exists(conn, "workflow_tasks"):
-                    task_row = conn.execute(
-                        """
-                        SELECT retry_count, max_retries FROM workflow_tasks
-                        WHERE game_id=? AND task_id=?
-                        """,
-                        (tick.game_session_id, attempt.task_id),
-                    ).fetchone()
                 if task_row is None:
                     raise KeyError(f"unknown attempt task: {attempt.task_id}")
                 failure_resolution = resolve_failed_attempt(
@@ -11704,42 +11529,26 @@ class WorkflowStore:
                     "SELECT 1 FROM turn_action_nodes WHERE game_id=? AND node_id=?",
                     (tick.game_session_id, attempt.task_id),
                 ).fetchone()
-                if node_row is not None:
-                    node_status = TurnActionNodeStatus(task_status.value)
-                    cursor = conn.execute(
-                        """
-                        UPDATE turn_action_nodes SET
-                            status=?, last_error=?,
-                            retry_count=COALESCE(?, retry_count),
-                            updated_at=?
-                        WHERE game_id=? AND node_id=?
-                        """,
-                        (
-                            node_status.value,
-                            task_error,
-                            task_retry_count,
-                            datetime.now(UTC).isoformat(),
-                            tick.game_session_id,
-                            attempt.task_id,
-                        ),
-                    )
-                else:
-                    cursor = conn.execute(
-                        """
-                        UPDATE workflow_tasks SET
-                            status=?, last_error=?,
-                            retry_count=COALESCE(?, retry_count),
-                            updated_at=CURRENT_TIMESTAMP
-                        WHERE game_id=? AND task_id=?
-                        """,
-                        (
-                            task_status.value,
-                            task_error,
-                            task_retry_count,
-                            tick.game_session_id,
-                            attempt.task_id,
-                        ),
-                    )
+                if node_row is None:
+                    raise KeyError(f"unknown attempt task: {attempt.task_id}")
+                node_status = TurnActionNodeStatus(task_status.value)
+                cursor = conn.execute(
+                    """
+                    UPDATE turn_action_nodes SET
+                        status=?, last_error=?,
+                        retry_count=COALESCE(?, retry_count),
+                        updated_at=?
+                    WHERE game_id=? AND node_id=?
+                    """,
+                    (
+                        node_status.value,
+                        task_error,
+                        task_retry_count,
+                        datetime.now(UTC).isoformat(),
+                        tick.game_session_id,
+                        attempt.task_id,
+                    ),
+                )
                 if cursor.rowcount != 1:
                     raise KeyError(f"unknown attempt task: {attempt.task_id}")
             self._save_runtime_state_in_connection(

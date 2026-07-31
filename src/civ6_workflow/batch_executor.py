@@ -39,7 +39,7 @@ from .domain import (
 from .models import (
     ExecutionMode,
     MutationDeliveryStatus,
-    StoredTask,
+    TurnActionExecution,
     TaskStatus,
     TickMetrics,
 )
@@ -64,11 +64,11 @@ class BarrierState:
 @dataclass(frozen=True, slots=True)
 class ExecutionWave:
     graph_id: str | None
-    eligible: tuple[StoredTask, ...] = ()
+    eligible: tuple[TurnActionExecution, ...] = ()
     barriers: tuple[BarrierState, ...] = ()
 
     @property
-    def selected(self) -> StoredTask | None:
+    def selected(self) -> TurnActionExecution | None:
         return self.eligible[0] if self.eligible else None
 
 
@@ -253,7 +253,7 @@ class BatchExecutor:
     async def _send_task(
         self,
         observation: NormalizedRuntimeObservation,
-        task: StoredTask,
+        task: TurnActionExecution,
         *,
         source_observation_id: str,
         available_tools: set[str],
@@ -766,7 +766,7 @@ class BatchExecutor:
 
     @staticmethod
     def _idempotency_key(
-        task: StoredTask,
+        task: TurnActionExecution,
         normalized_arguments: Mapping[str, Any],
     ) -> str:
         semantic = {
@@ -785,7 +785,7 @@ class BatchExecutor:
 
     def _task_invalidation(
         self,
-        task: StoredTask,
+        task: TurnActionExecution,
         observation: NormalizedRuntimeObservation,
     ) -> str | None:
         preconditions = self.conditions.evaluate_all(task.preconditions, observation)

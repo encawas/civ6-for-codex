@@ -45,7 +45,7 @@ from .models import (
     MutationDeliveryStatus,
     RiskLevel,
     RuntimeSnapshot,
-    StoredTask,
+    TurnActionExecution,
     TaskStatus,
     TickResult,
 )
@@ -1058,7 +1058,7 @@ class WorkflowEngine:
         if missing:
             raise RuntimeError(f"civ6-mcp is missing required tools: {sorted(missing)}")
 
-    def _uncertain_tasks(self, game_id: str) -> list[StoredTask]:
+    def _uncertain_tasks(self, game_id: str) -> list[TurnActionExecution]:
         return self.store.list_tasks(game_id, statuses=[TaskStatus.UNCERTAIN])
 
     def _may_end_turn(self, snapshot: RuntimeSnapshot, result: TickResult) -> bool:

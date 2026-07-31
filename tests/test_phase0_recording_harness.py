@@ -19,15 +19,14 @@ from civ6_workflow.models import (
     ActionResult,
     AgentRequest,
     ExecutionMode,
-    PlanBundle,
     RuntimeSnapshot,
-    StoredTask,
+    TurnActionExecution,
     TaskStatus,
 )
 
 
-def _task() -> StoredTask:
-    return StoredTask(
+def _task() -> TurnActionExecution:
+    return TurnActionExecution(
         task_id="task-1",
         action_type="city_set_production",
         entity_type="city",
@@ -126,7 +125,7 @@ def test_met_003_planner_counts_logical_requests_and_provider_attempts():
             }
         )
         delegate = ScriptedPlanner(
-            [PlanBundle(summary="first"), PlanBundle(summary="final")],
+            ['{"round":"first"}', '{"round":"final"}'],
             provider_attempts=[2, 3],
         )
         planner = RecordingPlanner(delegate)

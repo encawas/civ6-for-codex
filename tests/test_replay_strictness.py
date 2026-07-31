@@ -7,12 +7,13 @@ from civ6_workflow.models import (
     ExecutionMode,
     GameEvent,
     RuntimeSnapshot,
-    StoredTask,
+    TurnActionExecution,
 )
-from civ6_workflow.workflow_protocol import WorkflowAgentRequest, WorkflowPlanBundle
+from civ6_workflow.workflow_protocol import WorkflowAgentRequest
 from civ6_workflow.replay import (
     RecordedAction,
     RecordedPlannerCall,
+    RecordingPlanner,
     ReplayDataError,
     ReplayFrame,
     ReplayGamePort,
@@ -23,8 +24,8 @@ from civ6_workflow.replay import (
 
 def _task(
     *, action_type: str, task_id: str = "same-id", unit_id: int = 7
-) -> StoredTask:
-    return StoredTask(
+) -> TurnActionExecution:
+    return TurnActionExecution(
         task_id=task_id,
         plan_id="plan-1",
         action_type=action_type,
@@ -172,7 +173,7 @@ def test_replay_rejects_planner_request_drift():
         planner_calls=[
             RecordedPlannerCall(
                 request=expected,
-                response=WorkflowPlanBundle(summary="recorded response"),
+                response='{"proposal": "recorded response"}',
             )
         ]
     )
@@ -187,7 +188,7 @@ def test_replay_rejects_unconsumed_planner_calls():
         planner_calls=[
             RecordedPlannerCall(
                 request=_request(turn=12),
-                response=WorkflowPlanBundle(summary="recorded response"),
+                response='{"proposal": "recorded response"}',
             )
         ]
     )
@@ -195,6 +196,21 @@ def test_replay_rejects_unconsumed_planner_calls():
 
     with pytest.raises(ReplayDataError, match="1 unconsumed planner call"):
         planner.assert_consumed()
+
+
+def test_recording_round_trips_raw_strategic_planner_response():
+    response = '{"proposal":{"proposal_id":"proposal-1"}}'
+
+    class RawPlanner:
+        async def plan(self, _request):
+            return response
+
+    tape = SnapshotRecording()
+    recorded = asyncio.run(RecordingPlanner(RawPlanner(), tape).plan(_request(turn=12)))
+
+    assert recorded == response
+    restored = SnapshotRecording.model_validate_json(tape.model_dump_json())
+    assert asyncio.run(ReplayPlanner(restored).plan(_request(turn=12))) == response
 
 
 def test_recording_rejects_cross_game_store_rows():

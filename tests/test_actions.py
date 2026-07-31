@@ -8,11 +8,11 @@ from civ6_workflow.actions import (
     action_argument_contracts,
     resolve_action,
 )
-from civ6_workflow.models import StoredTask
+from civ6_workflow.models import TurnActionExecution
 
 
 def _task(action_type, arguments):
-    return StoredTask(
+    return TurnActionExecution(
         task_id=f"test-{action_type}",
         plan_id="plan-1",
         action_type=action_type,

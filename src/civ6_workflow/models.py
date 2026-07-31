@@ -92,7 +92,20 @@ class ProposedTask(StrictModel):
     reason: str = Field(min_length=1, max_length=500)
 
 
-class StoredTask(ProposedTask):
+class TurnActionExecution(StrictModel):
+    task_id: str
+    action_type: str
+    entity_type: str
+    entity_id: str | int
+    due_turn: int = Field(ge=0)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    preconditions: list[dict[str, Any]] = Field(default_factory=list)
+    postconditions: list[dict[str, Any]] = Field(default_factory=list)
+    invalidators: list[dict[str, Any]] = Field(default_factory=list)
+    risk: RiskLevel = RiskLevel.LOW
+    requires_confirmation: bool = False
+    expires_turn: int | None = Field(default=None, ge=0)
+    reason: str = Field(min_length=1, max_length=500)
     plan_id: str
     created_turn: int = Field(ge=0)
     created_from_observation_id: str | None = None
@@ -118,7 +131,7 @@ class StoredTask(ProposedTask):
             value is not None for value in provenance
         ):
             raise ValueError(
-                "StoredTask Contract/Mission provenance must be all present or all null"
+                "TurnActionExecution Contract/Mission provenance must be all present or all null"
             )
         return self
 

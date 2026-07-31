@@ -58,11 +58,9 @@ from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
     MutationDeliveryStatus,
-    PlanBundle,
-    ProposedTask,
     RiskLevel,
     RuntimeSnapshot,
-    StoredTask,
+    TurnActionExecution,
     TaskStatus,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
@@ -117,7 +115,7 @@ class _Game:
         return {"notifications": [], "tool": name}
 
     async def execute_task(self, task):
-        raise AssertionError("Proposal generation cannot execute StoredTask")
+        raise AssertionError("Proposal generation cannot execute TurnActionExecution")
 
     async def end_turn(self, reflections=None):
         raise AssertionError("Proposal generation cannot end the turn")
@@ -4353,11 +4351,11 @@ def test_stored_task_rejects_partial_mission_provenance(provenance):
         **provenance,
     }
     with pytest.raises(ValueError, match="all present or all null"):
-        StoredTask(**fields)
+        TurnActionExecution(**fields)
 
 
 def test_stored_task_accepts_complete_mission_provenance():
-    task = StoredTask(
+    task = TurnActionExecution(
         task_id="task-1",
         plan_id="plan-1",
         action_type="set_research",
@@ -5520,56 +5518,6 @@ def test_dormant_approval_crash_points_roll_back_complete_aggregate(
 
     assert store.export_replay_state(proposal.game_session_id) == before
     WorkflowStore(store.path)
-
-
-def _legacy_research_bundle(status=TaskStatus.READY):
-    task = ProposedTask(
-        task_id="legacy-research-task",
-        action_type="set_research",
-        entity_type="player",
-        entity_id="player-1",
-        due_turn=1,
-        arguments={"tech_or_civic": "TECH_MINING"},
-        preconditions=[],
-        postconditions=[],
-        invalidators=[],
-        risk=RiskLevel.LOW,
-        requires_confirmation=(status is TaskStatus.AWAITING_CONFIRMATION),
-        reason="legacy research task",
-    )
-    return PlanBundle(
-        plan_id="legacy-research-plan",
-        summary="legacy research",
-        strategy_updates={"research_queue": ["TECH_MINING"]},
-        tasks=[task],
-    )
-
-
-def _authoritative_research_bundle(
-    *,
-    task_id: str = "mission-research-task",
-    technology: str = "TECH_WRITING",
-) -> PlanBundle:
-    return PlanBundle(
-        plan_id=f"mission-plan-{task_id}",
-        summary="Mission-derived research projection",
-        tasks=[
-            ProposedTask(
-                task_id=task_id,
-                action_type="set_research",
-                entity_type="player",
-                entity_id="player-1",
-                due_turn=1,
-                arguments={"tech_or_civic": technology},
-                preconditions=[],
-                postconditions=[],
-                invalidators=[],
-                risk=RiskLevel.LOW,
-                requires_confirmation=False,
-                reason="active research Mission projection",
-            )
-        ],
-    )
 
 
 def test_two_concurrent_identical_approvals_commit_one_revision(tmp_path):

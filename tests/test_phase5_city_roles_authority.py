@@ -13,17 +13,10 @@ from civ6_workflow.domain import (
     AttemptStatus,
     AuthorityScopeSet,
     Condition,
-    ContinuationPolicy,
-    DecisionGap,
-    DecisionGapStatus,
-    DecisionRoute,
-    LeaseValidationResult,
     Mission,
     MissionGraph,
     MissionStatus,
     ObservationComparisonKind,
-    PlanLease,
-    PlanLeaseStatus,
     RuntimeState,
     StateDeltaBuilder,
     StateDeltaChangeKind,
@@ -36,10 +29,18 @@ from civ6_workflow.domain import (
 )
 from civ6_workflow.models import (
     ExecutionMode,
-    PlanBundle,
-    ProposedTask,
-    RiskLevel,
     RuntimeSnapshot,
+)
+from civ6_workflow.domain.legacy_decisions import (
+    DecisionGap,
+    DecisionGapStatus,
+    DecisionRoute,
+)
+from civ6_workflow.domain.legacy_plans import (
+    ContinuationPolicy,
+    LeaseValidationResult,
+    PlanLease,
+    PlanLeaseStatus,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
@@ -203,43 +204,6 @@ def _legacy_lease(gap: DecisionGap) -> PlanLease:
         relevant_input_hash=gap.relevant_input_hash,
         last_validated_observation_id="obs-activation",
         last_validation_result=LeaseValidationResult.VALID,
-    )
-
-
-def _legacy_bundle() -> PlanBundle:
-    return PlanBundle(
-        plan_id="legacy-city-plan",
-        summary="legacy city role projection",
-        city_plan_updates=[
-            {
-                "city_id": CITY_ID,
-                "role": "production",
-                "followup_queue": ["BUILDING_MONUMENT"],
-            }
-        ],
-        tasks=[
-            ProposedTask(
-                task_id="legacy-city-task",
-                action_type="city_set_production",
-                entity_type="city",
-                entity_id=CITY_ID,
-                due_turn=12,
-                arguments={
-                    "city_id": CITY_ID,
-                    "item_type": "BUILDING",
-                    "item_name": "BUILDING_MONUMENT",
-                },
-                postconditions=[
-                    {
-                        "type": "city_production_equals",
-                        "city_id": CITY_ID,
-                        "item_name": "BUILDING_MONUMENT",
-                    }
-                ],
-                risk=RiskLevel.LOW,
-                reason="legacy city production",
-            )
-        ],
     )
 
 

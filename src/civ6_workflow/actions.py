@@ -6,7 +6,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .domain import RetryClassification
-from .models import StoredTask
+from .models import TurnActionExecution
 
 
 class ActionValidationError(ValueError):
@@ -44,7 +44,7 @@ class ActionSpec:
             MappingProxyType(dict(self.argument_aliases)),
         )
 
-    def build_arguments(self, task: StoredTask) -> dict[str, Any]:
+    def build_arguments(self, task: TurnActionExecution) -> dict[str, Any]:
         supplied = dict(task.arguments)
         allowed = self.required_arguments | self.optional_arguments
         unknown = set(supplied) - allowed
@@ -189,7 +189,7 @@ def resolve_action_spec(action_type: str) -> ActionSpec:
 
 
 def resolve_action(
-    task: StoredTask,
+    task: TurnActionExecution,
     allowed_tools: set[str],
 ) -> tuple[str, dict[str, Any]]:
     spec = resolve_action_spec(task.action_type)

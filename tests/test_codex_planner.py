@@ -10,26 +10,16 @@ from civ6_workflow.codex_planner import (
     CodexPlannerConfig,
     PlannerError,
 )
-from civ6_workflow.models import AgentRequest, ExecutionMode, PlanBundle
+from civ6_workflow.models import AgentRequest, ExecutionMode
 from civ6_workflow.workflow_prompt import EXTENDED_SYSTEM_INSTRUCTIONS
 
 
-def test_planner_prompt_names_versioned_input_contracts():
-    for contract_key in (
-        "constraints.action_argument_contracts",
-        "constraints.action_entity_types",
-        "constraints.entity_id_arguments",
-        "constraints.condition_contracts",
-    ):
-        assert contract_key in EXTENDED_SYSTEM_INSTRUCTIONS
+def test_planner_prompt_enforces_strategic_only_output():
+    assert "STRATEGIC_CONTRACT_CREATION" in EXTENDED_SYSTEM_INSTRUCTIONS
+    assert "MISSION_GRAPH_REPAIR" in EXTENDED_SYSTEM_INSTRUCTIONS
     assert "constraints.information_tool_arguments" in EXTENDED_SYSTEM_INSTRUCTIONS
-    assert "never emit arguments listed in injected_by_runtime" in (
-        EXTENDED_SYSTEM_INSTRUCTIONS
-    )
-    assert "$..." in EXTENDED_SYSTEM_INSTRUCTIONS
-    assert "never emit an unresolved `$...` placeholder" in (
-        EXTENDED_SYSTEM_INSTRUCTIONS
-    )
+    assert "Never emit a PlanBundle" in EXTENDED_SYSTEM_INSTRUCTIONS
+    assert "Runtime alone validates and persists" in EXTENDED_SYSTEM_INSTRUCTIONS
 
 
 def test_codex_command_is_noninteractive_and_read_only(tmp_path: Path):
@@ -131,7 +121,9 @@ def test_cli_planner_keeps_request_artifacts_in_project_state(
         turn=1,
         execution_mode=ExecutionMode.READONLY,
         trigger_events=[],
-        constraints={"max_tasks": 1},
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
 
     class FakeProcess:
@@ -144,7 +136,15 @@ def test_cli_planner_keeps_request_artifacts_in_project_state(
             assert payload
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             self.output_path.write_text(
-                PlanBundle(summary="persistent test").model_dump_json(),
+                json.dumps(
+                    {
+                        "schema_version": (
+                            "strategic-research-proposal-response/v1"
+                        ),
+                        "information_requests": [],
+                        "proposal_candidates": [],
+                    }
+                ),
                 encoding="utf-8",
             )
             return b"", b""
@@ -165,10 +165,12 @@ def test_cli_planner_keeps_request_artifacts_in_project_state(
         with recording.logical_request_scope("cli-success"):
             return await recording.plan(request)
 
-    bundle = asyncio.run(scenario())
+    response = asyncio.run(scenario())
 
     request_directory = state_directory / "requests" / request.request_id
-    assert bundle.summary == "persistent test"
+    assert json.loads(response)["schema_version"] == (
+        "strategic-research-proposal-response/v1"
+    )
     assert (request_directory / "request.txt").exists()
     assert (request_directory / "plan.schema.json").exists()
     assert (request_directory / "plan.json").exists()
@@ -179,7 +181,7 @@ def test_cli_planner_keeps_request_artifacts_in_project_state(
     assert recording.summary.provider_attempts == 1
 
 
-def test_recording_planner_counts_started_cli_with_invalid_output(
+def test_recording_planner_preserves_invalid_output_for_lifecycle_validation(
     tmp_path: Path, monkeypatch
 ):
     planner = CodexPlanner(
@@ -196,6 +198,9 @@ def test_recording_planner_counts_started_cli_with_invalid_output(
         turn=1,
         execution_mode=ExecutionMode.READONLY,
         trigger_events=[],
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
 
     class InvalidOutputProcess:
@@ -224,10 +229,9 @@ def test_recording_planner_counts_started_cli_with_invalid_output(
 
     async def scenario():
         with recording.logical_request_scope("cli-invalid-output"):
-            await recording.plan(request)
+            return await recording.plan(request)
 
-    with pytest.raises(PlannerError, match="invalid plan"):
-        asyncio.run(scenario())
+    assert asyncio.run(scenario()) == "{not valid json"
 
     assert planner.last_diagnostics is not None
     assert planner.last_diagnostics["attempt_count"] == 1
@@ -252,6 +256,9 @@ def test_recording_planner_does_not_count_missing_cli_executable(
         turn=1,
         execution_mode=ExecutionMode.READONLY,
         trigger_events=[],
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
 
     async def fake_create_subprocess_exec(*command, **kwargs):
@@ -278,7 +285,6 @@ def test_recording_planner_does_not_count_missing_cli_executable(
         ("nonzero", "exit code 7"),
         ("missing_output", "without writing"),
         ("empty_output", "empty plan"),
-        ("too_many_tasks", "max_tasks=1"),
     ],
 )
 def test_started_cli_failure_paths_record_current_diagnostics(
@@ -297,7 +303,9 @@ def test_started_cli_failure_paths_record_current_diagnostics(
         turn=1,
         execution_mode=ExecutionMode.READONLY,
         trigger_events=[],
-        constraints={"max_tasks": 1},
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
 
     class FailureProcess:
@@ -312,22 +320,6 @@ def test_started_cli_failure_paths_record_current_diagnostics(
             )
             if mode == "empty_output":
                 output_path.write_text("   ", encoding="utf-8")
-            elif mode == "too_many_tasks":
-                bundle = PlanBundle(
-                    summary="too many",
-                    tasks=[
-                        {
-                            "task_id": f"task-{index}",
-                            "action_type": "unit_skip",
-                            "entity_type": "unit",
-                            "entity_id": index,
-                            "due_turn": 1,
-                            "reason": "diagnostics coverage",
-                        }
-                        for index in range(2)
-                    ],
-                )
-                output_path.write_text(bundle.model_dump_json(), encoding="utf-8")
             return b"", b"cli failure"
 
         def kill(self):
@@ -364,6 +356,9 @@ def test_timed_out_cli_records_started_provider_attempt(tmp_path: Path, monkeypa
         turn=1,
         execution_mode=ExecutionMode.READONLY,
         trigger_events=[],
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
 
     class TimeoutProcess:
@@ -410,6 +405,9 @@ def test_cli_started_hook_precedes_subprocess_creation(tmp_path: Path, monkeypat
         turn=1,
         execution_mode=ExecutionMode.READONLY,
         trigger_events=[],
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
     phases = []
     spawned = False

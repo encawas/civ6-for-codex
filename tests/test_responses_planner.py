@@ -9,7 +9,7 @@ from civ6_workflow.codex_planner import (
     PlannerError,
     SYSTEM_INSTRUCTIONS,
 )
-from civ6_workflow.models import AgentRequest, ExecutionMode, PlanBundle
+from civ6_workflow.models import AgentRequest, ExecutionMode
 from civ6_workflow.responses_planner import ResponsesPlanner
 
 
@@ -43,7 +43,13 @@ class _Client:
         assert payload["store"] is False
         assert payload["text"]["format"]["type"] == "json_schema"
         assert payload["text"]["format"]["strict"] is False
-        plan = PlanBundle(summary="compact response plan").model_dump_json()
+        plan = json.dumps(
+            {
+                "schema_version": "strategic-research-proposal-response/v1",
+                "information_requests": [],
+                "proposal_candidates": [],
+            }
+        )
         body = {
             "id": "resp_test",
             "output": [
@@ -81,12 +87,16 @@ def test_responses_planner_returns_schema_plan_and_diagnostics(monkeypatch):
         execution_mode=ExecutionMode.CONFIRM,
         trigger_events=[],
         relevant_state={"turn": 5},
-        constraints={"max_tasks": 2},
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
 
-    bundle = asyncio.run(planner.plan(request))
+    response = asyncio.run(planner.plan(request))
 
-    assert bundle.summary == "compact response plan"
+    assert json.loads(response)["schema_version"] == (
+        "strategic-research-proposal-response/v1"
+    )
     assert planner.last_diagnostics is not None
     assert planner.last_diagnostics["backend"] == "responses"
     assert planner.last_diagnostics["request_id"] == "req_http_123"
@@ -111,7 +121,9 @@ def test_responses_planner_fails_fast_without_api_key(monkeypatch):
         turn=5,
         execution_mode=ExecutionMode.CONFIRM,
         trigger_events=[],
-        constraints={"max_tasks": 1},
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
 
     async def scenario():
@@ -171,16 +183,20 @@ def test_responses_planner_retries_transient_gateway_errors(monkeypatch):
         turn=5,
         execution_mode=ExecutionMode.CONFIRM,
         trigger_events=[],
-        constraints={"max_tasks": 2},
+        constraints={
+            "planner_request_target_kind": "STRATEGIC_CONTRACT_CREATION"
+        },
     )
 
     async def scenario():
         with recording.logical_request_scope("retrying-http-request"):
             return await recording.plan(request)
 
-    bundle = asyncio.run(scenario())
+    response = asyncio.run(scenario())
 
-    assert bundle.summary == "compact response plan"
+    assert json.loads(response)["schema_version"] == (
+        "strategic-research-proposal-response/v1"
+    )
     assert _RetryClient.calls == 3
     assert planner.last_diagnostics["attempt_count"] == 3
     assert recording.summary.logical_requests == 1

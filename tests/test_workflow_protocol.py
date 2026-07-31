@@ -1,6 +1,6 @@
 import pytest
 
-from civ6_workflow.domain import ContinuationPolicy
+from civ6_workflow.domain.legacy_plans import ContinuationPolicy
 from civ6_workflow.models import (
     EventLevel,
     GameEvent,

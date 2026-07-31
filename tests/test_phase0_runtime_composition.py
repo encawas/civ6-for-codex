@@ -14,9 +14,7 @@ from civ6_workflow import (
     mcp_port,
     models,
     replay,
-    rules,
     store,
-    validation,
     web_ui,
     workflow_prompt,
 )
@@ -46,7 +44,6 @@ def _composition_snapshot() -> dict:
         "package.WorkflowEngine": _identity(civ6_workflow.WorkflowEngine),
         "engine.WorkflowEngine": _identity(engine.WorkflowEngine),
         "engine.EngineConfig": _identity(engine.EngineConfig),
-        "rules.DeterministicRuleCompiler": _identity(rules.DeterministicRuleCompiler),
         "store.WorkflowStore": _identity(store.WorkflowStore),
         "mcp_port.Civ6GamePort": _identity(mcp_port.Civ6GamePort),
         "conditions.ConditionEvaluator": _identity(conditions.ConditionEvaluator),
@@ -55,7 +52,6 @@ def _composition_snapshot() -> dict:
         "web_ui.ControlPanelState": _identity(web_ui.ControlPanelState),
         "web_ui.ControlPanelHandler": _identity(web_ui.ControlPanelHandler),
         "web_ui.ControlPanelHTTPServer": _identity(web_ui.ControlPanelHTTPServer),
-        "models.PlanBundle": _identity(models.PlanBundle),
         "models.AgentRequest": _identity(models.AgentRequest),
         "models.TickMetrics": _identity(models.TickMetrics),
         "unit_found_city_spec": {
@@ -70,15 +66,11 @@ def _composition_snapshot() -> dict:
                 "unit_found_city"
             ].retry_classification.value,
         },
-        "unit_found_city_entity_types": sorted(
-            validation.ACTION_ENTITY_TYPES["unit_found_city"]
-        ),
         "codex_system_instructions_extended": (
             codex_planner.SYSTEM_INSTRUCTIONS
             == workflow_prompt.EXTENDED_SYSTEM_INSTRUCTIONS
         ),
         "control_panel_html_enhanced": "plannerBtn" in web_ui.CONTROL_PANEL_HTML,
-        "condition_types": sorted(validation.DEFAULT_CONDITION_TYPES),
     }
 
 
@@ -133,10 +125,9 @@ def test_imp_004_import_order_does_not_mutate_runtime_identity():
     program = """
 import json
 {imports}
-from civ6_workflow import actions, conditions, engine, mcp_port, replay, rules, store, web_ui
+from civ6_workflow import actions, conditions, engine, mcp_port, replay, store, web_ui
 before = {{
     "engine": id(engine.WorkflowEngine),
-    "rules": id(rules.DeterministicRuleCompiler),
     "store": id(store.WorkflowStore),
     "mcp": id(mcp_port.Civ6GamePort),
     "conditions": id(conditions.ConditionEvaluator),
@@ -148,7 +139,6 @@ before = {{
 import civ6_workflow
 after = {{
     "engine": id(engine.WorkflowEngine),
-    "rules": id(rules.DeterministicRuleCompiler),
     "store": id(store.WorkflowStore),
     "mcp": id(mcp_port.Civ6GamePort),
     "conditions": id(conditions.ConditionEvaluator),
@@ -159,7 +149,6 @@ after = {{
 }}
 print(json.dumps({{"stable": before == after, "modules": [
     engine.WorkflowEngine.__module__,
-    rules.DeterministicRuleCompiler.__module__,
     store.WorkflowStore.__module__,
     mcp_port.Civ6GamePort.__module__,
 ]}}))
@@ -168,7 +157,7 @@ print(json.dumps({{"stable": before == after, "modules": [
     env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
     outputs = []
     for imports in (
-        "import civ6_workflow.engine\nimport civ6_workflow.rules",
+        "import civ6_workflow.engine\nimport civ6_workflow.store",
         "import civ6_workflow\nimport civ6_workflow.bootstrap",
     ):
         process = subprocess.run(
@@ -186,7 +175,6 @@ print(json.dumps({{"stable": before == after, "modules": [
             "stable": True,
             "modules": [
                 "civ6_workflow.engine",
-                "civ6_workflow.rules",
                 "civ6_workflow.store",
                 "civ6_workflow.mcp_port",
             ],
@@ -195,7 +183,6 @@ print(json.dumps({{"stable": before == after, "modules": [
             "stable": True,
             "modules": [
                 "civ6_workflow.engine",
-                "civ6_workflow.rules",
                 "civ6_workflow.store",
                 "civ6_workflow.mcp_port",
             ],

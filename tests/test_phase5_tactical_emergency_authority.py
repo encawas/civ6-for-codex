@@ -12,17 +12,10 @@ from civ6_workflow.domain import (
     AttemptStatus,
     AuthorityScopeSet,
     Condition,
-    ContinuationPolicy,
-    DecisionGap,
-    DecisionGapStatus,
-    DecisionRoute,
-    LeaseValidationResult,
     Mission,
     MissionGraph,
     MissionImpactAnalyzer,
     MissionStatus,
-    PlanLease,
-    PlanLeaseStatus,
     RuntimeState,
     StateDeltaBuilder,
     StrategicContract,
@@ -31,16 +24,24 @@ from civ6_workflow.domain import (
     VerificationStatus,
     build_strategic_contract_id,
 )
+from civ6_workflow.domain.legacy_decisions import (
+    DecisionGap,
+    DecisionGapStatus,
+    DecisionRoute,
+)
+from civ6_workflow.domain.legacy_plans import (
+    ContinuationPolicy,
+    LeaseValidationResult,
+    PlanLease,
+    PlanLeaseStatus,
+)
 from civ6_workflow.models import (
     ExecutionMode,
-    PlanBundle,
-    ProposedTask,
     RiskLevel,
     RuntimeSnapshot,
     TaskStatus,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
-from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.turn_compiler import TurnCompiler
 
@@ -210,26 +211,6 @@ def _legacy_lease(gap: DecisionGap) -> PlanLease:
     )
 
 
-def _legacy_bundle() -> PlanBundle:
-    return PlanBundle(
-        plan_id="legacy-tactical-plan",
-        summary="legacy routine unit projection",
-        tasks=[
-            ProposedTask(
-                task_id="legacy-unit-skip",
-                action_type="unit_skip",
-                entity_type="unit",
-                entity_id=UNIT_ID,
-                due_turn=12,
-                arguments={"unit_id": UNIT_ID},
-                postconditions=[{"type": "unit_no_moves", "unit_id": UNIT_ID}],
-                risk=RiskLevel.LOW,
-                reason="legacy routine order",
-            )
-        ],
-    )
-
-
 def _activate(store, base, observation, *, activation_id="activate-tactical"):
     store.save_normalized_observation(observation)
     return store.activate_tactical_emergency_authority(
@@ -284,33 +265,6 @@ def test_tactical_graph_is_high_risk_and_suppresses_legacy_unit_skip(tmp_path):
     }
     assert node.risk == RiskLevel.HIGH.value
     assert node.requires_confirmation is True
-
-    normalized = normalize_runtime_snapshot(
-        RuntimeSnapshot(
-            game_id=GAME_ID,
-            turn=12,
-            units=[
-                {
-                    "unit_id": UNIT_ID,
-                    "unit_type": "UNIT_WARRIOR",
-                    "x": 1,
-                    "y": 2,
-                    "moves_remaining": 2,
-                }
-            ],
-            blockers=[
-                {
-                    "type": "end_turn_blocker",
-                    "blocking_type": "ENDTURN_BLOCKING_UNITS",
-                }
-            ],
-        )
-    )
-    compiled = DeterministicRuleCompiler(store).compile(normalized)
-    assert compiled.bundle is None or all(
-        task.entity_id != UNIT_ID for task in compiled.bundle.tasks
-    )
-
 
 def test_verified_tactical_action_completes_mission_once(tmp_path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")

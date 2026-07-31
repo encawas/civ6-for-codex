@@ -15,12 +15,9 @@ from civ6_workflow.engine import EngineConfig, WorkflowEngine
 from civ6_workflow.models import (
     ActionResult,
     ExecutionMode,
-    PlanBundle,
     RuntimeSnapshot,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
-from civ6_workflow.progression import ProgressionRuleCompiler
-from civ6_workflow.rules import DeterministicRuleCompiler
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.conditions import ConditionEvaluator
 
@@ -61,36 +58,14 @@ def _city_snapshot(production, *, turn: int = 10) -> RuntimeSnapshot:
     )
 
 
-def test_obs_003_raw_payload_is_audit_only_and_rules_have_no_empty_spelling_list():
+def test_obs_003_raw_payload_representation_is_owned_by_the_boundary():
     """OBS-003: representation quirks are owned only by the boundary."""
 
     repository = Path(__file__).parents[1]
-    rule_files = [
-        repository / "src" / "civ6_workflow" / "rules.py",
-        repository / "src" / "civ6_workflow" / "progression.py",
-    ]
-
-    for path in rule_files:
-        source = path.read_text(encoding="utf-8").casefold()
-        assert "nothing" not in source
-        assert "empty_slot_strings" not in source
-
     boundary = (
         repository / "src" / "civ6_workflow" / "domain" / "observations.py"
     ).read_text(encoding="utf-8")
     assert boundary.count("EMPTY_SLOT_STRINGS") == 2
-
-
-def test_obs_003_rule_compilers_reject_raw_runtime_snapshots(tmp_path: Path):
-    """OBS-003: rules accept the normalized boundary type, not raw snapshots."""
-
-    store = WorkflowStore(tmp_path / "workflow.sqlite3")
-    raw_snapshot = _city_snapshot("nothing")
-
-    with pytest.raises(AttributeError):
-        DeterministicRuleCompiler(store).compile(raw_snapshot)  # type: ignore[arg-type]
-    with pytest.raises(AttributeError):
-        ProgressionRuleCompiler(store).compile(raw_snapshot)  # type: ignore[arg-type]
 
 
 def test_obs_006_normalization_identity_is_unique_and_projection_is_stable():
@@ -157,7 +132,7 @@ class _NoPlanner:
 
     async def plan(self, request):
         self.calls += 1
-        return PlanBundle(summary="unexpected planner call")
+        raise AssertionError("observation-only workflow must not call the planner")
 
 
 class _ReadPolicyGame:

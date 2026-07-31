@@ -8,16 +8,9 @@ from civ6_workflow.domain import (
     ApprovalStatus,
     AuthorityScopeSet,
     Condition,
-    ContinuationPolicy,
-    DecisionGap,
-    DecisionGapStatus,
-    DecisionRoute,
-    LeaseValidationResult,
     Mission,
     MissionGraph,
     MissionStatus,
-    PlanLease,
-    PlanLeaseStatus,
     StrategicContract,
     StrategicContractCommit,
     SubjectRef,
@@ -25,10 +18,18 @@ from civ6_workflow.domain import (
 )
 from civ6_workflow.models import (
     ExecutionMode,
-    PlanBundle,
-    ProposedTask,
-    RiskLevel,
     RuntimeSnapshot,
+)
+from civ6_workflow.domain.legacy_decisions import (
+    DecisionGap,
+    DecisionGapStatus,
+    DecisionRoute,
+)
+from civ6_workflow.domain.legacy_plans import (
+    ContinuationPolicy,
+    LeaseValidationResult,
+    PlanLease,
+    PlanLeaseStatus,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
@@ -168,31 +169,6 @@ def _civic_lease(gap: DecisionGap, *, scope: str = "civic") -> PlanLease:
     )
 
 
-def _legacy_civic_bundle(*, task_id: str = "legacy-civic-task") -> PlanBundle:
-    return PlanBundle(
-        plan_id=f"plan-{task_id}",
-        summary="legacy civic projection",
-        tasks=[
-            ProposedTask(
-                task_id=task_id,
-                action_type="set_civic",
-                entity_type="civic",
-                entity_id="CIVIC_CODE_OF_LAWS",
-                due_turn=8,
-                arguments={"tech_or_civic": "CIVIC_CODE_OF_LAWS"},
-                postconditions=[
-                    {
-                        "type": "civic_equals",
-                        "civic_type": "CIVIC_CODE_OF_LAWS",
-                    }
-                ],
-                risk=RiskLevel.LOW,
-                reason="legacy civic queue",
-            )
-        ],
-    )
-
-
 def _activate(
     store: WorkflowStore,
     base: StrategicContract,
@@ -239,11 +215,6 @@ def test_civic_turn_graph_is_the_only_claimable_execution_authority(tmp_path):
     assert store.due_turn_action_nodes(
         GAME_ID, 8, source_observation_id=observation.observation_id
     ) == list(tasks)
-    assert [
-        task for task in store.due_tasks(GAME_ID, 8) if task.action_type == "set_civic"
-    ] == []
-
-
 def test_turn_compiler_emits_one_graph_for_research_and_civic():
     observation = _observation(current_research=None)
     contract_id = build_strategic_contract_id(GAME_ID)

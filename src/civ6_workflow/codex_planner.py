@@ -12,7 +12,6 @@ from .ports import Planner as Planner
 from .workflow_prompt import EXTENDED_SYSTEM_INSTRUCTIONS
 from .workflow_protocol import (
     WorkflowAgentRequest as AgentRequest,
-    WorkflowPlanBundle as PlanBundle,
     planner_response_model_for_request,
 )
 
@@ -263,24 +262,8 @@ class CodexPlanner:
             record_diagnostics(response_bytes=0, error_body=error)
             raise PlannerError(error)
         response_bytes = len(raw.encode("utf-8"))
-        if response_model is not PlanBundle:
-            record_diagnostics(response_bytes=response_bytes)
-            return raw
-        try:
-            bundle = PlanBundle.model_validate_json(raw)
-        except Exception as exc:
-            record_diagnostics(
-                response_bytes=response_bytes,
-                error_body=f"invalid PlanBundle: {exc}",
-            )
-            raise PlannerError(f"Codex returned an invalid plan: {exc}") from exc
-        max_tasks = int(request.constraints.get("max_tasks", 8))
-        if len(bundle.tasks) > max_tasks:
-            error = f"Codex returned {len(bundle.tasks)} tasks; max_tasks={max_tasks}"
-            record_diagnostics(response_bytes=response_bytes, error_body=error)
-            raise PlannerError(error)
         record_diagnostics(response_bytes=response_bytes)
-        return bundle
+        return raw
 
     @staticmethod
     def _diagnostic_output(stdout: bytes, stderr: bytes) -> str:

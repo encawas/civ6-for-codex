@@ -5,11 +5,7 @@ import pytest
 
 from civ6_workflow.bootstrap import build_runtime_services
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
-from civ6_workflow.models import (
-    ExecutionMode,
-    ProposedTask,
-    RuntimeSnapshot,
-)
+from civ6_workflow.models import ExecutionMode, RuntimeSnapshot
 from civ6_workflow.replay import (
     ReplayDataError,
     ReplayFrame,
@@ -23,30 +19,6 @@ from civ6_workflow.store import WorkflowStore
 
 def _compile(compiler, snapshot):
     return getattr(compiler, "compile")(normalize_runtime_snapshot(snapshot))
-
-
-def _production_task() -> ProposedTask:
-    return ProposedTask(
-        task_id="set-production",
-        action_type="city_set_production",
-        entity_type="city",
-        entity_id=1,
-        due_turn=10,
-        arguments={
-            "city_id": 1,
-            "item_type": "UNIT",
-            "item_name": "UNIT_BUILDER",
-        },
-        preconditions=[{"type": "city_has_no_production", "city_id": 1}],
-        postconditions=[
-            {
-                "type": "city_production_equals",
-                "city_id": 1,
-                "item_name": "UNIT_BUILDER",
-            }
-        ],
-        reason="replay production",
-    )
 
 
 def test_recording_rejects_unknown_schema_version(tmp_path: Path):

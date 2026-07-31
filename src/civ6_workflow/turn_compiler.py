@@ -21,7 +21,7 @@ from .domain import (
     tactical_emergency_mission_order,
     thaw_json,
 )
-from .models import ExecutionMode, RiskLevel, StoredTask, TaskStatus
+from .models import ExecutionMode, RiskLevel, TurnActionExecution, TaskStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,7 +581,7 @@ class TurnCompiler:
         return False
 
 
-def turn_action_node_as_stored_task(
+def turn_action_node_as_execution(
     node: TurnActionNode,
     *,
     status: TaskStatus,
@@ -589,10 +589,10 @@ def turn_action_node_as_stored_task(
     max_retries: int = 2,
     last_error: str | None = None,
     approved_by: str | None = None,
-) -> StoredTask:
+) -> TurnActionExecution:
     """Adapt the canonical node to the proven action and verification surface."""
 
-    return StoredTask(
+    return TurnActionExecution(
         task_id=node.node_id,
         plan_id=node.graph_id,
         action_type=node.action_type,

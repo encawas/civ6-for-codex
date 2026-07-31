@@ -10,23 +10,27 @@ from civ6_workflow.domain import (
     ApprovalStatus,
     AuthorityScopeSet,
     Condition,
-    ContinuationPolicy,
-    DecisionGap,
-    DecisionGapStatus,
-    DecisionRoute,
-    LeaseValidationResult,
     Mission,
     MissionGraph,
     MissionStatus,
-    PlanLease,
-    PlanLeaseStatus,
     StrategicContract,
     StrategicContractCommit,
     SubjectRef,
     build_strategic_contract_id,
 )
+from civ6_workflow.domain.legacy_decisions import (
+    DecisionGap,
+    DecisionGapStatus,
+    DecisionRoute,
+)
+from civ6_workflow.domain.legacy_plans import (
+    ContinuationPolicy,
+    LeaseValidationResult,
+    PlanLease,
+    PlanLeaseStatus,
+)
 from civ6_workflow.engine import EngineConfig, WorkflowEngine
-from civ6_workflow.models import ExecutionMode, PlanBundle, RuntimeSnapshot
+from civ6_workflow.models import ExecutionMode, RuntimeSnapshot
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
 
@@ -41,7 +45,7 @@ class _Planner:
 
     async def plan(self, _request):
         self.calls += 1
-        return PlanBundle(summary="planner must not own diplomacy/trade after cutover")
+        raise AssertionError("planner must not own diplomacy/trade after cutover")
 
 
 class _Game:

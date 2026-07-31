@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
@@ -10,10 +11,10 @@ from .models import (
     ActionResult,
     ExecutionMode,
     RuntimeSnapshot,
-    StoredTask,
+    TurnActionExecution,
     StrictModel,
 )
-from .workflow_protocol import WorkflowAgentRequest, WorkflowPlanBundle
+from .workflow_protocol import WorkflowAgentRequest
 
 
 class ReplayDataError(RuntimeError):
@@ -23,7 +24,7 @@ class ReplayDataError(RuntimeError):
 _SIGNATURE_KEY = "_workflow_task_signature_v1"
 
 
-def _task_signature(task: StoredTask) -> dict[str, Any]:
+def _task_signature(task: TurnActionExecution) -> dict[str, Any]:
     spec = ACTION_REGISTRY.get(task.action_type)
     if spec is None:
         tool_name = None
@@ -59,7 +60,7 @@ class ReplayFrame(StrictModel):
 
 class ReplayPlanSeed(StrictModel):
     turn: int = Field(ge=0)
-    bundle: WorkflowPlanBundle
+    bundle: dict[str, Any]
     mode: ExecutionMode = ExecutionMode.AUTO
     auto_action_types: list[str] = Field(default_factory=list)
 
@@ -76,7 +77,7 @@ class ReplayEngineSettings(StrictModel):
 
 class RecordedPlannerCall(StrictModel):
     request: WorkflowAgentRequest
-    response: WorkflowPlanBundle
+    response: Any
 
 
 class SnapshotRecording(StrictModel):
@@ -86,7 +87,7 @@ class SnapshotRecording(StrictModel):
     planner_calls: list[RecordedPlannerCall] = Field(default_factory=list)
     # Compatibility for early hand-authored fixtures. New live recordings use
     # planner_calls so request drift can be detected.
-    planner_responses: list[WorkflowPlanBundle] = Field(default_factory=list)
+    planner_responses: list[Any] = Field(default_factory=list)
     seed_plans: list[ReplayPlanSeed] = Field(default_factory=list)
     store_state: dict[str, Any] | None = None
     engine_settings: ReplayEngineSettings | None = None
@@ -177,7 +178,7 @@ class RecordableGamePort(Protocol):
         self, *, include_units: bool = False
     ) -> RuntimeSnapshot: ...
 
-    async def execute_task(self, task: StoredTask) -> ActionResult: ...
+    async def execute_task(self, task: TurnActionExecution) -> ActionResult: ...
 
     async def end_turn(self, reflections: dict[str, str]) -> ActionResult: ...
 
@@ -212,7 +213,7 @@ class RecordingGamePort:
         self.recording.frames.append(self._current)
         return snapshot
 
-    async def execute_task(self, task: StoredTask) -> ActionResult:
+    async def execute_task(self, task: TurnActionExecution) -> ActionResult:
         if self._current is None:
             raise ReplayDataError("cannot record an action before a snapshot")
         result = await self.delegate.execute_task(task)
@@ -305,7 +306,7 @@ class ReplayGamePort:
             )
         return snapshot
 
-    async def execute_task(self, task: StoredTask) -> ActionResult:
+    async def execute_task(self, task: TurnActionExecution) -> ActionResult:
         if self._current is None:
             raise ReplayDataError("cannot replay an action before a snapshot")
         if self._end_turn_used:
@@ -361,12 +362,12 @@ class RecordingPlanner:
         self.delegate = delegate
         self.recording = recording
 
-    async def plan(self, request: WorkflowAgentRequest) -> WorkflowPlanBundle:
+    async def plan(self, request: WorkflowAgentRequest) -> Any:
         response = await self.delegate.plan(request)
         self.recording.planner_calls.append(
             RecordedPlannerCall(
                 request=request.model_copy(deep=True),
-                response=response.model_copy(deep=True),
+                response=copy.deepcopy(response),
             )
         )
         return response
@@ -392,7 +393,7 @@ class ReplayPlanner:
                 f"replay ended with {self.remaining_calls} unconsumed planner call(s)"
             )
 
-    async def plan(self, request: WorkflowAgentRequest) -> WorkflowPlanBundle:
+    async def plan(self, request: WorkflowAgentRequest) -> Any:
         if self.recording.planner_calls:
             if self._next_response >= len(self.recording.planner_calls):
                 raise ReplayDataError(
@@ -409,7 +410,7 @@ class ReplayPlanner:
                     f"actual turn={request.turn}, events={self._event_keys(request)}"
                 )
             self._next_response += 1
-            return recorded.response.model_copy(deep=True)
+            return copy.deepcopy(recorded.response)
 
         if self._next_response >= len(self.recording.planner_responses):
             raise ReplayDataError(
@@ -417,7 +418,7 @@ class ReplayPlanner:
             )
         response = self.recording.planner_responses[self._next_response]
         self._next_response += 1
-        return response.model_copy(deep=True)
+        return copy.deepcopy(response)
 
     @staticmethod
     def _request_signature(request: WorkflowAgentRequest) -> dict[str, Any]:

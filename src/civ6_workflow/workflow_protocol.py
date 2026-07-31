@@ -10,7 +10,8 @@ from uuid import uuid4
 
 from pydantic import Field, field_validator, model_validator
 
-from .domain import ContinuationPolicy, Mission, PlannerRequestTargetKind, thaw_json
+from .domain import Mission, PlannerRequestTargetKind, thaw_json
+from .domain.legacy_plans import ContinuationPolicy
 
 from .models import (
     ExecutionMode,
@@ -339,17 +340,15 @@ def canonical_mission_graph_patch_response_payload(value: Any) -> dict[str, Any]
 
 def planner_response_model_for_request(
     request: "WorkflowAgentRequest",
-) -> (
-    type[WorkflowPlanBundle]
-    | type[StrategicResearchProposalResponse]
-    | type[MissionGraphPatchResponse]
-):
+) -> type[StrategicResearchProposalResponse] | type[MissionGraphPatchResponse]:
     target_kind = request.constraints.get("planner_request_target_kind")
     if target_kind == PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value:
         return StrategicResearchProposalResponse
     if target_kind == PlannerRequestTargetKind.MISSION_GRAPH_REPAIR.value:
         return MissionGraphPatchResponse
-    return WorkflowPlanBundle
+    raise WorkflowProtocolError(
+        "runtime Planner responses require a strategic PlannerRequest target"
+    )
 
 
 class WorkflowAgentRequest(BaseAgentRequest):
