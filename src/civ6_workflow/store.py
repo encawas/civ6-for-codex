@@ -760,6 +760,18 @@ PHASE6_DROPPED_REPLAY_TABLES = frozenset(
 
 class WorkflowStore:
     _MAX_SCHEMA_VERSION = 14
+    _PHASE6_DISPOSITION_SOURCE = "phase6_authority_disposition"
+    _PHASE6_PRODUCTION_SCOPES = frozenset(
+        {
+            "research",
+            "civic",
+            "opening_strategy",
+            "settler",
+            "city_roles",
+            "diplomacy_trade",
+            "tactical_emergency",
+        }
+    )
     _LEGACY_AUTHORITY_TABLES = (
         "strategy_state",
         "city_plans",
@@ -1200,6 +1212,211 @@ class WorkflowStore:
         ]
 
     @classmethod
+    def _archive_phase6_authority_dispositions(
+        cls, conn: sqlite3.Connection
+    ) -> None:
+        game_ids = tuple(
+            str(row["game_id"])
+            for row in conn.execute(
+                """
+                SELECT DISTINCT game_id FROM legacy_workflow_archive
+                WHERE source_table<>?
+                ORDER BY game_id
+                """,
+                (cls._PHASE6_DISPOSITION_SOURCE,),
+            ).fetchall()
+        )
+        for game_id in game_ids:
+            source_tables = tuple(
+                str(row["source_table"])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT source_table FROM legacy_workflow_archive
+                    WHERE game_id=? AND source_table<>?
+                    ORDER BY source_table
+                    """,
+                    (game_id, cls._PHASE6_DISPOSITION_SOURCE),
+                ).fetchall()
+            )
+            root = conn.execute(
+                "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+                (game_id,),
+            ).fetchone()
+            disposition: dict[str, Any] = {
+                "schema_version": "phase6-authority-disposition/v1",
+                "game_session_id": game_id,
+                "source_tables": list(source_tables),
+            }
+            if root is not None:
+                revision_row = conn.execute(
+                    """
+                    SELECT * FROM strategic_contract_revisions
+                    WHERE game_id=? AND revision=?
+                    """,
+                    (game_id, int(root["active_revision"])),
+                ).fetchone()
+                if revision_row is None:
+                    raise ValueError(
+                        "Phase 6 migration Contract takeover revision is missing"
+                    )
+                contract = cls._contract_from_revision_row(revision_row)
+                owned_scopes = contract.authority_scope_set.mission_graph_scopes
+                if set(owned_scopes) == cls._PHASE6_PRODUCTION_SCOPES:
+                    disposition.update(
+                        {
+                            "disposition": "MISSION_GRAPH_TAKEOVER",
+                            "contract_id": contract.contract_id,
+                            "contract_revision": contract.revision,
+                            "mission_graph_scopes": list(owned_scopes),
+                        }
+                    )
+            if "disposition" not in disposition:
+                disposition.update(
+                    {
+                        "disposition": "EXPLICIT_ABANDONMENT",
+                        "reason": (
+                            "all archived legacy authority objects are terminal "
+                            "and intentionally retired by schema v14"
+                        ),
+                    }
+                )
+            source_key = canonical_json([game_id])
+            record_json = canonical_json(disposition)
+            record_hash = hashlib.sha256(record_json.encode("utf-8")).hexdigest()
+            archive_id = hashlib.sha256(
+                f"{cls._PHASE6_DISPOSITION_SOURCE}:{source_key}".encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO legacy_workflow_archive(
+                    archive_id, game_id, source_table, source_key,
+                    record_json, record_hash, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"legacy_{archive_id}",
+                    game_id,
+                    cls._PHASE6_DISPOSITION_SOURCE,
+                    source_key,
+                    record_json,
+                    record_hash,
+                    "1970-01-01T00:00:00+00:00",
+                ),
+            )
+
+    @classmethod
+    def _validate_phase6_authority_dispositions(
+        cls, conn: sqlite3.Connection
+    ) -> None:
+        cls._validate_phase6_authority_disposition_rows(
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM legacy_workflow_archive ORDER BY archive_id"
+                ).fetchall()
+            ],
+            [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM strategic_contract_revisions "
+                    "ORDER BY game_id, revision"
+                ).fetchall()
+            ],
+        )
+
+    @classmethod
+    def _validate_phase6_authority_disposition_rows(
+        cls,
+        archive_rows: Sequence[Mapping[str, Any]],
+        revision_rows: Sequence[Mapping[str, Any]],
+    ) -> None:
+        for row in archive_rows:
+            record_json = str(row["record_json"])
+            try:
+                normalized = canonical_json(json.loads(record_json))
+            except Exception as exc:
+                raise ValueError("legacy archive contains invalid JSON") from exc
+            if normalized != record_json:
+                raise ValueError("legacy archive record is not canonical")
+            if hashlib.sha256(record_json.encode("utf-8")).hexdigest() != str(
+                row["record_hash"]
+            ):
+                raise ValueError("legacy archive record hash does not match")
+        archived_games = {
+            str(row["game_id"])
+            for row in archive_rows
+            if str(row["source_table"]) != cls._PHASE6_DISPOSITION_SOURCE
+        }
+        disposition_rows = [
+            row
+            for row in archive_rows
+            if str(row["source_table"]) == cls._PHASE6_DISPOSITION_SOURCE
+        ]
+        if {str(row["game_id"]) for row in disposition_rows} != archived_games:
+            raise ValueError(
+                "legacy authority archive requires one disposition per game"
+            )
+        if len(disposition_rows) != len(archived_games):
+            raise ValueError(
+                "legacy authority archive has duplicate game dispositions"
+            )
+        for row in disposition_rows:
+            game_id = str(row["game_id"])
+            record = json.loads(str(row["record_json"]))
+            source_tables = sorted(
+                {
+                    str(item["source_table"])
+                    for item in archive_rows
+                    if str(item["game_id"]) == game_id
+                    and str(item["source_table"])
+                    != cls._PHASE6_DISPOSITION_SOURCE
+                }
+            )
+            if (
+                record.get("schema_version")
+                != "phase6-authority-disposition/v1"
+                or record.get("game_session_id") != game_id
+                or record.get("source_tables") != source_tables
+            ):
+                raise ValueError("legacy authority disposition identity disagrees")
+            if record.get("disposition") == "MISSION_GRAPH_TAKEOVER":
+                revision_row = next(
+                    (
+                        item
+                        for item in revision_rows
+                        if str(item["game_id"]) == game_id
+                        and str(item["contract_id"]) == record.get("contract_id")
+                        and int(item["revision"])
+                        == record.get("contract_revision")
+                    ),
+                    None,
+                )
+                if revision_row is None:
+                    raise ValueError(
+                        "legacy authority takeover Contract revision is missing"
+                    )
+                contract = cls._contract_from_revision_row(revision_row)
+                if (
+                    set(contract.authority_scope_set.mission_graph_scopes)
+                    != cls._PHASE6_PRODUCTION_SCOPES
+                    or record.get("mission_graph_scopes")
+                    != list(contract.authority_scope_set.mission_graph_scopes)
+                ):
+                    raise ValueError(
+                        "legacy authority takeover scope evidence disagrees"
+                    )
+            elif record.get("disposition") == "EXPLICIT_ABANDONMENT":
+                if record.get("reason") != (
+                    "all archived legacy authority objects are terminal "
+                    "and intentionally retired by schema v14"
+                ):
+                    raise ValueError(
+                        "legacy authority abandonment evidence disagrees"
+                    )
+            else:
+                raise ValueError("legacy authority disposition is unsupported")
+
+    @classmethod
     def _validate_phase6_migration_preconditions(cls, conn: sqlite3.Connection) -> None:
         if conn.execute(
             """
@@ -1376,6 +1593,7 @@ class WorkflowStore:
         )
         for table, keys in archive_specs:
             cls._archive_legacy_rows(conn, table, keys)
+        cls._archive_phase6_authority_dispositions(conn)
         conn.execute("PRAGMA foreign_keys=OFF")
         try:
             for table in reversed(cls._LEGACY_AUTHORITY_TABLES):
@@ -1403,6 +1621,7 @@ class WorkflowStore:
                 row["record_hash"]
             ):
                 raise ValueError("legacy archive record hash does not match")
+        cls._validate_phase6_authority_dispositions(conn)
         if conn.execute(
             """
             SELECT 1 FROM logical_planner_requests
@@ -2852,14 +3071,14 @@ class WorkflowStore:
                 if item["game_id"] == patch.game_session_id
                 and item["observation_id"] == patch.created_from_observation_id
             ]
-            if (
-                len(accepted) != 1
-                or accepted[0]["previous_observation_id"]
+            if len(accepted) > 1 or (
+                accepted
+                and accepted[0]["previous_observation_id"]
                 != delta.baseline_observation_id
             ):
                 raise ValueError(
-                    "MissionGraphPatch current Observation is not the direct "
-                    "accepted successor of its StateDelta baseline"
+                    "MissionGraphPatch current Observation baseline evidence "
+                    "disagrees with its StateDelta"
                 )
 
     @classmethod
@@ -3100,6 +3319,8 @@ class WorkflowStore:
                 or tick.accepted_observation_id != patch.created_from_observation_id
                 or tick.previous_baseline_observation_id
                 != repair_context.get("baseline_observation_id")
+                or tick.baseline_accepted
+                is not bool(repair_context.get("accept_observation_baseline", True))
                 or tick.completed_at < patch.created_at
             ):
                 raise ValueError(
@@ -7493,6 +7714,11 @@ class WorkflowStore:
             existing_request = self._planner_request_from_row(existing_request_row)
             if existing_request.status is not PlannerRequestStatus.IN_PROGRESS:
                 raise ValueError("MissionGraphPatch PlannerRequest is not in progress")
+            repair_context = planner_request.input_projection.get(
+                "mission_repair_context"
+            )
+            if not isinstance(repair_context, Mapping):
+                raise ValueError("MissionGraphPatch input context is missing")
             stored_attempt_row = conn.execute(
                 "SELECT * FROM provider_attempts WHERE provider_attempt_id=?",
                 (provider_attempt.provider_attempt_id,),
@@ -7631,6 +7857,8 @@ class WorkflowStore:
                 or tick.previous_baseline_observation_id
                 != delta.baseline_observation_id
                 or tick.accepted_observation_id != delta.current_observation_id
+                or tick.baseline_accepted
+                is not bool(repair_context.get("accept_observation_baseline", True))
             ):
                 raise ValueError("stale MissionGraphPatch Observation baseline")
             current_observation_row = conn.execute(
@@ -7714,35 +7942,36 @@ class WorkflowStore:
             if updated.rowcount != 1:
                 raise ValueError("stale MissionGraphPatch Contract base")
             checkpoint("after_mission_patch_contract_appended")
-            baseline_row = conn.execute(
-                "SELECT * FROM observation_baseline_acceptances "
-                "WHERE game_id=? ORDER BY sequence DESC LIMIT 1",
-                (patch.game_session_id,),
-            ).fetchone()
-            assert baseline_row is not None
-            sequence = int(baseline_row["sequence"]) + 1
-            conn.execute(
-                """
-                INSERT INTO observation_baseline_acceptances(
-                    baseline_acceptance_id, game_id, sequence, observation_id,
-                    previous_observation_id, reason, accepted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    self._build_baseline_acceptance_id(
+            if tick.baseline_accepted:
+                baseline_row = conn.execute(
+                    "SELECT * FROM observation_baseline_acceptances "
+                    "WHERE game_id=? ORDER BY sequence DESC LIMIT 1",
+                    (patch.game_session_id,),
+                ).fetchone()
+                assert baseline_row is not None
+                sequence = int(baseline_row["sequence"]) + 1
+                conn.execute(
+                    """
+                    INSERT INTO observation_baseline_acceptances(
+                        baseline_acceptance_id, game_id, sequence, observation_id,
+                        previous_observation_id, reason, accepted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._build_baseline_acceptance_id(
+                            patch.game_session_id,
+                            current_observation.observation_id,
+                            current_baseline.observation_id,
+                        ),
                         patch.game_session_id,
+                        sequence,
                         current_observation.observation_id,
                         current_baseline.observation_id,
+                        "MissionGraphPatch closure committed",
+                        tick.completed_at.isoformat(),
                     ),
-                    patch.game_session_id,
-                    sequence,
-                    current_observation.observation_id,
-                    current_baseline.observation_id,
-                    "MissionGraphPatch committed",
-                    tick.completed_at.isoformat(),
-                ),
-            )
-            checkpoint("after_mission_patch_baseline_accepted")
+                )
+                checkpoint("after_mission_patch_baseline_accepted")
             conn.execute(
                 """
                 INSERT INTO mission_graph_patches(
@@ -13800,6 +14029,11 @@ class WorkflowStore:
                     seen.add(identity)
                 prepared_rows.append(row)
             prepared[table] = prepared_rows
+
+        cls._validate_phase6_authority_disposition_rows(
+            prepared["legacy_workflow_archive"],
+            prepared["strategic_contract_revisions"],
+        )
 
         for row in prepared["logical_planner_requests"]:
             cls._validate_contract_schema_failure_attempt(

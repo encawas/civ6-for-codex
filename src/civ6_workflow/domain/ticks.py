@@ -197,6 +197,7 @@ class MissionGraphPatchedTick(TickRecord):
     committed_revision: int = Field(ge=2)
     previous_baseline_observation_id: str = Field(min_length=1)
     accepted_observation_id: str = Field(min_length=1)
+    baseline_accepted: bool = True
 
 
 class LegacyScopeObjectDisposition(DomainModel):

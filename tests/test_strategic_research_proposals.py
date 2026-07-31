@@ -285,7 +285,7 @@ def _engine(store, game, planner):
         config=RuntimeConfig(
             execution_mode=ExecutionMode.AUTO,
             auto_end_turn=False,
-            max_agent_calls_per_turn=0,
+            max_agent_calls_per_turn=1,
         ),
     )
 
@@ -6258,3 +6258,256 @@ def test_phase1c_enablement_preserves_generic_human_resume(tmp_path):
     context = store.human_wait_context("game-generic")
     assert context is not None
     assert context["resume_requested"] is True
+
+
+def test_empty_store_creates_initial_contract_request_before_provider_call(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "empty-store-creation.sqlite3")
+        game = _Game()
+        planner = _Planner()
+        engine = _engine(store, game, planner)
+
+        created = await engine.tick()
+
+        assert (
+            created.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        request = store.active_planner_request(game.snapshot.game_id)
+        assert request is not None
+        assert (
+            request.target.kind
+            is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION
+        )
+        assert request.target.strategic_contract_id == build_strategic_contract_id(
+            game.snapshot.game_id
+        )
+        assert request.target.strategic_scope == "research"
+        assert request.status is PlannerRequestStatus.PENDING
+        assert planner.calls == 0
+        assert store.get_active_strategic_contract(game.snapshot.game_id) is None
+
+        response = _response(game.snapshot.game_id, request.target.strategic_contract_id)
+        candidate = response.proposal_candidates[0].model_copy(
+            update={"created_from_observation_id": request.observation_id}
+        )
+        planner.responses.append(
+            response.model_copy(update={"proposal_candidates": (candidate,)})
+        )
+        completed = await engine.tick()
+
+        assert (
+            completed.workflow_tick["outcome"]
+            == TickOutcomeKind.STRATEGIC_PROPOSAL_READY
+        )
+        assert planner.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_zero_agent_call_budget_prevents_initial_contract_request(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "zero-budget-creation.sqlite3")
+        planner = _Planner()
+        engine = _engine(store, _Game(), planner)
+        engine.config.max_agent_calls_per_turn = 0
+
+        result = await engine.tick()
+
+        assert result.workflow_tick["outcome"] == TickOutcomeKind.NO_SAFE_ACTION
+        assert store.active_planner_request("game-1") is None
+        assert store.logical_request_count_for_turn("game-1", 1) == 0
+        assert planner.calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_multi_scope_delta_repairs_each_scope_before_accepting_baseline(tmp_path):
+    async def scenario():
+        path = tmp_path / "multi-scope-repair.sqlite3"
+        store, _request_record, proposal, _attempt = await _completed_proposal_state(
+            path
+        )
+        store = _dormant_store(store)
+        store.approve_strategic_research_proposal(
+            proposal.game_session_id,
+            _proposal_decision(store, proposal, ApprovalDecision.APPROVED),
+        )
+        research_contract = store.get_active_strategic_contract("game-1")
+        assert research_contract is not None
+
+        game = _Game()
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "tech_civics": {
+                    "current_research_type": "TECH_WRITING",
+                    "available_techs": [
+                        {"tech_type": "TECH_WRITING"},
+                        {"tech_type": "TECH_MINING"},
+                    ],
+                    "current_civic_type": "CIVIC_CODE_OF_LAWS",
+                    "available_civics": [
+                        {"civic_type": "CIVIC_CODE_OF_LAWS"},
+                        {"civic_type": "CIVIC_CRAFTSMANSHIP"},
+                    ],
+                }
+            }
+        )
+        activation_observation = normalize_runtime_snapshot(game.snapshot).canonical
+        store.save_normalized_observation(activation_observation)
+        civic_mission = Mission(
+            mission_id="mission-civic-multi-scope",
+            game_session_id="game-1",
+            contract_id=research_contract.contract_id,
+            mission_revision=1,
+            scope="civic",
+            subject=SubjectRef(subject_type="player", subject_id="player-1"),
+            slot="player:civic",
+            objective="Complete Code of Laws",
+            desired_outcome={"civic": "CIVIC_CODE_OF_LAWS"},
+            status=MissionStatus.ACTIVE,
+        )
+        activation_time = max(
+            activation_observation.observed_at,
+            store.list_strategic_contract_commits("game-1")[-1].committed_at,
+        ) + timedelta(seconds=1)
+        store.activate_civic_authority(
+            game_session_id="game-1",
+            expected_base_revision=research_contract.revision,
+            mission=civic_mission,
+            activation_id="activate-civic-multi-scope",
+            observation_id=activation_observation.observation_id,
+            turn_number=game.snapshot.turn,
+            activated_at=activation_time,
+        )
+
+        planner = _Planner()
+        engine = _engine(store, game, planner)
+        engine.config.execution_mode = ExecutionMode.READONLY
+        engine.config.max_agent_calls_per_turn = 1
+        runtime_clock = [activation_time + timedelta(seconds=10)]
+
+        def next_runtime_time():
+            runtime_clock[0] += timedelta(milliseconds=1)
+            return runtime_clock[0]
+
+        engine._now = next_runtime_time
+        await engine.tick()
+        baseline = store.get_accepted_observation_baseline("game-1")
+        assert baseline is not None
+
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 2,
+                "overview": {"turn": 2, "player_id": 1, "num_cities": 1},
+                "tech_civics": {
+                    "current_research_type": "TECH_MINING",
+                    "available_techs": [
+                        {"tech_type": "TECH_WRITING"},
+                        {"tech_type": "TECH_MINING"},
+                    ],
+                    "current_civic_type": "CIVIC_CRAFTSMANSHIP",
+                    "available_civics": [
+                        {"civic_type": "CIVIC_CRAFTSMANSHIP"},
+                        {"civic_type": "CIVIC_FOREIGN_TRADE"},
+                    ],
+                },
+            }
+        )
+
+        first_created = await engine.tick()
+        assert (
+            first_created.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        civic_request = store.active_planner_request("game-1")
+        assert civic_request is not None
+        assert civic_request.target.strategic_scope == "civic"
+        assert civic_request.target.affected_mission_ids == (civic_mission.mission_id,)
+        civic_update = civic_mission.model_copy(
+            update={
+                "mission_revision": 2,
+                "objective": "Continue Craftsmanship",
+                "desired_outcome": {"civic": "CIVIC_CRAFTSMANSHIP"},
+                "evidence_refs": (f"observation:{civic_request.observation_id}",),
+            }
+        )
+        planner.responses.append(
+            MissionGraphPatchResponse(
+                schema_version="mission-graph-patch-response/v1",
+                patch_candidates=(
+                    MissionGraphPatchCandidate(
+                        mission_updates=(civic_update,),
+                        created_from_observation_id=civic_request.observation_id,
+                    ),
+                ),
+            )
+        )
+        first_patch = await engine.tick()
+        assert first_patch.workflow_tick["baseline_accepted"] is False
+        assert store.get_accepted_observation_baseline("game-1") == baseline
+
+        budget_blocked = await engine.tick()
+        assert budget_blocked.workflow_tick["outcome"] == TickOutcomeKind.NO_SAFE_ACTION
+        assert store.active_planner_request("game-1") is None
+        assert store.logical_request_count_for_turn("game-1", 2) == 1
+        assert planner.calls == 1
+
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "turn": 3,
+                "overview": {"turn": 3, "player_id": 1, "num_cities": 1},
+            }
+        )
+        second_created = await engine.tick()
+        assert (
+            second_created.workflow_tick["outcome"]
+            == TickOutcomeKind.LOGICAL_PLANNER_REQUEST_CREATED
+        )
+        research_request = store.active_planner_request("game-1")
+        assert research_request is not None
+        assert research_request.target.strategic_scope == "research"
+        current_contract = store.get_active_strategic_contract("game-1")
+        assert current_contract is not None
+        research_mission = next(
+            mission
+            for mission in current_contract.mission_graph.missions
+            if mission.scope == "research"
+        )
+        research_update = research_mission.model_copy(
+            update={
+                "mission_revision": research_mission.mission_revision + 1,
+                "objective": "Continue Mining",
+                "desired_outcome": {"technology": "TECH_MINING"},
+                "evidence_refs": (f"observation:{research_request.observation_id}",),
+            }
+        )
+        planner.responses.append(
+            MissionGraphPatchResponse(
+                schema_version="mission-graph-patch-response/v1",
+                patch_candidates=(
+                    MissionGraphPatchCandidate(
+                        mission_updates=(research_update,),
+                        created_from_observation_id=research_request.observation_id,
+                    ),
+                ),
+            )
+        )
+        second_patch = await engine.tick()
+
+        assert second_patch.workflow_tick["baseline_accepted"] is True
+        assert planner.calls == 2
+        assert store.logical_request_count_for_turn("game-1", 3) == 1
+        assert [
+            patch.affected_mission_ids
+            for patch in store.list_mission_graph_patches("game-1")
+        ] == [(civic_mission.mission_id,), (research_mission.mission_id,)]
+        accepted = store.get_accepted_observation_baseline("game-1")
+        assert accepted is not None
+        assert accepted.observation_id == research_request.observation_id
+        replay = store.export_replay_state("game-1")
+        restored = WorkflowStore(tmp_path / "multi-scope-restored.sqlite3")
+        restored.import_replay_state(replay)
+        assert restored.export_replay_state("game-1") == replay
+
+    asyncio.run(scenario())

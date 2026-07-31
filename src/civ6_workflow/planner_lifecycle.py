@@ -134,7 +134,14 @@ class PlannerLifecycleCoordinator:
 
         active_contract = runtime.store.get_active_strategic_contract(snapshot.game_id)
         if active_contract is None:
-            return None
+            if (
+                runtime.store.provider_budget_request_count_for_turn(
+                    snapshot.game_id, snapshot.turn
+                )
+                >= runtime.config.max_agent_calls_per_turn
+            ):
+                return None
+            return self._create_initial_contract_request(ctx, observation)
         owned_scopes = set(
             active_contract.authority_scope_set.mission_graph_scopes
         ).intersection(
@@ -162,23 +169,51 @@ class PlannerLifecycleCoordinator:
                 comparison.state_delta,
                 active_contract.mission_graph,
             )
+            repaired_mission_ids: set[str] = set()
+            deltas_by_id = {
+                delta.state_delta_id: delta
+                for delta in runtime.store.list_state_deltas(snapshot.game_id)
+            }
+            for patch in runtime.store.list_mission_graph_patches(snapshot.game_id):
+                prior_delta = deltas_by_id.get(patch.source_state_delta_id)
+                if (
+                    prior_delta is not None
+                    and prior_delta.baseline_observation_id
+                    == comparison.state_delta.baseline_observation_id
+                    and prior_delta.changes == comparison.state_delta.changes
+                ):
+                    repaired_mission_ids.update(patch.affected_mission_ids)
+            affected_mission_ids = tuple(
+                mission_id
+                for mission_id in affected_mission_ids
+                if mission_id not in repaired_mission_ids
+            )
             affected = tuple(
                 mission
                 for mission in active_contract.mission_graph.missions
                 if mission.mission_id in affected_mission_ids
             )
             affected_scopes = tuple(sorted({mission.scope for mission in affected}))
-            if len(affected_scopes) > 1:
-                raise RuntimeError(
-                    "MissionGraph repair cannot combine independently owned scopes"
-                )
             repair_scope = None if not affected_scopes else affected_scopes[0]
+            scope_missions = tuple(
+                mission for mission in affected if mission.scope == repair_scope
+            )
+            scope_mission_ids = tuple(
+                sorted(mission.mission_id for mission in scope_missions)
+            )
             if (
-                affected_mission_ids
+                scope_mission_ids
                 and repair_scope is not None
                 and repair_scope in owned_scopes
                 and current.completeness.supports_scope(repair_scope)
             ):
+                if (
+                    runtime.store.provider_budget_request_count_for_turn(
+                        snapshot.game_id, snapshot.turn
+                    )
+                    >= runtime.config.max_agent_calls_per_turn
+                ):
+                    return None
                 base_context = {
                     "target_contract_id": active_contract.contract_id,
                     "expected_base_revision": active_contract.revision,
@@ -193,10 +228,11 @@ class PlannerLifecycleCoordinator:
                         comparison.state_delta.current_observation_id
                     ),
                     "current_observation_projection_hash": current.projection_hash,
-                    "affected_mission_ids": list(affected_mission_ids),
+                    "affected_mission_ids": list(scope_mission_ids),
                     "affected_missions": [
-                        mission.model_dump(mode="json") for mission in affected
+                        mission.model_dump(mode="json") for mission in scope_missions
                     ],
+                    "accept_observation_baseline": len(affected_scopes) == 1,
                 }
                 projection = {
                     "strategic_proposal_context": base_context,
@@ -229,7 +265,7 @@ class PlannerLifecycleCoordinator:
                             "contract_id": active_contract.contract_id,
                             "base_revision": active_contract.revision,
                             "state_delta_id": comparison.state_delta.state_delta_id,
-                            "affected_mission_ids": affected_mission_ids,
+                            "affected_mission_ids": scope_mission_ids,
                         }
                     )[:24]
                 )
@@ -243,7 +279,7 @@ class PlannerLifecycleCoordinator:
                         strategic_contract_id=active_contract.contract_id,
                         base_contract_revision=active_contract.revision,
                         strategic_scope=repair_scope,
-                        affected_mission_ids=affected_mission_ids,
+                        affected_mission_ids=scope_mission_ids,
                     ),
                     input_projection_hash=canonical_json_hash(projection),
                     input_projection_version="mission-repair-input/v1",
@@ -293,6 +329,99 @@ class PlannerLifecycleCoordinator:
                 accepted_at=runtime._now(),
             )
         return None
+
+    def _create_initial_contract_request(self, ctx, observation):
+        runtime = self.runtime
+        snapshot = observation.snapshot
+        current = observation.canonical
+        contract_id = build_strategic_contract_id(snapshot.game_id)
+        proposal_context = {
+            "target_contract_id": contract_id,
+            "expected_base_revision": 0,
+            "strategic_scope": "research",
+        }
+        observation_projection = current.model_dump(
+            mode="json",
+            exclude={"raw_observation"},
+        )
+        projection = {
+            "strategic_proposal_context": proposal_context,
+            "normalized_observation": observation_projection,
+            "planner_input_contract_revision": PLANNER_INPUT_CONTRACT_REVISION,
+        }
+        request_payload = AgentRequest(
+            turn=snapshot.turn,
+            execution_mode=runtime.config.execution_mode,
+            trigger_events=[],
+            relevant_state={"normalized_observation": observation_projection},
+            constraints={
+                "planning_phase": "initial",
+                "allow_information_requests": True,
+                "planner_request_target_kind": (
+                    PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value
+                ),
+                "target_contract_id": contract_id,
+                "expected_base_revision": 0,
+                "strategic_scope": "research",
+                "response_schema_version": (
+                    "strategic-research-proposal-response/v1"
+                ),
+            },
+        )
+        projection_hash = canonical_json_hash(projection)
+        target = PlannerRequestTarget(
+            kind=PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+            strategic_contract_id=contract_id,
+            strategic_scope="research",
+        )
+        existing = runtime.store.planner_request_for_input(
+            snapshot.game_id,
+            target.target_key,
+            projection_hash,
+        )
+        if existing is not None:
+            return None
+        request_id = (
+            "strategic_contract_creation_request_"
+            + canonical_json_hash(
+                {
+                    "game_session_id": snapshot.game_id,
+                    "observation_id": current.observation_id,
+                    "projection_hash": projection_hash,
+                }
+            )[:24]
+        )
+        request = PlannerRequest(
+            planner_request_id=request_id,
+            game_session_id=snapshot.game_id,
+            turn_number=snapshot.turn,
+            observation_id=current.observation_id,
+            target=target,
+            input_projection_hash=projection_hash,
+            input_projection_version="strategic-proposal-input/v1",
+            input_projection=projection,
+            request_payload=request_payload.model_dump(mode="json"),
+            policy_revision=PLANNER_REQUEST_POLICY_REVISION,
+            approval_contract_hash=canonical_json_hash(
+                {"approval": "explicit-human-decision"}
+            ),
+            allowed_actions_hash=canonical_json_hash({"research": ["set_research"]}),
+            model_settings={"provider": type(runtime.planner).__name__},
+            status=PlannerRequestStatus.PENDING,
+            created_at=runtime._now(),
+            context_bytes=len(canonical_json(projection).encode("utf-8")),
+        )
+        ctx.metrics.logical_planner_request_count += 1
+        ctx.metrics.planner_context_bytes += request.context_bytes
+        return self._finish(
+            ctx,
+            snapshot,
+            LogicalPlannerRequestCreatedTick,
+            planner_request=request,
+            planner_request_id=request.planner_request_id,
+            request_target_kind=request.target.kind,
+            decision_gap_ids=(),
+        )
 
     async def _advance_active_strategic_request(
         self,
@@ -1156,6 +1285,9 @@ class PlannerLifecycleCoordinator:
                     repair_context["baseline_observation_id"]
                 ),
                 accepted_observation_id=patch.created_from_observation_id,
+                baseline_accepted=bool(
+                    repair_context.get("accept_observation_baseline", True)
+                ),
             )
         )
         runtime.store.record_agent_run(
