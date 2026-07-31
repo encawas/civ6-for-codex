@@ -67,6 +67,7 @@ class TurnActionNode(DomainModel):
         if self.node_id in self.dependency_node_ids:
             raise ValueError("TurnActionNode cannot depend on itself")
         expected_entity_type = {
+            "city_set_production": "city",
             "set_research": "research",
             "set_civic": "civic",
             "unit_move": "unit",

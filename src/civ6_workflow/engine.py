@@ -442,7 +442,7 @@ class WorkflowEngine:
         if active_contract is not None:
             for mission in execution_missions:
                 scope = mission.scope
-                if scope == "settler":
+                if scope in {"settler", "city_roles"}:
                     unavailable_target = self.turn_compiler.unavailable_target(
                         observation.canonical, mission
                     )
@@ -450,9 +450,9 @@ class WorkflowEngine:
                         continue
                     authoritative_mission_events.append(
                         GameEvent(
-                            event_type="settler_mission_target_unavailable",
+                            event_type=f"{scope}_mission_target_unavailable",
                             turn=snapshot.turn,
-                            entity_type="settler",
+                            entity_type=scope,
                             entity_id=unavailable_target,
                             level=EventLevel.L3,
                             risk=RiskLevel.MEDIUM,
@@ -465,7 +465,7 @@ class WorkflowEngine:
                                 "target": unavailable_target,
                             },
                             dedupe_key=(
-                                "settler_mission_target_unavailable:"
+                                f"{scope}_mission_target_unavailable:"
                                 f"{active_contract.revision}:"
                                 f"{mission.mission_revision}:{unavailable_target}"
                             ),
@@ -539,6 +539,13 @@ class WorkflowEngine:
             *authoritative_mission_events,
             *events_from_snapshot(snapshot),
         ]
+        if "city_roles" in owned_execution_scopes:
+            current_events = [
+                event
+                for event in current_events
+                if event.event_type
+                not in {"city_role_required", "invalid_city_plan_item"}
+            ]
         lease_tick = await self._pre_route_decision_runtime(
             ctx, observation, current_events
         )
@@ -1412,6 +1419,7 @@ class WorkflowEngine:
         civic_authoritative = "civic" in owned_scopes
         opening_authoritative = "opening_strategy" in owned_scopes
         settler_authoritative = "settler" in owned_scopes
+        city_roles_authoritative = "city_roles" in owned_scopes
         if research_authoritative or civic_authoritative:
             context = dict(context)
             strategy = context.get("strategy")
@@ -1432,6 +1440,9 @@ class WorkflowEngine:
         relevant_state, relevant_plans, max_tasks = project_agent_context(
             snapshot, events, context
         )
+        if city_roles_authoritative:
+            relevant_plans = dict(relevant_plans)
+            relevant_plans.pop("cities", None)
         allowed_action_types = set(self.config.allowed_action_types)
         if research_authoritative:
             allowed_action_types.discard("set_research")
@@ -1439,6 +1450,8 @@ class WorkflowEngine:
             allowed_action_types.discard("set_civic")
         if settler_authoritative:
             allowed_action_types.difference_update({"unit_move", "unit_found_city"})
+        if city_roles_authoritative:
+            allowed_action_types.discard("city_set_production")
         argument_contracts = action_argument_contracts(allowed_action_types)
         entity_type_contracts = action_entity_type_contracts(allowed_action_types)
         entity_id_contracts = entity_id_argument_contracts(entity_type_contracts)

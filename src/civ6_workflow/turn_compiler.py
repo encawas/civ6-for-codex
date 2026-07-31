@@ -14,6 +14,7 @@ from .domain import (
     TurnActionNode,
     build_turn_action_graph_id,
     build_turn_action_node_id,
+    city_roles_mission_plan,
     settler_mission_plan,
     strategic_mission_action,
     thaw_json,
@@ -49,6 +50,12 @@ class TurnCompiler:
                 if TurnCompiler._settler_target_is_safe(unit.values, plan)
                 else f"site:{plan['target_x']}:{plan['target_y']}"
             )
+        if mission.scope == "city_roles":
+            policy = city_roles_mission_plan(mission)
+            for city_plan in policy["cities"]:
+                if observation.city(str(city_plan["city_id"])) is None:
+                    return f"city:{city_plan['city_id']}"
+            return None
         strategic_mission_action(mission)
         desired = thaw_json(mission.desired_outcome)
         target_key = "technology" if mission.scope == "research" else "civic"
@@ -156,6 +163,14 @@ class TurnCompiler:
     ) -> tuple[TurnActionNode | None, str | None]:
         if mission.scope == "settler":
             return self._compile_settler_node(
+                observation,
+                contract,
+                mission,
+                mode=mode,
+                auto_action_types=auto_action_types,
+            )
+        if mission.scope == "city_roles":
+            return self._compile_city_roles_node(
                 observation,
                 contract,
                 mission,
@@ -336,6 +351,82 @@ class TurnCompiler:
             **node_identity,
         )
         return node, None
+
+    def _compile_city_roles_node(
+        self,
+        observation: NormalizedObservation,
+        contract: StrategicContract,
+        mission: Mission,
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+    ) -> tuple[TurnActionNode | None, str | None]:
+        policy = city_roles_mission_plan(mission)
+        unavailable = self.unavailable_target(observation, mission)
+        if unavailable is not None:
+            return None, unavailable
+        for city_plan in policy["cities"]:
+            queue = city_plan["production_queue"]
+            if not queue:
+                continue
+            city_id = city_plan["city_id"]
+            city = observation.city(str(city_id))
+            if city is None or city.production.state is not SlotState.EMPTY:
+                continue
+            item = queue[0]
+            arguments = {
+                "city_id": city_id,
+                "item_type": item["item_type"],
+                "item_name": item["item_name"],
+            }
+            for key in ("target_x", "target_y"):
+                if key in item:
+                    arguments[key] = item[key]
+            node_identity = {
+                "game_session_id": observation.game_session_id,
+                "turn_number": observation.turn_number,
+                "source_observation_id": observation.observation_id,
+                "source_contract_id": contract.contract_id,
+                "source_contract_revision": contract.revision,
+                "source_mission_id": mission.mission_id,
+                "source_mission_revision": mission.mission_revision,
+                "action_type": "city_set_production",
+                "entity_id": str(city_id),
+                "arguments": arguments,
+                "target_turn": observation.turn_number,
+            }
+            node_id = build_turn_action_node_id(**node_identity)
+            node = TurnActionNode(
+                node_id=node_id,
+                graph_id="pending",
+                source_observation_projection_hash=observation.projection_hash,
+                entity_type="city",
+                preconditions=(
+                    {
+                        "type": "entity_exists",
+                        "entity_type": "city",
+                        "entity_id": city_id,
+                    },
+                    {"type": "city_has_no_production", "city_id": city_id},
+                ),
+                postconditions=(
+                    {
+                        "type": "city_production_equals",
+                        "city_id": city_id,
+                        "item_name": item["item_name"],
+                    },
+                ),
+                risk=RiskLevel.LOW.value,
+                requires_confirmation=(
+                    mode is not ExecutionMode.AUTO
+                    or "city_set_production" not in auto_action_types
+                ),
+                reason="Advance the active city-role production policy.",
+                idempotency_key=f"turn-action:{node_id}",
+                **node_identity,
+            )
+            return node, None
+        return None, None
 
     @staticmethod
     def _settler_target_is_safe(values, plan) -> bool:

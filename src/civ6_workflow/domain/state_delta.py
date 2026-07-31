@@ -204,7 +204,7 @@ class StateDeltaBuilder:
             }
             self._append_entity_changes(
                 changes,
-                scope="settler",
+                scope="city_roles",
                 collection="cities",
                 before=before_cities,
                 after=after_cities,

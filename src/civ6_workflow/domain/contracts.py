@@ -285,16 +285,24 @@ class StrategicContractCommit(DomainModel):
                     "Action-derived Contract must advance one source Mission"
                 )
             mission = matching[0]
+            valid_transition_status = (
+                mission.status in {MissionStatus.ACTIVE, MissionStatus.COMPLETED}
+                if mission.scope == "city_roles"
+                else mission.status is MissionStatus.COMPLETED
+            )
             if (
-                mission.status is not MissionStatus.COMPLETED
+                not valid_transition_status
                 or self.source_action_attempt_id not in mission.evidence_refs
             ):
                 raise ValueError(
-                    "Action-derived Contract requires completed Mission evidence"
+                    "Action-derived Contract requires Mission transition evidence"
                 )
-            strategic_mission_action_types(
-                mission.model_copy(update={"status": MissionStatus.ACTIVE})
-            )
+            if mission.scope == "city_roles":
+                city_roles_mission_plan(mission)
+            else:
+                strategic_mission_action_types(
+                    mission.model_copy(update={"status": MissionStatus.ACTIVE})
+                )
         if self.source_scope_activation_id is not None:
             scope = str(self.source_scope)
             if scope not in self.contract.authority_scope_set.mission_graph_scopes:
@@ -435,6 +443,79 @@ def settler_mission_plan(mission: Mission) -> dict[str, object]:
     return plan
 
 
+def city_roles_mission_plan(mission: Mission) -> dict[str, object]:
+    """Validate one closed city-role policy and its deterministic production queues."""
+
+    if mission.scope != "city_roles":
+        raise ValueError("city roles Mission scope must be city_roles")
+    if mission.status not in {MissionStatus.ACTIVE, MissionStatus.COMPLETED}:
+        raise ValueError("city roles Mission must be ACTIVE or COMPLETED")
+    desired_outcome = thaw_json(mission.desired_outcome)
+    if set(desired_outcome) != {"city_roles"}:
+        raise ValueError(
+            "city roles Mission desired_outcome must contain only city_roles"
+        )
+    policy = desired_outcome["city_roles"]
+    if not isinstance(policy, dict) or set(policy) != {"owner", "cities"}:
+        raise ValueError("city roles Mission policy fields do not match the contract")
+    owner = policy["owner"]
+    if not isinstance(owner, (str, int)) or not str(owner).strip():
+        raise ValueError("city roles Mission requires an owner identity")
+    if mission.subject.subject_type != "player" or mission.subject.subject_id != str(
+        owner
+    ):
+        raise ValueError("city roles Mission subject must match its owner")
+    cities = policy["cities"]
+    if not isinstance(cities, list) or not cities:
+        raise ValueError("city roles Mission requires at least one city policy")
+    identities: list[str] = []
+    has_work = False
+    for city in cities:
+        if not isinstance(city, dict) or set(city) != {
+            "city_id",
+            "role",
+            "production_queue",
+        }:
+            raise ValueError("city role policy fields do not match the contract")
+        city_id = city["city_id"]
+        role = city["role"]
+        queue = city["production_queue"]
+        if not isinstance(city_id, (str, int)) or not str(city_id).strip():
+            raise ValueError("city role policy requires a city identity")
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError("city role policy requires a role")
+        if not isinstance(queue, list):
+            raise ValueError("city role production_queue must be a list")
+        identities.append(str(city_id))
+        has_work = has_work or bool(queue)
+        for item in queue:
+            if not isinstance(item, dict):
+                raise ValueError("city role production item must be an object")
+            required = {"item_type", "item_name"}
+            optional = {"target_x", "target_y"}
+            if set(item) - (required | optional) or required - set(item):
+                raise ValueError(
+                    "city role production item fields do not match the action contract"
+                )
+            if any(
+                not isinstance(item[key], str) or not item[key].strip()
+                for key in required
+            ):
+                raise ValueError("city role production item names cannot be empty")
+            for key in optional.intersection(item):
+                if type(item[key]) is not int:
+                    raise ValueError(
+                        f"city role production item {key} must be an integer"
+                    )
+    if identities != sorted(set(identities)):
+        raise ValueError("city role policies must have unique sorted city identities")
+    if mission.status is MissionStatus.ACTIVE and not has_work:
+        raise ValueError("active city roles Mission requires queued production")
+    if mission.status is MissionStatus.COMPLETED and has_work:
+        raise ValueError("completed city roles Mission cannot retain queued production")
+    return policy
+
+
 def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
     """Return the closed action set permitted by one executable Mission scope."""
 
@@ -445,6 +526,11 @@ def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
     if mission.scope == "settler":
         settler_mission_plan(mission)
         return ("unit_found_city", "unit_move")
+    if mission.scope == "city_roles":
+        if mission.status is not MissionStatus.ACTIVE:
+            raise ValueError("city roles execution Mission must be ACTIVE")
+        city_roles_mission_plan(mission)
+        return ("city_set_production",)
     raise ValueError(f"scope has no Phase 5 execution contract: {mission.scope}")
 
 

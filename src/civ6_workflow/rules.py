@@ -58,15 +58,20 @@ class DeterministicRuleCompiler:
         observation: NormalizedRuntimeObservation,
         *,
         include_settler: bool | None = None,
+        include_city_roles: bool | None = None,
     ) -> RuleCompilation:
         snapshot = observation.snapshot
-        if include_settler is None:
+        if include_settler is None or include_city_roles is None:
             active_contract = self.store.get_active_strategic_contract(snapshot.game_id)
-            include_settler = (
-                active_contract is None
-                or "settler"
-                not in active_contract.authority_scope_set.mission_graph_scopes
+            owned_scopes = (
+                set()
+                if active_contract is None
+                else set(active_contract.authority_scope_set.mission_graph_scopes)
             )
+            if include_settler is None:
+                include_settler = "settler" not in owned_scopes
+            if include_city_roles is None:
+                include_city_roles = "city_roles" not in owned_scopes
         context = self.store.current_context(snapshot.game_id)
         tasks: list[ProposedTask] = []
         events: list[GameEvent] = []
@@ -79,11 +84,12 @@ class DeterministicRuleCompiler:
             bindable_units,
             events,
         )
-        tasks.extend(
-            self._compile_city_production(
-                observation, context.get("cities", {}), events
+        if include_city_roles:
+            tasks.extend(
+                self._compile_city_production(
+                    observation, context.get("cities", {}), events
+                )
             )
-        )
         tasks.extend(
             self._compile_builders(snapshot, context.get("builders", {}), events)
         )
