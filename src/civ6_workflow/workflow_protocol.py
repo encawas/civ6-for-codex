@@ -13,11 +13,11 @@ from pydantic import Field, field_validator, model_validator
 from .domain import Mission, PlannerRequestTargetKind, thaw_json
 from .domain.legacy_plans import ContinuationPolicy
 
+from .legacy_models import PlanBundle as BasePlanBundle
 from .models import (
     ExecutionMode,
     RiskLevel,
     AgentRequest as BaseAgentRequest,
-    PlanBundle as BasePlanBundle,
     StrictModel,
     TickMetrics as BaseTickMetrics,
 )

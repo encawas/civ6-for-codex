@@ -1,11 +1,10 @@
 import pytest
 
 from civ6_workflow.domain.legacy_plans import ContinuationPolicy
+from civ6_workflow.legacy_models import PlanBundle, ProposedTask
 from civ6_workflow.models import (
     EventLevel,
     GameEvent,
-    PlanBundle,
-    ProposedTask,
     RiskLevel,
 )
 from civ6_workflow.workflow_protocol import (

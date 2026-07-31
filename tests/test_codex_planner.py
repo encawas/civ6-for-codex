@@ -12,6 +12,10 @@ from civ6_workflow.codex_planner import (
 )
 from civ6_workflow.models import AgentRequest, ExecutionMode
 from civ6_workflow.workflow_prompt import EXTENDED_SYSTEM_INSTRUCTIONS
+from civ6_workflow.workflow_protocol import (
+    WorkflowProtocolError,
+    planner_response_model_for_request,
+)
 
 
 def test_planner_prompt_enforces_strategic_only_output():
@@ -20,6 +24,18 @@ def test_planner_prompt_enforces_strategic_only_output():
     assert "constraints.information_tool_arguments" in EXTENDED_SYSTEM_INSTRUCTIONS
     assert "Never emit a PlanBundle" in EXTENDED_SYSTEM_INSTRUCTIONS
     assert "Runtime alone validates and persists" in EXTENDED_SYSTEM_INSTRUCTIONS
+
+
+def test_runtime_planner_response_selector_rejects_legacy_target():
+    request = AgentRequest(
+        turn=12,
+        execution_mode=ExecutionMode.CONFIRM,
+        trigger_events=[],
+        constraints={"planner_request_target_kind": "LEGACY_DECISION_GROUP"},
+    )
+
+    with pytest.raises(WorkflowProtocolError, match="strategic PlannerRequest target"):
+        planner_response_model_for_request(request)
 
 
 def test_codex_command_is_noninteractive_and_read_only(tmp_path: Path):
