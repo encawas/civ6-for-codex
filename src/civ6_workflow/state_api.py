@@ -57,8 +57,11 @@ class Civ6StateApi:
         while True:
             self.call_count += 1
             try:
-                return await self._require_client().get(path)
+                response = await self._require_client().get(path)
             except (httpx.ConnectError, httpx.ConnectTimeout):
                 if time.monotonic() >= deadline:
                     raise
-                await asyncio.sleep(0.25)
+            else:
+                if response.status_code != 503 or time.monotonic() >= deadline:
+                    return response
+            await asyncio.sleep(0.25)

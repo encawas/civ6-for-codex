@@ -310,6 +310,15 @@ def canonical_workflow_plan_bundle_payload(value: Any) -> dict[str, Any]:
     return WorkflowPlanBundle.model_validate(source).model_dump(mode="json")
 
 
+def _canonicalize_mission_reference_sets(mission: Any) -> None:
+    if not isinstance(mission, dict):
+        return
+    for field_name in ("dependency_mission_ids", "evidence_refs"):
+        values = mission.get(field_name)
+        if isinstance(values, list) and all(isinstance(item, str) for item in values):
+            mission[field_name] = sorted(set(values))
+
+
 def canonical_strategic_research_proposal_response_payload(
     value: Any,
 ) -> dict[str, Any]:
@@ -321,7 +330,16 @@ def canonical_strategic_research_proposal_response_payload(
         source_json = json.dumps(
             thaw_json(value), ensure_ascii=False, separators=(",", ":")
         )
-    response = StrategicResearchProposalResponse.model_validate_json(source_json)
+    source = json.loads(source_json)
+    if isinstance(source, dict):
+        for candidate in source.get("proposal_candidates", ()):
+            if isinstance(candidate, dict):
+                _canonicalize_mission_reference_sets(
+                    candidate.get("proposed_research_mission")
+                )
+    response = StrategicResearchProposalResponse.model_validate_json(
+        json.dumps(source, ensure_ascii=False, separators=(",", ":"))
+    )
     return response.model_dump(mode="json")
 
 
@@ -334,7 +352,15 @@ def canonical_mission_graph_patch_response_payload(value: Any) -> dict[str, Any]
         source_json = json.dumps(
             thaw_json(value), ensure_ascii=False, separators=(",", ":")
         )
-    response = MissionGraphPatchResponse.model_validate_json(source_json)
+    source = json.loads(source_json)
+    if isinstance(source, dict):
+        for candidate in source.get("patch_candidates", ()):
+            if isinstance(candidate, dict):
+                for mission in candidate.get("mission_updates", ()):
+                    _canonicalize_mission_reference_sets(mission)
+    response = MissionGraphPatchResponse.model_validate_json(
+        json.dumps(source, ensure_ascii=False, separators=(",", ":"))
+    )
     return response.model_dump(mode="json")
 
 
@@ -358,14 +384,19 @@ def planner_response_json_schema_for_request(
 
     response_model = planner_response_model_for_request(request)
     schema = response_model.model_json_schema()
+    mission = schema["$defs"]["Mission"]
+    properties = mission["properties"]
+    for field_name in ("dependency_mission_ids", "evidence_refs"):
+        properties[field_name] = {
+            **properties[field_name],
+            "uniqueItems": True,
+        }
     if (
         request.constraints.get("planner_request_target_kind")
         != PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value
     ):
         return schema
 
-    mission = schema["$defs"]["Mission"]
-    properties = mission["properties"]
     properties["mission_revision"] = {"const": 1, "type": "integer"}
     properties["scope"] = {"const": "research", "type": "string"}
     properties["subject"] = {

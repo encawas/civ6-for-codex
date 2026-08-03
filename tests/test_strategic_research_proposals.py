@@ -73,6 +73,9 @@ from civ6_workflow.workflow_protocol import (
     StrategicResearchProposalCandidate,
     StrategicResearchProposalResponse,
     WorkflowAgentRequest,
+    canonical_mission_graph_patch_response_payload,
+    canonical_strategic_research_proposal_response_payload,
+    planner_response_json_schema_for_request,
 )
 
 
@@ -215,6 +218,64 @@ def _information_response():
         ),
     )
 
+
+def test_strategic_response_canonicalizes_set_like_mission_references():
+    contract_id = build_strategic_contract_id("game-1")
+    raw = _response("game-1", contract_id).model_dump(mode="json")
+    mission = raw["proposal_candidates"][0]["proposed_research_mission"]
+    mission["dependency_mission_ids"] = ["mission-z", "mission-a", "mission-z"]
+    mission["evidence_refs"] = ["obs-z", "obs-a", "obs-z"]
+
+    payload = canonical_strategic_research_proposal_response_payload(
+        json.dumps(raw)
+    )
+    canonical = payload["proposal_candidates"][0]["proposed_research_mission"]
+
+    assert canonical["dependency_mission_ids"] == ["mission-a", "mission-z"]
+    assert canonical["evidence_refs"] == ["obs-a", "obs-z"]
+    assert mission["evidence_refs"] == ["obs-z", "obs-a", "obs-z"]
+
+
+def test_patch_response_canonicalizes_set_like_mission_references():
+    mission = _mission("game-1", build_strategic_contract_id("game-1")).model_dump(
+        mode="json"
+    )
+    mission["dependency_mission_ids"] = ["mission-z", "mission-a", "mission-z"]
+    mission["evidence_refs"] = ["obs-z", "obs-a", "obs-z"]
+    raw = {
+        "schema_version": "mission-graph-patch-response/v1",
+        "patch_candidates": [
+            {
+                "mission_updates": [mission],
+                "created_from_observation_id": "obs-source",
+            }
+        ],
+    }
+
+    payload = canonical_mission_graph_patch_response_payload(raw)
+    canonical = payload["patch_candidates"][0]["mission_updates"][0]
+
+    assert canonical["dependency_mission_ids"] == ["mission-a", "mission-z"]
+    assert canonical["evidence_refs"] == ["obs-a", "obs-z"]
+
+
+def test_planner_transport_schema_requires_unique_mission_reference_sets():
+    request = WorkflowAgentRequest(
+        turn=1,
+        execution_mode=ExecutionMode.AUTO,
+        trigger_events=[],
+        relevant_state={},
+        constraints={
+            "planner_request_target_kind": (
+                PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value
+            )
+        },
+    )
+
+    mission = planner_response_json_schema_for_request(request)["$defs"]["Mission"]
+
+    assert mission["properties"]["dependency_mission_ids"]["uniqueItems"] is True
+    assert mission["properties"]["evidence_refs"]["uniqueItems"] is True
 
 def _request(
     game_id: str,
