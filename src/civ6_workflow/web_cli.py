@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-import webbrowser
 import threading
-from pathlib import Path
+import webbrowser
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
-from typing import Any
 import typer
 
+from . import web_ui as web_ui_module
 from .bootstrap import build_store, compose_control_panel, open_live_runtime
 from .config import AppConfig, load_config
+from .control_panel_page import CONTROL_PANEL_HTML
 from .store import WorkflowStore
+
+# The CLI is the supported control-panel entrypoint. Install the coherent page
+# before the canonical composition root creates the localhost HTTP server.
+web_ui_module.CONTROL_PANEL_HTML = CONTROL_PANEL_HTML
 
 
 def _store(config: AppConfig, config_path: Path) -> WorkflowStore:
