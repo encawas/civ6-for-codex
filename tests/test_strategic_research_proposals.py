@@ -6578,7 +6578,7 @@ def test_multi_scope_delta_repairs_each_scope_before_accepting_baseline(tmp_path
         assert store.get_accepted_observation_baseline("game-1") == baseline
 
         budget_blocked = await engine.tick()
-        assert budget_blocked.workflow_tick["outcome"] == TickOutcomeKind.NO_SAFE_ACTION
+        assert budget_blocked.workflow_tick["outcome"] == TickOutcomeKind.AWAITING_HUMAN
         assert store.active_planner_request("game-1") is None
         assert store.logical_request_count_for_turn("game-1", 2) == 1
         assert planner.calls == 1
