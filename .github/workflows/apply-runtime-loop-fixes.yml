@@ -1,14 +1,14 @@
-name: Stage validated runtime loop repair
+name: Build validated runtime loop repair
 
 on:
   pull_request:
     types: [synchronize]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  stage:
+  build:
     if: github.head_ref == 'codex/fix-runtime-convergence-gaps'
     runs-on: ubuntu-latest
     steps:
@@ -47,16 +47,13 @@ jobs:
           python -m ruff check src/civ6_workflow tests/test_runtime_loop_closure.py
           git diff --check
 
-      - name: Publish validated staging commit
-        shell: bash
-        run: |
-          rm .github/workflows/apply-runtime-loop-fixes.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/civ6_workflow/runtime.py \
-                  src/civ6_workflow/planner_lifecycle.py \
-                  src/civ6_workflow/domain/state_delta.py \
-                  tests/test_runtime_loop_closure.py \
-                  .github/workflows/apply-runtime-loop-fixes.yml
-          git commit -m "fix: close game runtime loop hazards"
-          git push --force origin HEAD:agent/runtime-loop-staged
+      - name: Package validated files
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-loop-patched-files
+          path: |
+            src/civ6_workflow/runtime.py
+            src/civ6_workflow/planner_lifecycle.py
+            src/civ6_workflow/domain/state_delta.py
+            tests/test_runtime_loop_closure.py
+          if-no-files-found: error
