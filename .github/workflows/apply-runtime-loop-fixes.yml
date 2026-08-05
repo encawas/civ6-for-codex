@@ -15,6 +15,7 @@ jobs:
           for path in (
               "scripts/apply_runtime_loop_patch.py",
               "scripts/refine_runtime_loop_tests.py",
+              "scripts/refine_runtime_loop_imports.py",
           ):
               code = subprocess.check_output(
                   [
