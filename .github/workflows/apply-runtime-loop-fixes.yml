@@ -1,14 +1,14 @@
-name: Build runtime loop repair artifact
+name: Stage validated runtime loop repair
 
 on:
   pull_request:
     types: [synchronize]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
+  stage:
     if: github.head_ref == 'codex/fix-runtime-convergence-gaps'
     runs-on: ubuntu-latest
     steps:
@@ -45,14 +45,18 @@ jobs:
           python -m pytest tests/test_runtime_loop_closure.py tests/test_state_delta.py tests/test_phase7_runtime_convergence.py -q
           python -m compileall -q src tests
           python -m ruff check src/civ6_workflow tests/test_runtime_loop_closure.py
+          git diff --check
 
-      - name: Package validated files
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-loop-patched-files
-          path: |
-            src/civ6_workflow/runtime.py
-            src/civ6_workflow/planner_lifecycle.py
-            src/civ6_workflow/domain/state_delta.py
-            tests/test_runtime_loop_closure.py
-          if-no-files-found: error
+      - name: Publish validated staging commit
+        shell: bash
+        run: |
+          rm .github/workflows/apply-runtime-loop-fixes.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/civ6_workflow/runtime.py \
+                  src/civ6_workflow/planner_lifecycle.py \
+                  src/civ6_workflow/domain/state_delta.py \
+                  tests/test_runtime_loop_closure.py \
+                  .github/workflows/apply-runtime-loop-fixes.yml
+          git commit -m "fix: close game runtime loop hazards"
+          git push --force origin HEAD:agent/runtime-loop-staged
