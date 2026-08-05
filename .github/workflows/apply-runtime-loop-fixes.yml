@@ -12,13 +12,17 @@ jobs:
           python - <<'PY'
           import subprocess
 
-          code = subprocess.check_output(
-              [
-                  "git",
-                  "show",
-                  "origin/agent/runtime-loop-fixes:scripts/apply_runtime_loop_patch.py",
-              ],
-              text=True,
-          )
-          exec(compile(code, "scripts/apply_runtime_loop_patch.py", "exec"))
+          for path in (
+              "scripts/apply_runtime_loop_patch.py",
+              "scripts/refine_runtime_loop_tests.py",
+          ):
+              code = subprocess.check_output(
+                  [
+                      "git",
+                      "show",
+                      f"origin/agent/runtime-loop-fixes:{path}",
+                  ],
+                  text=True,
+              )
+              exec(compile(code, path, "exec"))
           PY
