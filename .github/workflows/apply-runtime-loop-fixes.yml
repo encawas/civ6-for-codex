@@ -1,9 +1,11 @@
 name: Materialize validated runtime loop fixes
 
 on:
-  push:
+  pull_request:
     branches:
-      - codex/fix-runtime-convergence-gaps
+      - codex/phase7-runtime-convergence
+    types:
+      - synchronize
 
 permissions:
   contents: write
