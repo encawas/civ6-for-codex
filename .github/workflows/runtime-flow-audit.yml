@@ -157,7 +157,11 @@ jobs:
               ]
               assert outcomes == expected, (outcomes, results)
               assert game.snapshot.turn == 2
-              assert [item["action_type"] for item in game.mutations if item["kind"] == "task"] == ["set_research"]
+              assert [
+                  item["action_type"]
+                  for item in game.mutations
+                  if item["kind"] == "task"
+              ] == ["set_research"]
               assert sum(item["kind"] == "end_turn" for item in game.mutations) == 1
               assert all(item["mutation_count"] <= 1 for item in results)
 
@@ -174,7 +178,9 @@ jobs:
                   "final_runtime_state": store.load_runtime_state(
                       proposal.game_session_id
                   ).value,
-                  "active_contract_revision": None if contract is None else contract.revision,
+                  "active_contract_revision": None
+                  if contract is None
+                  else contract.revision,
                   "mission_statuses": {}
                   if contract is None
                   else {
@@ -218,12 +224,12 @@ jobs:
           path: runtime-flow-audit.json
           if-no-files-found: error
 
-      - name: Remove temporary workflow from audit branch
+      - name: Persist evidence and remove temporary workflow
         shell: bash
         run: |
           rm .github/workflows/runtime-flow-audit.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/workflows/runtime-flow-audit.yml
-          git commit -m "chore: remove isolated runtime flow audit workflow"
+          git add runtime-flow-audit.json .github/workflows/runtime-flow-audit.yml
+          git commit -m "test: record isolated one-turn runtime audit"
           git push origin HEAD:agent/runtime-flow-audit-20260805
