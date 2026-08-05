@@ -13,11 +13,15 @@ import typer
 from . import web_ui as web_ui_module
 from .bootstrap import build_store, compose_control_panel, open_live_runtime
 from .config import AppConfig, load_config
-from .control_panel_page import CONTROL_PANEL_HTML
+from .control_panel_page import CONTROL_PANEL_HTML as CONTROL_PANEL_HTML_SOURCE
 from .store import WorkflowStore
 
 # The CLI is the supported control-panel entrypoint. Install the coherent page
 # before the canonical composition root creates the localhost HTTP server.
+CONTROL_PANEL_HTML = CONTROL_PANEL_HTML_SOURCE.replace(
+    "grid-template-columns:repeat(3,minmax(0,1fr);row-gap:13px",
+    "grid-template-columns:repeat(3,minmax(0,1fr));row-gap:13px",
+)
 web_ui_module.CONTROL_PANEL_HTML = CONTROL_PANEL_HTML
 
 
