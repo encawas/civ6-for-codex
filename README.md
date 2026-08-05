@@ -4,7 +4,14 @@
 
 ## Windows 一键启动
 
-克隆仓库后，先编辑 `config.toml`，填写可用模型：
+首次使用时，在 PowerShell 中克隆仓库并进入项目目录：
+
+```powershell
+git clone https://github.com/encawas/civ6-for-codex.git
+cd civ6-for-codex
+```
+
+然后编辑 `config.toml`，填写可用模型：
 
 ```toml
 [codex]
