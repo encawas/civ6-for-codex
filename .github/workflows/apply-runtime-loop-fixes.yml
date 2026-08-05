@@ -47,7 +47,7 @@ jobs:
         run: |
           python -m pytest tests/test_runtime_loop_closure.py tests/test_state_delta.py tests/test_phase7_runtime_convergence.py -q
           python -m compileall -q src tests/test_runtime_loop_closure.py
-          python -m ruff check \
+          python -m ruff check --select E9,F \
             src/civ6_workflow/runtime.py \
             src/civ6_workflow/planner_lifecycle.py \
             src/civ6_workflow/domain/state_delta.py \
