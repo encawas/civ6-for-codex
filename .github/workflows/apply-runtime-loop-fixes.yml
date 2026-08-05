@@ -1,0 +1,77 @@
+name: Apply runtime loop repair
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.head_ref == 'codex/fix-runtime-convergence-gaps'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/fix-runtime-convergence-gaps
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract and apply reviewed patch
+        shell: bash
+        run: |
+          git fetch origin agent/runtime-loop-fixes
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          text = subprocess.check_output(
+              [
+                  "git",
+                  "show",
+                  "origin/agent/runtime-loop-fixes:.github/workflows/apply-runtime-loop-fixes.yml",
+              ],
+              text=True,
+          )
+          marker = "          python - <<'PY'\n"
+          start = text.index(marker) + len(marker)
+          end = text.index("          PY\n", start)
+          lines = text[start:end].splitlines()
+          code = "\n".join(
+              line[10:] if line.startswith("          ") else line for line in lines
+          )
+          Path("/tmp/apply_runtime_loop_fixes.py").write_text(
+              code + "\n", encoding="utf-8"
+          )
+          PY
+          python /tmp/apply_runtime_loop_fixes.py
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest ruff
+
+      - name: Validate focused fixes
+        run: |
+          python -m pytest tests/test_runtime_loop_closure.py tests/test_state_delta.py tests/test_phase7_runtime_convergence.py -q
+          python -m compileall -q src tests
+          python -m ruff check src/civ6_workflow tests/test_runtime_loop_closure.py
+
+      - name: Commit validated repair
+        shell: bash
+        run: |
+          rm .github/workflows/apply-runtime-loop-fixes.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/civ6_workflow/runtime.py \
+                  src/civ6_workflow/planner_lifecycle.py \
+                  src/civ6_workflow/domain/state_delta.py \
+                  tests/test_runtime_loop_closure.py \
+                  .github/workflows/apply-runtime-loop-fixes.yml
+          git commit -m "fix: close game runtime loop hazards"
+          git push origin HEAD:codex/fix-runtime-convergence-gaps
