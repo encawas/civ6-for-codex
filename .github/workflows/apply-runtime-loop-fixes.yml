@@ -1,14 +1,14 @@
-name: Apply runtime loop repair
+name: Build runtime loop repair artifact
 
 on:
   pull_request:
     types: [synchronize]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply:
+  build:
     if: github.head_ref == 'codex/fix-runtime-convergence-gaps'
     runs-on: ubuntu-latest
     steps:
@@ -21,286 +21,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Extract and apply reviewed patch
+      - name: Apply reviewed patch
         shell: bash
         run: |
           git fetch origin agent/runtime-loop-fixes
-          python - <<'PY'
-          from pathlib import Path
-          import subprocess
-
-          text = subprocess.check_output(
-              [
-                  "git",
-                  "show",
-                  "origin/agent/runtime-loop-fixes:.github/workflows/apply-runtime-loop-fixes.yml",
-              ],
-              text=True,
-          )
-          marker = "          python - <<'PY'\n"
-          start = text.index(marker) + len(marker)
-          end = text.index("          PY\n", start)
-          lines = text[start:end].splitlines()
-          code = "\n".join(
-              line[10:] if line.startswith("          ") else line for line in lines
-          )
-          Path("/tmp/apply_runtime_loop_fixes.py").write_text(
-              code + "\n", encoding="utf-8"
-          )
-          PY
-          python /tmp/apply_runtime_loop_fixes.py
-
-          python - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path: str, old: str, new: str) -> None:
-              target = Path(path)
-              text = target.read_text(encoding="utf-8")
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{path}: expected one refinement match, found {count}")
-              target.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-          delta_path = "src/civ6_workflow/domain/state_delta.py"
-          replace_once(
-              delta_path,
-              '''            self._append_entity_changes(
-                changes,
-                scope="tactical_emergency",
-                collection="units",
-                before={
-                    unit.entity_id.value: _tactical_unit_projection(unit)
-                    for unit in baseline.units
-                    if "SETTLER" not in unit.unit_type
-                },
-                after={
-                    unit.entity_id.value: _tactical_unit_projection(unit)
-                    for unit in current.units
-                    if "SETTLER" not in unit.unit_type
-                },
-            )
-
-        if baseline.completeness.blockers and current.completeness.blockers:
-''',
-              '''            self._append_entity_changes(
-                changes,
-                scope="tactical_emergency",
-                collection="units",
-                before={
-                    unit.entity_id.value: _tactical_unit_projection(unit)
-                    for unit in baseline.units
-                    if "SETTLER" not in unit.unit_type
-                },
-                after={
-                    unit.entity_id.value: _tactical_unit_projection(unit)
-                    for unit in current.units
-                    if "SETTLER" not in unit.unit_type
-                },
-            )
-            settler_unit_paths = {
-                f"units.{unit.entity_id.value}"
-                for unit in (*baseline.units, *current.units)
-                if "SETTLER" in unit.unit_type
-            }
-            changes[:] = [
-                change
-                for change in changes
-                if not (
-                    change.scope == "tactical_emergency"
-                    and change.field_path in settler_unit_paths
-                )
-            ]
-
-        if baseline.completeness.blockers and current.completeness.blockers:
-''',
-          )
-
-          planner_path = "src/civ6_workflow/planner_lifecycle.py"
-          start = '''    def _accept_verified_action_baseline(
-        self,
-        current,
-        baseline,
-        owned_scopes: set[str],
-    ) -> bool:
-        if not all(
-            current.completeness.supports_scope(scope) for scope in owned_scopes
-        ):
-            return False
-        candidates: list[ActionAttempt] = [
-            attempt
-            for attempt in self.runtime.store.list_action_attempts(
-                current.game_session_id
-            )
-            if attempt.status is AttemptStatus.SUCCEEDED
-            and attempt.action_type != "end_turn"
-            and attempt.verified_at is not None
-            and attempt.verified_at >= baseline.observed_at
-            and attempt.last_verification_projection_hash == current.projection_hash
-        ]
-        if not candidates:
-            return False
-        latest = max(
-            candidates,
-            key=lambda attempt: (attempt.verified_at, attempt.action_attempt_id),
-        )
-        self.runtime.store.accept_observation_baseline(
-            current.observation_id,
-            expected_previous_observation_id=baseline.observation_id,
-            reason=(
-                "accepted verified action effect from "
-                f"{latest.action_attempt_id}:{latest.action_type}"
-            ),
-            accepted_at=self.runtime._now(),
-        )
-        return True
-'''
-          refined = '''    def _accept_verified_action_baseline(
-        self,
-        current,
-        baseline,
-        state_delta,
-    ) -> bool:
-        """Accept only the closed, verified effect of one settler move.
-
-        Other successful actions complete or revise their Mission and are handled by
-        the ordinary active-Mission impact filter. This narrow exception keeps a
-        multi-turn settler Mission alive without swallowing unrelated game changes.
-        """
-
-        if not current.completeness.supports_scope("settler"):
-            return False
-        candidates: list[ActionAttempt] = []
-        for attempt in self.runtime.store.list_action_attempts(
-            current.game_session_id
-        ):
-            if (
-                attempt.status is not AttemptStatus.SUCCEEDED
-                or attempt.action_type != "unit_move"
-                or attempt.verified_at is None
-                or attempt.prepared_at < baseline.observed_at
-                or attempt.last_verification_projection_hash
-                != current.projection_hash
-            ):
-                continue
-            arguments = thaw_json(attempt.normalized_arguments)
-            unit_id = str(arguments.get("unit_id", ""))
-            target_x = arguments.get("target_x")
-            target_y = arguments.get("target_y")
-            expected_path = f"units.{unit_id}"
-            if (
-                not unit_id
-                or type(target_x) is not int
-                or type(target_y) is not int
-                or any(
-                    change.scope != "settler"
-                    or change.field_path != expected_path
-                    for change in state_delta.changes
-                )
-            ):
-                continue
-            resulting = thaw_json(state_delta.changes[0].after)
-            if (
-                not isinstance(resulting, dict)
-                or resulting.get("x") != target_x
-                or resulting.get("y") != target_y
-            ):
-                continue
-            candidates.append(attempt)
-        if not candidates:
-            return False
-        latest = max(
-            candidates,
-            key=lambda attempt: (attempt.verified_at, attempt.action_attempt_id),
-        )
-        self.runtime.store.accept_observation_baseline(
-            current.observation_id,
-            expected_previous_observation_id=baseline.observation_id,
-            reason=(
-                "accepted verified settler movement effect from "
-                f"{latest.action_attempt_id}"
-            ),
-            accepted_at=self.runtime._now(),
-        )
-        return True
-'''
-          replace_once(planner_path, start, refined)
-          replace_once(
-              planner_path,
-              '''            and self._accept_verified_action_baseline(
-                current, baseline, owned_scopes
-            )
-''',
-              '''            and self._accept_verified_action_baseline(
-                current, baseline, comparison.state_delta
-            )
-''',
-          )
-
-          test_path = "tests/test_runtime_loop_closure.py"
-          replace_once(
-              test_path,
-              '''    graph = MissionGraph(
-        missions=(
-            _mission(MissionStatus.ACTIVE),
-            _mission(MissionStatus.COMPLETED),
-        )
-    )
-
-    affected = MissionImpactAnalyzer().affected_mission_ids(
-        result.state_delta, graph
-    )
-
-    assert affected == ("mission-active",)
-''',
-              '''    completed_graph = MissionGraph(
-        missions=(_mission(MissionStatus.COMPLETED),)
-    )
-    active_graph = MissionGraph(
-        missions=(_mission(MissionStatus.ACTIVE),)
-    )
-
-    assert (
-        MissionImpactAnalyzer().affected_mission_ids(
-            result.state_delta, completed_graph
-        )
-        == ()
-    )
-    assert MissionImpactAnalyzer().affected_mission_ids(
-        result.state_delta, active_graph
-    ) == ("mission-active",)
-''',
-          )
-          replace_once(
-              test_path,
-              '''                    verified_at=NOW + timedelta(seconds=3),
-                    last_verification_projection_hash=current.projection_hash,
-                    action_attempt_id="attempt-1",
-''',
-              '''                    prepared_at=NOW + timedelta(seconds=1),
-                    verified_at=NOW + timedelta(seconds=3),
-                    last_verification_projection_hash=current.projection_hash,
-                    normalized_arguments={
-                        "unit_id": 7,
-                        "target_x": 2,
-                        "target_y": 2,
-                    },
-                    action_attempt_id="attempt-1",
-''',
-          )
-          replace_once(
-              test_path,
-              '''    accepted = coordinator._accept_verified_action_baseline(
-        current, baseline, {"settler"}
-    )
-''',
-              '''    delta = StateDeltaBuilder().compare(baseline, current).state_delta
-    assert delta is not None
-    accepted = coordinator._accept_verified_action_baseline(
-        current, baseline, delta
-    )
-''',
-          )
-          PY
+          for script in \
+            scripts/apply_runtime_loop_patch.py \
+            scripts/refine_runtime_loop_tests.py \
+            scripts/refine_runtime_loop_imports.py
+          do
+            git show "origin/agent/runtime-loop-fixes:${script}" > "/tmp/$(basename "${script}")"
+            python "/tmp/$(basename "${script}")"
+          done
 
       - name: Install test dependencies
         run: |
@@ -314,16 +46,13 @@ jobs:
           python -m compileall -q src tests
           python -m ruff check src/civ6_workflow tests/test_runtime_loop_closure.py
 
-      - name: Commit validated repair
-        shell: bash
-        run: |
-          rm .github/workflows/apply-runtime-loop-fixes.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/civ6_workflow/runtime.py \
-                  src/civ6_workflow/planner_lifecycle.py \
-                  src/civ6_workflow/domain/state_delta.py \
-                  tests/test_runtime_loop_closure.py \
-                  .github/workflows/apply-runtime-loop-fixes.yml
-          git commit -m "fix: close game runtime loop hazards"
-          git push origin HEAD:codex/fix-runtime-convergence-gaps
+      - name: Package validated files
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-loop-patched-files
+          path: |
+            src/civ6_workflow/runtime.py
+            src/civ6_workflow/planner_lifecycle.py
+            src/civ6_workflow/domain/state_delta.py
+            tests/test_runtime_loop_closure.py
+          if-no-files-found: error
