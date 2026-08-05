@@ -97,7 +97,7 @@ def test_incomplete_observation_cannot_replace_accepted_baseline(tmp_path):
             accepted_at=incomplete.observed_at + timedelta(seconds=2),
         )
 
-    assert comparison.kind is ObservationComparisonKind.REBASELINE_REQUIRED
+    assert comparison.kind is ObservationComparisonKind.NO_CHANGE
     assert store.get_accepted_observation_baseline("game-1") == baseline
 
     complete = _observation(

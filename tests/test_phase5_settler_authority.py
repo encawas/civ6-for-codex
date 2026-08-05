@@ -4,7 +4,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from civ6_workflow.actions import resolve_action_spec
+from civ6_workflow.actions import (
+    build_action_attempt_idempotency_key,
+    resolve_action_spec,
+)
 from civ6_workflow.domain import (
     ActionAttempt,
     ApprovalStatus,
@@ -22,6 +25,7 @@ from civ6_workflow.domain import (
     StrategicContract,
     StrategicContractCommit,
     SubjectRef,
+    VerificationEvidence,
     VerificationStatus,
     build_strategic_contract_id,
 )
@@ -257,6 +261,7 @@ def _finalize_success(
     minute: int,
 ):
     spec = resolve_action_spec(task.action_type)
+    normalized_arguments = spec.build_arguments(task)
     prepared = ActionAttempt(
         action_attempt_id=f"attempt-{task.task_id}",
         game_session_id=GAME_ID,
@@ -264,30 +269,37 @@ def _finalize_success(
         action_type=task.action_type,
         attempt_number=1,
         request_id=f"request-{task.task_id}",
-        idempotency_key=f"turn-action:{task.task_id}",
+        idempotency_key=build_action_attempt_idempotency_key(
+            task, normalized_arguments
+        ),
         prepared_from_observation_id=task.created_from_observation_id,
-        prepared_at=NOW + timedelta(minutes=minute),
+        prepared_at=NOW,
         status=AttemptStatus.PREPARED,
         retry_classification=spec.retry_classification,
-        normalized_arguments=spec.build_arguments(task),
+        normalized_arguments=normalized_arguments,
         postconditions=tuple(task.postconditions),
     )
     store.save_action_attempt(prepared)
     uncertain = prepared.model_copy(
         update={
             "status": AttemptStatus.UNCERTAIN,
-            "sent_at": NOW + timedelta(minutes=minute),
+            "sent_at": NOW,
             "transport_result": {"phase": "delivery_started"},
         }
     )
     store.update_action_attempt(uncertain)
+    observation = store.get_normalized_observation(verification_observation_id)
     succeeded = uncertain.model_copy(
         update={
             "status": AttemptStatus.SUCCEEDED,
-            "response_received_at": NOW + timedelta(minutes=minute),
+            "response_received_at": NOW,
             "tool_result": {"success": True},
             "verification_status": VerificationStatus.PASSED,
             "last_verification_observation_id": verification_observation_id,
+            "last_verification_projection_hash": observation.projection_hash,
+            "verification_evidence": VerificationEvidence.POSITIVE_COMMIT_EVIDENCE,
+            "verification_reason": "test postconditions satisfied",
+            "verified_at": observation.observed_at,
             "verification_count": 1,
         }
     )
@@ -386,6 +398,9 @@ def test_verified_found_city_completes_mission_once(tmp_path):
     at_target = _observation(observation_id="obs-at-target", position=TARGET)
     contract, _tick = _activate(store, base, at_target)
     _graph, task = _compile_and_activate(store, at_target, contract)
+    assert task.requires_confirmation is True
+    assert store.approve_task(GAME_ID, task.task_id, approved_by="reviewer") is True
+
     after = _observation(
         observation_id="obs-city-founded",
         position=None,
@@ -455,7 +470,7 @@ def test_settler_state_delta_tracks_complete_facts_but_not_unknown_deletions():
     assert result.kind is ObservationComparisonKind.STATE_DELTA
     assert result.state_delta is not None
     assert any(
-        change.scope == "unit"
+        change.scope == "settler"
         and change.field_path == f"units.{UNIT_ID}"
         and change.change_kind is StateDeltaChangeKind.FIELD_CHANGED
         for change in result.state_delta.changes
@@ -467,7 +482,31 @@ def test_settler_state_delta_tracks_complete_facts_but_not_unknown_deletions():
     )
     unknown = StateDeltaBuilder().compare(baseline, incomplete)
     assert unknown.state_delta is None or not any(
-        change.scope == "unit"
+        change.scope == "settler"
         and change.change_kind is StateDeltaChangeKind.ENTITY_DELETED
         for change in unknown.state_delta.changes
     )
+
+
+def test_disallowed_settler_action_is_not_compiled_even_with_auto_or_confirmation(
+    tmp_path,
+):
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    base = _foundation(store)
+    moving = _observation(observation_id="obs-policy")
+    contract, _tick = _activate(store, base, moving)
+
+    for mode in (ExecutionMode.AUTO, ExecutionMode.CONFIRM):
+        compilation = TurnCompiler().compile_missions(
+            moving,
+            contract,
+            contract.mission_graph.missions,
+            mode=mode,
+            auto_action_types={"unit_move"},
+            allowed_action_types=set(),
+            compiled_at=NOW + timedelta(minutes=2),
+        )
+        assert compilation.nodes == ()
+        assert compilation.unavailable_targets == (
+            ("settler", "action_not_allowed:unit_move"),
+        )

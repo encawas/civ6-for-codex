@@ -8,7 +8,7 @@ import json
 
 from pydantic import Field
 
-from .base import DomainModel, ImmutableJsonValue
+from .base import DomainModel, ImmutableJsonValue, thaw_json
 from .contracts import MissionGraph
 from .observations import NormalizedObservation, SlotState
 
@@ -86,6 +86,103 @@ def build_state_delta_id(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:24]
     return f"state_delta_{digest}"
+
+
+STRATEGIC_SCOPES = (
+    "research",
+    "civic",
+    "opening_strategy",
+    "settler",
+    "city_roles",
+    "diplomacy_trade",
+    "tactical_emergency",
+)
+
+
+def _city_role_projection(city: object) -> dict[str, object]:
+    return {
+        "production": city.production.model_dump(mode="json"),
+        "owner": city.values.get("owner"),
+        "x": city.values.get("x"),
+        "y": city.values.get("y"),
+        "role": city.values.get("role", city.values.get("city_role")),
+        "population": city.values.get("population"),
+    }
+
+
+def _settler_projection(unit: object) -> dict[str, object]:
+    return {
+        "unit_type": unit.unit_type,
+        "x": unit.x,
+        "y": unit.y,
+        "moves_remaining": unit.moves_remaining,
+    }
+
+
+def _tactical_unit_projection(unit: object) -> dict[str, object]:
+    return {
+        "unit_type": unit.unit_type,
+        "x": unit.x,
+        "y": unit.y,
+        "health": unit.health,
+        "max_health": unit.max_health,
+        "moves_remaining": unit.moves_remaining,
+        "action_state": unit.action_state,
+        "needs_promotion": unit.needs_promotion,
+    }
+
+
+def _blocker_projection(
+    observation: NormalizedObservation,
+    source_types: set[str],
+) -> list[dict[str, object]]:
+    projection: list[dict[str, object]] = []
+    for blocker in observation.blockers:
+        if blocker.source_type not in source_types:
+            continue
+        values = thaw_json(blocker.values)
+        data = values.get("data")
+        rows = data if isinstance(data, list) else [values]
+        entries = [
+            {
+                "identity": row.get("blocker_id")
+                or row.get("offer_id")
+                or row.get("notification_id")
+                or row.get("diplomacy_id")
+                or row.get("request_id")
+                or row.get("deal_id")
+                or row.get("player_id")
+                or row.get("other_player_id"),
+                "status": row.get("status"),
+                "action_required": row.get(
+                    "is_action_required",
+                    row.get(
+                        "action_required",
+                        row.get("actionRequired", row.get("blocking")),
+                    ),
+                ),
+            }
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        projection.append(
+            {
+                "source_type": blocker.source_type,
+                "blocker_type": blocker.blocker_type,
+                "entries": sorted(
+                    entries,
+                    key=lambda row: json.dumps(
+                        row, sort_keys=True, separators=(",", ":"), default=str
+                    ),
+                ),
+            }
+        )
+    return sorted(
+        projection,
+        key=lambda row: json.dumps(
+            row, sort_keys=True, separators=(",", ":"), default=str
+        ),
+    )
 
 
 class StateDeltaBuilder:
@@ -172,48 +269,87 @@ class StateDeltaBuilder:
                     )
                 )
 
+        if baseline.completeness.cities and current.completeness.cities:
+            self._append_entity_changes(
+                changes,
+                scope="city_roles",
+                collection="cities",
+                before={
+                    city.entity_id.value: _city_role_projection(city)
+                    for city in baseline.cities
+                },
+                after={
+                    city.entity_id.value: _city_role_projection(city)
+                    for city in current.cities
+                },
+            )
+
         if (
             baseline.completeness.units
             and current.completeness.units
             and baseline.units is not None
             and current.units is not None
         ):
-            before_units = {
-                unit.entity_id.value: unit.model_dump(mode="json")
-                for unit in baseline.units
-            }
-            after_units = {
-                unit.entity_id.value: unit.model_dump(mode="json")
-                for unit in current.units
-            }
             self._append_entity_changes(
                 changes,
-                scope="unit",
+                scope="settler",
                 collection="units",
-                before=before_units,
-                after=after_units,
+                before={
+                    unit.entity_id.value: _settler_projection(unit)
+                    for unit in baseline.units
+                    if "SETTLER" in unit.unit_type
+                },
+                after={
+                    unit.entity_id.value: _settler_projection(unit)
+                    for unit in current.units
+                    if "SETTLER" in unit.unit_type
+                },
             )
-        if baseline.completeness.cities and current.completeness.cities:
-            before_cities = {
-                city.entity_id.value: city.model_dump(mode="json")
-                for city in baseline.cities
-            }
-            after_cities = {
-                city.entity_id.value: city.model_dump(mode="json")
-                for city in current.cities
-            }
             self._append_entity_changes(
                 changes,
-                scope="city_roles",
-                collection="cities",
-                before=before_cities,
-                after=after_cities,
+                scope="tactical_emergency",
+                collection="units",
+                before={
+                    unit.entity_id.value: _tactical_unit_projection(unit)
+                    for unit in baseline.units
+                },
+                after={
+                    unit.entity_id.value: _tactical_unit_projection(unit)
+                    for unit in current.units
+                },
+            )
+
+        if baseline.completeness.blockers and current.completeness.blockers:
+            self._append_projection_change(
+                changes,
+                scope="diplomacy_trade",
+                field_path="blockers.diplomacy_trade",
+                before=_blocker_projection(
+                    baseline,
+                    {"pending_diplomacy", "pending_trades", "end_turn_blocker"},
+                ),
+                after=_blocker_projection(
+                    current,
+                    {"pending_diplomacy", "pending_trades", "end_turn_blocker"},
+                ),
+            )
+            self._append_projection_change(
+                changes,
+                scope="tactical_emergency",
+                field_path="blockers.tactical_emergency",
+                before=_blocker_projection(
+                    baseline,
+                    {"end_turn_blocker", "tactical_emergency"},
+                ),
+                after=_blocker_projection(
+                    current,
+                    {"end_turn_blocker", "tactical_emergency"},
+                ),
             )
 
         if not changes:
             if not any(
-                current.completeness.supports_scope(scope)
-                for scope in ("research", "civic", "settler")
+                current.completeness.supports_scope(scope) for scope in STRATEGIC_SCOPES
             ):
                 return ObservationComparisonResult(
                     kind=ObservationComparisonKind.REBASELINE_REQUIRED,
@@ -245,6 +381,27 @@ class StateDeltaBuilder:
             kind=ObservationComparisonKind.STATE_DELTA,
             reason="comparable strategic facts changed",
             state_delta=delta,
+        )
+
+    @staticmethod
+    def _append_projection_change(
+        changes: list[StateDeltaChange],
+        *,
+        scope: str,
+        field_path: str,
+        before: object,
+        after: object,
+    ) -> None:
+        if before == after:
+            return
+        changes.append(
+            StateDeltaChange(
+                change_kind=StateDeltaChangeKind.FIELD_CHANGED,
+                scope=scope,
+                field_path=field_path,
+                before=before,
+                after=after,
+            )
         )
 
     @staticmethod
@@ -307,7 +464,8 @@ class MissionImpactAnalyzer:
         changed_unit_ids = {
             item.field_path.split(".", 1)[1]
             for item in state_delta.changes
-            if item.scope == "unit" and item.field_path.startswith("units.")
+            if item.scope in {"settler", "tactical_emergency"}
+            and item.field_path.startswith("units.")
         }
         direct.update(
             mission.mission_id

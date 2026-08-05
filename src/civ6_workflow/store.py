@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import AbstractSet, Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
-from .actions import resolve_action_spec
+from .actions import build_action_attempt_idempotency_key, resolve_action_spec
 from .action_retry import FailedAttemptResolution, resolve_failed_attempt
 from .domain import (
     ACTIVE_TURN_ACTION_NODE_STATUSES,
+    SUPPORTED_POSTCONDITION_VERSION,
     ActionAttempt,
     ApprovalDecision,
     ApprovalRecord,
@@ -82,6 +83,8 @@ from .domain import (
     TurnActionGraph,
     TurnActionNode,
     TurnActionNodeStatus,
+    VerificationEvidence,
+    VerificationStatus,
     TurnTransitionConfirmedTick,
     WorkflowTick,
     validate_workflow_tick,
@@ -95,6 +98,7 @@ from .domain.legacy_decisions import DecisionGap, DecisionGapStatus
 from .domain.legacy_plans import PlanLease, PlanLeaseStatus
 from .turn_compiler import turn_action_node_as_execution
 from .domain.planner import TERMINAL_PLANNER_STATUSES
+from .runtime_errors import PlannerProviderBudgetExceeded
 from .ports import StaleStrategicContractBaseError
 from .models import (
     AgentRequest,
@@ -110,6 +114,13 @@ from .workflow_protocol import (
     canonical_mission_graph_patch_response_payload,
     canonical_workflow_plan_bundle_payload,
 )
+
+_PROVIDER_BOUNDARY_FAILURES = {
+    "provider_budget_exhausted",
+    "local_planner_configuration_failure",
+    "local_credential_failure",
+    "local_backend_unavailable",
+}
 
 
 _STICKY_EVENT_TYPES = {
@@ -127,6 +138,7 @@ class TaskIdentityConflictError(ValueError):
 class _PlannerResponseFacts(StrEnum):
     CANONICAL_RESPONSE = "CANONICAL_RESPONSE"
     CONTRACT_SCHEMA_FAILURE = "CONTRACT_SCHEMA_FAILURE"
+    INFORMATION_QUERY_FAILURE = "INFORMATION_QUERY_FAILURE"
     LEGACY_V7_MISSING_PAYLOAD = "LEGACY_V7_MISSING_PAYLOAD"
     NO_RESPONSE = "NO_RESPONSE"
 
@@ -798,6 +810,9 @@ class WorkflowStore:
         "source_turn_action_node_id",
         "source_execution_mission_id",
         "source_execution_mission_revision",
+        "source_verification_observation_id",
+        "source_verification_projection_hash",
+        "source_verification_evidence",
     )
     _SCOPE_ACTIVATION_COMMIT_FIELDS = (
         "source_scope_activation_id",
@@ -1213,9 +1228,7 @@ class WorkflowStore:
         ]
 
     @classmethod
-    def _archive_phase6_authority_dispositions(
-        cls, conn: sqlite3.Connection
-    ) -> None:
+    def _archive_phase6_authority_dispositions(cls, conn: sqlite3.Connection) -> None:
         game_ids = tuple(
             str(row["game_id"])
             for row in conn.execute(
@@ -1306,9 +1319,7 @@ class WorkflowStore:
             )
 
     @classmethod
-    def _validate_phase6_authority_dispositions(
-        cls, conn: sqlite3.Connection
-    ) -> None:
+    def _validate_phase6_authority_dispositions(cls, conn: sqlite3.Connection) -> None:
         cls._validate_phase6_authority_disposition_rows(
             [
                 dict(row)
@@ -1358,9 +1369,7 @@ class WorkflowStore:
                 "legacy authority archive requires one disposition per game"
             )
         if len(disposition_rows) != len(archived_games):
-            raise ValueError(
-                "legacy authority archive has duplicate game dispositions"
-            )
+            raise ValueError("legacy authority archive has duplicate game dispositions")
         for row in disposition_rows:
             game_id = str(row["game_id"])
             record = json.loads(str(row["record_json"]))
@@ -1369,13 +1378,11 @@ class WorkflowStore:
                     str(item["source_table"])
                     for item in archive_rows
                     if str(item["game_id"]) == game_id
-                    and str(item["source_table"])
-                    != cls._PHASE6_DISPOSITION_SOURCE
+                    and str(item["source_table"]) != cls._PHASE6_DISPOSITION_SOURCE
                 }
             )
             if (
-                record.get("schema_version")
-                != "phase6-authority-disposition/v1"
+                record.get("schema_version") != "phase6-authority-disposition/v1"
                 or record.get("game_session_id") != game_id
                 or record.get("source_tables") != source_tables
             ):
@@ -1387,8 +1394,7 @@ class WorkflowStore:
                         for item in revision_rows
                         if str(item["game_id"]) == game_id
                         and str(item["contract_id"]) == record.get("contract_id")
-                        and int(item["revision"])
-                        == record.get("contract_revision")
+                        and int(item["revision"]) == record.get("contract_revision")
                     ),
                     None,
                 )
@@ -1397,12 +1403,11 @@ class WorkflowStore:
                         "legacy authority takeover Contract revision is missing"
                     )
                 contract = cls._contract_from_revision_row(revision_row)
-                if (
-                    set(contract.authority_scope_set.mission_graph_scopes)
-                    != cls._PHASE6_PRODUCTION_SCOPES
-                    or record.get("mission_graph_scopes")
-                    != list(contract.authority_scope_set.mission_graph_scopes)
-                ):
+                if set(
+                    contract.authority_scope_set.mission_graph_scopes
+                ) != cls._PHASE6_PRODUCTION_SCOPES or record.get(
+                    "mission_graph_scopes"
+                ) != list(contract.authority_scope_set.mission_graph_scopes):
                     raise ValueError(
                         "legacy authority takeover scope evidence disagrees"
                     )
@@ -1411,9 +1416,7 @@ class WorkflowStore:
                     "all archived legacy authority objects are terminal "
                     "and intentionally retired by schema v14"
                 ):
-                    raise ValueError(
-                        "legacy authority abandonment evidence disagrees"
-                    )
+                    raise ValueError("legacy authority abandonment evidence disagrees")
             else:
                 raise ValueError("legacy authority disposition is unsupported")
 
@@ -2364,6 +2367,10 @@ class WorkflowStore:
             )
             for row in nodes
         }
+        node_rows = {
+            str(row["node_id"]): cls._normalize_turn_action_node_row(row)
+            for row in nodes
+        }
         observation_models = {
             str(row["observation_id"]): NormalizedObservation.model_validate_json(
                 str(cls._normalize_observation_row(row)["observation_json"])
@@ -2396,6 +2403,17 @@ class WorkflowStore:
             )
             for row in action_attempts
         }
+        for attempt in attempt_models.values():
+            node_row = node_rows.get(attempt.task_id)
+            task = (
+                None if node_row is None else cls._turn_action_task_from_row(node_row)
+            )
+            if task is not None:
+                cls._validate_action_attempt_contract(attempt, task)
+            observation = observation_models.get(
+                str(attempt.last_verification_observation_id)
+            )
+            cls._validate_action_attempt_verification_model(attempt, observation, task)
         action_commit_attempt_ids: set[str] = set()
         for commit in commit_models.values():
             if commit.source_action_attempt_id is None:
@@ -2408,7 +2426,7 @@ class WorkflowStore:
             )
             if (
                 attempt is None
-                or attempt.status is not AttemptStatus.SUCCEEDED
+                or attempt.status not in {AttemptStatus.SUCCEEDED, AttemptStatus.FAILED}
                 or graph is None
                 or node is None
                 or node.graph_id != graph.graph_id
@@ -2420,7 +2438,22 @@ class WorkflowStore:
                 or node.source_mission_id != commit.source_execution_mission_id
                 or node.source_mission_revision
                 != commit.source_execution_mission_revision
-                or node.action_type == "unit_move"
+                or commit.source_verification_observation_id
+                != attempt.last_verification_observation_id
+                or commit.source_verification_projection_hash
+                != attempt.last_verification_projection_hash
+                or commit.source_verification_evidence != attempt.verification_evidence
+                or (
+                    attempt.status is AttemptStatus.SUCCEEDED
+                    and observation_models.get(
+                        str(commit.source_verification_observation_id)
+                    )
+                    is None
+                )
+                or (
+                    attempt.status is AttemptStatus.SUCCEEDED
+                    and node.action_type == "unit_move"
+                )
                 or base is None
                 or commit.source_action_attempt_id in action_commit_attempt_ids
             ):
@@ -2441,12 +2474,18 @@ class WorkflowStore:
             expected_result = (
                 None
                 if source is None
-                else cls._mission_after_verified_action(
-                    source,
-                    action_type=node.action_type,
-                    arguments=node.arguments,
-                    entity_id=node.entity_id,
-                    action_attempt_id=attempt.action_attempt_id,
+                else (
+                    cls._mission_after_verified_action(
+                        source,
+                        action_type=node.action_type,
+                        arguments=node.arguments,
+                        entity_id=node.entity_id,
+                        action_attempt_id=attempt.action_attempt_id,
+                    )
+                    if attempt.status is AttemptStatus.SUCCEEDED
+                    else cls._mission_after_terminal_failure(
+                        source, action_attempt_id=attempt.action_attempt_id
+                    )
                 )
             )
             if (
@@ -4093,18 +4132,35 @@ class WorkflowStore:
                 )
             if (
                 request.status is PlannerRequestStatus.SUPERSEDED
-                and request.failure_category != "stale_strategic_contract_base"
+                and request.failure_category
+                not in {
+                    "stale_strategic_contract_base",
+                    "stale_planning_input",
+                }
             ):
                 raise ValueError("strategic SUPERSEDED requires a stale Contract base")
-            if request.status is PlannerRequestStatus.FAILED and (
-                latest_attempt is None
-                or latest_attempt.status is not ProviderAttemptStatus.FAILED
-                or latest_attempt.completed_at is None
-            ):
-                raise ValueError(
-                    "FAILED strategic PlannerRequest requires a final FAILED "
-                    "ProviderAttempt"
+            if request.status is PlannerRequestStatus.FAILED:
+                boundary_failure = (
+                    request.failure_category in _PROVIDER_BOUNDARY_FAILURES
                 )
+                if boundary_failure:
+                    if (
+                        latest_attempt is not None
+                        and latest_attempt.status is ProviderAttemptStatus.STARTED
+                    ):
+                        raise ValueError(
+                            "local Planner failure cannot retain a STARTED ProviderAttempt"
+                        )
+                elif (
+                    latest_attempt is None
+                    or latest_attempt.status is not ProviderAttemptStatus.FAILED
+                    or latest_attempt.completed_at is None
+                ):
+                    raise ValueError(
+                        "FAILED strategic PlannerRequest requires a final FAILED "
+                        "ProviderAttempt"
+                    )
+
             if request.status in {
                 PlannerRequestStatus.COMPLETED,
                 PlannerRequestStatus.REJECTED,
@@ -4388,6 +4444,31 @@ class WorkflowStore:
             or projection_context.get("strategic_scope") != target.strategic_scope
         )
         return base_is_stale or projection_is_stale
+
+    @classmethod
+    def _strategic_request_observation_is_stale(
+        cls,
+        request: PlannerRequest,
+        tick_rows: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        source_hash = request.input_projection.get("source_observation_projection_hash")
+        if not isinstance(source_hash, str) or not source_hash:
+            return False
+        matching = []
+        for row in tick_rows:
+            tick = cls._workflow_tick_from_row(row)
+            if (
+                isinstance(tick, StrategicRequestTerminatedTick)
+                and tick.planner_request_id == request.planner_request_id
+                and tick.terminal_status is PlannerRequestStatus.SUPERSEDED
+                and tick.failure_category == "stale_planning_input"
+            ):
+                matching.append(tick)
+        return (
+            len(matching) == 1
+            and bool(matching[0].observation_ids)
+            and matching[0].observation_ids[-1] != request.observation_id
+        )
 
     @classmethod
     def _validate_explicit_wait_tick_interval(
@@ -4703,13 +4784,20 @@ class WorkflowStore:
             if (
                 request.target.kind in STRATEGIC_PROPOSAL_TARGET_KINDS
                 and request.status is PlannerRequestStatus.SUPERSEDED
-                and not cls._strategic_request_base_is_stale(
-                    request, roots_by_game.get(request.game_session_id)
-                )
             ):
-                raise ValueError(
-                    "strategic SUPERSEDED Request has no stale Contract base"
+                valid_stale_evidence = (
+                    request.failure_category == "stale_strategic_contract_base"
+                    and cls._strategic_request_base_is_stale(
+                        request, roots_by_game.get(request.game_session_id)
+                    )
+                ) or (
+                    request.failure_category == "stale_planning_input"
+                    and cls._strategic_request_observation_is_stale(request, tick_rows)
                 )
+                if not valid_stale_evidence:
+                    raise ValueError(
+                        "strategic SUPERSEDED Request has no stale input evidence"
+                    )
             requests[request.planner_request_id] = request
         cls._validate_strategic_information_round_state(
             requests,
@@ -9698,6 +9786,25 @@ class WorkflowStore:
         )
 
     @classmethod
+    def _mission_after_terminal_failure(
+        cls,
+        mission: Mission,
+        *,
+        action_attempt_id: str,
+    ) -> Mission:
+        if mission.status is not MissionStatus.ACTIVE:
+            raise ValueError("terminal action failure requires an active Mission")
+        return mission.model_copy(
+            update={
+                "mission_revision": mission.mission_revision + 1,
+                "status": MissionStatus.BLOCKED,
+                "evidence_refs": tuple(
+                    sorted({*mission.evidence_refs, action_attempt_id})
+                ),
+            }
+        )
+
+    @classmethod
     def _active_scope_missions_in_connection(
         cls,
         conn: sqlite3.Connection,
@@ -10025,6 +10132,26 @@ class WorkflowStore:
             "DELETE FROM active_turn_action_graphs WHERE game_id=?",
             (game_id,),
         )
+
+    def invalidate_active_turn_action_graph(
+        self,
+        game_id: str,
+        *,
+        expected_contract_revision: int,
+        invalidated_at: datetime,
+    ) -> None:
+        if invalidated_at.tzinfo is None or invalidated_at.utcoffset() is None:
+            raise ValueError(
+                "TurnActionGraph invalidation time must include a timezone"
+            )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._invalidate_active_turn_action_graph_in_connection(
+                conn,
+                game_id,
+                expected_contract_revision=expected_contract_revision,
+                invalidated_at=invalidated_at,
+            )
 
     def activate_turn_action_graph(
         self,
@@ -10710,6 +10837,106 @@ class WorkflowStore:
             attempt.model_dump_json(),
         )
 
+    @staticmethod
+    def _validate_action_attempt_contract(
+        attempt: ActionAttempt,
+        task: TurnActionExecution,
+    ) -> None:
+        spec = resolve_action_spec(task.action_type)
+        expected_arguments = spec.build_arguments(task)
+        expected_idempotency_key = build_action_attempt_idempotency_key(
+            task, expected_arguments
+        )
+        if attempt.action_type != task.action_type:
+            raise ValueError("ActionAttempt action does not match TurnActionNode")
+        if dict(attempt.normalized_arguments) != expected_arguments:
+            raise ValueError("ActionAttempt arguments do not match TurnActionNode")
+        if tuple(attempt.postconditions) != tuple(task.postconditions):
+            raise ValueError("ActionAttempt postconditions do not match TurnActionNode")
+        if attempt.retry_classification is not spec.retry_classification:
+            raise ValueError("ActionAttempt retry policy does not match ActionSpec")
+        if attempt.idempotency_key != expected_idempotency_key:
+            raise ValueError("ActionAttempt idempotency key is not canonical")
+        if attempt.postcondition_version != SUPPORTED_POSTCONDITION_VERSION:
+            raise ValueError("ActionAttempt postcondition version is unsupported")
+
+    @classmethod
+    def _validate_action_attempt_verification_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        attempt: ActionAttempt,
+        task: TurnActionExecution | None,
+    ) -> None:
+        observation_id = attempt.last_verification_observation_id
+        if observation_id is None:
+            if attempt.status is AttemptStatus.SUCCEEDED:
+                raise ValueError(
+                    "successful ActionAttempt has no verification evidence"
+                )
+            return
+        row = conn.execute(
+            "SELECT * FROM normalized_observations WHERE observation_id=?",
+            (observation_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("ActionAttempt verification Observation is missing")
+        observation = cls._observation_from_row(row)
+        if observation.game_session_id != attempt.game_session_id:
+            raise ValueError(
+                "ActionAttempt verification Observation belongs to another game"
+            )
+        if observation.projection_hash != attempt.last_verification_projection_hash:
+            raise ValueError("ActionAttempt verification projection hash disagrees")
+        if attempt.sent_at is None or observation.observed_at < attempt.sent_at:
+            raise ValueError("ActionAttempt verification Observation predates delivery")
+        if attempt.verified_at is None or attempt.verified_at < observation.observed_at:
+            raise ValueError("ActionAttempt verification time predates its Observation")
+        if task is not None and observation.turn_number != task.created_turn:
+            raise ValueError(
+                "ActionAttempt verification crosses its TurnActionGraph turn"
+            )
+        if attempt.status is AttemptStatus.SUCCEEDED and (
+            attempt.verification_status is not VerificationStatus.PASSED
+            or attempt.verification_evidence
+            is not VerificationEvidence.POSITIVE_COMMIT_EVIDENCE
+        ):
+            raise ValueError("successful ActionAttempt lacks positive verification")
+
+    @staticmethod
+    def _validate_action_attempt_verification_model(
+        attempt: ActionAttempt,
+        observation: NormalizedObservation | None,
+        task: TurnActionExecution | None,
+    ) -> None:
+        if attempt.last_verification_observation_id is None:
+            if attempt.status is AttemptStatus.SUCCEEDED:
+                raise ValueError(
+                    "successful ActionAttempt has no verification evidence"
+                )
+            return
+        if observation is None:
+            raise ValueError("ActionAttempt verification Observation is missing")
+        if observation.game_session_id != attempt.game_session_id:
+            raise ValueError(
+                "ActionAttempt verification Observation belongs to another game"
+            )
+        if observation.projection_hash != attempt.last_verification_projection_hash:
+            raise ValueError("ActionAttempt verification projection hash disagrees")
+        if attempt.sent_at is None or observation.observed_at < attempt.sent_at:
+            raise ValueError("ActionAttempt verification Observation predates delivery")
+        if attempt.verified_at is None or attempt.verified_at < observation.observed_at:
+            raise ValueError("ActionAttempt verification time predates its Observation")
+        if task is not None and observation.turn_number != task.created_turn:
+            raise ValueError(
+                "ActionAttempt verification crosses its TurnActionGraph turn"
+            )
+        if attempt.status is AttemptStatus.SUCCEEDED and (
+            attempt.verification_status is not VerificationStatus.PASSED
+            or attempt.verification_evidence
+            is not VerificationEvidence.POSITIVE_COMMIT_EVIDENCE
+        ):
+            raise ValueError("successful ActionAttempt lacks positive verification")
+
     def save_action_attempt(self, attempt: ActionAttempt) -> None:
         if attempt.game_session_id is None:
             raise ValueError("persisted attempts require game_session_id")
@@ -10758,17 +10985,16 @@ class WorkflowStore:
                         "ActionAttempt source Observation does not match TurnActionGraph"
                     )
             if task is not None and task.plan_id.startswith("turn_action_graph_"):
-                expected_arguments = resolve_action_spec(
-                    task.action_type
-                ).build_arguments(task)
-                if (
-                    task.status is not TaskStatus.READY
-                    or (task.requires_confirmation and task.approved_by is None)
-                    or dict(attempt.normalized_arguments) != expected_arguments
+                self._validate_action_attempt_contract(attempt, task)
+                if task.status is not TaskStatus.READY or (
+                    task.requires_confirmation and task.approved_by is None
                 ):
                     raise ValueError(
                         "TurnActionNode is not approved and ready for this Attempt"
                     )
+            self._validate_action_attempt_verification_in_connection(
+                conn, attempt, task
+            )
             conn.execute(
                 """
                 INSERT INTO action_attempts(
@@ -10799,12 +11025,15 @@ class WorkflowStore:
         conn: sqlite3.Connection,
         attempt: ActionAttempt,
     ) -> None:
-        self._validate_research_task_authority_in_connection(
+        task = self._validate_research_task_authority_in_connection(
             conn,
             attempt.game_session_id,
             attempt.task_id,
             action_type=attempt.action_type,
         )
+        if task is not None and task.plan_id.startswith("turn_action_graph_"):
+            self._validate_action_attempt_contract(attempt, task)
+        self._validate_action_attempt_verification_in_connection(conn, attempt, task)
         row = conn.execute(
             "SELECT attempt_json FROM action_attempts WHERE action_attempt_id=?",
             (attempt.action_attempt_id,),
@@ -10824,6 +11053,7 @@ class WorkflowStore:
             "prepared_at",
             "retry_classification",
             "normalized_arguments",
+            "authorization_evidence",
             "parent_attempt_id",
             "pre_send_turn",
             "postconditions",
@@ -11497,6 +11727,17 @@ class WorkflowStore:
                 )
                 if cursor.rowcount != 1:
                     raise KeyError(f"unknown attempt task: {attempt.task_id}")
+                if failure_resolution is not None and task_status in {
+                    TaskStatus.FAILED,
+                    TaskStatus.ESCALATED,
+                }:
+                    self._commit_terminal_attempt_failure_in_connection(
+                        conn,
+                        attempt,
+                        node_status=node_status,
+                        failure_reason=task_error,
+                        committed_at=tick.completed_at,
+                    )
             self._save_runtime_state_in_connection(
                 conn,
                 tick.game_session_id,
@@ -11766,6 +12007,11 @@ class WorkflowStore:
                 source_turn_action_node_id=node.node_id,
                 source_execution_mission_id=source_mission.mission_id,
                 source_execution_mission_revision=source_mission.mission_revision,
+                source_verification_observation_id=attempt.last_verification_observation_id,
+                source_verification_projection_hash=(
+                    attempt.last_verification_projection_hash
+                ),
+                source_verification_evidence=attempt.verification_evidence,
             )
             conn.execute(
                 """
@@ -11845,6 +12091,158 @@ class WorkflowStore:
             self._insert_workflow_tick_in_connection(conn, tick)
             self._validate_phase1c_v11(conn)
             self._validate_phase3_v13(conn)
+
+    def _commit_terminal_attempt_failure_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        attempt: ActionAttempt,
+        *,
+        node_status: TurnActionNodeStatus,
+        failure_reason: str | None,
+        committed_at: datetime,
+    ) -> None:
+        node_row = conn.execute(
+            "SELECT * FROM turn_action_nodes WHERE game_id=? AND node_id=?",
+            (attempt.game_session_id, attempt.task_id),
+        ).fetchone()
+        if node_row is None:
+            return
+        node = TurnActionNode.model_validate_json(str(node_row["node_json"]))
+        active = conn.execute(
+            "SELECT graph_id FROM active_turn_action_graphs WHERE game_id=?",
+            (attempt.game_session_id,),
+        ).fetchone()
+        graph_row = conn.execute(
+            "SELECT * FROM turn_action_graphs WHERE graph_id=?",
+            (node.graph_id,),
+        ).fetchone()
+        if (
+            active is None
+            or str(active["graph_id"]) != node.graph_id
+            or graph_row is None
+        ):
+            raise ValueError(
+                "terminal action failure requires the active TurnActionGraph"
+            )
+        graph = self._turn_action_graph_from_row(graph_row)
+        root = conn.execute(
+            "SELECT * FROM strategic_contract_roots WHERE game_id=?",
+            (attempt.game_session_id,),
+        ).fetchone()
+        if (
+            root is None
+            or str(root["contract_id"]) != graph.source_contract_id
+            or int(root["active_revision"]) != graph.source_contract_revision
+        ):
+            raise ValueError("terminal action failure has a stale Contract base")
+        base_row = conn.execute(
+            "SELECT * FROM strategic_contract_revisions WHERE game_id=? AND revision=?",
+            (attempt.game_session_id, graph.source_contract_revision),
+        ).fetchone()
+        if base_row is None:
+            raise ValueError("terminal action failure Contract base is missing")
+        base = self._contract_from_revision_row(base_row)
+        missions = {
+            mission.mission_id: mission for mission in base.mission_graph.missions
+        }
+        source = missions.get(node.source_mission_id)
+        if (
+            source is None
+            or source.mission_revision != node.source_mission_revision
+            or not self._mission_action_matches(
+                source, node.action_type, node.arguments, node.entity_id
+            )
+        ):
+            raise ValueError("terminal action failure Mission provenance is stale")
+        blocked = self._mission_after_terminal_failure(
+            source, action_attempt_id=attempt.action_attempt_id
+        )
+        missions[blocked.mission_id] = blocked
+        contract = base.model_copy(
+            update={
+                "revision": base.revision + 1,
+                "mission_graph": MissionGraph(
+                    missions=tuple(
+                        sorted(missions.values(), key=lambda item: item.mission_id)
+                    )
+                ),
+            }
+        )
+        commit = StrategicContractCommit(
+            commit_id=(
+                "turn_action_failure_commit_"
+                + hashlib.sha256(attempt.action_attempt_id.encode("utf-8")).hexdigest()[
+                    :24
+                ]
+            ),
+            game_session_id=attempt.game_session_id,
+            contract_id=base.contract_id,
+            expected_base_revision=base.revision,
+            contract=contract,
+            committed_at=committed_at,
+            reason=failure_reason or "TurnActionNode reached a terminal failure",
+            source_action_attempt_id=attempt.action_attempt_id,
+            source_turn_action_graph_id=graph.graph_id,
+            source_turn_action_node_id=node.node_id,
+            source_execution_mission_id=source.mission_id,
+            source_execution_mission_revision=source.mission_revision,
+            source_verification_observation_id=attempt.last_verification_observation_id,
+            source_verification_projection_hash=attempt.last_verification_projection_hash,
+            source_verification_evidence=attempt.verification_evidence,
+        )
+        conn.execute(
+            "INSERT INTO strategic_contract_revisions(game_id, contract_id, revision, contract_json, committed_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                contract.game_session_id,
+                contract.contract_id,
+                contract.revision,
+                self._dump(contract.model_dump(mode="json")),
+                committed_at.isoformat(),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO strategic_contract_commits(commit_id, game_id, contract_id, expected_base_revision, committed_revision, commit_json, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                commit.commit_id,
+                commit.game_session_id,
+                commit.contract_id,
+                commit.expected_base_revision,
+                contract.revision,
+                self._dump(self._contract_commit_payload(commit)),
+                committed_at.isoformat(),
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE strategic_contract_roots SET active_revision=? WHERE game_id=? AND contract_id=? AND active_revision=?",
+            (
+                contract.revision,
+                attempt.game_session_id,
+                contract.contract_id,
+                base.revision,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("terminal action failure lost the Contract CAS")
+        conn.execute(
+            "UPDATE turn_action_nodes SET status=?, updated_at=? WHERE graph_id=? AND status IN (?, ?, ?, ?)",
+            (
+                TurnActionNodeStatus.EXPIRED.value,
+                committed_at.isoformat(),
+                graph.graph_id,
+                TurnActionNodeStatus.AWAITING_APPROVAL.value,
+                TurnActionNodeStatus.READY.value,
+                TurnActionNodeStatus.EXECUTING.value,
+                TurnActionNodeStatus.FAILED.value,
+            ),
+        )
+        conn.execute(
+            "UPDATE turn_action_nodes SET status=?, last_error=?, updated_at=? WHERE node_id=?",
+            (node_status.value, failure_reason, committed_at.isoformat(), node.node_id),
+        )
+        conn.execute(
+            "DELETE FROM active_turn_action_graphs WHERE game_id=?",
+            (attempt.game_session_id,),
+        )
 
     def finalize_attempt_failure(
         self,
@@ -12115,6 +12513,13 @@ class WorkflowStore:
             and request.failure_category == "planner_contract_failure"
         ):
             return _PlannerResponseFacts.CONTRACT_SCHEMA_FAILURE
+
+        if (
+            not any(value is not None for value in response_evidence.values())
+            and request.status is PlannerRequestStatus.REJECTED
+            and request.failure_category == "information_query_failure"
+        ):
+            return _PlannerResponseFacts.INFORMATION_QUERY_FAILURE
 
         required_evidence = {
             **response_evidence,
@@ -12457,15 +12862,17 @@ class WorkflowStore:
         )
         placeholders = ",".join("?" for _ in terminal)
         with self._connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 f"""
                 SELECT * FROM logical_planner_requests
                 WHERE game_id=? AND status NOT IN ({placeholders})
-                ORDER BY created_at LIMIT 1
+                ORDER BY created_at LIMIT 2
                 """,
                 (game_id, *terminal),
-            ).fetchone()
-        return None if row is None else self._planner_request_from_row(row)
+            ).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError(f"game {game_id} has multiple active PlannerRequests")
+        return None if not rows else self._planner_request_from_row(rows[0])
 
     def planner_request_for_input(
         self,
@@ -12664,6 +13071,8 @@ class WorkflowStore:
             attempt.planner_request_id,
             attempt.attempt_number,
             attempt.provider_request_id,
+            attempt.actual_turn_number,
+            attempt.provider_phase_id,
             attempt.started_at,
         )
 
@@ -12822,6 +13231,11 @@ class WorkflowStore:
         game_id: str,
         request: PlannerRequest,
         attempt: ProviderAttempt,
+        *,
+        actual_turn_number: int,
+        max_attempts_per_turn: int,
+        max_attempts_per_request: int,
+        max_abandoned_attempts_per_request: int,
     ) -> PlannerRequest:
         """Persist STARTED before the provider call and abandon crash leftovers."""
 
@@ -12829,7 +13243,19 @@ class WorkflowStore:
             raise ValueError("provider attempt must start in STARTED")
         if request.game_session_id != game_id:
             raise ValueError("planner request belongs to another game")
+        if attempt.actual_turn_number != actual_turn_number:
+            raise ValueError("ProviderAttempt actual turn does not match reservation")
+        if (
+            min(
+                max_attempts_per_turn,
+                max_attempts_per_request,
+                max_abandoned_attempts_per_request,
+            )
+            < 0
+        ):
+            raise ValueError("provider attempt budgets must be non-negative")
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             request_row = conn.execute(
                 "SELECT * FROM logical_planner_requests WHERE planner_request_id=?",
                 (request.planner_request_id,),
@@ -12879,6 +13305,40 @@ class WorkflowStore:
                     ProviderAttemptStatus.STARTED.value,
                 ),
             ).fetchall()
+            all_game_attempt_rows = conn.execute(
+                "SELECT * FROM provider_attempts WHERE game_id=?",
+                (game_id,),
+            ).fetchall()
+            game_turn_attempt_count = sum(
+                self._provider_attempt_from_row(conn, row).actual_turn_number
+                == actual_turn_number
+                for row in all_game_attempt_rows
+            )
+            request_attempt_rows = conn.execute(
+                "SELECT * FROM provider_attempts WHERE game_id=? AND planner_request_id=?",
+                (game_id, request.planner_request_id),
+            ).fetchall()
+            request_attempts = [
+                self._provider_attempt_from_row(conn, row)
+                for row in request_attempt_rows
+            ]
+            abandoned_count = sum(
+                item.status is ProviderAttemptStatus.ABANDONED
+                for item in request_attempts
+            )
+            interrupted_count = len(rows)
+            if game_turn_attempt_count >= max_attempts_per_turn:
+                raise PlannerProviderBudgetExceeded(
+                    "provider attempt budget exhausted for the current game turn"
+                )
+            if len(request_attempts) >= max_attempts_per_request:
+                raise PlannerProviderBudgetExceeded(
+                    "provider attempt budget exhausted for the logical request"
+                )
+            if abandoned_count + interrupted_count > max_abandoned_attempts_per_request:
+                raise PlannerProviderBudgetExceeded(
+                    "abandoned provider attempt recovery budget exhausted"
+                )
             for row in rows:
                 interrupted = self._provider_attempt_from_row(conn, row).model_copy(
                     update={
@@ -13294,6 +13754,10 @@ class WorkflowStore:
                 PlannerRequestStatus.AWAITING_INFORMATION,
                 PlannerRequestStatus.FAILED,
             ),
+            (
+                PlannerRequestStatus.AWAITING_INFORMATION,
+                PlannerRequestStatus.REJECTED,
+            ),
         }
         if transition in information_transitions:
             return
@@ -13312,24 +13776,65 @@ class WorkflowStore:
                 if latest_attempt_row is None
                 else str(latest_attempt_row["provider_attempt_id"])
             )
+            base_stale = (
+                planner_request.failure_category == "stale_strategic_contract_base"
+                and cls._strategic_request_base_is_stale(
+                    existing,
+                    None if contract_root is None else dict(contract_root),
+                )
+            )
+            observation_stale = (
+                planner_request.failure_category == "stale_planning_input"
+                and isinstance(
+                    existing.input_projection.get("source_observation_projection_hash"),
+                    str,
+                )
+                and bool(tick.observation_ids)
+                and tick.observation_ids[-1] != existing.observation_id
+            )
             if (
                 isinstance(tick, StrategicRequestTerminatedTick)
                 and tick.planner_request_id == existing.planner_request_id
                 and tick.terminal_status is PlannerRequestStatus.SUPERSEDED
                 and tick.failure_category == planner_request.failure_category
                 and tick.provider_attempt_id == latest_attempt_id
-                and planner_request.failure_category == "stale_strategic_contract_base"
                 and planner_request.completed_at is not None
                 and planner_request.next_retry_at is None
                 and not provider_attempts
                 and strategic_research_proposal is None
-                and cls._strategic_request_base_is_stale(
-                    existing,
-                    None if contract_root is None else dict(contract_root),
-                )
+                and (base_stale or observation_stale)
             ):
                 return
             raise ValueError("strategic SUPERSEDED transition is invalid")
+        if (
+            planner_request.status is PlannerRequestStatus.FAILED
+            and planner_request.failure_category in _PROVIDER_BOUNDARY_FAILURES
+        ):
+            if (
+                existing.status
+                in {
+                    PlannerRequestStatus.PENDING,
+                    PlannerRequestStatus.IN_PROGRESS,
+                    PlannerRequestStatus.BACKOFF,
+                    PlannerRequestStatus.READY_TO_CONTINUE,
+                }
+                and isinstance(tick, StrategicRequestTerminatedTick)
+                and tick.planner_request_id == existing.planner_request_id
+                and tick.terminal_status is PlannerRequestStatus.FAILED
+                and tick.failure_category == planner_request.failure_category
+                and tick.provider_attempt_id is None
+                and planner_request.provider_attempt_count
+                == existing.provider_attempt_count
+                and planner_request.completed_at is not None
+                and planner_request.next_retry_at is None
+                and not provider_attempts
+                and information_round is None
+                and strategic_research_proposal is None
+            ):
+                return
+            raise ValueError(
+                "strategic Provider-boundary failure transition is invalid"
+            )
         if existing.status is not PlannerRequestStatus.IN_PROGRESS:
             raise ValueError(
                 "strategic PlannerRequest status transition is not allowed"

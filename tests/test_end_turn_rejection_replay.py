@@ -1,9 +1,18 @@
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from civ6_workflow.bootstrap import build_runtime_services
-from civ6_workflow.domain import AttemptStatus, TickOutcomeKind
+from civ6_workflow.domain import (
+    AttemptStatus,
+    AuthorityScopeSet,
+    MissionGraph,
+    StrategicContract,
+    StrategicContractCommit,
+    TickOutcomeKind,
+    build_strategic_contract_id,
+)
 from civ6_workflow.runtime import RuntimeConfig, WorkflowRuntime
 from civ6_workflow.models import (
     ActionResult,
@@ -73,7 +82,34 @@ def snapshot(*, production="UNIT_BUILDER", turn=10, blockers=None):
     )
 
 
+def ensure_contract(store):
+    active = store.get_active_strategic_contract("game-1")
+    if active is not None:
+        return active
+    contract = StrategicContract(
+        contract_id=build_strategic_contract_id("game-1"),
+        game_session_id="game-1",
+        revision=1,
+        authority_scope_set=AuthorityScopeSet(),
+        mission_graph=MissionGraph(),
+        created_from_observation_id="obs-end-turn-authority",
+        strategic_objectives=("Exercise end-turn recovery",),
+    )
+    return store.commit_strategic_contract_revision(
+        StrategicContractCommit(
+            commit_id="commit-end-turn-authority",
+            game_session_id="game-1",
+            contract_id=contract.contract_id,
+            expected_base_revision=0,
+            contract=contract,
+            committed_at=datetime.now(UTC),
+            reason="establish end-turn test authority",
+        )
+    )
+
+
 def engine(store, game, planner=None, **config):
+    ensure_contract(store)
     return WorkflowRuntime(
         service_factory=build_runtime_services,
         store=store,
@@ -115,6 +151,17 @@ def test_explicit_end_turn_rejection_is_not_replayed_on_next_tick(tmp_path: Path
         attempts = store.list_action_attempts("game-1")
         assert len(attempts) == 1
         assert attempts[0].status is AttemptStatus.FAILED
+        assert set(attempts[0].normalized_arguments) == {
+            "tactical",
+            "strategic",
+            "tooling",
+            "planning",
+            "hypothesis",
+        }
+        assert set(attempts[0].authorization_evidence) == {
+            "projection_version",
+            "projection_hash",
+        }
         assert (
             attempts[0].transport_result["delivery_status"]
             == MutationDeliveryStatus.EXPLICITLY_REJECTED.value
@@ -240,6 +287,7 @@ def test_legacy_end_turn_rejection_without_hash_requires_explicit_retry(tmp_path
             ).fetchone()
             legacy_json = json.loads(row["attempt_json"])
             legacy_json["normalized_arguments"] = {}
+            legacy_json["authorization_evidence"] = {}
             connection.execute(
                 """
                 UPDATE action_attempts

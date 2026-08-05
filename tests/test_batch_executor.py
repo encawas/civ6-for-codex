@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import civ6_workflow.batch_executor as batch_executor_module
 from civ6_workflow.batch_executor import BatchExecutor, BarrierKind
 from civ6_workflow.conditions import ConditionEvaluator
-from civ6_workflow.domain import AttemptStatus, MutationSentTick, RuntimeState
+from civ6_workflow.domain import (
+    AttemptRecoveredTick,
+    AttemptStatus,
+    MutationSentTick,
+    RuntimeState,
+    TaskInvalidatedTick,
+)
 from civ6_workflow.runtime import WorkflowRuntime
 from civ6_workflow.models import (
     ActionResult,
@@ -95,11 +101,42 @@ class _WaveStore:
         return list(reversed(self.eligible))
 
 
-def _executor(store, game=None) -> BatchExecutor:
+def _executor(
+    store,
+    game=None,
+    *,
+    allowed_action_types=None,
+    allowed_tools=None,
+) -> BatchExecutor:
     return BatchExecutor(
         store=store,
         game=game or SimpleNamespace(),
         conditions=ConditionEvaluator(),
+        allowed_action_types=(
+            {
+                "city_set_production",
+                "set_research",
+                "set_civic",
+                "send_envoy",
+                "unit_move",
+                "unit_found_city",
+                "tactical_unit_move",
+                "tactical_unit_fortify",
+                "tactical_unit_skip",
+            }
+            if allowed_action_types is None
+            else allowed_action_types
+        ),
+        allowed_tools=(
+            {
+                "set_city_production",
+                "set_research",
+                "send_envoy",
+                "unit_action",
+            }
+            if allowed_tools is None
+            else allowed_tools
+        ),
         verification_attempts=3,
         now=lambda: NOW,
         monotonic=lambda: 0.0,
@@ -235,8 +272,13 @@ class _ExecutionGame:
         self.executed = []
 
     async def execute_task(self, task):
+        raise AssertionError("canonical execution must use PreparedAction")
+
+    async def execute_prepared_action(self, prepared, task):
         assert self.store.saved_attempts
-        assert self.store.saved_attempts[0].status is AttemptStatus.PREPARED
+        attempt = self.store.saved_attempts[0]
+        assert attempt.status is AttemptStatus.PREPARED
+        assert dict(attempt.normalized_arguments) == dict(prepared.normalized_arguments)
         self.call_count += 1
         self.executed.append(task.task_id)
         return ActionResult(
@@ -267,6 +309,9 @@ def test_executor_persists_attempt_before_one_deterministic_mutation():
     assert budget.used == 1
     assert store.status_updates == [("game", "node_a", TaskStatus.RUNNING)]
     assert store.runtime_updates[0][1] is RuntimeState.RECONCILING
+    assert transition.attempt_update is not None
+    assert "delivery_status" in transition.attempt_update.transport_result
+    assert "delivery_status" not in transition.attempt_update.tool_result
 
 
 def test_batch_executor_has_no_planner_dependency():
@@ -285,3 +330,105 @@ def test_runtime_routes_task_execution_only_through_batch_executor():
     assert not hasattr(WorkflowRuntime, "_reconcile_attempt")
     assert not hasattr(WorkflowRuntime, "_send_end_turn")
     assert not hasattr(WorkflowRuntime, "_reconcile_end_turn")
+
+
+def test_configured_tool_policy_rejects_before_action_attempt():
+    store = _ExecutionStore()
+    game = _ExecutionGame(store)
+    budget = MutationBudget()
+
+    transition = asyncio.run(
+        _executor(store, game, allowed_tools=set()).advance(
+            _observation(),
+            source_observation_id="obs_7",
+            mode=ExecutionMode.AUTO,
+            available_tools={"set_research"},
+            metrics=TickMetrics(),
+            budget=budget,
+        )
+    )
+
+    assert transition is not None
+    assert transition.tick_type is TaskInvalidatedTick
+    assert store.saved_attempts == []
+    assert store.updated_attempts == []
+    assert game.executed == []
+    assert budget.used == 0
+
+
+def test_disallowed_action_policy_rejects_before_action_attempt():
+    store = _ExecutionStore()
+    game = _ExecutionGame(store)
+    budget = MutationBudget()
+
+    transition = asyncio.run(
+        _executor(store, game, allowed_action_types=set()).advance(
+            _observation(),
+            source_observation_id="obs_7",
+            mode=ExecutionMode.AUTO,
+            available_tools={"set_research"},
+            metrics=TickMetrics(),
+            budget=budget,
+        )
+    )
+
+    assert transition is not None
+    assert transition.tick_type is TaskInvalidatedTick
+    assert store.saved_attempts == []
+    assert game.executed == []
+    assert budget.used == 0
+
+
+def test_exhausted_budget_is_rejected_before_send_without_uncertain_state():
+    store = _ExecutionStore()
+    game = _ExecutionGame(store)
+    budget = MutationBudget(limit=1, used=1)
+
+    transition = asyncio.run(
+        _executor(store, game).advance(
+            _observation(),
+            source_observation_id="obs_7",
+            mode=ExecutionMode.AUTO,
+            available_tools={"set_research"},
+            metrics=TickMetrics(),
+            budget=budget,
+        )
+    )
+
+    assert transition is not None
+    assert transition.tick_type is AttemptRecoveredTick
+    assert transition.attempt_update is not None
+    assert transition.attempt_update.status is AttemptStatus.REJECTED_BEFORE_SEND
+    assert transition.attempt_update.transport_result["phase"] == "pre_send"
+    assert game.executed == []
+    assert store.runtime_updates == []
+    assert budget.used == 1
+
+
+def test_preflight_failure_is_rejected_before_send_without_consuming_budget():
+    class _DisconnectedGame(_ExecutionGame):
+        def preflight_mutation(self, _tool_name):
+            raise RuntimeError("MCP client is not connected")
+
+    store = _ExecutionStore()
+    game = _DisconnectedGame(store)
+    budget = MutationBudget()
+
+    transition = asyncio.run(
+        _executor(store, game).advance(
+            _observation(),
+            source_observation_id="obs_7",
+            mode=ExecutionMode.AUTO,
+            available_tools={"set_research"},
+            metrics=TickMetrics(),
+            budget=budget,
+        )
+    )
+
+    assert transition is not None
+    assert transition.tick_type is AttemptRecoveredTick
+    assert transition.attempt_update is not None
+    assert transition.attempt_update.status is AttemptStatus.REJECTED_BEFORE_SEND
+    assert game.executed == []
+    assert store.runtime_updates == []
+    assert budget.used == 0

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+from hashlib import sha256
 
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal, Self
-from uuid import uuid4
 
 from pydantic import Field, field_validator, model_validator
 
@@ -21,6 +21,13 @@ from .models import (
     StrictModel,
     TickMetrics as BaseTickMetrics,
 )
+
+MAX_INFORMATION_QUERIES_PER_ROUND = 8
+MAX_INFORMATION_RESULT_BYTES = 64 * 1024
+MAX_INFORMATION_RESULT_ITEMS = 256
+MAX_INFORMATION_ROUND_BYTES = 256 * 1024
+MAX_INFORMATION_QUERY_RADIUS = 12
+MAX_INFORMATION_COORDINATE = 9_999
 
 _LEGACY_STRATEGIC_EVENT_TYPES = frozenset(
     {
@@ -187,7 +194,7 @@ class ResolutionDisposition(str, Enum):
 
 
 class InformationRequest(StrictModel):
-    request_id: str = Field(default_factory=lambda: f"info_{uuid4().hex}")
+    request_id: str | None = None
     event_dedupe_key: str
     query_type: str
     tool_name: str
@@ -258,7 +265,7 @@ class EventResolution(StrictModel):
 
 class WorkflowPlanBundle(BasePlanBundle):
     information_requests: list[InformationRequest] = Field(
-        default_factory=list, max_length=8
+        default_factory=list, max_length=MAX_INFORMATION_QUERIES_PER_ROUND
     )
     event_resolutions: list[EventResolution] = Field(
         default_factory=list, max_length=100
@@ -274,7 +281,9 @@ class StrategicResearchProposalCandidate(StrictModel):
 
 class StrategicResearchProposalResponse(StrictModel):
     schema_version: Literal["strategic-research-proposal-response/v1"]
-    information_requests: tuple[InformationRequest, ...] = ()
+    information_requests: tuple[InformationRequest, ...] = Field(
+        default=(), max_length=MAX_INFORMATION_QUERIES_PER_ROUND
+    )
     proposal_candidates: tuple[StrategicResearchProposalCandidate, ...] = ()
 
     @model_validator(mode="after")
@@ -291,7 +300,9 @@ class MissionGraphPatchCandidate(StrictModel):
 
 class MissionGraphPatchResponse(StrictModel):
     schema_version: Literal["mission-graph-patch-response/v1"]
-    information_requests: tuple[InformationRequest, ...] = ()
+    information_requests: tuple[InformationRequest, ...] = Field(
+        default=(), max_length=MAX_INFORMATION_QUERIES_PER_ROUND
+    )
     patch_candidates: tuple[MissionGraphPatchCandidate, ...] = ()
 
     @model_validator(mode="after")
@@ -384,6 +395,27 @@ def planner_response_json_schema_for_request(
 
     response_model = planner_response_model_for_request(request)
     schema = response_model.model_json_schema()
+    information_requests = schema["properties"]["information_requests"]
+    if request.constraints.get("allow_information_requests") is False:
+        information_requests["maxItems"] = 0
+    else:
+        information_requests["maxItems"] = MAX_INFORMATION_QUERIES_PER_ROUND
+        candidate_field = (
+            "proposal_candidates"
+            if response_model is StrategicResearchProposalResponse
+            else "patch_candidates"
+        )
+        schema.setdefault("allOf", []).append(
+            {
+                "not": {
+                    "properties": {
+                        "information_requests": {"minItems": 1},
+                        candidate_field: {"minItems": 1},
+                    },
+                    "required": ["information_requests", candidate_field],
+                }
+            }
+        )
     mission = schema["$defs"]["Mission"]
     properties = mission["properties"]
     for field_name in ("dependency_mission_ids", "evidence_refs"):
@@ -426,24 +458,20 @@ def planner_response_json_schema_for_request(
 
 
 class WorkflowAgentRequest(BaseAgentRequest):
-    information_results: dict[str, Any] = Field(default_factory=dict)
+    pass
 
 
 class WorkflowTickMetrics(BaseTickMetrics):
-    agent_attempt_count: int = Field(default=0, ge=0)
-    agent_success_count: int = Field(default=0, ge=0)
-    information_query_count: int = Field(default=0, ge=0)
-    logical_planner_request_count: int = Field(default=0, ge=0)
-    provider_attempt_count: int = Field(default=0, ge=0)
-    information_round_count: int = Field(default=0, ge=0)
-    duplicate_request_suppression_count: int = Field(default=0, ge=0)
-    planner_context_bytes: int = Field(default=0, ge=0)
+    pass
 
 
 @dataclass(frozen=True, slots=True)
 class QuerySpec:
     required_arguments: frozenset[str] = field(default_factory=frozenset)
     optional_arguments: frozenset[str] = field(default_factory=frozenset)
+    strategic_scopes: frozenset[str] = field(default_factory=frozenset)
+    max_result_bytes: int = MAX_INFORMATION_RESULT_BYTES
+    max_result_items: int = MAX_INFORMATION_RESULT_ITEMS
 
 
 READ_ONLY_QUERY_SPECS: dict[str, QuerySpec] = {
@@ -456,23 +484,61 @@ READ_ONLY_QUERY_SPECS: dict[str, QuerySpec] = {
     "get_map_area": QuerySpec(
         frozenset({"center_x", "center_y"}), frozenset({"radius"})
     ),
-    "get_policies": QuerySpec(),
+    "get_policies": QuerySpec(strategic_scopes=frozenset({"research"})),
     "get_trade_options": QuerySpec(frozenset({"other_player_id"})),
     "get_pantheon_beliefs": QuerySpec(),
     "get_religion_beliefs": QuerySpec(),
     "get_dedications": QuerySpec(),
-    "get_city_states": QuerySpec(),
+    "get_city_states": QuerySpec(strategic_scopes=frozenset({"research"})),
     "get_builder_tasks": QuerySpec(),
 }
 
 
-def information_tool_argument_contracts() -> dict[str, dict[str, list[str]]]:
+_IDENTIFIER_ARGUMENTS = frozenset({"unit_id", "city_id", "other_player_id"})
+_COORDINATE_ARGUMENTS = frozenset({"center_x", "center_y", "target_x", "target_y"})
+
+
+def _argument_contract(name: str) -> dict[str, Any]:
+    if name in _IDENTIFIER_ARGUMENTS:
+        return {"type": ["integer", "string"], "minimum": 0, "minLength": 1}
+    if name in _COORDINATE_ARGUMENTS:
+        return {
+            "type": "integer",
+            "minimum": -MAX_INFORMATION_COORDINATE,
+            "maximum": MAX_INFORMATION_COORDINATE,
+        }
+    if name == "radius":
+        return {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_INFORMATION_QUERY_RADIUS,
+        }
+    if name == "district_type":
+        return {"type": "string", "minLength": 1, "maxLength": 100}
+    raise AssertionError(f"information query argument contract is missing: {name}")
+
+
+def information_tool_argument_contracts(
+    *,
+    available_tools: set[str] | frozenset[str] | None = None,
+    strategic_scope: str | None = None,
+) -> dict[str, dict[str, Any]]:
     return {
         name: {
             "required": sorted(spec.required_arguments),
             "optional": sorted(spec.optional_arguments),
+            "arguments": {
+                argument: _argument_contract(argument)
+                for argument in sorted(
+                    spec.required_arguments | spec.optional_arguments
+                )
+            },
+            "max_result_bytes": spec.max_result_bytes,
+            "max_result_items": spec.max_result_items,
         }
         for name, spec in sorted(READ_ONLY_QUERY_SPECS.items())
+        if (available_tools is None or name in available_tools)
+        and (strategic_scope is None or strategic_scope in spec.strategic_scopes)
     }
 
 
@@ -480,7 +546,61 @@ class WorkflowProtocolError(ValueError):
     pass
 
 
-def validate_information_request(request: InformationRequest) -> None:
+def normalize_information_arguments(
+    tool_name: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for name, value in arguments.items():
+        if name in _IDENTIFIER_ARGUMENTS:
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                raise WorkflowProtocolError(
+                    f"information query argument {name} must be a stable identifier"
+                )
+            if isinstance(value, int):
+                if value < 0:
+                    raise WorkflowProtocolError(
+                        f"information query argument {name} must be non-negative"
+                    )
+                normalized[name] = value
+            else:
+                stripped = value.strip()
+                if not stripped:
+                    raise WorkflowProtocolError(
+                        f"information query argument {name} must not be blank"
+                    )
+                normalized[name] = stripped
+        elif name in _COORDINATE_ARGUMENTS:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise WorkflowProtocolError(
+                    f"information query argument {name} must be an integer"
+                )
+            if abs(value) > MAX_INFORMATION_COORDINATE:
+                raise WorkflowProtocolError(
+                    f"information query argument {name} is outside the supported map"
+                )
+            normalized[name] = value
+        elif name == "radius":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= MAX_INFORMATION_QUERY_RADIUS
+            ):
+                raise WorkflowProtocolError(
+                    "information query radius must be a bounded positive integer"
+                )
+            normalized[name] = value
+        elif name == "district_type":
+            if not isinstance(value, str) or not value.strip():
+                raise WorkflowProtocolError(
+                    "information query district_type must be a non-blank string"
+                )
+            normalized[name] = value.strip()
+        else:
+            normalized[name] = value
+    return normalized
+
+
+def validate_information_request(request: InformationRequest) -> InformationRequest:
     spec = READ_ONLY_QUERY_SPECS.get(request.tool_name)
     if spec is None:
         raise WorkflowProtocolError(
@@ -497,6 +617,61 @@ def validate_information_request(request: InformationRequest) -> None:
         raise WorkflowProtocolError(
             f"information request {request.request_id} has unknown arguments: {sorted(unknown)}"
         )
+    if request.query_type != request.tool_name:
+        raise WorkflowProtocolError(
+            f"information request query_type must equal tool_name: {request.tool_name}"
+        )
+    normalized = normalize_information_arguments(request.tool_name, request.arguments)
+    return request.model_copy(update={"arguments": normalized})
+
+
+def materialize_information_requests(
+    requests: tuple[InformationRequest, ...] | list[InformationRequest],
+    *,
+    planner_request_id: str,
+    round_number: int,
+) -> tuple[InformationRequest, ...]:
+    if len(requests) > MAX_INFORMATION_QUERIES_PER_ROUND:
+        raise WorkflowProtocolError(
+            f"information query batch exceeds limit {MAX_INFORMATION_QUERIES_PER_ROUND}"
+        )
+    supplied_ids = [item.request_id for item in requests if item.request_id is not None]
+    if len(supplied_ids) != len(set(supplied_ids)):
+        raise WorkflowProtocolError("duplicate information request_id")
+
+    materialized: list[InformationRequest] = []
+    semantic_keys: set[str] = set()
+    for request in requests:
+        normalized = validate_information_request(request)
+        semantic_payload = {
+            "tool_name": normalized.tool_name,
+            "arguments": normalized.arguments,
+        }
+        semantic_key = json.dumps(
+            semantic_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if semantic_key in semantic_keys:
+            raise WorkflowProtocolError("duplicate semantic information query")
+        semantic_keys.add(semantic_key)
+        digest = sha256(
+            json.dumps(
+                {
+                    "planner_request_id": planner_request_id,
+                    "round_number": round_number,
+                    **semantic_payload,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        materialized.append(
+            normalized.model_copy(update={"request_id": f"info_{digest}"})
+        )
+    return tuple(sorted(materialized, key=lambda item: str(item.request_id)))
 
 
 def validate_global_resolution_structure(

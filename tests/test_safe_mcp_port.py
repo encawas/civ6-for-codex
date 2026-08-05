@@ -21,7 +21,11 @@ class _StateApi:
             "overview": {"turn": 8},
             "tech_civics": {},
             "cities": [],
-            "units": None,
+            "units": (
+                [{"unit_id": 7, "unit_type": "UNIT_SCOUT", "moves_remaining": 2}]
+                if "include_units=true" in path
+                else None
+            ),
             "notifications": [],
             "end_turn_blockers": [
                 {"blocking_type": self.blocking_type, "message": "blocked"}
@@ -48,7 +52,7 @@ def test_unit_blocker_expands_snapshot_units():
     ]
     assert state.paths == [
         "/api/workflow/snapshot?include_units=false",
-        "/api/units",
+        "/api/workflow/snapshot?include_units=true",
     ]
 
 

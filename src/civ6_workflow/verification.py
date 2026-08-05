@@ -1,21 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 
 from .conditions import ConditionEvaluator
-from .domain import ActionAttempt
+from .domain import ActionAttempt, VerificationEvidence
 from .domain.observations import SlotState
 from .models import TurnActionExecution
 from .observation_normalization import NormalizedRuntimeObservation
-
-
-class VerificationEvidence(StrEnum):
-    POSITIVE_COMMIT_EVIDENCE = "POSITIVE_COMMIT_EVIDENCE"
-    EXPLICIT_NON_COMMIT_EVIDENCE = "EXPLICIT_NON_COMMIT_EVIDENCE"
-    INCONCLUSIVE = "INCONCLUSIVE"
-    CONFLICTING_STATE = "CONFLICTING_STATE"
-    IMPOSSIBLE_POSTCONDITION = "IMPOSSIBLE_POSTCONDITION"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +35,11 @@ def evaluate_action_verification(
             VerificationEvidence.POSITIVE_COMMIT_EVIDENCE,
             "all versioned postconditions are satisfied",
         )
+    if not postconditions.known:
+        return ActionVerificationDecision(
+            VerificationEvidence.INCONCLUSIVE,
+            postconditions.reason,
+        )
     if postconditions.reason.startswith("unsupported condition type"):
         return ActionVerificationDecision(
             VerificationEvidence.IMPOSSIBLE_POSTCONDITION,
@@ -59,9 +55,14 @@ def evaluate_action_verification(
                 VerificationEvidence.CONFLICTING_STATE,
                 f"city {city_id} is absent while verifying production",
             )
+        if city.production.state is SlotState.NOT_LOADED:
+            return ActionVerificationDecision(
+                VerificationEvidence.INCONCLUSIVE,
+                f"city {city_id} production was not loaded",
+            )
         if city.production.state is SlotState.EMPTY:
             return ActionVerificationDecision(
-                VerificationEvidence.EXPLICIT_NON_COMMIT_EVIDENCE,
+                VerificationEvidence.CURRENT_STATE_DOES_NOT_SHOW_EFFECT,
                 f"city {city_id} production slot remains empty",
             )
         return ActionVerificationDecision(
@@ -75,9 +76,14 @@ def evaluate_action_verification(
             if action_type == "set_research"
             else observation.canonical.progression.current_civic
         )
+        if slot.state is SlotState.NOT_LOADED:
+            return ActionVerificationDecision(
+                VerificationEvidence.INCONCLUSIVE,
+                f"{action_type} slot was not loaded",
+            )
         if slot.state is SlotState.EMPTY:
             return ActionVerificationDecision(
-                VerificationEvidence.EXPLICIT_NON_COMMIT_EVIDENCE,
+                VerificationEvidence.CURRENT_STATE_DOES_NOT_SHOW_EFFECT,
                 f"{action_type} slot remains empty",
             )
         return ActionVerificationDecision(
@@ -98,8 +104,13 @@ def evaluate_action_verification(
                 VerificationEvidence.CONFLICTING_STATE,
                 f"unit {unit_id} is absent while verifying movement",
             )
-        x = unit.values.get("x")
-        y = unit.values.get("y")
+        if unit.x is None or unit.y is None:
+            return ActionVerificationDecision(
+                VerificationEvidence.INCONCLUSIVE,
+                f"unit {unit_id} position was not loaded",
+            )
+        x = unit.x
+        y = unit.y
         return ActionVerificationDecision(
             VerificationEvidence.CONFLICTING_STATE,
             f"unit {unit_id} is at {(x, y)}, not the requested destination",

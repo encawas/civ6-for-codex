@@ -4,7 +4,16 @@ import hashlib
 import json
 from typing import Any
 
-from .models import EventLevel, GameEvent, RiskLevel, RuntimeSnapshot, TurnActionExecution
+from .domain.base import thaw_json
+from .domain.observations import NormalizedObservation
+from .models import (
+    EventLevel,
+    GameEvent,
+    RiskLevel,
+    RuntimeSnapshot,
+    TurnActionExecution,
+)
+from .observation_normalization import normalize_runtime_snapshot
 
 
 def _stable_hash(value: Any) -> str:
@@ -13,13 +22,24 @@ def _stable_hash(value: Any) -> str:
 
 
 def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
+    """Compatibility adapter; production should pass the canonical observation."""
+
+    return events_from_observation(normalize_runtime_snapshot(snapshot).canonical)
+
+
+def events_from_observation(
+    observation: NormalizedObservation,
+) -> list[GameEvent]:
     events: list[GameEvent] = []
-    for blocker in snapshot.blockers:
-        blocker_type = str(blocker.get("type", "unknown_blocker"))
+    for blocker in observation.blockers:
+        blocker_type = blocker.source_type
+        blocker_payload = thaw_json(blocker.values)
         if blocker_type == "pending_diplomacy":
-            data = blocker.get("data")
-            rows = data if isinstance(data, list) else [data or blocker]
-            base = {key: value for key, value in blocker.items() if key != "data"}
+            data = blocker_payload.get("data")
+            rows = data if isinstance(data, list) else [data or blocker_payload]
+            base = {
+                key: value for key, value in blocker_payload.items() if key != "data"
+            }
             for row in rows:
                 payload = {**base, **(row if isinstance(row, dict) else {})}
                 instance_id = next(
@@ -28,23 +48,21 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
                         for key in (
                             "diplomacy_id",
                             "request_id",
-                            "other_player_id",
+                            "deal_id",
                             "player_id",
+                            "other_player_id",
                         )
                         if payload.get(key) is not None
                     ),
-                    None,
+                    f"content-{_stable_hash(payload)}",
                 )
-                if instance_id is None:
-                    instance_id = f"content-{_stable_hash(payload)}"
-                    payload["diplomacy_id"] = instance_id
-                player_id = payload.get(
-                    "other_player_id", payload.get("player_id", instance_id)
+                player_id = str(
+                    payload.get("player_id", payload.get("other_player_id", "unknown"))
                 )
                 events.append(
                     GameEvent(
                         event_type="pending_diplomacy",
-                        turn=snapshot.turn,
+                        turn=observation.turn_number,
                         entity_type="player",
                         entity_id=player_id,
                         level=EventLevel.L3,
@@ -55,9 +73,11 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
                     )
                 )
         elif blocker_type == "pending_trades":
-            data = blocker.get("data")
-            rows = data if isinstance(data, list) else [data or blocker]
-            base = {key: value for key, value in blocker.items() if key != "data"}
+            data = blocker_payload.get("data")
+            rows = data if isinstance(data, list) else [data or blocker_payload]
+            base = {
+                key: value for key, value in blocker_payload.items() if key != "data"
+            }
             for row in rows:
                 payload = {**base, **(row if isinstance(row, dict) else {})}
                 offer_id = payload.get("offer_id")
@@ -67,7 +87,7 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
                 events.append(
                     GameEvent(
                         event_type="pending_trade_offer",
-                        turn=snapshot.turn,
+                        turn=observation.turn_number,
                         entity_type="trade_offer",
                         entity_id=str(offer_id),
                         level=EventLevel.L3,
@@ -78,13 +98,13 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
                     )
                 )
         elif blocker_type == "city_no_production":
-            for city_id in blocker.get("city_ids", []):
+            for city_id in blocker_payload.get("city_ids", []):
                 events.append(
                     GameEvent(
                         event_type="city_no_production",
-                        turn=snapshot.turn,
+                        turn=observation.turn_number,
                         entity_type="city",
-                        entity_id=city_id,
+                        entity_id=str(city_id),
                         level=EventLevel.L3,
                         risk=RiskLevel.MEDIUM,
                         blocking=True,
@@ -96,37 +116,42 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
             events.append(
                 GameEvent(
                     event_type="action_required_notification",
-                    turn=snapshot.turn,
+                    turn=observation.turn_number,
                     level=EventLevel.L2,
                     risk=RiskLevel.MEDIUM,
                     blocking=True,
-                    payload=blocker,
-                    dedupe_key=f"action_required_notification:{_stable_hash(blocker)}",
+                    payload=blocker_payload,
+                    dedupe_key=(
+                        f"action_required_notification:{_stable_hash(blocker_payload)}"
+                    ),
                 )
             )
         else:
             events.append(
                 GameEvent(
                     event_type=blocker_type,
-                    turn=snapshot.turn,
+                    turn=observation.turn_number,
                     level=EventLevel.L2,
                     risk=RiskLevel.MEDIUM,
                     blocking=True,
-                    payload=blocker,
-                    dedupe_key=f"{blocker_type}:{_stable_hash(blocker)}",
+                    payload=blocker_payload,
+                    dedupe_key=f"{blocker_type}:{_stable_hash(blocker_payload)}",
                 )
             )
-    city_count = len(snapshot.cities)
-    if snapshot.units is not None and city_count == 0:
-        for unit in snapshot.units:
-            unit_type = str(unit.get("unit_type", unit.get("type", ""))).upper()
-            if "SETTLER" not in unit_type:
+    if (
+        observation.completeness.cities
+        and observation.completeness.units
+        and not observation.cities
+        and observation.units is not None
+    ):
+        for unit in observation.units:
+            if "SETTLER" not in unit.unit_type:
                 continue
-            unit_id = unit.get("unit_id", unit.get("id", "unknown"))
+            unit_id = unit.entity_id.external_value
             events.append(
                 GameEvent(
                     event_type="settler_site_selection_required",
-                    turn=snapshot.turn,
+                    turn=observation.turn_number,
                     entity_type="unit",
                     entity_id=unit_id,
                     level=EventLevel.L3,
@@ -136,7 +161,7 @@ def events_from_snapshot(snapshot: RuntimeSnapshot) -> list[GameEvent]:
                         "reason": (
                             "A settler needs an approved city site before it can move."
                         ),
-                        "unit": unit,
+                        "unit": thaw_json(unit.values),
                     },
                     dedupe_key=f"settler_site_selection_required:{unit_id}",
                 )

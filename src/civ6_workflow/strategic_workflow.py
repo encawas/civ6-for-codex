@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .domain import MissionImpactAnalyzer
 from .models import EventLevel, ExecutionMode, GameEvent, RiskLevel, TickResult
 from .observation_normalization import NormalizedRuntimeObservation
 from .planner_lifecycle import PlannerLifecycleCoordinator
@@ -32,6 +33,7 @@ class StrategicProjection:
     owned_scopes: frozenset[str]
     authoritative_events: tuple[GameEvent, ...]
     current_events: tuple[GameEvent, ...]
+    pending_repair_scopes: frozenset[str] = frozenset()
     lifecycle_tick: TickResult | None = None
     human_wait_events: tuple[GameEvent, ...] = ()
     human_wait_reason: str | None = None
@@ -66,6 +68,7 @@ class StrategicWorkflowCoordinator:
         snapshot_events: tuple[GameEvent, ...],
         mode: ExecutionMode,
         auto_action_types: set[str],
+        allowed_action_types: set[str],
     ) -> StrategicProjection:
         lifecycle_tick = await self.planner_lifecycle.advance_mission_repair(
             ctx, observation
@@ -90,6 +93,14 @@ class StrategicWorkflowCoordinator:
             raise RuntimeError(
                 "execution Mission projection disagrees with active Contract"
             )
+        pending_repair_scopes = self._pending_repair_scopes(
+            observation, active_contract
+        )
+        execution_missions = tuple(
+            mission
+            for mission in execution_missions
+            if mission.scope not in pending_repair_scopes
+        )
         owned_scopes = frozenset(
             ()
             if active_contract is None
@@ -103,6 +114,7 @@ class StrategicWorkflowCoordinator:
         reusable_graph = (
             active_contract is not None
             and bool(execution_missions)
+            and not pending_repair_scopes
             and existing_graph_state is not None
             and existing_graph_state[0].turn_number == snapshot.turn
             and existing_graph_state[0].source_observation_projection_hash
@@ -111,7 +123,23 @@ class StrategicWorkflowCoordinator:
             == active_contract.contract_id
             and existing_graph_state[0].source_contract_revision
             == active_contract.revision
+            and all(
+                task.action_type in allowed_action_types
+                for task in existing_graph_state[1]
+            )
         )
+        action_policy_wait_events: tuple[GameEvent, ...] = ()
+        if (
+            pending_repair_scopes
+            and existing_graph_state is not None
+            and not execution_missions
+        ):
+            self.store.invalidate_active_turn_action_graph(
+                snapshot.game_id,
+                expected_contract_revision=active_contract.revision,
+                invalidated_at=observation.canonical.observed_at,
+            )
+            existing_graph_state = None
         if active_contract is not None and execution_missions and not reusable_graph:
             compilation = self.turn_compiler.compile_missions(
                 observation.canonical,
@@ -119,12 +147,34 @@ class StrategicWorkflowCoordinator:
                 execution_missions,
                 mode=mode,
                 auto_action_types=auto_action_types,
+                allowed_action_types=allowed_action_types,
                 compiled_at=observation.canonical.observed_at,
             )
             self.store.activate_turn_action_graph(
                 compilation.graph,
                 compilation.nodes,
                 activated_at=observation.canonical.observed_at,
+            )
+            action_policy_wait_events = tuple(
+                GameEvent(
+                    event_type="action_not_allowed",
+                    turn=snapshot.turn,
+                    entity_type=scope,
+                    entity_id=target,
+                    level=EventLevel.L3,
+                    risk=RiskLevel.HIGH,
+                    blocking=True,
+                    payload={
+                        "scope": scope,
+                        "action_type": target.removeprefix("action_not_allowed:"),
+                    },
+                    dedupe_key=(
+                        f"action-not-allowed:{active_contract.contract_id}:"
+                        f"{active_contract.revision}:{scope}:{target}"
+                    ),
+                )
+                for scope, target in compilation.unavailable_targets
+                if target.startswith("action_not_allowed:")
             )
 
         all_events = (*authoritative_events, *snapshot_events)
@@ -143,6 +193,11 @@ class StrategicWorkflowCoordinator:
             human_wait_reason = (
                 "Diplomacy and trade responses require explicit human review."
             )
+        elif action_policy_wait_events:
+            human_wait_events = action_policy_wait_events
+            human_wait_reason = (
+                "The active Mission requires an action disabled by safety policy."
+            )
         elif "tactical_emergency" in owned_scopes and tactical_wait:
             human_wait_events = tactical_wait
             human_wait_reason = (
@@ -153,8 +208,58 @@ class StrategicWorkflowCoordinator:
             owned_scopes=owned_scopes,
             authoritative_events=authoritative_events,
             current_events=self.filter_events(owned_scopes, all_events),
+            pending_repair_scopes=pending_repair_scopes,
             human_wait_events=human_wait_events,
             human_wait_reason=human_wait_reason,
+        )
+
+    def _pending_repair_scopes(self, observation, active_contract) -> frozenset[str]:
+        if active_contract is None:
+            return frozenset()
+        baseline = self.store.get_accepted_observation_baseline(
+            observation.snapshot.game_id
+        )
+        if baseline is None:
+            return frozenset()
+        matching = [
+            delta
+            for delta in self.store.list_state_deltas(observation.snapshot.game_id)
+            if delta.baseline_observation_id == baseline.observation_id
+            and delta.current_observation_id == observation.canonical.observation_id
+        ]
+        if not matching:
+            return frozenset()
+        change_sets = {
+            tuple(change.model_dump_json() for change in delta.changes)
+            for delta in matching
+        }
+        if len(change_sets) != 1:
+            raise RuntimeError("current Observation has conflicting StateDelta history")
+        delta = sorted(matching, key=lambda item: item.state_delta_id)[0]
+        affected_ids = set(
+            MissionImpactAnalyzer().affected_mission_ids(
+                delta, active_contract.mission_graph
+            )
+        )
+        deltas_by_id = {
+            item.state_delta_id: item
+            for item in self.store.list_state_deltas(observation.snapshot.game_id)
+        }
+        repaired_ids = {
+            mission_id
+            for patch in self.store.list_mission_graph_patches(
+                observation.snapshot.game_id
+            )
+            if (source_delta := deltas_by_id.get(patch.source_state_delta_id))
+            is not None
+            and source_delta.baseline_observation_id == delta.baseline_observation_id
+            and source_delta.changes == delta.changes
+            for mission_id in patch.affected_mission_ids
+        }
+        return frozenset(
+            mission.scope
+            for mission in active_contract.mission_graph.missions
+            if mission.mission_id in affected_ids - repaired_ids
         )
 
     async def advance_planning(

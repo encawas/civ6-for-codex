@@ -21,6 +21,7 @@ from civ6_workflow.domain import (
     SubjectRef,
     Task,
     TaskStatus,
+    VerificationEvidence,
     VerificationStatus,
     build_task_idempotency_key,
 )
@@ -133,6 +134,10 @@ def test_all_canonical_identity_semantic_and_audit_objects_are_deeply_immutable(
         tool_result=_nested_json(),
         verification_status=VerificationStatus.PASSED,
         last_verification_observation_id="obs-2",
+        last_verification_projection_hash="a" * 64,
+        verification_evidence=VerificationEvidence.POSITIVE_COMMIT_EVIDENCE,
+        verification_reason="test evidence",
+        verified_at=NOW + timedelta(seconds=3),
     )
     tick = PlanRequestedTick(
         tick_id="tick-1",

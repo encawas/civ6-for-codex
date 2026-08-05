@@ -63,6 +63,7 @@ from civ6_workflow.models import (
     TurnActionExecution,
     TaskStatus,
 )
+from civ6_workflow.runtime_errors import PlannerProviderBudgetExceeded
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.web_ui import ControlPanelState
@@ -211,7 +212,7 @@ def _information_response():
         information_requests=(
             InformationRequest(
                 event_dedupe_key="strategic-research-context",
-                query_type="notifications",
+                query_type="get_policies",
                 tool_name="get_policies",
                 purpose="Check known research constraints",
             ),
@@ -226,9 +227,7 @@ def test_strategic_response_canonicalizes_set_like_mission_references():
     mission["dependency_mission_ids"] = ["mission-z", "mission-a", "mission-z"]
     mission["evidence_refs"] = ["obs-z", "obs-a", "obs-z"]
 
-    payload = canonical_strategic_research_proposal_response_payload(
-        json.dumps(raw)
-    )
+    payload = canonical_strategic_research_proposal_response_payload(json.dumps(raw))
     canonical = payload["proposal_candidates"][0]["proposed_research_mission"]
 
     assert canonical["dependency_mission_ids"] == ["mission-a", "mission-z"]
@@ -276,6 +275,7 @@ def test_planner_transport_schema_requires_unique_mission_reference_sets():
 
     assert mission["properties"]["dependency_mission_ids"]["uniqueItems"] is True
     assert mission["properties"]["evidence_refs"]["uniqueItems"] is True
+
 
 def _request(
     game_id: str,
@@ -594,6 +594,13 @@ def test_information_round_then_proposal_and_second_round_limit(tmp_path):
         assert awaiting is not None
         assert awaiting.status is PlannerRequestStatus.AWAITING_INFORMATION
         assert requested_round.status is InformationRoundStatus.REQUESTED
+        persisted_query = requested_round.requests[0]
+        assert persisted_query["request_id"].startswith("info_")
+        assert planner.requests[0].constraints["information_tool_arguments"] == {
+            "get_policies": planner.requests[0].constraints[
+                "information_tool_arguments"
+            ]["get_policies"]
+        }
         store.save_planner_request(awaiting)
         store.save_information_round("game-1", requested_round)
 
@@ -605,6 +612,11 @@ def test_information_round_then_proposal_and_second_round_limit(tmp_path):
         assert ready.information_round_count == 1
         assert ready.information_results == collected_round.results
         assert collected_round.status is InformationRoundStatus.COLLECTED
+        persisted_result = next(iter(collected_round.results.values()))
+        assert persisted_result["status"] == "SUCCEEDED"
+        assert (
+            persisted_result["information_request_id"] == persisted_query["request_id"]
+        )
         store.save_planner_request(ready)
         store.save_information_round("game-1", collected_round)
 
@@ -622,6 +634,9 @@ def test_information_round_then_proposal_and_second_round_limit(tmp_path):
         )
         assert game.query_count == 1
         assert planner.calls == 2
+        assert planner.requests[1].constraints["information_tool_arguments"] == {}
+        final_schema = planner_response_json_schema_for_request(planner.requests[1])
+        assert final_schema["properties"]["information_requests"]["maxItems"] == 0
         assert store.human_wait_context("game-1") is None
         assert len(store.list_strategic_proposal_wait_resume_requests("game-1")) == 1
         assert store.get_active_strategic_contract("game-1") is None
@@ -1689,7 +1704,14 @@ def test_public_strategic_information_round_transition_rolls_back(
         "completed_at": datetime.now(UTC),
     }
     if terminal_status is InformationRoundStatus.COLLECTED:
-        updates["results"] = {"research": "known"}
+        request_id = original.requests[0]["request_id"]
+        updates["results"] = {
+            request_id: {
+                "information_request_id": request_id,
+                "status": "SUCCEEDED",
+                "result": {"research": "known"},
+            }
+        }
     candidate = original.model_copy(update=updates)
     before = store.export_replay_state("game-1")
     with pytest.raises(ValueError):
@@ -1892,9 +1914,19 @@ def _start_strategic_attempt(store, request, *, suffix="1"):
         attempt_number=1,
         provider_request_id=f"provider-call-{suffix}",
         status=ProviderAttemptStatus.STARTED,
+        actual_turn_number=request.turn_number,
+        provider_phase_id=f"{request.planner_request_id}:initial",
         started_at=NOW,
     )
-    in_progress = store.start_provider_attempt("game-1", request, started)
+    in_progress = store.start_provider_attempt(
+        "game-1",
+        request,
+        started,
+        actual_turn_number=request.turn_number,
+        max_attempts_per_turn=6,
+        max_attempts_per_request=6,
+        max_abandoned_attempts_per_request=1,
+    )
     return in_progress, started
 
 
@@ -2063,9 +2095,19 @@ def test_forged_information_requested_aggregate_is_rejected(tmp_path, source_sta
                     attempt_number=2,
                     provider_request_id="provider-call-second",
                     status=ProviderAttemptStatus.STARTED,
+                    actual_turn_number=current.turn_number,
+                    provider_phase_id=f"{current.planner_request_id}:initial",
                     started_at=NOW + timedelta(seconds=2),
                 )
-                current = store.start_provider_attempt("game-1", current, second)
+                current = store.start_provider_attempt(
+                    "game-1",
+                    current,
+                    second,
+                    actual_turn_number=current.turn_number,
+                    max_attempts_per_turn=6,
+                    max_attempts_per_request=6,
+                    max_abandoned_attempts_per_request=1,
+                )
     awaiting, round_record, tick = _forged_information_requested_aggregate(
         current,
         source_attempt_id=source_id,
@@ -2436,6 +2478,12 @@ def test_strategic_backoff_derives_failure_count_from_attempt_history(tmp_path):
         assert result.workflow_tick["provider_attempt_id"] == (
             attempts[-1].provider_attempt_id
         )
+        assert result.metrics.planner_phase_call_count == 1
+        assert result.metrics.provider_http_attempt_count == 2
+        assert result.metrics.provider_retry_count == 1
+        assert result.metrics.provider_success_count == 0
+        assert result.metrics.provider_failure_count == 2
+        assert result.metrics.provider_attempt_count == 2
         assert result.workflow_tick["provider_attempt_count"] == 2
         assert (
             engine.strategic_workflow.planner_lifecycle._active_backoff(stored)[
@@ -2478,12 +2526,22 @@ def test_strategic_backoff_is_atomic_durable_and_replay_stable(tmp_path):
             planner_request_id=request.planner_request_id,
             attempt_number=2,
             provider_request_id="provider-before-retry-deadline",
+            actual_turn_number=stored.turn_number,
+            provider_phase_id=f"{stored.planner_request_id}:initial",
             status=ProviderAttemptStatus.STARTED,
             started_at=stored.next_retry_at - timedelta(microseconds=1),
         )
         before_early_retry = store.export_replay_state("game-1")
         with pytest.raises(ValueError, match="before next_retry_at"):
-            store.start_provider_attempt("game-1", stored, early_attempt)
+            store.start_provider_attempt(
+                "game-1",
+                stored,
+                early_attempt,
+                actual_turn_number=stored.turn_number,
+                max_attempts_per_turn=6,
+                max_attempts_per_request=6,
+                max_abandoned_attempts_per_request=1,
+            )
         assert store.export_replay_state("game-1") == before_early_retry
         WorkflowStore(source_path)
 
@@ -2509,8 +2567,12 @@ def test_strategic_backoff_is_atomic_durable_and_replay_stable(tmp_path):
             restored_request
         )
         assert backoff["until"] == stored.next_retry_at.isoformat()
+        tick_count = len(restored.list_workflow_ticks("game-1"))
         waiting = await waiting_engine.tick()
-        assert waiting.workflow_tick["outcome"] == TickOutcomeKind.PLANNER_BACKOFF
+        assert len(restored.list_workflow_ticks("game-1")) == tick_count
+        assert waiting.workflow_tick is None
+        assert waiting.paused is True
+        assert waiting.runtime_state == RuntimeState.PLANNER_BACKOFF
         assert waiting_planner.calls == 0
 
     asyncio.run(scenario())
@@ -6337,18 +6399,25 @@ def test_empty_store_creates_initial_contract_request_before_provider_call(tmp_p
         request = store.active_planner_request(game.snapshot.game_id)
         assert request is not None
         assert (
-            request.target.kind
-            is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION
+            request.target.kind is PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION
         )
         assert request.target.strategic_contract_id == build_strategic_contract_id(
             game.snapshot.game_id
         )
         assert request.target.strategic_scope == "research"
         assert request.status is PlannerRequestStatus.PENDING
+        request_payload = request.request_payload
+        assert request_payload["constraints"]["information_tool_arguments"] == {
+            "get_policies": request_payload["constraints"][
+                "information_tool_arguments"
+            ]["get_policies"]
+        }
         assert planner.calls == 0
         assert store.get_active_strategic_contract(game.snapshot.game_id) is None
 
-        response = _response(game.snapshot.game_id, request.target.strategic_contract_id)
+        response = _response(
+            game.snapshot.game_id, request.target.strategic_contract_id
+        )
         candidate = response.proposal_candidates[0].model_copy(
             update={"created_from_observation_id": request.observation_id}
         )
@@ -6444,7 +6513,7 @@ def test_multi_scope_delta_repairs_each_scope_before_accepting_baseline(tmp_path
 
         planner = _Planner()
         engine = _engine(store, game, planner)
-        engine.config.execution_mode = ExecutionMode.READONLY
+        engine.config.execution_mode = ExecutionMode.AUTO
         engine.config.max_agent_calls_per_turn = 1
         runtime_clock = [activation_time + timedelta(seconds=10)]
 
@@ -6570,5 +6639,310 @@ def test_multi_scope_delta_repairs_each_scope_before_accepting_baseline(tmp_path
         restored = WorkflowStore(tmp_path / "multi-scope-restored.sqlite3")
         restored.import_replay_state(replay)
         assert restored.export_replay_state("game-1") == replay
+
+    asyncio.run(scenario())
+
+
+def test_information_query_failure_terminates_once_without_round_replay(tmp_path):
+    class FailingQueryGame(_Game):
+        async def query_tool(self, name, arguments=None):
+            self.query_count += 1
+            raise RuntimeError("permanent MCP query failure")
+
+    async def scenario():
+        store = WorkflowStore(tmp_path / "information-failure.sqlite3")
+        planner = _Planner(_information_response())
+        game = FailingQueryGame()
+        request = _request("game-1")
+        store.save_planner_request(request)
+        engine = _engine(store, game, planner)
+
+        await engine.tick()
+        terminated_tick = await engine.tick()
+        rejected = store.get_planner_request(request.planner_request_id)
+        round_record = store.list_information_rounds(request.planner_request_id)[0]
+
+        assert terminated_tick.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
+        )
+        assert rejected.status is PlannerRequestStatus.REJECTED
+        assert rejected.failure_category == "information_query_failure"
+        assert round_record.status is InformationRoundStatus.FAILED
+        result = next(iter(round_record.results.values()))
+        assert result["status"] == "FAILED"
+        assert result["failure_category"] == "query_rejected"
+        assert game.query_count == 1
+        assert planner.calls == 1
+
+        await engine.tick()
+        assert game.query_count == 1
+        assert planner.calls == 1
+        assert store.load_runtime_state("game-1") is RuntimeState.AWAITING_HUMAN
+
+        replay = store.export_replay_state("game-1")
+        restored = WorkflowStore(tmp_path / "information-failure-restored.sqlite3")
+        restored.import_replay_state(replay)
+        assert restored.get_planner_request(request.planner_request_id) == rejected
+
+    asyncio.run(scenario())
+
+
+def test_creation_observation_change_supersedes_before_query_or_provider(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "stale-observation.sqlite3")
+        game = _Game()
+        planner = _Planner(_information_response())
+        engine = _engine(store, game, planner)
+
+        created = await engine.tick()
+        request_id = created.workflow_tick["planner_request_id"]
+        request = store.get_planner_request(request_id)
+        assert request.input_projection["source_observation_projection_hash"]
+
+        game.snapshot = game.snapshot.model_copy(
+            update={
+                "tech_civics": {
+                    "current_research": "TECH_WRITING",
+                    "available_techs": [{"tech_type": "TECH_WRITING"}],
+                }
+            }
+        )
+        result = await engine.tick()
+        stored = store.get_planner_request(request_id)
+
+        assert stored.status is PlannerRequestStatus.SUPERSEDED
+        assert stored.failure_category == "stale_planning_input"
+        assert result.runtime_state == RuntimeState.AWAITING_HUMAN
+        assert planner.calls == 0
+        assert game.query_count == 0
+
+        replay = store.export_replay_state("game-1")
+        restored = WorkflowStore(tmp_path / "stale-observation-restored.sqlite3")
+        restored.import_replay_state(replay)
+        assert restored.get_planner_request(request_id) == stored
+
+    asyncio.run(scenario())
+
+
+def test_runtime_tool_surface_cache_invalidates_on_sidecar_epoch(tmp_path):
+    class EpochGame(_Game):
+        def __init__(self):
+            super().__init__()
+            self.tool_surface_epoch = 1
+            self.list_count = 0
+
+        async def list_tools(self):
+            self.list_count += 1
+            return await super().list_tools()
+
+    async def scenario():
+        game = EpochGame()
+        engine = _engine(
+            WorkflowStore(tmp_path / "tool-surface.sqlite3"),
+            game,
+            _Planner(),
+        )
+
+        await engine._verify_tool_surface()
+        await engine._verify_tool_surface()
+        assert game.list_count == 1
+
+        game.tool_surface_epoch += 1
+        await engine._verify_tool_surface()
+        assert game.list_count == 2
+
+    asyncio.run(scenario())
+
+
+def test_permitted_but_unused_missing_tool_does_not_block_runtime_startup(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "unused-tool.sqlite3")
+        game = _Game()
+        runtime = WorkflowRuntime(
+            service_factory=build_runtime_services,
+            store=store,
+            game=game,
+            planner=_Planner(),
+            config=RuntimeConfig(
+                execution_mode=ExecutionMode.AUTO,
+                auto_end_turn=False,
+                auto_action_types={"set_research"},
+                allowed_action_types={"set_research", "send_envoy"},
+                allowed_tools={"set_research", "send_envoy", "end_turn"},
+            ),
+        )
+
+        await runtime._verify_tool_surface()
+
+        assert "send_envoy" not in runtime._available_tools
+        assert runtime.config.allowed_tools == {
+            "set_research",
+            "send_envoy",
+            "end_turn",
+        }
+
+    asyncio.run(scenario())
+
+
+def test_provider_attempt_budget_reservation_is_atomic(tmp_path):
+    path = tmp_path / "provider-budget-atomic.sqlite3"
+    store = WorkflowStore(path)
+    request = _request("game-1")
+    store.save_planner_request(request)
+    first = ProviderAttempt(
+        provider_attempt_id="provider-budget-first",
+        planner_request_id=request.planner_request_id,
+        attempt_number=1,
+        provider_request_id="provider-budget-first",
+        actual_turn_number=4,
+        provider_phase_id=f"{request.planner_request_id}:initial",
+        status=ProviderAttemptStatus.STARTED,
+        started_at=NOW,
+    )
+    in_progress = store.start_provider_attempt(
+        "game-1",
+        request,
+        first,
+        actual_turn_number=4,
+        max_attempts_per_turn=1,
+        max_attempts_per_request=6,
+        max_abandoned_attempts_per_request=1,
+    )
+    before = store.export_replay_state("game-1")
+    second = ProviderAttempt(
+        provider_attempt_id="provider-budget-second",
+        planner_request_id=request.planner_request_id,
+        attempt_number=2,
+        provider_request_id="provider-budget-second",
+        actual_turn_number=4,
+        provider_phase_id=f"{request.planner_request_id}:initial",
+        status=ProviderAttemptStatus.STARTED,
+        started_at=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(
+        PlannerProviderBudgetExceeded,
+        match="current game turn",
+    ):
+        store.start_provider_attempt(
+            "game-1",
+            in_progress,
+            second,
+            actual_turn_number=4,
+            max_attempts_per_turn=1,
+            max_attempts_per_request=6,
+            max_abandoned_attempts_per_request=1,
+        )
+
+    assert store.export_replay_state("game-1") == before
+    assert store.list_provider_attempts(request.planner_request_id) == [first]
+    assert store.get_planner_request(request.planner_request_id) == in_progress
+    WorkflowStore(path)
+
+
+def test_zero_provider_attempt_budget_terminates_without_calling_planner(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "zero-provider-budget.sqlite3")
+        request = _request("game-1")
+        store.save_planner_request(request)
+        planner = _Planner(_response("game-1", build_strategic_contract_id("game-1")))
+        engine = _engine(store, _Game(), planner)
+        engine.config.max_provider_attempts_per_turn = 0
+
+        result = await engine.tick()
+        stored = store.get_planner_request(request.planner_request_id)
+
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_REQUEST_TERMINATED
+        )
+        assert stored.status is PlannerRequestStatus.FAILED
+        assert stored.failure_category == "provider_budget_exhausted"
+        assert store.list_provider_attempts(request.planner_request_id) == []
+        assert planner.calls == 0
+        assert result.metrics.planner_phase_call_count == 0
+        assert result.metrics.provider_http_attempt_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_system_error_runtime_state_holds_without_new_work(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "system-error-hold.sqlite3")
+        store.save_runtime_state("game-1", RuntimeState.SYSTEM_ERROR)
+        planner = _Planner(_response("game-1", build_strategic_contract_id("game-1")))
+        game = _Game()
+        engine = _engine(store, game, planner)
+        before_ticks = store.list_workflow_ticks("game-1")
+
+        result = await engine.tick()
+
+        assert result.paused is True
+        assert result.runtime_state == RuntimeState.SYSTEM_ERROR
+        assert result.workflow_tick is None
+        assert planner.calls == 0
+        assert store.list_workflow_ticks("game-1") == before_ticks
+
+    asyncio.run(scenario())
+
+
+def test_runtime_services_expose_only_read_only_game_to_planning(tmp_path):
+    engine = _engine(
+        WorkflowStore(tmp_path / "read-only-planner-port.sqlite3"),
+        _Game(),
+        _Planner(),
+    )
+    planner_game = engine.strategic_workflow.planner_lifecycle.runtime.game
+    query_game = engine.information_queries.game
+
+    for game_view in (planner_game, query_game):
+        assert not hasattr(game_view, "execute_task")
+        assert not hasattr(game_view, "end_turn")
+        assert hasattr(game_view, "query_tool")
+        assert hasattr(game_view, "read_snapshot")
+
+
+def test_zero_creation_budget_cannot_auto_end_turn_without_contract(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "zero-creation-budget.sqlite3")
+        planner = _Planner()
+        runtime = WorkflowRuntime(
+            service_factory=build_runtime_services,
+            store=store,
+            game=_Game(),
+            planner=planner,
+            config=RuntimeConfig(
+                execution_mode=ExecutionMode.AUTO,
+                auto_end_turn=True,
+                max_new_planner_requests_per_turn=0,
+            ),
+        )
+
+        result = await runtime.tick()
+
+        assert result.turn_ended is False
+        assert planner.calls == 0
+        assert store.get_active_strategic_contract("game-1") is None
+
+    asyncio.run(scenario())
+
+
+def test_new_request_budget_does_not_block_existing_pending_request(tmp_path):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "split-planner-budget.sqlite3")
+        request = _request("game-1")
+        store.save_planner_request(request)
+        planner = _Planner(_response("game-1", build_strategic_contract_id("game-1")))
+        engine = _engine(store, _Game(), planner)
+        engine.config.max_new_planner_requests_per_turn = 0
+
+        result = await engine.tick()
+
+        assert result.workflow_tick["outcome"] == (
+            TickOutcomeKind.STRATEGIC_PROPOSAL_READY
+        )
+        assert planner.calls == 1
+        assert store.get_planner_request(request.planner_request_id).status is (
+            PlannerRequestStatus.COMPLETED
+        )
 
     asyncio.run(scenario())

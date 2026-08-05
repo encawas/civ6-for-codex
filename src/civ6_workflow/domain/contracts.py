@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from pydantic import Field
 
+from .attempts import VerificationEvidence
 from .base import (
     ApprovalStatus,
     DomainModel,
@@ -159,6 +160,11 @@ class StrategicContractCommit(DomainModel):
     source_turn_action_node_id: str | None = Field(default=None, min_length=1)
     source_execution_mission_id: str | None = Field(default=None, min_length=1)
     source_execution_mission_revision: int | None = Field(default=None, ge=1)
+    source_verification_observation_id: str | None = Field(default=None, min_length=1)
+    source_verification_projection_hash: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
+    source_verification_evidence: VerificationEvidence | None = None
     source_scope_activation_id: str | None = Field(default=None, min_length=1)
     source_scope: str | None = Field(default=None, min_length=1)
     source_scope_mission_ids: tuple[str, ...] = ()
@@ -207,11 +213,28 @@ class StrategicContractCommit(DomainModel):
             self.source_execution_mission_id,
             self.source_execution_mission_revision,
         )
+        verification_provenance = (
+            self.source_verification_observation_id,
+            self.source_verification_projection_hash,
+            self.source_verification_evidence,
+        )
         if any(value is not None for value in action_provenance) and not all(
             value is not None for value in action_provenance
         ):
             raise ValueError(
                 "Action-derived Contract provenance must be all present or all null"
+            )
+        if any(value is not None for value in verification_provenance) and not all(
+            value is not None for value in verification_provenance
+        ):
+            raise ValueError(
+                "Action verification provenance must be all present or all null"
+            )
+        if self.source_action_attempt_id is None and any(
+            value is not None for value in verification_provenance
+        ):
+            raise ValueError(
+                "verification provenance requires an Action-derived commit"
             )
         scope_activation_provenance = (
             self.source_scope_activation_id,
@@ -285,7 +308,7 @@ class StrategicContractCommit(DomainModel):
                     "Action-derived Contract must advance one source Mission"
                 )
             mission = matching[0]
-            valid_transition_status = (
+            valid_transition_status = mission.status is MissionStatus.BLOCKED or (
                 mission.status in {MissionStatus.ACTIVE, MissionStatus.COMPLETED}
                 if mission.scope == "city_roles"
                 else mission.status is MissionStatus.COMPLETED
@@ -293,12 +316,20 @@ class StrategicContractCommit(DomainModel):
             if (
                 not valid_transition_status
                 or self.source_action_attempt_id not in mission.evidence_refs
+                or (
+                    mission.status is not MissionStatus.BLOCKED
+                    and not all(value is not None for value in verification_provenance)
+                )
             ):
                 raise ValueError(
                     "Action-derived Contract requires Mission transition evidence"
                 )
             if mission.scope == "city_roles":
-                city_roles_mission_plan(mission)
+                city_roles_mission_plan(
+                    mission.model_copy(update={"status": MissionStatus.ACTIVE})
+                    if mission.status is MissionStatus.BLOCKED
+                    else mission
+                )
             else:
                 strategic_mission_action_types(
                     mission.model_copy(update={"status": MissionStatus.ACTIVE})
@@ -603,28 +634,31 @@ def tactical_emergency_mission_order(mission: Mission) -> dict[str, object]:
 def strategic_mission_action_types(mission: Mission) -> tuple[str, ...]:
     """Return the closed action set permitted by one executable Mission scope."""
 
+    # Import lazily because the action catalog depends on shared domain enums.
+    from ..actions import action_types_for_scope
+
     if mission.scope == "research":
-        return (research_mission_action(mission),)
+        research_mission_action(mission)
+        return action_types_for_scope(mission.scope)
     if mission.scope == "civic":
-        return (civic_mission_action(mission),)
+        civic_mission_action(mission)
+        return action_types_for_scope(mission.scope)
     if mission.scope == "settler":
         settler_mission_plan(mission)
-        return ("unit_found_city", "unit_move")
+        return action_types_for_scope(mission.scope)
     if mission.scope == "city_roles":
         if mission.status is not MissionStatus.ACTIVE:
             raise ValueError("city roles execution Mission must be ACTIVE")
         city_roles_mission_plan(mission)
-        return ("city_set_production",)
+        return action_types_for_scope(mission.scope)
     if mission.scope == "diplomacy_trade":
         policy = diplomacy_trade_mission_policy(mission)
-        return ("send_envoy",) if "envoy_player_id" in policy else ()
+        return (
+            action_types_for_scope(mission.scope) if "envoy_player_id" in policy else ()
+        )
     if mission.scope == "tactical_emergency":
         tactical_emergency_mission_order(mission)
-        return (
-            "tactical_unit_fortify",
-            "tactical_unit_move",
-            "tactical_unit_skip",
-        )
+        return action_types_for_scope(mission.scope)
     raise ValueError(f"scope has no Phase 5 execution contract: {mission.scope}")
 
 

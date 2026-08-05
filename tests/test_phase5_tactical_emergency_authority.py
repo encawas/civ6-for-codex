@@ -4,7 +4,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from civ6_workflow.actions import resolve_action_spec
+from civ6_workflow.actions import (
+    build_action_attempt_idempotency_key,
+    resolve_action_spec,
+)
 from civ6_workflow.domain import (
     ActionAttempt,
     ApprovalStatus,
@@ -16,11 +19,13 @@ from civ6_workflow.domain import (
     MissionGraph,
     MissionImpactAnalyzer,
     MissionStatus,
+    RetryClassification,
     RuntimeState,
     StateDeltaBuilder,
     StrategicContract,
     StrategicContractCommit,
     SubjectRef,
+    VerificationEvidence,
     VerificationStatus,
     build_strategic_contract_id,
 )
@@ -266,6 +271,7 @@ def test_tactical_graph_is_high_risk_and_suppresses_legacy_unit_skip(tmp_path):
     assert node.risk == RiskLevel.HIGH.value
     assert node.requires_confirmation is True
 
+
 def test_verified_tactical_action_completes_mission_once(tmp_path):
     store = WorkflowStore(tmp_path / "workflow.sqlite3")
     base = _foundation(store)
@@ -279,6 +285,7 @@ def test_verified_tactical_action_completes_mission_once(tmp_path):
     after = _observation("obs-after", position=TARGET, targets=[])
     store.save_normalized_observation(after)
     spec = resolve_action_spec(task.action_type)
+    normalized_arguments = spec.build_arguments(task)
     prepared = ActionAttempt(
         action_attempt_id=f"attempt-{task.task_id}",
         game_session_id=GAME_ID,
@@ -286,19 +293,21 @@ def test_verified_tactical_action_completes_mission_once(tmp_path):
         action_type=task.action_type,
         attempt_number=1,
         request_id=f"request-{task.task_id}",
-        idempotency_key=f"turn-action:{task.task_id}",
+        idempotency_key=build_action_attempt_idempotency_key(
+            task, normalized_arguments
+        ),
         prepared_from_observation_id=task.created_from_observation_id,
-        prepared_at=NOW + timedelta(minutes=3),
+        prepared_at=NOW,
         status=AttemptStatus.PREPARED,
         retry_classification=spec.retry_classification,
-        normalized_arguments=spec.build_arguments(task),
+        normalized_arguments=normalized_arguments,
         postconditions=tuple(task.postconditions),
     )
     store.save_action_attempt(prepared)
     uncertain = prepared.model_copy(
         update={
             "status": AttemptStatus.UNCERTAIN,
-            "sent_at": NOW + timedelta(minutes=3),
+            "sent_at": NOW,
             "transport_result": {"phase": "delivery_started"},
         }
     )
@@ -306,10 +315,14 @@ def test_verified_tactical_action_completes_mission_once(tmp_path):
     succeeded = uncertain.model_copy(
         update={
             "status": AttemptStatus.SUCCEEDED,
-            "response_received_at": NOW + timedelta(minutes=3),
+            "response_received_at": NOW,
             "tool_result": {"success": True},
             "verification_status": VerificationStatus.PASSED,
             "last_verification_observation_id": after.observation_id,
+            "last_verification_projection_hash": after.projection_hash,
+            "verification_evidence": VerificationEvidence.POSITIVE_COMMIT_EVIDENCE,
+            "verification_reason": "test postconditions satisfied",
+            "verified_at": after.observed_at,
             "verification_count": 1,
         }
     )
@@ -387,7 +400,9 @@ def test_unit_delta_impacts_only_the_matching_unit_mission():
     current = _observation("obs-current", position=(2, 3))
     result = StateDeltaBuilder().compare(baseline, current)
     assert result.state_delta is not None
-    assert {change.scope for change in result.state_delta.changes} == {"unit"}
+    assert {change.scope for change in result.state_delta.changes} == {
+        "tactical_emergency"
+    }
 
     other = _mission("contract").model_copy(
         update={
@@ -434,3 +449,221 @@ def test_replay_rejects_missing_tactical_activation_tick_before_delete(tmp_path)
         target.import_replay_state(replay)
     assert target.export_replay_state(GAME_ID) == before
     assert target.get_active_strategic_contract(GAME_ID) == target_base
+
+
+def test_tactical_move_requires_explicit_legal_and_reachable_facts(tmp_path):
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    base = _foundation(store)
+    activation = _observation("obs-policy-activation")
+    contract, _tick = _activate(store, base, activation)
+    unknown = _observation(
+        "obs-policy-unknown",
+        targets=[{"x": TARGET[0], "y": TARGET[1]}],
+    )
+
+    compilation = TurnCompiler().compile_missions(
+        unknown,
+        contract,
+        contract.mission_graph.missions,
+        mode=ExecutionMode.AUTO,
+        auto_action_types={"tactical_unit_move"},
+        compiled_at=NOW + timedelta(minutes=2),
+    )
+
+    assert compilation.nodes == ()
+    assert compilation.unavailable_target == f"tile:{TARGET[0]}:{TARGET[1]}"
+
+
+def _prepared_tactical_attempt(store: WorkflowStore, task) -> ActionAttempt:
+    spec = resolve_action_spec(task.action_type)
+    arguments = spec.build_arguments(task)
+    return ActionAttempt(
+        action_attempt_id=f"attempt-contract-{task.task_id}",
+        game_session_id=GAME_ID,
+        task_id=task.task_id,
+        action_type=task.action_type,
+        attempt_number=1,
+        request_id=f"request-contract-{task.task_id}",
+        idempotency_key=build_action_attempt_idempotency_key(task, arguments),
+        prepared_from_observation_id=task.created_from_observation_id,
+        prepared_at=NOW,
+        status=AttemptStatus.PREPARED,
+        retry_classification=spec.retry_classification,
+        normalized_arguments=arguments,
+        postconditions=tuple(task.postconditions),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("postconditions", ({"type": "turn_at_least", "turn": 0},), "postconditions"),
+        ("retry_classification", RetryClassification.NEVER_BLIND_RETRY, "retry policy"),
+        ("idempotency_key", "task:forged", "idempotency key"),
+        ("postcondition_version", 2, "postcondition version"),
+    ],
+)
+def test_store_binds_attempt_to_turn_action_contract(tmp_path, field, value, message):
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    base = _foundation(store)
+    before = _observation("obs-contract-before")
+    contract, _tick = _activate(store, base, before)
+    _graph, task = _compile_and_activate(store, before, contract)
+    assert store.approve_task(GAME_ID, task.task_id, approved_by="reviewer")
+    task = store.get_task(GAME_ID, task.task_id)
+    candidate = _prepared_tactical_attempt(store, task).model_copy(
+        update={field: value}
+    )
+
+    with pytest.raises(ValueError, match=message):
+        store.save_action_attempt(candidate)
+
+    assert store.list_action_attempts(GAME_ID) == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing_observation",
+        "other_game",
+        "projection_hash_mismatch",
+        "observation_before_send",
+    ],
+)
+def test_store_rejects_untrusted_verification_observation(tmp_path, case):
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    base = _foundation(store)
+    before = _observation(f"obs-verification-before-{case}")
+    contract, _tick = _activate(store, base, before)
+    _graph, task = _compile_and_activate(store, before, contract)
+    assert store.approve_task(GAME_ID, task.task_id, approved_by="reviewer")
+    task = store.get_task(GAME_ID, task.task_id)
+    prepared = _prepared_tactical_attempt(store, task)
+    store.save_action_attempt(prepared)
+    uncertain = prepared.model_copy(
+        update={
+            "status": AttemptStatus.UNCERTAIN,
+            "sent_at": NOW,
+            "transport_result": {"phase": "delivery_started"},
+        }
+    )
+    store.update_action_attempt(uncertain)
+
+    evidence = _observation(f"obs-verification-{case}", position=TARGET, targets=[])
+    evidence_id = evidence.observation_id
+    evidence_hash = evidence.projection_hash
+    if case == "missing_observation":
+        evidence_id = "obs-verification-missing"
+    elif case == "other_game":
+        evidence = evidence.model_copy(
+            update={
+                "observation_id": "obs-verification-other-game",
+                "game_session_id": "other-game",
+            }
+        )
+        evidence_id = evidence.observation_id
+        evidence_hash = evidence.projection_hash
+        store.save_normalized_observation(evidence)
+    elif case == "projection_hash_mismatch":
+        store.save_normalized_observation(evidence)
+        evidence_hash = "0" * 64
+    elif case == "observation_before_send":
+        evidence = evidence.model_copy(
+            update={"observed_at": NOW - timedelta(minutes=1)}
+        )
+        store.save_normalized_observation(evidence)
+    else:
+        raise AssertionError(case)
+
+    forged = uncertain.model_copy(
+        update={
+            "status": AttemptStatus.SUCCEEDED,
+            "response_received_at": NOW,
+            "tool_result": {"success": True},
+            "verification_status": VerificationStatus.PASSED,
+            "last_verification_observation_id": evidence_id,
+            "last_verification_projection_hash": evidence_hash,
+            "verification_evidence": VerificationEvidence.POSITIVE_COMMIT_EVIDENCE,
+            "verification_reason": "forged verification evidence",
+            "verified_at": NOW,
+            "verification_count": 1,
+        }
+    )
+
+    with pytest.raises(ValueError):
+        store.update_action_attempt(forged)
+
+    assert store.get_action_attempt(forged.action_attempt_id) == uncertain
+
+
+def test_terminal_action_failure_blocks_mission_and_expires_graph(tmp_path):
+
+    store = WorkflowStore(tmp_path / "workflow.sqlite3")
+    base = _foundation(store)
+    before = _observation("obs-terminal-before")
+    contract, _tick = _activate(store, base, before)
+    graph, task = _compile_and_activate(store, before, contract)
+    assert store.approve_task(GAME_ID, task.task_id, approved_by="reviewer")
+    task = store.get_task(GAME_ID, task.task_id)
+    prepared = _prepared_tactical_attempt(store, task)
+    store.save_action_attempt(prepared)
+    uncertain = prepared.model_copy(
+        update={
+            "status": AttemptStatus.UNCERTAIN,
+            "sent_at": NOW,
+            "transport_result": {"phase": "delivery_started"},
+        }
+    )
+    store.update_action_attempt(uncertain)
+    conflicting = _observation("obs-terminal-conflict", position=(4, 4), targets=[])
+    store.save_normalized_observation(conflicting)
+    failed = uncertain.model_copy(
+        update={
+            "status": AttemptStatus.FAILED,
+            "response_received_at": NOW,
+            "verification_status": VerificationStatus.FAILED,
+            "last_verification_observation_id": conflicting.observation_id,
+            "last_verification_projection_hash": conflicting.projection_hash,
+            "verification_evidence": VerificationEvidence.CONFLICTING_STATE,
+            "verification_reason": "unit is not at the approved target",
+            "verified_at": conflicting.observed_at,
+            "verification_count": 1,
+        }
+    )
+    tick = AttemptReconciledTick(
+        tick_id="tick-terminal-failure",
+        game_session_id=GAME_ID,
+        turn_number=12,
+        starting_runtime_state=RuntimeState.RECONCILING,
+        observation_ids=(conflicting.observation_id,),
+        started_at=NOW + timedelta(minutes=4),
+        completed_at=NOW + timedelta(minutes=4),
+        metrics={},
+        action_attempt_id=failed.action_attempt_id,
+        task_id=failed.task_id,
+        attempt_status=AttemptStatus.FAILED,
+    )
+
+    resolution = store.finalize_attempt_failure(
+        failed, tick, task_error="unit is not at the approved target"
+    )
+
+    assert resolution.task_status is TaskStatus.FAILED
+    active = store.get_active_strategic_contract(GAME_ID)
+    assert active.revision == contract.revision + 1
+    assert active.mission_graph.missions[0].status is MissionStatus.BLOCKED
+    assert failed.action_attempt_id in active.mission_graph.missions[0].evidence_refs
+    assert store.active_turn_action_graph(GAME_ID) is None
+    assert graph.graph_id
+    assert store.get_task(GAME_ID, task.task_id).status is TaskStatus.FAILED
+
+    reopened = WorkflowStore(tmp_path / "workflow.sqlite3")
+    assert reopened.get_active_strategic_contract(GAME_ID) == active
+    replay = reopened.export_replay_state(GAME_ID)
+    restored = WorkflowStore(tmp_path / "restored.sqlite3")
+    restored.import_replay_state(replay)
+    assert restored.export_replay_state(GAME_ID) == replay
+    assert (
+        restored.get_active_strategic_contract(GAME_ID).mission_graph.missions[0].status
+        is MissionStatus.BLOCKED
+    )

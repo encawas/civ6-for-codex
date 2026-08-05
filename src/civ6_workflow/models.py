@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum
-from typing import Any, Literal, Self
+from typing import Any, Self
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -135,9 +135,34 @@ class AgentRequest(StrictModel):
 class ActionResult(StrictModel):
     success: bool
     blocked: bool = False
-    message: str = ""
+    message: str = Field(default="", max_length=1024)
     details: dict[str, Any] = Field(default_factory=dict)
     delivery_status: MutationDeliveryStatus | None = None
+
+    @model_validator(mode="after")
+    def validate_delivery_facts(self) -> Self:
+        status = self.delivery_status
+        if status is None:
+            return self
+        if status is MutationDeliveryStatus.ACKNOWLEDGED:
+            if not self.success or self.blocked:
+                raise ValueError(
+                    "ACKNOWLEDGED requires a successful, non-blocking tool response"
+                )
+        elif self.success:
+            raise ValueError(f"{status.value} cannot report success")
+        if (
+            status
+            in {
+                MutationDeliveryStatus.PROVEN_NOT_SENT,
+                MutationDeliveryStatus.UNKNOWN,
+            }
+            and self.blocked
+        ):
+            raise ValueError(
+                f"{status.value} is transport evidence, not a business blocker"
+            )
+        return self
 
     @property
     def effective_delivery_status(self) -> MutationDeliveryStatus:
@@ -161,6 +186,13 @@ class TickMetrics(StrictModel):
     persistence_seconds: float = 0.0
     total_seconds: float = 0.0
     mcp_call_count: int = 0
+    state_api_call_count: int = 0
+    mcp_list_tools_count: int = 0
+    mcp_read_query_count: int = 0
+    mcp_mutation_count: int = 0
+    mcp_mutation_seconds: float = 0.0
+    mcp_timeout_count: int = 0
+    mcp_reconnect_count: int = 0
     mutation_count: int = 0
     agent_call_count: int = 0
     agent_attempt_count: int = Field(default=0, ge=0)
@@ -168,6 +200,11 @@ class TickMetrics(StrictModel):
     information_query_count: int = Field(default=0, ge=0)
     logical_planner_request_count: int = Field(default=0, ge=0)
     provider_attempt_count: int = Field(default=0, ge=0)
+    planner_phase_call_count: int = Field(default=0, ge=0)
+    provider_http_attempt_count: int = Field(default=0, ge=0)
+    provider_success_count: int = Field(default=0, ge=0)
+    provider_failure_count: int = Field(default=0, ge=0)
+    provider_retry_count: int = Field(default=0, ge=0)
     information_round_count: int = Field(default=0, ge=0)
     duplicate_request_suppression_count: int = Field(default=0, ge=0)
     planner_context_bytes: int = Field(default=0, ge=0)
@@ -195,27 +232,17 @@ class RuntimeSnapshot(StrictModel):
     turn: int = Field(ge=0)
     game_id: str
     overview: dict[str, Any] = Field(default_factory=dict)
-    tech_civics: dict[str, Any] | list[Any] = Field(default_factory=dict)
+    tech_civics: dict[str, Any] = Field(default_factory=dict)
     notifications: dict[str, Any] | list[Any] = Field(default_factory=dict)
     diplomacy: dict[str, Any] | list[Any] = Field(default_factory=dict)
     trades: dict[str, Any] | list[Any] = Field(default_factory=dict)
     cities: dict[str, Any] | list[Any] = Field(default_factory=dict)
     units: dict[str, Any] | list[Any] | None = None
     blockers: list[dict[str, Any]] = Field(default_factory=list)
-
-
-ActionType = Literal[
-    "city_set_production",
-    "set_research",
-    "set_civic",
-    "send_envoy",
-    "unit_move",
-    "unit_found_city",
-    "builder_improve",
-    "unit_heal",
-    "unit_fortify",
-    "unit_skip",
-    "tactical_unit_move",
-    "tactical_unit_fortify",
-    "tactical_unit_skip",
-]
+    tech_civics_loaded: bool = True
+    cities_loaded: bool = True
+    notifications_loaded: bool = True
+    diplomacy_loaded: bool = True
+    trades_loaded: bool = True
+    end_turn_blockers_loaded: bool = True
+    blockers_loaded: bool = True

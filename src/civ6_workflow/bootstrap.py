@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .actions import ACTION_REGISTRY
+from .actions import canonical_action_types
 from .batch_executor import BatchExecutor
 from .codex_planner import CodexPlanner
 from .conditions import ConditionEvaluator
@@ -15,7 +15,7 @@ from .runtime import RuntimeConfig, RuntimeServices, WorkflowRuntime
 from .gate import EventGate, GateConfig
 from .mcp_port import Civ6GamePort, Civ6McpClient
 from .planner_lifecycle import PlannerLifecycleCoordinator, PlannerLifecycleRuntime
-from .ports import GamePort, Planner
+from .ports import GamePort, Planner, ReadOnlyGameQueryPortView
 from .models import ExecutionMode, RuntimeSnapshot
 from .replay import (
     RecordingGamePort,
@@ -68,11 +68,12 @@ def build_runtime_services(runtime: WorkflowRuntime) -> RuntimeServices:
     """Build the one application-service graph used by every Runtime entry point."""
 
     conditions = ConditionEvaluator()
-    information_queries = InformationQueryRouter(runtime.game)
+    read_only_game = ReadOnlyGameQueryPortView(runtime.game)
+    information_queries = InformationQueryRouter(read_only_game)
     planner_lifecycle = PlannerLifecycleCoordinator(
         PlannerLifecycleRuntime(
             store=runtime.store,
-            game=runtime.game,
+            game=read_only_game,
             planner=runtime.planner,
             config=runtime.config,
             conditions=conditions,
@@ -82,6 +83,7 @@ def build_runtime_services(runtime: WorkflowRuntime) -> RuntimeServices:
             checkpoint=lambda name: runtime._checkpoint(name),
             observation_id=lambda: runtime._active_observation_id,
             human_wait_context=lambda snapshot: runtime._human_wait_context(snapshot),
+            available_tools=lambda: runtime._available_tools or set(),
         )
     )
     return RuntimeServices(
@@ -98,6 +100,8 @@ def build_runtime_services(runtime: WorkflowRuntime) -> RuntimeServices:
             store=runtime.store,
             game=runtime.game,
             conditions=conditions,
+            allowed_action_types=runtime.config.allowed_action_types,
+            allowed_tools=runtime.config.allowed_tools,
             verification_attempts=runtime.config.verification_attempts,
             now=lambda: runtime._now(),
             monotonic=lambda: runtime._monotonic(),
@@ -215,10 +219,12 @@ def replay_runtime_config(
 ) -> RuntimeConfig:
     settings: ReplayEngineSettings | None = recording.engine_settings
     action_types = (
-        set(settings.allowed_action_types) if settings else set(ACTION_REGISTRY)
+        set(settings.allowed_action_types)
+        if settings
+        else set(canonical_action_types())
     )
     auto_action_types = (
-        set(settings.auto_action_types) if settings else set(ACTION_REGISTRY)
+        set(settings.auto_action_types) if settings else set(canonical_action_types())
     )
     return RuntimeConfig(
         execution_mode=settings.execution_mode if settings else ExecutionMode.AUTO,
@@ -228,10 +234,12 @@ def replay_runtime_config(
             settings.repeated_failure_threshold if settings else 2
         ),
         verification_attempts=settings.verification_attempts if settings else 3,
+        verification_delay_seconds=(
+            settings.verification_delay_seconds if settings else 0.25
+        ),
         auto_action_types=auto_action_types,
         allowed_action_types=action_types,
         allowed_tools=set(settings.allowed_tools) if settings else set(recording.tools),
-        verification_delay_seconds=0,
     )
 
 

@@ -368,6 +368,8 @@ class ProviderAttempt(DomainModel):
     planner_request_id: str
     attempt_number: int = Field(ge=1)
     provider_request_id: str
+    actual_turn_number: int | None = Field(default=None, ge=0)
+    provider_phase_id: str | None = None
     status: ProviderAttemptStatus
     started_at: datetime
     completed_at: datetime | None = None
@@ -408,4 +410,20 @@ class InformationRound(DomainModel):
             raise ValueError("terminal information rounds require completed_at")
         if self.status is InformationRoundStatus.COLLECTED and not self.results:
             raise ValueError("collected information rounds require results")
+        request_ids = [request.get("request_id") for request in self.requests]
+        materialized = all(
+            isinstance(request_id, str) and request_id for request_id in request_ids
+        )
+        if materialized and len(request_ids) != len(set(request_ids)):
+            raise ValueError("information round request IDs must be unique")
+        if self.status is InformationRoundStatus.COLLECTED and materialized:
+            if set(self.results) != set(request_ids):
+                raise ValueError("information round results must match request IDs")
+            for request_id, result in self.results.items():
+                if (
+                    not isinstance(result, Mapping)
+                    or result.get("information_request_id") != request_id
+                    or result.get("status") not in {"SUCCEEDED", "FAILED"}
+                ):
+                    raise ValueError("information round result evidence is invalid")
         return self

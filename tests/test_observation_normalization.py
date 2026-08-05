@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,10 @@ from civ6_workflow.models import (
     RuntimeSnapshot,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
+from civ6_workflow.verification import (
+    VerificationEvidence,
+    evaluate_action_verification,
+)
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.conditions import ConditionEvaluator
 
@@ -462,3 +467,284 @@ class _ExecutingGame(_ReadPolicyGame):
         self.call_count += 1
         self.snapshot.cities[0]["currently_building"] = task.arguments["item_name"]
         return ActionResult(success=True, message="production selected")
+
+
+@pytest.mark.parametrize(
+    ("condition", "snapshot_update"),
+    [
+        ({"type": "unit_absent", "unit_id": "7"}, {"units": None}),
+        (
+            {"type": "no_blocker_kind", "blocker_kind": "ENDTURN_BLOCKING_UNITS"},
+            {"blockers_loaded": False},
+        ),
+        (
+            {"type": "research_unselected"},
+            {"tech_civics_loaded": False, "tech_civics": {}},
+        ),
+    ],
+)
+def test_conditions_fail_unknown_when_required_facts_are_incomplete(
+    condition, snapshot_update
+):
+    observation = normalize_runtime_snapshot(
+        _city_snapshot("nothing").model_copy(update=snapshot_update)
+    )
+
+    result = ConditionEvaluator().evaluate(condition, observation)
+
+    assert not result.valid
+    assert not result.known
+    assert result.reason.startswith("condition evidence unavailable:")
+
+
+def test_normalizer_rejects_missing_and_conflicting_entity_identities():
+    missing_id = _city_snapshot("nothing").model_copy(
+        update={"cities": [{"currently_building": None}]}
+    )
+    with pytest.raises(ValueError, match="stable entity identifier"):
+        normalize_runtime_snapshot(missing_id)
+
+    duplicate = _city_snapshot("nothing").model_copy(
+        update={
+            "cities": [
+                {"city_id": 1, "currently_building": None},
+                {"city_id": 1, "currently_building": None},
+            ]
+        }
+    )
+    assert len(normalize_runtime_snapshot(duplicate).canonical.cities) == 1
+
+    conflicting = duplicate.model_copy(
+        update={
+            "cities": [
+                {"city_id": 1, "currently_building": None},
+                {"city_id": 1, "currently_building": "UNIT_SCOUT"},
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="conflicting duplicate city"):
+        normalize_runtime_snapshot(conflicting)
+
+
+def test_runtime_snapshot_rejects_list_tech_civics():
+    with pytest.raises(ValueError):
+        RuntimeSnapshot(turn=1, game_id="game", tech_civics=[])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("", None),
+        (0, 0),
+        ("2", 2),
+    ],
+)
+def test_unit_build_charges_preserve_unknown_and_real_zero(raw, expected):
+    snapshot = _city_snapshot("nothing").model_copy(
+        update={
+            "units": [
+                {
+                    "unit_id": 7,
+                    "unit_type": "UNIT_BUILDER",
+                    "build_charges": raw,
+                    "needs_promotion": "false",
+                }
+            ]
+        }
+    )
+
+    unit = normalize_runtime_snapshot(snapshot).canonical.unit("7")
+
+    assert unit is not None
+    assert unit.build_charges == expected
+    assert unit.needs_promotion is False
+
+
+@pytest.mark.parametrize("field", ["build_charges", "needs_promotion", "x", "health"])
+def test_unit_invalid_critical_value_is_rejected(field):
+    snapshot = _city_snapshot("nothing").model_copy(
+        update={
+            "units": [
+                {
+                    "unit_id": 7,
+                    "unit_type": "UNIT_BUILDER",
+                    field: {"invalid": True},
+                }
+            ]
+        }
+    )
+    with pytest.raises(TypeError, match=field):
+        normalize_runtime_snapshot(snapshot)
+
+
+def test_semantic_hash_ignores_order_and_extension_fields():
+    base = _city_snapshot("nothing").model_copy(
+        update={
+            "cities": [
+                {"city_id": 2, "currently_building": "UNIT_SCOUT", "ui": "a"},
+                {"city_id": 1, "currently_building": None, "ui": "b"},
+            ],
+            "units": [
+                {
+                    "unit_id": 2,
+                    "unit_type": "UNIT_WARRIOR",
+                    "moves_remaining": 1,
+                    "animation": "idle",
+                },
+                {
+                    "unit_id": 1,
+                    "unit_type": "UNIT_SETTLER",
+                    "moves_remaining": 2,
+                    "animation": "walk",
+                },
+            ],
+            "blockers": [
+                {"type": "pending_trades", "offer_id": "b", "status": "PENDING"},
+                {"type": "pending_diplomacy", "request_id": "a", "status": "PENDING"},
+            ],
+        }
+    )
+    reordered = base.model_copy(
+        update={
+            "cities": list(reversed(base.cities)),
+            "units": list(reversed(base.units)),
+            "blockers": list(reversed(base.blockers)),
+        },
+        deep=True,
+    )
+    reordered.cities[0]["ui"] = "changed"
+    reordered.units[0]["animation"] = "changed"
+
+    first = normalize_runtime_snapshot(base).canonical
+    second = normalize_runtime_snapshot(reordered).canonical
+
+    assert first.projection_hash == second.projection_hash
+    assert first.source_snapshot_hash != second.source_snapshot_hash
+
+    changed = reordered.model_copy(deep=True)
+    changed.units[0]["moves_remaining"] = 0
+    assert (
+        normalize_runtime_snapshot(changed).canonical.projection_hash
+        != first.projection_hash
+    )
+
+
+def test_evaluate_all_dumps_compatibility_projection_once(monkeypatch):
+    observation = normalize_runtime_snapshot(_city_snapshot("nothing"))
+    calls = 0
+    original = RuntimeSnapshot.model_dump
+
+    def counting_dump(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(RuntimeSnapshot, "model_dump", counting_dump)
+
+    result = ConditionEvaluator().evaluate_all(
+        [
+            {"type": "field_equals", "path": "turn", "value": 10},
+            {
+                "type": "field_in",
+                "path": "cities.0.currently_building",
+                "values": [None],
+            },
+        ],
+        observation,
+    )
+
+    assert result.valid
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("action_type", "postcondition", "snapshot_update"),
+    [
+        (
+            "set_research",
+            {"type": "research_equals", "tech_type": "TECH_MINING"},
+            {"tech_civics_loaded": False, "tech_civics": {}},
+        ),
+        (
+            "set_civic",
+            {"type": "civic_equals", "civic_type": "CIVIC_CODE_OF_LAWS"},
+            {"tech_civics_loaded": False, "tech_civics": {}},
+        ),
+        (
+            "city_set_production",
+            {
+                "type": "city_production_equals",
+                "city_id": 1,
+                "item_name": "UNIT_SCOUT",
+            },
+            {"cities": [{"city_id": 1}]},
+        ),
+        (
+            "unit_move",
+            {"type": "unit_at", "unit_id": 7, "x": 2, "y": 3},
+            {"units": None},
+        ),
+    ],
+)
+def test_verification_unknown_evidence_is_inconclusive(
+    action_type, postcondition, snapshot_update
+):
+    observation = normalize_runtime_snapshot(
+        _city_snapshot("nothing").model_copy(update=snapshot_update)
+    )
+    attempt = SimpleNamespace(
+        postconditions=(postcondition,),
+        action_type=action_type,
+        normalized_arguments={},
+    )
+    task = SimpleNamespace(action_type=action_type, entity_id="1")
+
+    decision = evaluate_action_verification(
+        attempt, task, observation, ConditionEvaluator()
+    )
+
+    assert decision.evidence is VerificationEvidence.INCONCLUSIVE
+
+
+@pytest.mark.parametrize(
+    ("field", "key", "identifier"),
+    [
+        ("units", "unit_id", "7"),
+        ("available_techs", "tech_type", "TECH_MINING"),
+        ("available_civics", "civic_type", "CIVIC_CODE_OF_LAWS"),
+    ],
+)
+def test_entity_collections_dedupe_identical_and_reject_conflicts(
+    field, key, identifier
+):
+    if field == "units":
+        row = {key: identifier, "unit_type": "UNIT_WARRIOR"}
+        snapshot = _city_snapshot("nothing").model_copy(
+            update={"units": [row, dict(row)]}
+        )
+        canonical = normalize_runtime_snapshot(snapshot).canonical
+        assert canonical.units is not None
+        assert len(canonical.units) == 1
+        conflict = dict(row, unit_type="UNIT_SCOUT")
+        invalid = snapshot.model_copy(update={"units": [row, conflict]})
+    else:
+        row = {key: identifier, "name": "Known"}
+        progression = dict(_city_snapshot("nothing").tech_civics)
+        progression[field] = [row, dict(row)]
+        snapshot = _city_snapshot("nothing").model_copy(
+            update={"tech_civics": progression}
+        )
+        canonical = normalize_runtime_snapshot(snapshot).canonical
+        values = (
+            canonical.progression.available_research_ids
+            if field == "available_techs"
+            else canonical.progression.available_civic_ids
+        )
+        assert len(values) == 1
+        conflict = dict(row, name="Conflicting")
+        progression[field] = [row, conflict]
+        invalid = snapshot.model_copy(update={"tech_civics": progression})
+
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        normalize_runtime_snapshot(invalid)
