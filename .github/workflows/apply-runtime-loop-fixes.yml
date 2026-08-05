@@ -1,0 +1,139 @@
+name: Apply runtime loop fixes
+
+on:
+  push:
+    branches:
+      - agent/runtime-loop-fixes
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/runtime-loop-fixes
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply focused runtime patches
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          runtime_path = "src/civ6_workflow/runtime.py"
+          replace_once(
+              runtime_path,
+              """        if ctx.starting_state in {RuntimeState.SYSTEM_ERROR, RuntimeState.PAUSED}:\n""",
+              """        if rewind_pending:\n            rewind_event = recover_turn_rewind(\n                self.store,\n                snapshot,\n                previous_game_id=previous_game_id,\n                previous_turn=previous_turn,\n                recovered_at=observation.canonical.observed_at,\n            )\n            reason = (\n                \"the loaded save predates the active strategic timeline; \"\n                \"automatic planning and mutation are disabled until strategic \"\n                \"authority is explicitly reset\"\n            )\n            compatibility = TickResult(\n                turn=snapshot.turn,\n                metrics=ctx.metrics,\n                events=[] if rewind_event is None else [rewind_event],\n                paused=True,\n                pause_reason=reason,\n            )\n            return self._finish(\n                ctx,\n                snapshot,\n                AwaitingHumanTick,\n                compatibility=compatibility,\n                blocking_reason=reason,\n                human_wait_context_override={\n                    \"version\": \"human-wait/v1\",\n                    \"wait_kind\": \"turn_rewind_requires_strategic_reset\",\n                    \"resume_policy\": \"explicit_reset_only\",\n                    \"previous_turn\": previous_turn,\n                    \"loaded_turn\": snapshot.turn,\n                    \"resume_requested\": False,\n                },\n            )\n        if ctx.starting_state in {RuntimeState.SYSTEM_ERROR, RuntimeState.PAUSED}:\n""",
+          )
+          replace_once(
+              runtime_path,
+              """        if ctx.starting_state is RuntimeState.AWAITING_HUMAN:\n            wait = self.store.human_wait_context(snapshot.game_id) or {}\n            if (\n""",
+              """        if ctx.starting_state is RuntimeState.AWAITING_HUMAN:\n            wait = self.store.human_wait_context(snapshot.game_id) or {}\n            if wait.get(\"wait_kind\") == \"turn_rewind_requires_strategic_reset\":\n                return self._finish(\n                    ctx,\n                    snapshot,\n                    AwaitingHumanTick,\n                    blocking_reason=(\n                        \"the loaded save invalidated the active strategic timeline; \"\n                        \"start a fresh workflow state or perform an explicit \"\n                        \"strategic reset before automation resumes\"\n                    ),\n                )\n            if (\n""",
+          )
+
+          planner_path = "src/civ6_workflow/planner_lifecycle.py"
+          replace_once(
+              planner_path,
+              """    AwaitingHumanTick,\n""",
+              """    ActionAttempt,\n    AttemptStatus,\n    AwaitingHumanTick,\n""",
+          )
+          replace_once(
+              planner_path,
+              """class PlannerLifecycleCoordinator:\n    \"\"\"Advance durable planning state without owning the workflow Tick loop.\"\"\"\n\n    def __init__(self, runtime: PlannerLifecycleRuntime):\n        self.runtime = runtime\n\n    async def advance_mission_repair(self, ctx, observation):\n""",
+              """class PlannerLifecycleCoordinator:\n    \"\"\"Advance durable planning state without owning the workflow Tick loop.\"\"\"\n\n    def __init__(self, runtime: PlannerLifecycleRuntime):\n        self.runtime = runtime\n\n    def _accept_verified_action_baseline(\n        self,\n        current,\n        baseline,\n        owned_scopes: set[str],\n    ) -> bool:\n        if not all(\n            current.completeness.supports_scope(scope) for scope in owned_scopes\n        ):\n            return False\n        candidates: list[ActionAttempt] = [\n            attempt\n            for attempt in self.runtime.store.list_action_attempts(\n                current.game_session_id\n            )\n            if attempt.status is AttemptStatus.SUCCEEDED\n            and attempt.action_type != \"end_turn\"\n            and attempt.verified_at is not None\n            and attempt.verified_at >= baseline.observed_at\n            and attempt.last_verification_projection_hash == current.projection_hash\n        ]\n        if not candidates:\n            return False\n        latest = max(\n            candidates,\n            key=lambda attempt: (attempt.verified_at, attempt.action_attempt_id),\n        )\n        self.runtime.store.accept_observation_baseline(\n            current.observation_id,\n            expected_previous_observation_id=baseline.observation_id,\n            reason=(\n                \"accepted verified action effect from \"\n                f\"{latest.action_attempt_id}:{latest.action_type}\"\n            ),\n            accepted_at=self.runtime._now(),\n        )\n        return True\n\n    async def advance_mission_repair(self, ctx, observation):\n""",
+          )
+          replace_once(
+              planner_path,
+              """        baseline = runtime.store.get_accepted_observation_baseline(snapshot.game_id)\n        if comparison.kind is ObservationComparisonKind.STATE_DELTA:\n""",
+              """        baseline = runtime.store.get_accepted_observation_baseline(snapshot.game_id)\n        if (\n            baseline is not None\n            and comparison.kind is ObservationComparisonKind.STATE_DELTA\n            and self._accept_verified_action_baseline(\n                current, baseline, owned_scopes\n            )\n        ):\n            return None\n        if comparison.kind is ObservationComparisonKind.STATE_DELTA:\n""",
+          )
+          replace_once(
+              planner_path,
+              """                if (\n                    runtime.store.provider_budget_request_count_for_turn(\n                        snapshot.game_id, snapshot.turn\n                    )\n                    >= runtime.config.new_planner_request_limit\n                ):\n                    return None\n                base_context = {\n""",
+              """                if (\n                    runtime.store.provider_budget_request_count_for_turn(\n                        snapshot.game_id, snapshot.turn\n                    )\n                    >= runtime.config.new_planner_request_limit\n                ):\n                    reason = (\n                        \"Mission repair closure exhausted this turn's \"\n                        \"PlannerRequest budget; remaining scope \"\n                        f\"{repair_scope} requires explicit human review\"\n                    )\n                    compatibility = TickResult(\n                        turn=snapshot.turn,\n                        metrics=ctx.metrics,\n                        events=[],\n                        paused=True,\n                        pause_reason=reason,\n                    )\n                    return self._finish(\n                        ctx,\n                        snapshot,\n                        AwaitingHumanTick,\n                        compatibility=compatibility,\n                        blocking_reason=reason,\n                    )\n                base_context = {\n""",
+          )
+
+          delta_path = "src/civ6_workflow/domain/state_delta.py"
+          replace_once(
+              delta_path,
+              """from .contracts import MissionGraph\n""",
+              """from .contracts import MissionGraph, MissionStatus\n""",
+          )
+          replace_once(
+              delta_path,
+              """                after={\n                    unit.entity_id.value: _tactical_unit_projection(unit)\n                    for unit in current.units\n                },\n""",
+              """                after={\n                    unit.entity_id.value: _tactical_unit_projection(unit)\n                    for unit in current.units\n                    if \"SETTLER\" not in unit.unit_type\n                },\n""",
+          )
+          replace_once(
+              delta_path,
+              """                before={\n                    unit.entity_id.value: _tactical_unit_projection(unit)\n                    for unit in baseline.units\n                },\n""",
+              """                before={\n                    unit.entity_id.value: _tactical_unit_projection(unit)\n                    for unit in baseline.units\n                    if \"SETTLER\" not in unit.unit_type\n                },\n""",
+          )
+          replace_once(
+              delta_path,
+              """        direct = {\n            mission.mission_id\n            for mission in mission_graph.missions\n            if mission.scope in changed_scopes\n        }\n""",
+              """        direct = {\n            mission.mission_id\n            for mission in mission_graph.missions\n            if mission.status is MissionStatus.ACTIVE\n            and mission.scope in changed_scopes\n        }\n""",
+          )
+          replace_once(
+              delta_path,
+              """        direct.update(\n            mission.mission_id\n            for mission in mission_graph.missions\n            if mission.subject.subject_type == \"unit\"\n            and mission.subject.subject_id in changed_unit_ids\n        )\n""",
+              """        direct.update(\n            mission.mission_id\n            for mission in mission_graph.missions\n            if mission.status is MissionStatus.ACTIVE\n            and mission.subject.subject_type == \"unit\"\n            and mission.subject.subject_id in changed_unit_ids\n        )\n""",
+          )
+          replace_once(
+              delta_path,
+              """        missions = {mission.mission_id: mission for mission in mission_graph.missions}\n        affected = set(direct)\n        changed = True\n        while changed:\n            changed = False\n            for mission in mission_graph.missions:\n""",
+              """        missions = {\n            mission.mission_id: mission\n            for mission in mission_graph.missions\n            if mission.status is MissionStatus.ACTIVE\n        }\n        affected = set(direct)\n        changed = True\n        while changed:\n            changed = False\n            for mission in missions.values():\n""",
+          )
+          replace_once(
+              delta_path,
+              """                for dependency_id in mission.dependency_mission_ids:\n                    if mission.mission_id in affected and dependency_id not in affected:\n                        affected.add(dependency_id)\n                        changed = True\n""",
+              """                for dependency_id in mission.dependency_mission_ids:\n                    if (\n                        mission.mission_id in affected\n                        and dependency_id in missions\n                        and dependency_id not in affected\n                    ):\n                        affected.add(dependency_id)\n                        changed = True\n""",
+          )
+
+          Path("tests/test_runtime_loop_closure.py").write_text(
+              '''from __future__ import annotations\n\nimport inspect\nfrom datetime import UTC, datetime, timedelta\nfrom types import SimpleNamespace\n\nfrom civ6_workflow.domain import (\n    AttemptStatus,\n    Mission,\n    MissionGraph,\n    MissionImpactAnalyzer,\n    MissionStatus,\n    StateDeltaBuilder,\n    SubjectRef,\n)\nfrom civ6_workflow.models import RuntimeSnapshot\nfrom civ6_workflow.observation_normalization import normalize_runtime_snapshot\nfrom civ6_workflow.planner_lifecycle import (\n    PlannerLifecycleCoordinator,\n    PlannerLifecycleRuntime,\n)\nfrom civ6_workflow.runtime import WorkflowRuntime\n\n\nNOW = datetime(2026, 8, 5, 3, 0, tzinfo=UTC)\n\n\ndef _observation(*, x: int):\n    return normalize_runtime_snapshot(\n        RuntimeSnapshot(\n            game_id="game-1",\n            turn=10,\n            units=[\n                {\n                    "unit_id": 7,\n                    "unit_type": "UNIT_SETTLER",\n                    "x": x,\n                    "y": 2,\n                    "moves_remaining": 1,\n                }\n            ],\n        ),\n        observed_at=NOW + timedelta(seconds=x),\n    ).canonical\n\n\ndef _mission(status: MissionStatus) -> Mission:\n    return Mission(\n        mission_id=f"mission-{status.value.lower()}",\n        game_session_id="game-1",\n        contract_id="contract-1",\n        mission_revision=1,\n        scope="settler",\n        subject=SubjectRef(subject_type="unit", subject_id="7"),\n        slot="unit:7:settlement",\n        objective="found city",\n        desired_outcome={\n            "settler": {\n                "unit_id": 7,\n                "target_x": 3,\n                "target_y": 2,\n                "baseline_city_count": 1,\n                "owner": "PLAYER_0",\n            }\n        },\n        status=status,\n    )\n\n\ndef test_settler_motion_does_not_also_create_tactical_delta():\n    result = StateDeltaBuilder().compare(_observation(x=1), _observation(x=2))\n\n    assert result.state_delta is not None\n    assert {change.scope for change in result.state_delta.changes} == {"settler"}\n\n\ndef test_completed_mission_is_not_reopened_by_state_delta():\n    result = StateDeltaBuilder().compare(_observation(x=1), _observation(x=2))\n    assert result.state_delta is not None\n    graph = MissionGraph(\n        missions=(\n            _mission(MissionStatus.ACTIVE),\n            _mission(MissionStatus.COMPLETED),\n        )\n    )\n\n    affected = MissionImpactAnalyzer().affected_mission_ids(\n        result.state_delta, graph\n    )\n\n    assert affected == ("mission-active",)\n\n\ndef test_verified_action_projection_advances_observation_baseline():\n    baseline = _observation(x=1)\n    current = _observation(x=2)\n\n    class Store:\n        def __init__(self):\n            self.accepted = []\n\n        def list_action_attempts(self, game_id):\n            assert game_id == "game-1"\n            return [\n                SimpleNamespace(\n                    status=AttemptStatus.SUCCEEDED,\n                    action_type="unit_move",\n                    verified_at=NOW + timedelta(seconds=3),\n                    last_verification_projection_hash=current.projection_hash,\n                    action_attempt_id="attempt-1",\n                )\n            ]\n\n        def accept_observation_baseline(self, observation_id, **kwargs):\n            self.accepted.append((observation_id, kwargs))\n\n    store = Store()\n    coordinator = PlannerLifecycleCoordinator(\n        PlannerLifecycleRuntime(\n            store=store,\n            game=SimpleNamespace(),\n            planner=SimpleNamespace(),\n            config=SimpleNamespace(),\n            conditions=SimpleNamespace(),\n            information_queries=SimpleNamespace(),\n            now=lambda: NOW + timedelta(seconds=4),\n            monotonic=lambda: 0.0,\n            checkpoint=lambda _name: None,\n            observation_id=lambda: current.observation_id,\n            human_wait_context=lambda _snapshot: {},\n            available_tools=lambda: set(),\n        )\n    )\n\n    accepted = coordinator._accept_verified_action_baseline(\n        current, baseline, {"settler"}\n    )\n\n    assert accepted is True\n    assert store.accepted[0][0] == current.observation_id\n    assert (\n        store.accepted[0][1]["expected_previous_observation_id"]\n        == baseline.observation_id\n    )\n\n\ndef test_rewind_recovery_precedes_projection_and_mutation():\n    source = inspect.getsource(WorkflowRuntime._run_tick)\n    rewind = source.index("if rewind_pending:", source.index("unresolved ="))\n    projection = source.index("projection = await self.strategic_workflow")\n    execution = source.index("execution = await self.batch_executor.advance")\n\n    assert rewind < projection < execution\n    assert "turn_rewind_requires_strategic_reset" in source\n\n\ndef test_repair_budget_exhaustion_is_an_explicit_human_wait():\n    source = inspect.getsource(PlannerLifecycleCoordinator.advance_mission_repair)\n\n    assert "Mission repair closure exhausted" in source\n    assert "AwaitingHumanTick" in source\n''',
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest ruff
+
+      - name: Validate focused fixes
+        run: |
+          python -m pytest tests/test_runtime_loop_closure.py tests/test_state_delta.py tests/test_phase7_runtime_convergence.py -q
+          python -m compileall -q src tests
+          python -m ruff check src/civ6_workflow tests/test_runtime_loop_closure.py
+
+      - name: Commit validated changes
+        shell: bash
+        run: |
+          rm .github/workflows/apply-runtime-loop-fixes.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/civ6_workflow/runtime.py \
+                  src/civ6_workflow/planner_lifecycle.py \
+                  src/civ6_workflow/domain/state_delta.py \
+                  tests/test_runtime_loop_closure.py \
+                  .github/workflows/apply-runtime-loop-fixes.yml
+          git commit -m "fix: close game runtime loop hazards"
+          git push origin HEAD:agent/runtime-loop-fixes
