@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+
+import json
 from enum import StrEnum
 from hashlib import sha256
-import json
 
 from pydantic import Field
 
 from .base import DomainModel, ImmutableJsonValue, thaw_json
-from .contracts import MissionGraph
+from .contracts import MissionGraph, MissionStatus
 from .observations import NormalizedObservation, SlotState
 
 
@@ -312,12 +313,27 @@ class StateDeltaBuilder:
                 before={
                     unit.entity_id.value: _tactical_unit_projection(unit)
                     for unit in baseline.units
+                    if "SETTLER" not in unit.unit_type
                 },
                 after={
                     unit.entity_id.value: _tactical_unit_projection(unit)
                     for unit in current.units
+                    if "SETTLER" not in unit.unit_type
                 },
             )
+            settler_unit_paths = {
+                f"units.{unit.entity_id.value}"
+                for unit in (*baseline.units, *current.units)
+                if "SETTLER" in unit.unit_type
+            }
+            changes[:] = [
+                change
+                for change in changes
+                if not (
+                    change.scope == "tactical_emergency"
+                    and change.field_path in settler_unit_paths
+                )
+            ]
 
         if baseline.completeness.blockers and current.completeness.blockers:
             self._append_projection_change(
@@ -459,7 +475,8 @@ class MissionImpactAnalyzer:
         direct = {
             mission.mission_id
             for mission in mission_graph.missions
-            if mission.scope in changed_scopes
+            if mission.status is MissionStatus.ACTIVE
+            and mission.scope in changed_scopes
         }
         changed_unit_ids = {
             item.field_path.split(".", 1)[1]
@@ -470,18 +487,23 @@ class MissionImpactAnalyzer:
         direct.update(
             mission.mission_id
             for mission in mission_graph.missions
-            if mission.subject.subject_type == "unit"
+            if mission.status is MissionStatus.ACTIVE
+            and mission.subject.subject_type == "unit"
             and mission.subject.subject_id in changed_unit_ids
         )
         if not direct:
             return ()
 
-        missions = {mission.mission_id: mission for mission in mission_graph.missions}
+        missions = {
+            mission.mission_id: mission
+            for mission in mission_graph.missions
+            if mission.status is MissionStatus.ACTIVE
+        }
         affected = set(direct)
         changed = True
         while changed:
             changed = False
-            for mission in mission_graph.missions:
+            for mission in missions.values():
                 shared_slot = any(
                     other_id in affected
                     and missions[other_id].subject == mission.subject
@@ -494,7 +516,11 @@ class MissionImpactAnalyzer:
                     affected.add(mission.mission_id)
                     changed = True
                 for dependency_id in mission.dependency_mission_ids:
-                    if mission.mission_id in affected and dependency_id not in affected:
+                    if (
+                        mission.mission_id in affected
+                        and dependency_id in missions
+                        and dependency_id not in affected
+                    ):
                         affected.add(dependency_id)
                         changed = True
         return tuple(sorted(affected))

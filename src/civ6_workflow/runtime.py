@@ -428,6 +428,41 @@ class WorkflowRuntime:
                 snapshot,
                 transition,
             )
+        if rewind_pending:
+            rewind_event = recover_turn_rewind(
+                self.store,
+                snapshot,
+                previous_game_id=previous_game_id,
+                previous_turn=previous_turn,
+                recovered_at=observation.canonical.observed_at,
+            )
+            reason = (
+                "the loaded save predates the active strategic timeline; "
+                "automatic planning and mutation are disabled until strategic "
+                "authority is explicitly reset"
+            )
+            compatibility = TickResult(
+                turn=snapshot.turn,
+                metrics=ctx.metrics,
+                events=[] if rewind_event is None else [rewind_event],
+                paused=True,
+                pause_reason=reason,
+            )
+            return self._finish(
+                ctx,
+                snapshot,
+                AwaitingHumanTick,
+                compatibility=compatibility,
+                blocking_reason=reason,
+                human_wait_context_override={
+                    "version": "human-wait/v1",
+                    "wait_kind": "turn_rewind_requires_strategic_reset",
+                    "resume_policy": "explicit_reset_only",
+                    "previous_turn": previous_turn,
+                    "loaded_turn": snapshot.turn,
+                    "resume_requested": False,
+                },
+            )
         if ctx.starting_state in {RuntimeState.SYSTEM_ERROR, RuntimeState.PAUSED}:
             return self._held_result(
                 ctx,
@@ -490,6 +525,17 @@ class WorkflowRuntime:
 
         if ctx.starting_state is RuntimeState.AWAITING_HUMAN:
             wait = self.store.human_wait_context(snapshot.game_id) or {}
+            if wait.get("wait_kind") == "turn_rewind_requires_strategic_reset":
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    AwaitingHumanTick,
+                    blocking_reason=(
+                        "the loaded save invalidated the active strategic timeline; "
+                        "start a fresh workflow state or perform an explicit "
+                        "strategic reset before automation resumes"
+                    ),
+                )
             if (
                 wait.get("wait_kind") == "strategic_contract_proposal_ready"
                 and wait.get("resume_policy") == "explicit_only"

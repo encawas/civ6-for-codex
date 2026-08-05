@@ -13,6 +13,8 @@ from uuid import uuid4
 from .actions import action_types_for_scope
 from .domain.base import thaw_json
 from .domain import (
+    ActionAttempt,
+    AttemptStatus,
     AwaitingHumanTick,
     InformationCollectedTick,
     InformationRequestedTick,
@@ -155,6 +157,75 @@ class PlannerLifecycleCoordinator:
     def __init__(self, runtime: PlannerLifecycleRuntime):
         self.runtime = runtime
 
+    def _accept_verified_action_baseline(
+        self,
+        current,
+        baseline,
+        state_delta,
+    ) -> bool:
+        """Accept only the closed, verified effect of one settler move.
+
+        Other successful actions complete or revise their Mission and are handled by
+        the ordinary active-Mission impact filter. This narrow exception keeps a
+        multi-turn settler Mission alive without swallowing unrelated game changes.
+        """
+
+        if not current.completeness.supports_scope("settler"):
+            return False
+        candidates: list[ActionAttempt] = []
+        for attempt in self.runtime.store.list_action_attempts(
+            current.game_session_id
+        ):
+            if (
+                attempt.status is not AttemptStatus.SUCCEEDED
+                or attempt.action_type != "unit_move"
+                or attempt.verified_at is None
+                or attempt.prepared_at < baseline.observed_at
+                or attempt.last_verification_projection_hash
+                != current.projection_hash
+            ):
+                continue
+            arguments = thaw_json(attempt.normalized_arguments)
+            unit_id = str(arguments.get("unit_id", ""))
+            target_x = arguments.get("target_x")
+            target_y = arguments.get("target_y")
+            expected_path = f"units.{unit_id}"
+            if (
+                not unit_id
+                or type(target_x) is not int
+                or type(target_y) is not int
+                or any(
+                    change.scope != "settler"
+                    or change.field_path != expected_path
+                    for change in state_delta.changes
+                )
+            ):
+                continue
+            resulting = thaw_json(state_delta.changes[0].after)
+            if (
+                not isinstance(resulting, dict)
+                or resulting.get("x") != target_x
+                or resulting.get("y") != target_y
+            ):
+                continue
+            candidates.append(attempt)
+        if not candidates:
+            return False
+        latest = max(
+            candidates,
+            key=lambda attempt: (attempt.verified_at, attempt.action_attempt_id),
+        )
+        self.runtime.store.accept_observation_baseline(
+            current.observation_id,
+            expected_previous_observation_id=baseline.observation_id,
+            reason=(
+                "accepted verified settler movement effect from "
+                f"{latest.action_attempt_id}"
+            ),
+            accepted_at=self.runtime._now(),
+        )
+        return True
+
     async def advance_mission_repair(self, ctx, observation):
         """Advance active Mission repair before current-turn graph projection."""
 
@@ -216,6 +287,14 @@ class PlannerLifecycleCoordinator:
             detected_at=runtime._now(),
         )
         baseline = runtime.store.get_accepted_observation_baseline(snapshot.game_id)
+        if (
+            baseline is not None
+            and comparison.kind is ObservationComparisonKind.STATE_DELTA
+            and self._accept_verified_action_baseline(
+                current, baseline, comparison.state_delta
+            )
+        ):
+            return None
         if comparison.kind is ObservationComparisonKind.STATE_DELTA:
             assert comparison.state_delta is not None
             affected_mission_ids = MissionImpactAnalyzer().affected_mission_ids(
@@ -266,7 +345,25 @@ class PlannerLifecycleCoordinator:
                     )
                     >= runtime.config.new_planner_request_limit
                 ):
-                    return None
+                    reason = (
+                        "Mission repair closure exhausted this turn's "
+                        "PlannerRequest budget; remaining scope "
+                        f"{repair_scope} requires explicit human review"
+                    )
+                    compatibility = TickResult(
+                        turn=snapshot.turn,
+                        metrics=ctx.metrics,
+                        events=[],
+                        paused=True,
+                        pause_reason=reason,
+                    )
+                    return self._finish(
+                        ctx,
+                        snapshot,
+                        AwaitingHumanTick,
+                        compatibility=compatibility,
+                        blocking_reason=reason,
+                    )
                 base_context = {
                     "target_contract_id": active_contract.contract_id,
                     "expected_base_revision": active_contract.revision,
