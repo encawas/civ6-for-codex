@@ -48,21 +48,21 @@ jobs:
           python -m ruff check \
             src/civ6_workflow/runtime.py \
             src/civ6_workflow/planner_lifecycle.py \
-            src/civ6_workflow/state_delta.py \
+            src/civ6_workflow/domain/state_delta.py \
             tests/test_runtime_loop_closure.py
           git diff --check
 
       - name: Package validated files
         run: |
-          mkdir -p runtime-loop-fix/src/civ6_workflow runtime-loop-fix/tests
+          mkdir -p runtime-loop-fix/src/civ6_workflow/domain runtime-loop-fix/tests
           cp src/civ6_workflow/runtime.py runtime-loop-fix/src/civ6_workflow/runtime.py
           cp src/civ6_workflow/planner_lifecycle.py runtime-loop-fix/src/civ6_workflow/planner_lifecycle.py
-          cp src/civ6_workflow/state_delta.py runtime-loop-fix/src/civ6_workflow/state_delta.py
+          cp src/civ6_workflow/domain/state_delta.py runtime-loop-fix/src/civ6_workflow/domain/state_delta.py
           cp tests/test_runtime_loop_closure.py runtime-loop-fix/tests/test_runtime_loop_closure.py
           git diff --binary -- \
             src/civ6_workflow/runtime.py \
             src/civ6_workflow/planner_lifecycle.py \
-            src/civ6_workflow/state_delta.py \
+            src/civ6_workflow/domain/state_delta.py \
             tests/test_runtime_loop_closure.py \
             > runtime-loop-fix/runtime-loop-fix.patch
 
@@ -82,7 +82,7 @@ jobs:
           git add -A -- \
             src/civ6_workflow/runtime.py \
             src/civ6_workflow/planner_lifecycle.py \
-            src/civ6_workflow/state_delta.py \
+            src/civ6_workflow/domain/state_delta.py \
             tests/test_runtime_loop_closure.py \
             .github/workflows/apply-runtime-loop-fixes.yml
           git commit -m "fix: close game runtime loop hazards"
