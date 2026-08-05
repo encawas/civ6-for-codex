@@ -1,25 +1,25 @@
 from pathlib import Path
 
 from civ6_workflow import web_cli, web_ui
-from civ6_workflow.control_panel_page import CONTROL_PANEL_HTML
 
 
 def test_web_cli_installs_one_coherent_control_panel_page():
-    assert web_cli.CONTROL_PANEL_HTML == CONTROL_PANEL_HTML
-    assert web_ui.CONTROL_PANEL_HTML == CONTROL_PANEL_HTML
-    assert 'data-ui-version="2"' in CONTROL_PANEL_HTML
-    assert 'id="workflow"' in CONTROL_PANEL_HTML
-    assert 'id="humanActions"' in CONTROL_PANEL_HTML
-    assert 'id="plannerBtn"' in CONTROL_PANEL_HTML
-    assert 'id="tickBtn"' in CONTROL_PANEL_HTML
-    assert "/api/state" in CONTROL_PANEL_HTML
-    assert "/api/tick" in CONTROL_PANEL_HTML
-    assert "/api/planner/probe" in CONTROL_PANEL_HTML
-    assert "data-human-action" in CONTROL_PANEL_HTML
-    assert "onclick=" not in CONTROL_PANEL_HTML
-    assert "<script src=" not in CONTROL_PANEL_HTML
-    assert "http://" not in CONTROL_PANEL_HTML
-    assert "https://" not in CONTROL_PANEL_HTML
+    html = web_cli.CONTROL_PANEL_HTML
+    assert web_ui.CONTROL_PANEL_HTML == html
+    assert 'data-ui-version="2"' in html
+    assert 'id="workflow"' in html
+    assert 'id="humanActions"' in html
+    assert 'id="plannerBtn"' in html
+    assert 'id="tickBtn"' in html
+    assert "/api/state" in html
+    assert "/api/tick" in html
+    assert "/api/planner/probe" in html
+    assert "data-human-action" in html
+    assert "onclick=" not in html
+    assert "<script src=" not in html
+    assert "http://" not in html
+    assert "https://" not in html
+    assert "repeat(3,minmax(0,1fr));row-gap:13px" in html
 
 
 def test_windows_double_click_and_desktop_shortcut_launchers_exist():
