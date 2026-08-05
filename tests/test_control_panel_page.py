@@ -1,11 +1,11 @@
 from pathlib import Path
 
-from civ6_workflow import web_ui
+from civ6_workflow import web_cli, web_ui
 from civ6_workflow.control_panel_page import CONTROL_PANEL_HTML
-from civ6_workflow import web_cli  # noqa: F401
 
 
 def test_web_cli_installs_one_coherent_control_panel_page():
+    assert web_cli.CONTROL_PANEL_HTML == CONTROL_PANEL_HTML
     assert web_ui.CONTROL_PANEL_HTML == CONTROL_PANEL_HTML
     assert 'data-ui-version="2"' in CONTROL_PANEL_HTML
     assert 'id="workflow"' in CONTROL_PANEL_HTML
