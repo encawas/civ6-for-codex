@@ -34,7 +34,11 @@ def test_planner_lifecycle_uses_a_narrow_runtime_service_container(tmp_path):
     assert isinstance(services, PlannerLifecycleRuntime)
     assert services is not composition.runtime
     assert services.store is store
-    assert services.game is game
+    assert services.game is not game
+    assert not hasattr(services.game, "execute_task")
+    assert not hasattr(services.game, "end_turn")
+    assert hasattr(services.game, "query_tool")
+    assert hasattr(services.game, "read_snapshot")
     assert services.planner is planner
     assert not hasattr(composition.runtime, "planner_lifecycle")
     assert not hasattr(composition.runtime, "turn_compiler")

@@ -1,17 +1,17 @@
 # Civ6 工作流智能体
 
-这是一个面向《文明6：风云变幻》的本地工作流智能体项目。前端是控制入口，本地后端负责连接游戏、MCP（模型上下文协议）和规划器。
+这是一个面向《文明6：风云变幻》的本地工作流智能体项目。浏览器控制台是监督入口，本地后端负责连接游戏、MCP（模型上下文协议）和规划器。
 
-## 启动前端
+## Windows 一键启动
 
-克隆仓库后，在 PowerShell 中进入仓库根目录：
+首次使用时，在 PowerShell 中克隆仓库并进入项目目录：
 
 ```powershell
 git clone https://github.com/encawas/civ6-for-codex.git
 cd civ6-for-codex
 ```
 
-编辑 `config.toml`，填写可用模型：
+然后编辑 `config.toml`，填写可用模型：
 
 ```toml
 [codex]
@@ -19,27 +19,49 @@ backend = "responses"
 model = "你的 API 可用模型"
 ```
 
-在当前 PowerShell 窗口设置 API Key：
+并在 Windows 用户环境或当前 PowerShell 中设置 API Key：
 
 ```powershell
 $env:OPENAI_API_KEY = "你的 OpenAI API Key"
 ```
 
-启动：
+### 直接双击启动
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start_frontend.ps1
-```
-
-首次运行时，脚本会自动创建 Python 虚拟环境、安装依赖并创建项目内的 `state/` 目录。
-
-终端会输出类似地址：
+双击仓库根目录的：
 
 ```text
-http://127.0.0.1:8765/?token=...
+启动文明6助手.cmd
 ```
 
-复制完整地址到浏览器，然后点击 **连接规划器**。
+它会调用现有 `start_frontend.ps1`，自动创建/复用 `.venv`、安装依赖、启动本地后端，并在浏览器中打开带随机本地令牌的控制台地址。
+
+### 创建桌面快捷方式
+
+双击一次：
+
+```text
+创建桌面快捷方式.cmd
+```
+
+脚本会在当前用户桌面创建 **“文明6 工作流助手”** 快捷方式。以后直接双击桌面图标即可启动。
+
+PowerShell 启动方式仍然可用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start_frontend.ps1 -OpenBrowser
+```
+
+新版控制台集中显示：
+
+- 游戏连接、回合、Runtime 状态和执行模式；
+- 当前工作流阶段与最近 Tick 结果；
+- Strategic Proposal、动作确认、Human Wait 恢复和安全重试；
+- TurnAction 任务队列与开放阻塞事件；
+- 规划器连接、HTTP 诊断和退避状态；
+- Tick 查询、规划、动作发送与验证耗时；
+- 最近一次持久化 Tick envelope。
+
+控制台仍只监听 `127.0.0.1`。API Key 保留在本地后端中，不会返回给浏览器 JavaScript；页面也不能绕过审批、动作白名单、单 Tick mutation budget、执行锁或后置验证。
 
 ## 首次实机测试
 
@@ -51,6 +73,8 @@ execution_mode = "readonly"
 auto_end_turn = false
 ```
 
+启动后先点击 **测试规划器**，确认模型和凭证可用；再运行一次 Tick，检查游戏 ID、回合和事件是否更新。随后再切换到 `confirm` 模式验证任务审批，不要在首次运行直接启用自动写操作。
+
 ## 项目结构
 
 ```text
@@ -58,10 +82,12 @@ civ6-for-codex/
 ├─ AGENTS.md             # Codex/编码智能体必须遵守的仓库约束
 ├─ config.toml
 ├─ start_frontend.ps1
+├─ 启动文明6助手.cmd
+├─ 创建桌面快捷方式.cmd
 ├─ pyproject.toml
-├─ src/                  # 后端与工作流运行时
+├─ src/                  # 后端、工作流运行时和控制台页面
 ├─ tests/                # 自动测试
-├─ scripts/              # 安装和辅助脚本
+├─ scripts/              # 安装、快捷方式和辅助脚本
 ├─ upstream_overlay/     # civ6-mcp 结构化接口补丁
 ├─ docs/                 # 架构、契约与实机说明
 ├─ state/                # 本地数据库和规划器运行数据
@@ -97,4 +123,4 @@ civ6-for-codex/
 - 原工作流智能体架构说明：`docs/WORKFLOW_AGENT_ARCHITECTURE.md`
 - Windows 实机验收：`docs/LIVE_SMOKE_TEST.md`
 
-停止前端：在启动终端按 `Ctrl+C`。
+停止后端：在启动终端按 `Ctrl+C`。

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Any, BinaryIO, Callable
 from uuid import uuid4
 
 from .actions import (
-    ACTION_REGISTRY,
+    canonical_action_types,
 )
 from .batch_executor import BatchExecutor, ExecutionTransition
 from .conditions import ConditionEvaluator
@@ -20,6 +22,7 @@ from .domain import (
     ActionAttempt,
     AttemptStatus,
     AwaitingHumanTick,
+    AwaitingApprovalTick,
     NoSafeActionTick,
     RuntimeState,
     StrategicProposalWaitErrorTick,
@@ -30,7 +33,7 @@ from .domain import (
     TickOutcomeKind,
     validate_workflow_tick,
 )
-from .events import events_from_snapshot
+from .events import events_from_observation
 from .gate import EventGate
 from .ports import (
     GamePort,
@@ -69,13 +72,24 @@ _TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 class RuntimeConfig:
     execution_mode: ExecutionMode = ExecutionMode.CONFIRM
     auto_end_turn: bool = False
+    max_new_planner_requests_per_turn: int | None = None
     max_agent_calls_per_turn: int = 1
+    max_provider_attempts_per_turn: int = 6
+    max_provider_attempts_per_logical_request: int = 6
+    max_abandoned_provider_attempts_per_request: int = 1
+    max_information_rounds_per_request: int = 1
+    max_turn_seconds: float = 300.0
+    mcp_mutation_timeout_seconds: float = 30.0
     repeated_failure_threshold: int = 2
     default_cooldown_turns: int = 2
     verification_attempts: int = 3
     verification_delay_seconds: float = 0.25
-    auto_action_types: set[str] = field(default_factory=lambda: set(ACTION_REGISTRY))
-    allowed_action_types: set[str] = field(default_factory=lambda: set(ACTION_REGISTRY))
+    auto_action_types: set[str] = field(
+        default_factory=lambda: set(canonical_action_types())
+    )
+    allowed_action_types: set[str] = field(
+        default_factory=lambda: set(canonical_action_types())
+    )
     allowed_tools: set[str] = field(
         default_factory=lambda: {
             "set_city_production",
@@ -84,6 +98,49 @@ class RuntimeConfig:
             "end_turn",
         }
     )
+
+    def __post_init__(self) -> None:
+        if (
+            self.max_new_planner_requests_per_turn is not None
+            and self.max_new_planner_requests_per_turn < 0
+        ):
+            raise ValueError("max_new_planner_requests_per_turn must be non-negative")
+        for name in (
+            "max_agent_calls_per_turn",
+            "max_provider_attempts_per_turn",
+            "max_provider_attempts_per_logical_request",
+            "max_abandoned_provider_attempts_per_request",
+            "max_information_rounds_per_request",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.max_turn_seconds <= 0:
+            raise ValueError("max_turn_seconds must be positive")
+        if self.mcp_mutation_timeout_seconds <= 0:
+            raise ValueError("mcp_mutation_timeout_seconds must be positive")
+        if self.mcp_mutation_timeout_seconds >= self.max_turn_seconds:
+            raise ValueError(
+                "mcp_mutation_timeout_seconds must be less than max_turn_seconds"
+            )
+        canonical = set(canonical_action_types())
+        unknown_allowed = self.allowed_action_types - canonical
+        if unknown_allowed:
+            raise ValueError(
+                "allowed_action_types contain non-canonical actions: "
+                f"{sorted(unknown_allowed)}"
+            )
+        if not self.auto_action_types <= self.allowed_action_types:
+            extra = sorted(self.auto_action_types - self.allowed_action_types)
+            raise ValueError(
+                "auto_action_types must be a subset of allowed_action_types; "
+                f"extra={extra}"
+            )
+
+    @property
+    def new_planner_request_limit(self) -> int:
+        if self.max_new_planner_requests_per_turn is not None:
+            return self.max_new_planner_requests_per_turn
+        return self.max_agent_calls_per_turn
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +160,7 @@ class _TickContext:
     started_at: datetime
     started_monotonic: float
     call_count_before: int
+    external_counts_before: dict[str, float | int]
     metrics: TickMetrics
     budget: MutationBudget
     starting_state: RuntimeState = RuntimeState.OBSERVING
@@ -188,6 +246,7 @@ class WorkflowRuntime:
         self.clock = clock
         self.crash_injector = crash_injector
         self._available_tools: set[str] | None = None
+        self._available_tools_epoch: object | None = None
         self._active_observation_id: str | None = None
         services = service_factory(self)
         self.gate = services.gate
@@ -208,7 +267,10 @@ class WorkflowRuntime:
     async def tick(self) -> TickResult:
         with _TickFileLock():
             self.store.prepare_execution_mode(self.config.execution_mode)
-            result = await self._tick_once()
+            result = await asyncio.wait_for(
+                self._tick_once(),
+                timeout=self.config.max_turn_seconds,
+            )
             game_id = self.store.get_meta("last_game_id")
             no_safe_action = (
                 isinstance(result.workflow_tick, dict)
@@ -247,6 +309,7 @@ class WorkflowRuntime:
             started_at=self._now(),
             started_monotonic=self._monotonic(),
             call_count_before=self.game.call_count,
+            external_counts_before=self._external_call_metrics(),
             metrics=TickMetrics(),
             budget=MutationBudget(),
         )
@@ -261,7 +324,9 @@ class WorkflowRuntime:
 
     async def _run_tick(self, ctx: _TickContext) -> TickResult:
         raw = await self._read_snapshot(ctx.metrics, include_units=False)
-        observation = self._normalize_snapshot(raw, ctx.metrics)
+        observation = self._normalize_snapshot(
+            raw, ctx.metrics, observed_at=ctx.started_at
+        )
         snapshot = observation.snapshot
         observation_id = self._observation_id(observation)
         self._active_observation_id = observation_id
@@ -277,9 +342,34 @@ class WorkflowRuntime:
         if not rewind_pending:
             self.store.set_meta("last_game_id", snapshot.game_id)
             self.store.set_meta("last_observed_turn", snapshot.turn)
-        await self._verify_tool_surface()
-
         unresolved = self.store.unresolved_action_attempt(snapshot.game_id)
+        if rewind_pending and unresolved is not None:
+            reason = (
+                "the game turn rewound while an action outcome is unresolved; "
+                "the old timeline cannot be used for verification"
+            )
+            wait = self.store.human_wait_context(snapshot.game_id) or {}
+            if (
+                ctx.starting_state is RuntimeState.AWAITING_HUMAN
+                and wait.get("wait_kind") == "turn_rewind_with_unresolved_attempt"
+                and wait.get("action_attempt_id") == unresolved.action_attempt_id
+            ):
+                return self._held_result(
+                    ctx, snapshot, state=RuntimeState.AWAITING_HUMAN, reason=reason
+                )
+            return self._finish(
+                ctx,
+                snapshot,
+                AwaitingHumanTick,
+                blocking_reason=reason,
+                human_wait_context_override={
+                    "version": "human-wait/v1",
+                    "wait_kind": "turn_rewind_with_unresolved_attempt",
+                    "resume_policy": "explicit_only",
+                    "action_attempt_id": unresolved.action_attempt_id,
+                    "resume_requested": False,
+                },
+            )
         if unresolved is not None:
             unresolved_task = self.store.get_task(snapshot.game_id, unresolved.task_id)
             if (
@@ -288,11 +378,45 @@ class WorkflowRuntime:
                 and snapshot.units is None
             ):
                 raw = await self._read_snapshot(ctx.metrics, include_units=True)
-                observation = self._normalize_snapshot(raw, ctx.metrics)
+                observation = self._normalize_snapshot(
+                    raw, ctx.metrics, observed_at=ctx.started_at
+                )
                 snapshot = observation.snapshot
                 observation_id = self._observation_id(observation)
                 self._active_observation_id = observation_id
                 ctx.observation_ids.append(observation_id)
+            if (
+                getattr(unresolved, "status", None) is AttemptStatus.UNCERTAIN
+                and unresolved.verification_count >= self.config.verification_attempts
+                and ctx.starting_state is RuntimeState.AWAITING_HUMAN
+                and getattr(unresolved, "last_verification_projection_hash", None)
+                == observation.canonical.projection_hash
+            ):
+                return self._held_result(
+                    ctx,
+                    snapshot,
+                    state=RuntimeState.AWAITING_HUMAN,
+                    reason=(
+                        "action verification remains inconclusive; a materially new "
+                        "Observation or explicit reconciliation is required"
+                    ),
+                )
+            if (
+                getattr(unresolved, "last_verification_projection_hash", None)
+                == observation.canonical.projection_hash
+                and getattr(unresolved, "verified_at", None) is not None
+                and self.config.verification_delay_seconds > 0
+                and self._now()
+                < unresolved.verified_at
+                + timedelta(seconds=self.config.verification_delay_seconds)
+            ):
+                self._finalize_metrics(ctx)
+                return TickResult(
+                    turn=snapshot.turn,
+                    metrics=ctx.metrics,
+                    runtime_state=ctx.starting_state.value,
+                )
+            self.store.save_normalized_observation(observation.canonical)
             transition = self.batch_executor.reconcile(
                 observation,
                 unresolved,
@@ -304,9 +428,114 @@ class WorkflowRuntime:
                 snapshot,
                 transition,
             )
+        if rewind_pending:
+            rewind_event = recover_turn_rewind(
+                self.store,
+                snapshot,
+                previous_game_id=previous_game_id,
+                previous_turn=previous_turn,
+                recovered_at=observation.canonical.observed_at,
+            )
+            reason = (
+                "the loaded save predates the active strategic timeline; "
+                "automatic planning and mutation are disabled until strategic "
+                "authority is explicitly reset"
+            )
+            compatibility = TickResult(
+                turn=snapshot.turn,
+                metrics=ctx.metrics,
+                events=[] if rewind_event is None else [rewind_event],
+                paused=True,
+                pause_reason=reason,
+            )
+            return self._finish(
+                ctx,
+                snapshot,
+                AwaitingHumanTick,
+                compatibility=compatibility,
+                blocking_reason=reason,
+                human_wait_context_override={
+                    "version": "human-wait/v1",
+                    "wait_kind": "turn_rewind_requires_strategic_reset",
+                    "resume_policy": "explicit_reset_only",
+                    "previous_turn": previous_turn,
+                    "loaded_turn": snapshot.turn,
+                    "resume_requested": False,
+                },
+            )
+        if ctx.starting_state in {RuntimeState.SYSTEM_ERROR, RuntimeState.PAUSED}:
+            return self._held_result(
+                ctx,
+                snapshot,
+                state=ctx.starting_state,
+                reason=f"runtime is halted in {ctx.starting_state.value}",
+            )
+
+        active_request = self.store.active_planner_request(snapshot.game_id)
+        if (
+            active_request is not None
+            and active_request.status.value == "BACKOFF"
+            and active_request.next_retry_at is not None
+            and active_request.target.kind.value == "STRATEGIC_CONTRACT_CREATION"
+            and self.store.get_active_strategic_contract(snapshot.game_id) is None
+            and (
+                active_request.input_projection.get(
+                    "source_observation_projection_hash"
+                )
+                in {None, observation.canonical.projection_hash}
+            )
+            and active_request.next_retry_at > self._now()
+        ):
+            return self._held_result(
+                ctx,
+                snapshot,
+                state=RuntimeState.PLANNER_BACKOFF,
+                reason=f"planner backoff until {active_request.next_retry_at.isoformat()}",
+            )
+
+        if ctx.starting_state is RuntimeState.AWAITING_APPROVAL:
+            active_graph = self.store.active_turn_action_graph(snapshot.game_id)
+            active_contract = self.store.get_active_strategic_contract(snapshot.game_id)
+            if active_graph is not None:
+                graph, tasks = active_graph
+                awaiting = [
+                    task
+                    for task in tasks
+                    if task.status is TaskStatus.AWAITING_CONFIRMATION
+                ]
+                graph_is_fresh = (
+                    graph.turn_number == snapshot.turn
+                    and graph.source_observation_projection_hash
+                    == observation.canonical.projection_hash
+                    and active_contract is not None
+                    and graph.source_contract_revision == active_contract.revision
+                )
+                if awaiting and graph_is_fresh:
+                    return self._held_result(
+                        ctx,
+                        snapshot,
+                        state=RuntimeState.AWAITING_APPROVAL,
+                        reason="task approval is required",
+                    )
+
+        recover_session = getattr(self.game, "recover_mutation_session", None)
+        if recover_session is not None:
+            await recover_session()
+        await self._verify_tool_surface()
 
         if ctx.starting_state is RuntimeState.AWAITING_HUMAN:
             wait = self.store.human_wait_context(snapshot.game_id) or {}
+            if wait.get("wait_kind") == "turn_rewind_requires_strategic_reset":
+                return self._finish(
+                    ctx,
+                    snapshot,
+                    AwaitingHumanTick,
+                    blocking_reason=(
+                        "the loaded save invalidated the active strategic timeline; "
+                        "start a fresh workflow state or perform an explicit "
+                        "strategic reset before automation resumes"
+                    ),
+                )
             if (
                 wait.get("wait_kind") == "strategic_contract_proposal_ready"
                 and wait.get("resume_policy") == "explicit_only"
@@ -358,7 +587,9 @@ class WorkflowRuntime:
                 )
             if wait.get("requires_unit_details") is True and snapshot.units is None:
                 raw = await self._read_snapshot(ctx.metrics, include_units=True)
-                observation = self._normalize_snapshot(raw, ctx.metrics)
+                observation = self._normalize_snapshot(
+                    raw, ctx.metrics, observed_at=ctx.started_at
+                )
                 snapshot = observation.snapshot
                 observation_id = self._observation_id(observation)
                 self._active_observation_id = observation_id
@@ -380,7 +611,9 @@ class WorkflowRuntime:
         )
         if need_units and snapshot.units is None:
             raw = await self._read_snapshot(ctx.metrics, include_units=True)
-            observation = self._normalize_snapshot(raw, ctx.metrics)
+            observation = self._normalize_snapshot(
+                raw, ctx.metrics, observed_at=ctx.started_at
+            )
             snapshot = observation.snapshot
             observation_id = self._observation_id(observation)
             self._active_observation_id = observation_id
@@ -389,9 +622,10 @@ class WorkflowRuntime:
         projection = await self.strategic_workflow.prepare_projection(
             ctx,
             observation,
-            snapshot_events=tuple(events_from_snapshot(snapshot)),
+            snapshot_events=tuple(events_from_observation(observation.canonical)),
             mode=self.config.execution_mode,
             auto_action_types=self.config.auto_action_types,
+            allowed_action_types=self.config.allowed_action_types,
         )
         if projection.lifecycle_tick is not None:
             return projection.lifecycle_tick
@@ -428,7 +662,9 @@ class WorkflowRuntime:
             and any(task.entity_type in {"unit", "builder"} for task in due_tasks)
         ):
             raw = await self._read_snapshot(ctx.metrics, include_units=True)
-            observation = self._normalize_snapshot(raw, ctx.metrics)
+            observation = self._normalize_snapshot(
+                raw, ctx.metrics, observed_at=ctx.started_at
+            )
             snapshot = observation.snapshot
             observation_id = self._observation_id(observation)
             self._active_observation_id = observation_id
@@ -488,7 +724,11 @@ class WorkflowRuntime:
                 blocking_reason=compat.pause_reason or "human review is required",
             )
         end_turn_suppression = self._end_turn_rejection_suppression(observation)
-        if self._may_end_turn(snapshot, compat):
+        if self._may_end_turn(
+            snapshot,
+            compat,
+            pending_repair_scopes=projection.pending_repair_scopes,
+        ):
             if end_turn_suppression is not None:
                 return self._finish(
                     ctx,
@@ -544,12 +784,11 @@ class WorkflowRuntime:
         task_status: TaskStatus | None = None,
         task_error: str | None = None,
         runtime_active_attempt_id: str | None = None,
+        human_wait_context_override: Mapping[str, Any] | None = None,
         **fields: Any,
     ) -> TickResult:
         completed = self._now()
-        ctx.metrics.mcp_call_count = self.game.call_count - ctx.call_count_before
-        ctx.metrics.mutation_count = ctx.budget.used
-        ctx.metrics.total_seconds = self._monotonic() - ctx.started_monotonic
+        self._finalize_metrics(ctx)
         common = {
             "tick_id": ctx.tick_id,
             "game_session_id": snapshot.game_id,
@@ -561,7 +800,11 @@ class WorkflowRuntime:
             "metrics": ctx.metrics.model_dump(mode="json"),
         }
         tick = validate_workflow_tick(tick_type(**common, **fields))
-        human_wait_context = None
+        human_wait_context = (
+            None
+            if human_wait_context_override is None
+            else dict(human_wait_context_override)
+        )
         if isinstance(
             tick,
             (
@@ -570,7 +813,11 @@ class WorkflowRuntime:
                 StrategicRequestWaitErrorTick,
             ),
         ):
-            existing_wait = self.store.human_wait_context(snapshot.game_id)
+            existing_wait = (
+                None
+                if human_wait_context is not None
+                else self.store.human_wait_context(snapshot.game_id)
+            )
             if existing_wait is not None and (
                 (
                     existing_wait.get("wait_kind")
@@ -580,7 +827,7 @@ class WorkflowRuntime:
                 or existing_wait.get("wait_kind") == "strategic_request_terminated"
             ):
                 human_wait_context = dict(existing_wait)
-            else:
+            elif human_wait_context is None:
                 human_wait_context = self._human_wait_context(snapshot)
             human_wait_context["blocking_reason"] = tick.blocking_reason
 
@@ -654,6 +901,7 @@ class WorkflowRuntime:
             tick,
             (
                 AwaitingHumanTick,
+                AwaitingApprovalTick,
                 StrategicProposalWaitErrorTick,
                 StrategicRequestWaitErrorTick,
                 SystemErrorTick,
@@ -662,6 +910,23 @@ class WorkflowRuntime:
             result.paused = True
             result.pause_reason = tick.blocking_reason
         return result
+
+    def _held_result(
+        self,
+        ctx: _TickContext,
+        snapshot: RuntimeSnapshot,
+        *,
+        state: RuntimeState,
+        reason: str,
+    ) -> TickResult:
+        self._finalize_metrics(ctx)
+        return TickResult(
+            turn=snapshot.turn,
+            paused=True,
+            pause_reason=reason,
+            metrics=ctx.metrics,
+            runtime_state=state.value,
+        )
 
     def _finish_execution_transition(
         self,
@@ -802,12 +1067,15 @@ class WorkflowRuntime:
             return float(self.clock.monotonic())
         return time.perf_counter()
 
-    @staticmethod
     def _normalize_snapshot(
-        snapshot: RuntimeSnapshot, metrics: TickMetrics
+        self,
+        snapshot: RuntimeSnapshot,
+        metrics: TickMetrics,
+        *,
+        observed_at: datetime,
     ) -> NormalizedRuntimeObservation:
         started = time.perf_counter()
-        observation = normalize_runtime_snapshot(snapshot)
+        observation = normalize_runtime_snapshot(snapshot, observed_at=observed_at)
         metrics.normalization_seconds += time.perf_counter() - started
         return observation
 
@@ -820,29 +1088,84 @@ class WorkflowRuntime:
         return snapshot
 
     async def _verify_tool_surface(self) -> None:
-        if self._available_tools is not None:
+        epoch = getattr(self.game, "tool_surface_epoch", None)
+        if self._available_tools is not None and epoch == self._available_tools_epoch:
             return
         self._available_tools = await self.game.list_tools()
+        self._available_tools_epoch = epoch
         fallback_queries = {
             "get_notifications",
             "get_pending_diplomacy",
             "get_pending_trades",
         }
-        missing = (self.config.allowed_tools | fallback_queries) - self._available_tools
+        missing = fallback_queries - self._available_tools
         if missing:
             raise RuntimeError(f"civ6-mcp is missing required tools: {sorted(missing)}")
+
+    def _finalize_metrics(self, ctx: _TickContext) -> None:
+        external_counts = self._external_call_metrics()
+        for name in (
+            "state_api_call_count",
+            "mcp_list_tools_count",
+            "mcp_read_query_count",
+            "mcp_mutation_count",
+            "mcp_timeout_count",
+            "mcp_reconnect_count",
+        ):
+            setattr(
+                ctx.metrics,
+                name,
+                int(external_counts.get(name, 0))
+                - int(ctx.external_counts_before.get(name, 0)),
+            )
+        ctx.metrics.mcp_mutation_seconds = max(
+            0.0,
+            float(external_counts.get("mcp_mutation_seconds", 0.0))
+            - float(ctx.external_counts_before.get("mcp_mutation_seconds", 0.0)),
+        )
+        ctx.metrics.mcp_call_count = (
+            ctx.metrics.mcp_list_tools_count
+            + ctx.metrics.mcp_read_query_count
+            + ctx.metrics.mcp_mutation_count
+        )
+        if not external_counts:
+            ctx.metrics.mcp_call_count = self.game.call_count - ctx.call_count_before
+        ctx.metrics.mutation_count = ctx.budget.used
+        ctx.metrics.total_seconds = self._monotonic() - ctx.started_monotonic
+
+    def _external_call_metrics(self) -> dict[str, float | int]:
+        metrics = getattr(self.game, "call_metrics", None)
+        if not isinstance(metrics, dict):
+            return {}
+        return dict(metrics)
 
     def _uncertain_tasks(self, game_id: str) -> list[TurnActionExecution]:
         return self.store.list_tasks(game_id, statuses=[TaskStatus.UNCERTAIN])
 
-    def _may_end_turn(self, snapshot: RuntimeSnapshot, result: TickResult) -> bool:
+    def _may_end_turn(
+        self,
+        snapshot: RuntimeSnapshot,
+        result: TickResult,
+        *,
+        pending_repair_scopes: frozenset[str] = frozenset(),
+    ) -> bool:
         if self.config.execution_mode is ExecutionMode.READONLY:
             return False
         if not self.config.auto_end_turn or result.paused or result.agent_invoked:
             return False
         if self.store.unresolved_action_attempt(snapshot.game_id) is not None:
             return False
-        if snapshot.blockers or any(event.blocking for event in result.events):
+        if self.store.get_active_strategic_contract(snapshot.game_id) is None:
+            return False
+        if pending_repair_scopes:
+            return False
+        if self.store.active_planner_request(snapshot.game_id) is not None:
+            return False
+        if (
+            not snapshot.blockers_loaded
+            or snapshot.blockers
+            or any(event.blocking for event in result.events)
+        ):
             return False
         blocking = [
             TaskStatus.READY,
@@ -973,9 +1296,15 @@ class WorkflowRuntime:
         if self.store.get_meta(self._end_turn_retry_key(attempt), False):
             return None
 
-        arguments = attempt.normalized_arguments
-        rejected_hash = arguments.get("authorization_projection_hash")
-        projection_version = arguments.get("authorization_projection_version")
+        authorization = attempt.authorization_evidence
+        rejected_hash = authorization.get("projection_hash")
+        projection_version = authorization.get("projection_version")
+        if not authorization:
+            # Replay compatibility for attempts written before authorization
+            # evidence was separated from the transmitted tool arguments.
+            arguments = attempt.normalized_arguments
+            rejected_hash = arguments.get("authorization_projection_hash")
+            projection_version = arguments.get("authorization_projection_version")
         if (
             projection_version != END_TURN_AUTHORIZATION_PROJECTION_VERSION
             or not isinstance(rejected_hash, str)

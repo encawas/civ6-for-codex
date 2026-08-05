@@ -66,31 +66,36 @@ class TurnActionNode(DomainModel):
             raise ValueError("TurnActionNode dependencies must be unique and sorted")
         if self.node_id in self.dependency_node_ids:
             raise ValueError("TurnActionNode cannot depend on itself")
-        expected_entity_type = {
-            "city_set_production": "city",
-            "set_research": "research",
-            "set_civic": "civic",
-            "unit_move": "unit",
-            "unit_found_city": "unit",
-            "tactical_unit_move": "unit",
-            "tactical_unit_fortify": "unit",
-            "tactical_unit_skip": "unit",
-        }.get(self.action_type)
-        if expected_entity_type is None or self.entity_type != expected_entity_type:
-            raise ValueError(
-                "TurnActionNode action and entity type are outside migrated scopes"
+        from ..actions import ActionValidationError, resolve_action_spec
+
+        try:
+            resolve_action_spec(self.action_type).validate_node_policy(
+                entity_type=self.entity_type,
+                risk=self.risk,
+                requires_confirmation=self.requires_confirmation,
             )
+        except ActionValidationError as exc:
+            raise ValueError(str(exc)) from exc
         expected = build_turn_action_node_id(
             game_session_id=self.game_session_id,
             turn_number=self.turn_number,
             source_observation_id=self.source_observation_id,
+            source_observation_projection_hash=self.source_observation_projection_hash,
             source_contract_id=self.source_contract_id,
             source_contract_revision=self.source_contract_revision,
             source_mission_id=self.source_mission_id,
             source_mission_revision=self.source_mission_revision,
             action_type=self.action_type,
+            entity_type=self.entity_type,
             entity_id=self.entity_id,
             arguments=self.arguments,
+            preconditions=self.preconditions,
+            postconditions=self.postconditions,
+            invalidators=self.invalidators,
+            risk=self.risk,
+            requires_confirmation=self.requires_confirmation,
+            dependency_node_ids=self.dependency_node_ids,
+            reason=self.reason,
             target_turn=self.target_turn,
         )
         if self.node_id != expected:

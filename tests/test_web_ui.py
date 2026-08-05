@@ -5,11 +5,15 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError
+from types import SimpleNamespace
 from urllib.request import Request, urlopen
 
 import pytest
 
-from civ6_workflow.actions import resolve_action_spec
+from civ6_workflow.actions import (
+    build_action_attempt_idempotency_key,
+    resolve_action_spec,
+)
 from civ6_workflow.config import AppConfig
 from civ6_workflow.domain import (
     ActionAttempt,
@@ -33,6 +37,7 @@ from civ6_workflow.models import (
     TaskStatus,
 )
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
+from civ6_workflow.web_cli import _RuntimeWorker
 from civ6_workflow.store import WorkflowStore
 from civ6_workflow.turn_compiler import TurnCompiler
 from civ6_workflow.web_ui import ControlPanelHTTPServer, ControlPanelState
@@ -365,19 +370,20 @@ def test_retry_endpoint_only_requeues_proven_not_sent_attempts(tmp_path: Path):
     assert panel.store.approve_task("game-1", task_id)
     task = panel.store.get_task("game-1", task_id)
     assert task is not None
+    normalized_arguments = resolve_action_spec(task.action_type).build_arguments(task)
     prepared = ActionAttempt(
         action_attempt_id="attempt-ui-retry",
         task_id=task_id,
         attempt_number=1,
         request_id="request-ui-retry",
-        idempotency_key="task-ui-retry",
+        idempotency_key=build_action_attempt_idempotency_key(
+            task, normalized_arguments
+        ),
         prepared_from_observation_id=task.created_from_observation_id,
         prepared_at=datetime.now(UTC),
         status=AttemptStatus.PREPARED,
         retry_classification=RetryClassification.SAFE_IF_PROVEN_NOT_SENT,
-        normalized_arguments=resolve_action_spec(task.action_type).build_arguments(
-            task
-        ),
+        normalized_arguments=normalized_arguments,
         postconditions=tuple(task.postconditions),
         game_session_id="game-1",
         action_type="city_set_production",
@@ -490,3 +496,34 @@ def test_http_routes_strategic_proposal_decisions(
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_control_panel_runtime_worker_reuses_one_live_runtime():
+    lifecycle = {"opens": 0, "closes": 0, "ticks": 0}
+
+    class _Runtime:
+        async def tick(self):
+            lifecycle["ticks"] += 1
+            return {"turn": lifecycle["ticks"]}
+
+    class _Context:
+        async def __aenter__(self):
+            lifecycle["opens"] += 1
+            return SimpleNamespace(runtime=_Runtime())
+
+        async def __aexit__(self, exc_type, exc, tb):
+            lifecycle["closes"] += 1
+
+    worker = _RuntimeWorker(
+        _Context,
+        startup_timeout_seconds=1,
+        tick_timeout_seconds=1,
+    )
+    try:
+        assert worker.run_tick() == {"turn": 1}
+        assert worker.run_tick() == {"turn": 2}
+        assert lifecycle == {"opens": 1, "closes": 0, "ticks": 2}
+    finally:
+        worker.close()
+
+    assert lifecycle == {"opens": 1, "closes": 1, "ticks": 2}

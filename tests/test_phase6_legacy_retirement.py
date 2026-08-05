@@ -184,12 +184,22 @@ def test_v13_terminal_legacy_state_is_hash_archived_and_tables_are_dropped(tmp_p
     archive = exported["tables"]["legacy_workflow_archive"]
 
     assert LEGACY_TABLES.isdisjoint(_table_names(path))
-    assert len(archive) == 1
-    assert archive[0]["source_table"] == "workflow_tasks"
-    assert json.loads(archive[0]["record_json"])["task_id"] == "legacy-task"
+    assert len(archive) == 2
+    task_archive = next(
+        row for row in archive if row["source_table"] == "workflow_tasks"
+    )
+    disposition_archive = next(
+        row
+        for row in archive
+        if row["source_table"] == WorkflowStore._PHASE6_DISPOSITION_SOURCE
+    )
+    assert json.loads(task_archive["record_json"])["task_id"] == "legacy-task"
+    disposition = json.loads(disposition_archive["record_json"])
+    assert disposition["disposition"] == "EXPLICIT_ABANDONMENT"
+    assert disposition["source_tables"] == ["workflow_tasks"]
     assert (
-        archive[0]["record_hash"]
-        == hashlib.sha256(archive[0]["record_json"].encode("utf-8")).hexdigest()
+        task_archive["record_hash"]
+        == hashlib.sha256(task_archive["record_json"].encode("utf-8")).hexdigest()
     )
 
     restored = WorkflowStore(tmp_path / "restored.sqlite3")
@@ -285,8 +295,11 @@ def test_v13_replay_is_migrated_before_canonical_import(tmp_path):
     target.import_replay_state(copy.deepcopy(state))
     archive = target.export_replay_state("game-1")["tables"]["legacy_workflow_archive"]
 
-    assert len(archive) == 1
-    assert archive[0]["source_table"] == "workflow_tasks"
+    assert len(archive) == 2
+    assert {row["source_table"] for row in archive} == {
+        "workflow_tasks",
+        WorkflowStore._PHASE6_DISPOSITION_SOURCE,
+    }
     canonical = target.export_replay_state("game-1")
     restored = WorkflowStore(tmp_path / "restored-v14.sqlite3")
     restored.import_replay_state(copy.deepcopy(canonical))
@@ -306,6 +319,43 @@ def test_v13_replay_preflight_failure_preserves_target_state(tmp_path):
 
     assert target.get_meta("last_game_id") == "game-1"
     assert target.get_meta("last_observed_turn") == 99
+    assert (
+        target.export_replay_state("game-1")["tables"]["legacy_workflow_archive"] == []
+    )
+
+
+def test_v14_startup_requires_legacy_authority_disposition(tmp_path):
+    path = tmp_path / "missing-disposition.sqlite3"
+    _seed_v13_task(path, TaskStatus.DONE)
+    WorkflowStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "DELETE FROM legacy_workflow_archive WHERE source_table=?",
+            (WorkflowStore._PHASE6_DISPOSITION_SOURCE,),
+        )
+
+    with pytest.raises(ValueError, match="one disposition per game"):
+        WorkflowStore(path)
+
+
+def test_v14_replay_missing_disposition_fails_before_target_delete(tmp_path):
+    source_path = tmp_path / "source-v13.sqlite3"
+    _seed_v13_task(source_path, TaskStatus.DONE)
+    source = WorkflowStore(source_path)
+    replay = source.export_replay_state("game-1")
+    replay["tables"]["legacy_workflow_archive"] = [
+        row
+        for row in replay["tables"]["legacy_workflow_archive"]
+        if row["source_table"] != WorkflowStore._PHASE6_DISPOSITION_SOURCE
+    ]
+    target = WorkflowStore(tmp_path / "disposition-target.sqlite3")
+    target.set_meta("last_game_id", "game-1")
+    target.set_meta("last_observed_turn", 77)
+
+    with pytest.raises(ValueError, match="one disposition per game"):
+        target.import_replay_state(replay)
+
+    assert target.get_meta("last_observed_turn") == 77
     assert (
         target.export_replay_state("game-1")["tables"]["legacy_workflow_archive"] == []
     )

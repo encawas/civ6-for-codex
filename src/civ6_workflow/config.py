@@ -6,7 +6,6 @@ from pathlib import Path
 
 from pydantic import Field, field_validator
 
-from .actions import ACTION_REGISTRY
 from .codex_planner import CodexPlannerConfig
 from .runtime import RuntimeConfig
 from .mcp_port import McpServerConfig
@@ -20,7 +19,20 @@ class RuntimeSection(StrictModel):
     auto_end_turn: bool = False
     poll_interval_seconds: float = Field(default=1.0, gt=0)
     max_agent_calls_per_turn: int = Field(default=1, ge=0, le=2)
+    max_new_planner_requests_per_turn: int | None = Field(default=None, ge=0, le=2)
+    max_provider_attempts_per_turn: int = Field(default=6, ge=0, le=100)
+    max_provider_attempts_per_logical_request: int = Field(default=6, ge=0, le=100)
+    max_abandoned_provider_attempts_per_request: int = Field(default=1, ge=0, le=20)
+    max_information_rounds_per_request: int = Field(default=1, ge=0, le=10)
+    verification_attempts: int = Field(default=3, ge=1, le=20)
+    verification_delay_seconds: float = Field(default=0.25, ge=0, le=60)
     max_turn_seconds: int = Field(default=300, ge=10)
+    mcp_mutation_timeout_seconds: float = Field(default=30.0, gt=0)
+
+    sidecar_startup_timeout_seconds: float = Field(default=30.0, gt=0)
+    sidecar_shutdown_timeout_seconds: float = Field(default=10.0, gt=0)
+    mcp_list_tools_timeout_seconds: float = Field(default=10.0, gt=0)
+    mcp_read_query_timeout_seconds: float = Field(default=30.0, gt=0)
 
 
 class Civ6McpSection(StrictModel):
@@ -98,7 +110,7 @@ class AppConfig(StrictModel):
 
     def runtime_config(self) -> RuntimeConfig:
         auto_actions = set(self.safety.auto_action_types)
-        allowed_actions = set(self.safety.allowed_action_types) or set(ACTION_REGISTRY)
+        allowed_actions = set(self.safety.allowed_action_types)
         if not auto_actions <= allowed_actions:
             extra = sorted(auto_actions - allowed_actions)
             raise ValueError(
@@ -107,9 +119,26 @@ class AppConfig(StrictModel):
             )
         allowed_tools = set(self.safety.allowed_tools)
         return RuntimeConfig(
+            max_new_planner_requests_per_turn=(
+                self.runtime.max_new_planner_requests_per_turn
+            ),
             execution_mode=self.runtime.execution_mode,
             auto_end_turn=self.runtime.auto_end_turn,
             max_agent_calls_per_turn=self.runtime.max_agent_calls_per_turn,
+            max_provider_attempts_per_turn=self.runtime.max_provider_attempts_per_turn,
+            max_provider_attempts_per_logical_request=(
+                self.runtime.max_provider_attempts_per_logical_request
+            ),
+            max_abandoned_provider_attempts_per_request=(
+                self.runtime.max_abandoned_provider_attempts_per_request
+            ),
+            max_information_rounds_per_request=(
+                self.runtime.max_information_rounds_per_request
+            ),
+            verification_attempts=self.runtime.verification_attempts,
+            verification_delay_seconds=self.runtime.verification_delay_seconds,
+            max_turn_seconds=self.runtime.max_turn_seconds,
+            mcp_mutation_timeout_seconds=self.runtime.mcp_mutation_timeout_seconds,
             repeated_failure_threshold=self.gate.repeated_failure_threshold,
             default_cooldown_turns=self.gate.default_cooldown_turns,
             auto_action_types=auto_actions,
@@ -122,6 +151,11 @@ class AppConfig(StrictModel):
             command=self.civ6_mcp.command,
             args=self.civ6_mcp.args,
             env=self.civ6_mcp.env,
+            mutation_timeout_seconds=self.runtime.mcp_mutation_timeout_seconds,
+            startup_timeout_seconds=self.runtime.sidecar_startup_timeout_seconds,
+            shutdown_timeout_seconds=self.runtime.sidecar_shutdown_timeout_seconds,
+            list_tools_timeout_seconds=self.runtime.mcp_list_tools_timeout_seconds,
+            read_query_timeout_seconds=self.runtime.mcp_read_query_timeout_seconds,
         )
 
     def state_api_config(self) -> StateApiConfig:
@@ -131,7 +165,9 @@ class AppConfig(StrictModel):
             startup_retry_seconds=self.state_api.startup_retry_seconds,
         )
 
-    def codex_config(self, base_directory: str | Path | None = None) -> CodexPlannerConfig:
+    def codex_config(
+        self, base_directory: str | Path | None = None
+    ) -> CodexPlannerConfig:
         state_directory = Path(self.codex.state_directory).expanduser()
         if not state_directory.is_absolute() and base_directory is not None:
             state_directory = Path(base_directory) / state_directory
@@ -175,8 +211,8 @@ def load_config(path: str | Path) -> AppConfig:
     with config_path.open("rb") as handle:
         raw = tomllib.load(handle)
     config = AppConfig.model_validate(raw)
-    if not config.safety.auto_action_types:
-        raise ValueError("safety.auto_action_types must not be empty")
+    if not config.safety.allowed_action_types:
+        raise ValueError("safety.allowed_action_types must not be empty")
     if not config.safety.allowed_tools:
         raise ValueError("safety.allowed_tools must not be empty")
     config.runtime_config()  # validate cross-field safety invariants eagerly

@@ -10,8 +10,11 @@ from datetime import timedelta
 from typing import Any, Callable
 from uuid import uuid4
 
+from .actions import action_types_for_scope
 from .domain.base import thaw_json
 from .domain import (
+    ActionAttempt,
+    AttemptStatus,
     AwaitingHumanTick,
     InformationCollectedTick,
     InformationRequestedTick,
@@ -54,10 +57,16 @@ from .workflow_protocol import (
     StrategicResearchProposalResponse,
     canonical_mission_graph_patch_response_payload,
     canonical_strategic_research_proposal_response_payload,
-    validate_information_request,
+    information_tool_argument_contracts,
+    materialize_information_requests,
 )
-from .ports import GamePort, Planner, StaleStrategicContractBaseError, WorkflowStorePort
-from .runtime_errors import InjectedCrashBoundary
+from .ports import (
+    ReadOnlyGameQueryPort,
+    Planner,
+    StaleStrategicContractBaseError,
+    WorkflowStorePort,
+)
+from .runtime_errors import InjectedCrashBoundary, PlannerProviderBudgetExceeded
 
 
 PLANNER_CALL_POLICY_REVISION = "planner-call-policy/v1"
@@ -68,12 +77,49 @@ PLANNER_REQUEST_POLICY_REVISION = (
 _TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 
 
+def _finalize_tick_metrics(runtime: "PlannerLifecycleRuntime", ctx: Any) -> None:
+    metrics = getattr(runtime.game, "call_metrics", None)
+    external_counts = dict(metrics) if isinstance(metrics, dict) else {}
+    for name in (
+        "state_api_call_count",
+        "mcp_list_tools_count",
+        "mcp_read_query_count",
+        "mcp_mutation_count",
+        "mcp_timeout_count",
+        "mcp_reconnect_count",
+    ):
+        setattr(
+            ctx.metrics,
+            name,
+            int(external_counts.get(name, 0))
+            - int(ctx.external_counts_before.get(name, 0)),
+        )
+    ctx.metrics.mcp_mutation_seconds = max(
+        0.0,
+        float(external_counts.get("mcp_mutation_seconds", 0.0))
+        - float(ctx.external_counts_before.get("mcp_mutation_seconds", 0.0)),
+    )
+    ctx.metrics.mcp_call_count = (
+        ctx.metrics.mcp_list_tools_count
+        + ctx.metrics.mcp_read_query_count
+        + ctx.metrics.mcp_mutation_count
+    )
+    if not external_counts:
+        ctx.metrics.mcp_call_count = runtime.game.call_count - ctx.call_count_before
+    ctx.metrics.mutation_count = ctx.budget.used
+    ctx.metrics.total_seconds = runtime._monotonic() - ctx.started_monotonic
+
+
+class StaleStrategicObservationError(ValueError):
+    pass
+
+
 @dataclass(slots=True)
 class PlannerLifecycleRuntime:
     """Narrow runtime services used by the planner application service."""
 
     store: WorkflowStorePort
-    game: GamePort
+    game: ReadOnlyGameQueryPort
     planner: Planner
     config: Any
     conditions: Any
@@ -83,6 +129,7 @@ class PlannerLifecycleRuntime:
     checkpoint: Callable[[str], None]
     observation_id: Callable[[], str | None]
     human_wait_context: Callable[[Any], dict[str, Any]]
+    available_tools: Callable[[], set[str]]
 
     @property
     def _active_observation_id(self) -> str | None:
@@ -100,12 +147,84 @@ class PlannerLifecycleRuntime:
     def _human_wait_context(self, snapshot) -> dict[str, Any]:
         return self.human_wait_context(snapshot)
 
+    def _available_tools(self) -> set[str]:
+        return set(self.available_tools())
+
 
 class PlannerLifecycleCoordinator:
     """Advance durable planning state without owning the workflow Tick loop."""
 
     def __init__(self, runtime: PlannerLifecycleRuntime):
         self.runtime = runtime
+
+    def _accept_verified_action_baseline(
+        self,
+        current,
+        baseline,
+        state_delta,
+    ) -> bool:
+        """Accept only the closed, verified effect of one settler move.
+
+        Other successful actions complete or revise their Mission and are handled by
+        the ordinary active-Mission impact filter. This narrow exception keeps a
+        multi-turn settler Mission alive without swallowing unrelated game changes.
+        """
+
+        if not current.completeness.supports_scope("settler"):
+            return False
+        candidates: list[ActionAttempt] = []
+        for attempt in self.runtime.store.list_action_attempts(
+            current.game_session_id
+        ):
+            if (
+                attempt.status is not AttemptStatus.SUCCEEDED
+                or attempt.action_type != "unit_move"
+                or attempt.verified_at is None
+                or attempt.prepared_at < baseline.observed_at
+                or attempt.last_verification_projection_hash
+                != current.projection_hash
+            ):
+                continue
+            arguments = thaw_json(attempt.normalized_arguments)
+            unit_id = str(arguments.get("unit_id", ""))
+            target_x = arguments.get("target_x")
+            target_y = arguments.get("target_y")
+            expected_path = f"units.{unit_id}"
+            if (
+                not unit_id
+                or type(target_x) is not int
+                or type(target_y) is not int
+                or any(
+                    change.scope != "settler"
+                    or change.field_path != expected_path
+                    for change in state_delta.changes
+                )
+            ):
+                continue
+            resulting = thaw_json(state_delta.changes[0].after)
+            if (
+                not isinstance(resulting, dict)
+                or resulting.get("x") != target_x
+                or resulting.get("y") != target_y
+            ):
+                continue
+            candidates.append(attempt)
+        if not candidates:
+            return False
+        latest = max(
+            candidates,
+            key=lambda attempt: (attempt.verified_at, attempt.action_attempt_id),
+        )
+        self.runtime.store.accept_observation_baseline(
+            current.observation_id,
+            expected_previous_observation_id=baseline.observation_id,
+            reason=(
+                "accepted verified settler movement effect from "
+                f"{latest.action_attempt_id}"
+            ),
+            accepted_at=self.runtime._now(),
+        )
+        return True
 
     async def advance_mission_repair(self, ctx, observation):
         """Advance active Mission repair before current-turn graph projection."""
@@ -118,6 +237,11 @@ class PlannerLifecycleCoordinator:
             and active_request.target.kind
             is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR
         ):
+            if (
+                active_request.status is PlannerRequestStatus.BACKOFF
+                and self._active_backoff(active_request) is not None
+            ):
+                return None
             compatibility = TickResult(
                 turn=snapshot.turn,
                 metrics=ctx.metrics,
@@ -134,7 +258,14 @@ class PlannerLifecycleCoordinator:
 
         active_contract = runtime.store.get_active_strategic_contract(snapshot.game_id)
         if active_contract is None:
-            return None
+            if (
+                runtime.store.provider_budget_request_count_for_turn(
+                    snapshot.game_id, snapshot.turn
+                )
+                >= runtime.config.new_planner_request_limit
+            ):
+                return None
+            return self._create_initial_contract_request(ctx, observation)
         owned_scopes = set(
             active_contract.authority_scope_set.mission_graph_scopes
         ).intersection(
@@ -156,11 +287,38 @@ class PlannerLifecycleCoordinator:
             detected_at=runtime._now(),
         )
         baseline = runtime.store.get_accepted_observation_baseline(snapshot.game_id)
+        if (
+            baseline is not None
+            and comparison.kind is ObservationComparisonKind.STATE_DELTA
+            and self._accept_verified_action_baseline(
+                current, baseline, comparison.state_delta
+            )
+        ):
+            return None
         if comparison.kind is ObservationComparisonKind.STATE_DELTA:
             assert comparison.state_delta is not None
             affected_mission_ids = MissionImpactAnalyzer().affected_mission_ids(
                 comparison.state_delta,
                 active_contract.mission_graph,
+            )
+            repaired_mission_ids: set[str] = set()
+            deltas_by_id = {
+                delta.state_delta_id: delta
+                for delta in runtime.store.list_state_deltas(snapshot.game_id)
+            }
+            for patch in runtime.store.list_mission_graph_patches(snapshot.game_id):
+                prior_delta = deltas_by_id.get(patch.source_state_delta_id)
+                if (
+                    prior_delta is not None
+                    and prior_delta.baseline_observation_id
+                    == comparison.state_delta.baseline_observation_id
+                    and prior_delta.changes == comparison.state_delta.changes
+                ):
+                    repaired_mission_ids.update(patch.affected_mission_ids)
+            affected_mission_ids = tuple(
+                mission_id
+                for mission_id in affected_mission_ids
+                if mission_id not in repaired_mission_ids
             )
             affected = tuple(
                 mission
@@ -168,17 +326,44 @@ class PlannerLifecycleCoordinator:
                 if mission.mission_id in affected_mission_ids
             )
             affected_scopes = tuple(sorted({mission.scope for mission in affected}))
-            if len(affected_scopes) > 1:
-                raise RuntimeError(
-                    "MissionGraph repair cannot combine independently owned scopes"
-                )
             repair_scope = None if not affected_scopes else affected_scopes[0]
+            scope_missions = tuple(
+                mission for mission in affected if mission.scope == repair_scope
+            )
+            scope_mission_ids = tuple(
+                sorted(mission.mission_id for mission in scope_missions)
+            )
             if (
-                affected_mission_ids
+                scope_mission_ids
                 and repair_scope is not None
                 and repair_scope in owned_scopes
                 and current.completeness.supports_scope(repair_scope)
             ):
+                if (
+                    runtime.store.provider_budget_request_count_for_turn(
+                        snapshot.game_id, snapshot.turn
+                    )
+                    >= runtime.config.new_planner_request_limit
+                ):
+                    reason = (
+                        "Mission repair closure exhausted this turn's "
+                        "PlannerRequest budget; remaining scope "
+                        f"{repair_scope} requires explicit human review"
+                    )
+                    compatibility = TickResult(
+                        turn=snapshot.turn,
+                        metrics=ctx.metrics,
+                        events=[],
+                        paused=True,
+                        pause_reason=reason,
+                    )
+                    return self._finish(
+                        ctx,
+                        snapshot,
+                        AwaitingHumanTick,
+                        compatibility=compatibility,
+                        blocking_reason=reason,
+                    )
                 base_context = {
                     "target_contract_id": active_contract.contract_id,
                     "expected_base_revision": active_contract.revision,
@@ -193,14 +378,16 @@ class PlannerLifecycleCoordinator:
                         comparison.state_delta.current_observation_id
                     ),
                     "current_observation_projection_hash": current.projection_hash,
-                    "affected_mission_ids": list(affected_mission_ids),
+                    "affected_mission_ids": list(scope_mission_ids),
                     "affected_missions": [
-                        mission.model_dump(mode="json") for mission in affected
+                        mission.model_dump(mode="json") for mission in scope_missions
                     ],
+                    "accept_observation_baseline": len(affected_scopes) == 1,
                 }
                 projection = {
                     "strategic_proposal_context": base_context,
                     "mission_repair_context": repair_context,
+                    "source_observation_projection_hash": current.projection_hash,
                     "planner_input_contract_revision": (
                         PLANNER_INPUT_CONTRACT_REVISION
                     ),
@@ -216,6 +403,10 @@ class PlannerLifecycleCoordinator:
                     constraints={
                         "planning_phase": "initial",
                         "allow_information_requests": True,
+                        "information_tool_arguments": information_tool_argument_contracts(
+                            available_tools=runtime._available_tools(),
+                            strategic_scope=repair_scope,
+                        ),
                         "planner_request_target_kind": (
                             PlannerRequestTargetKind.MISSION_GRAPH_REPAIR.value
                         ),
@@ -229,7 +420,7 @@ class PlannerLifecycleCoordinator:
                             "contract_id": active_contract.contract_id,
                             "base_revision": active_contract.revision,
                             "state_delta_id": comparison.state_delta.state_delta_id,
-                            "affected_mission_ids": affected_mission_ids,
+                            "affected_mission_ids": scope_mission_ids,
                         }
                     )[:24]
                 )
@@ -243,7 +434,7 @@ class PlannerLifecycleCoordinator:
                         strategic_contract_id=active_contract.contract_id,
                         base_contract_revision=active_contract.revision,
                         strategic_scope=repair_scope,
-                        affected_mission_ids=affected_mission_ids,
+                        affected_mission_ids=scope_mission_ids,
                     ),
                     input_projection_hash=canonical_json_hash(projection),
                     input_projection_version="mission-repair-input/v1",
@@ -254,18 +445,11 @@ class PlannerLifecycleCoordinator:
                         {"approval": "not-required"}
                     ),
                     allowed_actions_hash=canonical_json_hash(
-                        {
-                            "research": ["set_research"],
-                            "civic": ["set_civic"],
-                            "settler": ["unit_found_city", "unit_move"],
-                            "city_roles": ["city_set_production"],
-                            "diplomacy_trade": [],
-                            "tactical_emergency": [
-                                "tactical_unit_fortify",
-                                "tactical_unit_move",
-                                "tactical_unit_skip",
-                            ],
-                        }[repair_scope]
+                        [
+                            action_type
+                            for action_type in action_types_for_scope(repair_scope)
+                            if action_type in runtime.config.allowed_action_types
+                        ]
                     ),
                     model_settings={"provider": type(runtime.planner).__name__},
                     status=PlannerRequestStatus.PENDING,
@@ -294,6 +478,108 @@ class PlannerLifecycleCoordinator:
             )
         return None
 
+    def _create_initial_contract_request(self, ctx, observation):
+        runtime = self.runtime
+        snapshot = observation.snapshot
+        current = observation.canonical
+        contract_id = build_strategic_contract_id(snapshot.game_id)
+        proposal_context = {
+            "target_contract_id": contract_id,
+            "expected_base_revision": 0,
+            "strategic_scope": "research",
+        }
+        observation_projection = current.model_dump(
+            mode="json",
+            exclude={"raw_observation"},
+        )
+        projection = {
+            "strategic_proposal_context": proposal_context,
+            "normalized_observation": observation_projection,
+            "source_observation_projection_hash": current.projection_hash,
+            "planner_input_contract_revision": PLANNER_INPUT_CONTRACT_REVISION,
+        }
+        request_payload = AgentRequest(
+            turn=snapshot.turn,
+            execution_mode=runtime.config.execution_mode,
+            trigger_events=[],
+            relevant_state={"normalized_observation": observation_projection},
+            constraints={
+                "planning_phase": "initial",
+                "allow_information_requests": True,
+                "information_tool_arguments": information_tool_argument_contracts(
+                    available_tools=runtime._available_tools(),
+                    strategic_scope="research",
+                ),
+                "planner_request_target_kind": (
+                    PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION.value
+                ),
+                "target_contract_id": contract_id,
+                "expected_base_revision": 0,
+                "strategic_scope": "research",
+                "response_schema_version": ("strategic-research-proposal-response/v1"),
+            },
+        )
+        projection_hash = canonical_json_hash(projection)
+        target = PlannerRequestTarget(
+            kind=PlannerRequestTargetKind.STRATEGIC_CONTRACT_CREATION,
+            strategic_contract_id=contract_id,
+            strategic_scope="research",
+        )
+        existing = runtime.store.planner_request_for_input(
+            snapshot.game_id,
+            target.target_key,
+            projection_hash,
+        )
+        if existing is not None:
+            return None
+        request_id = (
+            "strategic_contract_creation_request_"
+            + canonical_json_hash(
+                {
+                    "game_session_id": snapshot.game_id,
+                    "observation_id": current.observation_id,
+                    "projection_hash": projection_hash,
+                }
+            )[:24]
+        )
+        request = PlannerRequest(
+            planner_request_id=request_id,
+            game_session_id=snapshot.game_id,
+            turn_number=snapshot.turn,
+            observation_id=current.observation_id,
+            target=target,
+            input_projection_hash=projection_hash,
+            input_projection_version="strategic-proposal-input/v1",
+            input_projection=projection,
+            request_payload=request_payload.model_dump(mode="json"),
+            policy_revision=PLANNER_REQUEST_POLICY_REVISION,
+            approval_contract_hash=canonical_json_hash(
+                {"approval": "explicit-human-decision"}
+            ),
+            allowed_actions_hash=canonical_json_hash(
+                [
+                    action_type
+                    for action_type in action_types_for_scope("research")
+                    if action_type in runtime.config.allowed_action_types
+                ]
+            ),
+            model_settings={"provider": type(runtime.planner).__name__},
+            status=PlannerRequestStatus.PENDING,
+            created_at=runtime._now(),
+            context_bytes=len(canonical_json(projection).encode("utf-8")),
+        )
+        ctx.metrics.logical_planner_request_count += 1
+        ctx.metrics.planner_context_bytes += request.context_bytes
+        return self._finish(
+            ctx,
+            snapshot,
+            LogicalPlannerRequestCreatedTick,
+            planner_request=request,
+            planner_request_id=request.planner_request_id,
+            request_target_kind=request.target.kind,
+            decision_gap_ids=(),
+        )
+
     async def _advance_active_strategic_request(
         self,
         ctx,
@@ -305,6 +591,15 @@ class PlannerLifecycleCoordinator:
         try:
             proposal_context = self._strategic_proposal_context(
                 active, observation=observation
+            )
+        except StaleStrategicObservationError as exc:
+            return self._supersede_strategic_request(
+                ctx,
+                snapshot,
+                active,
+                compatibility,
+                str(exc),
+                failure_category="stale_planning_input",
             )
         except ValueError as exc:
             return self._supersede_strategic_request(
@@ -388,7 +683,10 @@ class PlannerLifecycleCoordinator:
             InformationRequest.model_validate(payload)
             for payload in pending_round.requests
         ]
-        results = await runtime.information_queries.execute(requests)
+        results = await runtime.information_queries.execute(
+            requests,
+            available_tools=runtime._available_tools(),
+        )
         observation_id = runtime._active_observation_id or ctx.observation_ids[-1]
         results = {
             request_id: {
@@ -400,6 +698,44 @@ class PlannerLifecycleCoordinator:
             }
             for request_id, payload in results.items()
         }
+        if results and all(
+            payload.get("status") == "FAILED" for payload in results.values()
+        ):
+            now = runtime._now()
+            failed = pending_round.model_copy(
+                update={
+                    "status": InformationRoundStatus.FAILED,
+                    "results": results,
+                    "completed_at": now,
+                }
+            )
+            updated_request = logical_request.model_copy(
+                update={
+                    "status": PlannerRequestStatus.REJECTED,
+                    "completed_at": now,
+                    "failure_category": "information_query_failure",
+                    "pending_information_requests": (),
+                    "next_retry_at": None,
+                }
+            )
+            ctx.metrics.information_query_count += len(results)
+            ctx.metrics.information_round_count += 1
+            compatibility.paused = True
+            compatibility.pause_reason = "all focused information queries failed"
+            compatibility.planner_request_id = logical_request.planner_request_id
+            return self._finish(
+                ctx,
+                observation.snapshot,
+                StrategicRequestTerminatedTick,
+                compatibility=compatibility,
+                planner_request=updated_request,
+                information_round=failed,
+                planner_request_id=logical_request.planner_request_id,
+                terminal_status=PlannerRequestStatus.REJECTED,
+                failure_category="information_query_failure",
+                provider_attempt_id=pending_round.source_provider_attempt_id,
+                blocking_reason="all focused information queries failed",
+            )
         ctx.metrics.information_query_count += len(results)
         ctx.metrics.information_round_count += 1
         now = runtime._now()
@@ -496,6 +832,15 @@ class PlannerLifecycleCoordinator:
             for key, value in expected_projection.items()
         ):
             raise ValueError("strategic Proposal input projection is stale")
+        if (
+            observation is not None
+            and projection.get("source_observation_projection_hash") is not None
+            and projection.get("source_observation_projection_hash")
+            != observation.canonical.projection_hash
+        ):
+            raise StaleStrategicObservationError(
+                "strategic PlannerRequest source Observation is stale"
+            )
         if target.kind is PlannerRequestTargetKind.MISSION_GRAPH_REPAIR:
             repair_context = projection.get("mission_repair_context")
             if not isinstance(repair_context, dict):
@@ -523,6 +868,8 @@ class PlannerLifecycleCoordinator:
         logical_request: PlannerRequest,
         compatibility: TickResult,
         reason: str,
+        *,
+        failure_category: str = "stale_strategic_contract_base",
     ) -> TickResult:
         now = self.runtime._now()
         failed_round = None
@@ -554,7 +901,7 @@ class PlannerLifecycleCoordinator:
             update={
                 "status": PlannerRequestStatus.SUPERSEDED,
                 "completed_at": now,
-                "failure_category": "stale_strategic_contract_base",
+                "failure_category": failure_category,
                 "pending_information_requests": (),
                 "next_retry_at": None,
             }
@@ -574,7 +921,7 @@ class PlannerLifecycleCoordinator:
             information_round=failed_round,
             planner_request_id=logical_request.planner_request_id,
             terminal_status=PlannerRequestStatus.SUPERSEDED,
-            failure_category="stale_strategic_contract_base",
+            failure_category=failure_category,
             provider_attempt_id=(
                 None
                 if not existing_attempts
@@ -619,6 +966,10 @@ class PlannerLifecycleCoordinator:
                 ),
             }
         )
+        constraints["information_tool_arguments"] = information_tool_argument_contracts(
+            available_tools=runtime._available_tools(),
+            strategic_scope=logical_request.target.strategic_scope,
+        )
         if logical_request.information_results:
             payload["information_results"] = thaw_json(
                 logical_request.information_results
@@ -627,6 +978,7 @@ class PlannerLifecycleCoordinator:
                 {
                     "planning_phase": "final",
                     "allow_information_requests": False,
+                    "information_tool_arguments": {},
                 }
             )
         payload["constraints"] = constraints
@@ -651,28 +1003,47 @@ class PlannerLifecycleCoordinator:
                 provider_request_id = str(
                     details.get("provider_request_id", provider_request.request_id)
                 )
-                attempt_number = (
-                    len(
-                        runtime.store.list_provider_attempts(
-                            logical_request.planner_request_id
-                        )
-                    )
-                    + 1
+                existing_attempts = runtime.store.list_provider_attempts(
+                    logical_request.planner_request_id
+                )
+                attempt_number = len(existing_attempts) + 1
+                provider_phase_id = f"{logical_request.planner_request_id}:" + (
+                    "information-final"
+                    if logical_request.information_results
+                    else "initial"
                 )
                 started_record = ProviderAttempt(
                     provider_attempt_id=f"provider_{uuid4().hex}",
                     planner_request_id=logical_request.planner_request_id,
                     attempt_number=attempt_number,
                     provider_request_id=provider_request_id,
+                    actual_turn_number=snapshot.turn,
+                    provider_phase_id=provider_phase_id,
                     status=ProviderAttemptStatus.STARTED,
                     started_at=now,
                     diagnostics=details.get("diagnostics", {}),
                 )
                 logical_request = runtime.store.start_provider_attempt(
-                    snapshot.game_id, logical_request, started_record
+                    snapshot.game_id,
+                    logical_request,
+                    started_record,
+                    actual_turn_number=snapshot.turn,
+                    max_attempts_per_turn=runtime.config.max_provider_attempts_per_turn,
+                    max_attempts_per_request=(
+                        runtime.config.max_provider_attempts_per_logical_request
+                    ),
+                    max_abandoned_attempts_per_request=(
+                        runtime.config.max_abandoned_provider_attempts_per_request
+                    ),
                 )
                 active_provider_attempt = started_record
                 provider_count += 1
+                ctx.metrics.provider_http_attempt_count += 1
+                if any(
+                    attempt.provider_phase_id == provider_phase_id
+                    for attempt in existing_attempts
+                ):
+                    ctx.metrics.provider_retry_count += 1
                 runtime._checkpoint("after_provider_attempt_started")
                 return
             if phase == "failed" and active_provider_attempt is not None:
@@ -692,15 +1063,12 @@ class PlannerLifecycleCoordinator:
                 )
                 pending_failed_attempt = failed
                 active_provider_attempt = None
+                ctx.metrics.provider_failure_count += 1
 
         setter = getattr(runtime.planner, "set_provider_attempt_hook", None)
         hook_supported = (
             bool(setter(provider_attempt_hook)) if callable(setter) else False
         )
-        if not hook_supported:
-            await provider_attempt_hook(
-                "started", {"provider_request_id": provider_request.request_id}
-            )
 
         started_monotonic = time.perf_counter()
         response: (
@@ -716,6 +1084,10 @@ class PlannerLifecycleCoordinator:
             else nullcontext()
         )
         try:
+            if not hook_supported:
+                await provider_attempt_hook(
+                    "started", {"provider_request_id": provider_request.request_id}
+                )
             with scope:
                 raw_response = await self._plan_once(provider_request, ctx.metrics)
         except Exception as exc:
@@ -772,6 +1144,10 @@ class PlannerLifecycleCoordinator:
                 }
             )
             provider_attempts = [completed_attempt]
+            if error is None:
+                ctx.metrics.provider_success_count += 1
+            else:
+                ctx.metrics.provider_failure_count += 1
         elif pending_failed_attempt is not None:
             provider_attempts = [pending_failed_attempt]
         ctx.metrics.provider_attempt_count += provider_count
@@ -803,7 +1179,10 @@ class PlannerLifecycleCoordinator:
         assert response is not None
         assert canonical_response_payload is not None
         if response.information_requests:
-            if logical_request.information_round_count >= 1:
+            if (
+                logical_request.information_round_count
+                >= runtime.config.max_information_rounds_per_request
+            ):
                 return self._strategic_contract_failure(
                     ctx,
                     snapshot,
@@ -816,8 +1195,11 @@ class PlannerLifecycleCoordinator:
                     failure_category="information_round_limit_exceeded",
                 )
             try:
-                for information_request in response.information_requests:
-                    validate_information_request(information_request)
+                materialized_requests = materialize_information_requests(
+                    response.information_requests,
+                    planner_request_id=logical_request.planner_request_id,
+                    round_number=logical_request.information_round_count + 1,
+                )
             except Exception as exc:
                 return self._strategic_contract_failure(
                     ctx,
@@ -838,10 +1220,17 @@ class PlannerLifecycleCoordinator:
                     "strategic information response has no successful ProviderAttempt"
                 )
             source_attempt = provider_attempts[-1]
-            round_id = f"info_round_{uuid4().hex}"
+            round_id = (
+                "info_round_"
+                + canonical_json_hash(
+                    {
+                        "planner_request_id": logical_request.planner_request_id,
+                        "round_number": logical_request.information_round_count + 1,
+                    }
+                )[:32]
+            )
             pending = tuple(
-                request.model_dump(mode="json")
-                for request in response.information_requests
+                request.model_dump(mode="json") for request in materialized_requests
             )
             round_record = InformationRound(
                 information_round_id=round_id,
@@ -1132,9 +1521,7 @@ class PlannerLifecycleCoordinator:
                 "failure_category": None,
             }
         )
-        ctx.metrics.mcp_call_count = runtime.game.call_count - ctx.call_count_before
-        ctx.metrics.mutation_count = ctx.budget.used
-        ctx.metrics.total_seconds = runtime._monotonic() - ctx.started_monotonic
+        _finalize_tick_metrics(runtime, ctx)
         tick_completed = runtime._now()
         tick = validate_workflow_tick(
             MissionGraphPatchedTick(
@@ -1156,6 +1543,9 @@ class PlannerLifecycleCoordinator:
                     repair_context["baseline_observation_id"]
                 ),
                 accepted_observation_id=patch.created_from_observation_id,
+                baseline_accepted=bool(
+                    repair_context.get("accept_observation_baseline", True)
+                ),
             )
         )
         runtime.store.record_agent_run(
@@ -1264,7 +1654,9 @@ class PlannerLifecycleCoordinator:
             planner_request_id=logical_request.planner_request_id,
             terminal_status=PlannerRequestStatus.FAILED,
             failure_category=str(failure["category"]),
-            provider_attempt_id=provider_attempts[-1].provider_attempt_id,
+            provider_attempt_id=(
+                provider_attempts[-1].provider_attempt_id if provider_attempts else None
+            ),
             blocking_reason=compatibility.pause_reason,
         )
 
@@ -1324,6 +1716,8 @@ class PlannerLifecycleCoordinator:
         return json.loads(json.dumps(value, default=str))
 
     async def _plan_once(self, request: AgentRequest, metrics) -> Any:
+        metrics.planner_context_bytes += len(request.model_dump_json().encode("utf-8"))
+        metrics.planner_phase_call_count += 1
         metrics.agent_attempt_count += 1
         metrics.agent_call_count = metrics.agent_attempt_count
         response = await self.runtime.planner.plan(request)
@@ -1350,6 +1744,16 @@ class PlannerLifecycleCoordinator:
 
     def _classify_planner_failure(self, exc: Exception) -> dict[str, Any]:
         diagnostics = getattr(self.runtime.planner, "last_diagnostics", None)
+        if isinstance(exc, PlannerProviderBudgetExceeded):
+            return {
+                "category": "provider_budget_exhausted",
+                "transient": False,
+                "provider": "local",
+                "http_status": None,
+                "request_id": None,
+                "retry_count": 0,
+                "final_error": str(exc),
+            }
         if not isinstance(diagnostics, dict):
             diagnostics = {}
         status = diagnostics.get("http_status")
@@ -1369,7 +1773,26 @@ class PlannerLifecycleCoordinator:
                 "temporarily unavailable",
             )
         )
-        if transient:
+        local_category = None
+        if status is None:
+            if any(
+                marker in lowered
+                for marker in ("api key", "credential", "authentication")
+            ):
+                local_category = "local_credential_failure"
+            elif any(
+                marker in lowered
+                for marker in ("executable", "command not found", "backend unavailable")
+            ):
+                local_category = "local_backend_unavailable"
+            elif any(
+                marker in lowered
+                for marker in ("model", "configuration", "not configured")
+            ):
+                local_category = "local_planner_configuration_failure"
+        if local_category is not None:
+            category = local_category
+        elif transient:
             category = "transient_provider_failure"
         elif status in {401, 403}:
             category = "authentication_failure"
@@ -1408,9 +1831,7 @@ class PlannerLifecycleCoordinator:
     ):
         runtime = self.runtime
         completed = runtime._now()
-        ctx.metrics.mcp_call_count = runtime.game.call_count - ctx.call_count_before
-        ctx.metrics.mutation_count = ctx.budget.used
-        ctx.metrics.total_seconds = runtime._monotonic() - ctx.started_monotonic
+        _finalize_tick_metrics(runtime, ctx)
         common = {
             "tick_id": ctx.tick_id,
             "game_session_id": snapshot.game_id,

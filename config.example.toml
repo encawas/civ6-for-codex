@@ -3,9 +3,21 @@ database_path = "state/civ6-workflow.sqlite3"
 execution_mode = "readonly" # readonly | confirm | auto
 auto_end_turn = false
 poll_interval_seconds = 1.0
-max_agent_calls_per_turn = 1
+max_new_planner_requests_per_turn = 1
+# max_agent_calls_per_turn is accepted as a deprecated compatibility alias.
+max_provider_attempts_per_turn = 6
+max_provider_attempts_per_logical_request = 6
+max_abandoned_provider_attempts_per_request = 1
+max_information_rounds_per_request = 1
+verification_attempts = 3
+verification_delay_seconds = 0.25
 max_turn_seconds = 300
+mcp_mutation_timeout_seconds = 30
 
+sidecar_startup_timeout_seconds = 30
+sidecar_shutdown_timeout_seconds = 10
+mcp_list_tools_timeout_seconds = 10
+mcp_read_query_timeout_seconds = 30
 [civ6_mcp]
 command = "civ-mcp"
 args = []
@@ -62,10 +74,7 @@ allowed_action_types = [
   "unit_move",
   # Irreversible and intentionally excluded from auto_action_types.
   "unit_found_city",
-  "builder_improve",
-  "unit_heal",
-  "unit_fortify",
-  "unit_skip",
+  "send_envoy",
 ]
 # Subset allowed to execute without approval, but only when execution_mode="auto".
 # In execution_mode="confirm", every newly proposed task waits for approval.
@@ -73,16 +82,14 @@ auto_action_types = [
   "city_set_production",
   "set_research",
   "set_civic",
+  "send_envoy",
   "unit_move",
-  "builder_improve",
-  "unit_heal",
-  "unit_fortify",
-  "unit_skip",
 ]
 # These upstream MCP tools can be reached by the deterministic action registry.
 allowed_tools = [
   "set_city_production",
   "set_research",
+  "send_envoy",
   "unit_action",
   "end_turn",
 ]

@@ -91,6 +91,13 @@ class NormalizedUnit(DomainModel):
     unit_type: str
     action_state: UnitActionState
     moves_remaining: float | None = None
+    x: int | None = None
+    y: int | None = None
+    health: int | None = None
+    max_health: int | None = None
+    build_charges: int | None = None
+    needs_promotion: bool | None = None
+    valid_improvements: tuple[str, ...] = ()
     values: ImmutableJsonObject
 
 
@@ -165,6 +172,7 @@ class NormalizedObservation(DomainModel):
         min_length=1,
     )
     completeness: ObservationCompleteness = ObservationCompleteness()
+    # Persisted legacy name: this is the Adapter source snapshot, not raw HTTP/MCP.
     raw_observation: ImmutableJsonObject
     cities: tuple[NormalizedCity, ...] = ()
     progression: ProgressionState
@@ -195,18 +203,114 @@ class NormalizedObservation(DomainModel):
         )
 
     @property
+    def semantic_projection(self) -> dict[str, Any]:
+        """Return stable facts used by planning, execution and StateDelta."""
+
+        return {
+            "game_session_id": self.game_session_id,
+            "turn_number": self.turn_number,
+            "normalization_version": self.normalization_version,
+            "source_version": self.source_version,
+            "completeness": self.completeness.model_dump(mode="json"),
+            "cities": [
+                {
+                    "entity_id": city.entity_id.value,
+                    "production": city.production.model_dump(mode="json"),
+                    "owner": city.values.get("owner"),
+                    "x": city.values.get("x"),
+                    "y": city.values.get("y"),
+                    "role": city.values.get("role", city.values.get("city_role")),
+                    "population": city.values.get("population"),
+                }
+                for city in self.cities
+            ],
+            "progression": self.progression.model_dump(mode="json"),
+            "units": (
+                None
+                if self.units is None
+                else [
+                    {
+                        "entity_id": unit.entity_id.value,
+                        "unit_type": unit.unit_type,
+                        "action_state": unit.action_state,
+                        "moves_remaining": unit.moves_remaining,
+                        "x": unit.x,
+                        "y": unit.y,
+                        "health": unit.health,
+                        "max_health": unit.max_health,
+                        "build_charges": unit.build_charges,
+                        "needs_promotion": unit.needs_promotion,
+                        "valid_improvements": unit.valid_improvements,
+                        "owner": unit.values.get("owner"),
+                    }
+                    for unit in self.units
+                ]
+            ),
+            "blockers": [
+                _semantic_blocker_projection(blocker) for blocker in self.blockers
+            ],
+            "unit_summary": self.unit_summary.model_dump(mode="json"),
+        }
+
+    @property
+    def source_snapshot_hash(self) -> str:
+        return _json_hash(thaw_json(self.raw_observation))
+
+    @property
     def projection_hash(self) -> str:
-        projection = self.model_dump(
-            mode="json",
-            exclude={"observation_id", "observed_at", "raw_observation"},
-        )
-        encoded = json.dumps(
-            projection,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return sha256(encoded).hexdigest()
+        """Hash only canonical semantic facts, excluding audit extensions."""
+
+        return _json_hash(self.semantic_projection)
+
+
+def _semantic_blocker_projection(
+    blocker: NormalizedBlocker,
+) -> dict[str, Any]:
+    values = thaw_json(blocker.values)
+    data = values.get("data")
+    rows = data if isinstance(data, list) else [values]
+    entries = [
+        {
+            "identity": row.get("blocker_id")
+            or row.get("offer_id")
+            or row.get("notification_id")
+            or row.get("diplomacy_id")
+            or row.get("request_id")
+            or row.get("deal_id")
+            or row.get("player_id")
+            or row.get("other_player_id"),
+            "status": row.get("status"),
+            "action_required": row.get(
+                "is_action_required",
+                row.get(
+                    "action_required",
+                    row.get("actionRequired", row.get("blocking")),
+                ),
+            ),
+        }
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    return {
+        "source_type": blocker.source_type,
+        "blocker_type": blocker.blocker_type,
+        "entries": sorted(
+            entries,
+            key=lambda row: json.dumps(
+                row, sort_keys=True, separators=(",", ":"), default=str
+            ),
+        ),
+    }
+
+
+def _json_hash(projection: Any) -> str:
+    encoded = json.dumps(
+        projection,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
 
 
 def _freeze_string_map(value: dict[str, str]) -> FrozenDict:
@@ -221,6 +325,8 @@ ImmutableStringMap = Annotated[
 
 
 class Observation(DomainModel):
+    """Revision envelope for persisted entity state, not current game-fact authority."""
+
     observation_id: str
     game_session_id: str
     turn_number: int = Field(ge=0)

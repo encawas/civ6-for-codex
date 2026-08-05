@@ -30,7 +30,12 @@ from civ6_workflow.domain.legacy_plans import (
     PlanLeaseStatus,
 )
 from civ6_workflow.runtime import RuntimeConfig, WorkflowRuntime
-from civ6_workflow.models import ExecutionMode, RuntimeSnapshot
+from civ6_workflow.models import (
+    ActionResult,
+    ExecutionMode,
+    MutationDeliveryStatus,
+    RuntimeSnapshot,
+)
 from civ6_workflow.observation_normalization import normalize_runtime_snapshot
 from civ6_workflow.store import WorkflowStore
 
@@ -134,7 +139,18 @@ def _foundation(store: WorkflowStore) -> StrategicContract:
     )
 
 
-def _mission(contract_id: str, *, handling: str = "human_review") -> Mission:
+def _mission(
+    contract_id: str,
+    *,
+    handling: str = "human_review",
+    envoy_player_id: int | None = None,
+) -> Mission:
+    policy = {
+        "owner": "player-1",
+        "handling": handling,
+    }
+    if envoy_player_id is not None:
+        policy["envoy_player_id"] = envoy_player_id
     return Mission(
         mission_id="mission-diplomacy-trade",
         game_session_id=GAME_ID,
@@ -144,12 +160,7 @@ def _mission(contract_id: str, *, handling: str = "human_review") -> Mission:
         subject=SubjectRef(subject_type="player", subject_id="player-1"),
         slot="player:diplomacy_trade:response",
         objective="Keep diplomacy and trade responses under explicit human control",
-        desired_outcome={
-            "diplomacy_trade": {
-                "owner": "player-1",
-                "handling": handling,
-            }
-        },
+        desired_outcome={"diplomacy_trade": policy},
         status=MissionStatus.ACTIVE,
     )
 
@@ -301,6 +312,178 @@ def test_diplomacy_trade_policy_cannot_select_an_automatic_response(tmp_path):
         )
 
     assert store.export_replay_state(GAME_ID) == before
+
+
+def test_reviewed_envoy_target_compiles_one_verified_never_blind_retry_action(
+    tmp_path,
+):
+    store = WorkflowStore(tmp_path / "envoy.sqlite3")
+    base = _foundation(store)
+    observation = normalize_runtime_snapshot(
+        _snapshot(
+            blockers=[
+                {
+                    "type": "end_turn_blocker",
+                    "blocking_type": "ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN",
+                    "message": "Send an envoy",
+                }
+            ]
+        )
+    ).canonical.model_copy(update={"observation_id": "obs-envoy", "observed_at": NOW})
+    store.save_normalized_observation(observation)
+    contract, _tick = store.activate_diplomacy_trade_authority(
+        game_session_id=GAME_ID,
+        expected_base_revision=base.revision,
+        mission=_mission(base.contract_id, envoy_player_id=8),
+        activation_id="activate-envoy",
+        observation_id=observation.observation_id,
+        turn_number=observation.turn_number,
+        activated_at=NOW + timedelta(minutes=1),
+    )
+
+    from civ6_workflow.turn_compiler import TurnCompiler
+
+    compilation = TurnCompiler().compile_missions(
+        observation,
+        contract,
+        contract.mission_graph.missions,
+        mode=ExecutionMode.AUTO,
+        auto_action_types={"send_envoy"},
+        compiled_at=NOW + timedelta(minutes=2),
+    )
+
+    assert len(compilation.nodes) == 1
+    node = compilation.nodes[0]
+    assert node.action_type == "send_envoy"
+    assert dict(node.arguments) == {"player_id": 8}
+    assert node.requires_confirmation is False
+    assert tuple(map(dict, node.preconditions)) == (
+        {
+            "type": "blocker_kind_present",
+            "blocker_kind": "ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN",
+        },
+    )
+    assert tuple(map(dict, node.postconditions)) == (
+        {
+            "type": "no_blocker_kind",
+            "blocker_kind": "ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN",
+        },
+    )
+
+
+def test_runtime_sends_and_verifies_reviewed_envoy_before_completing_mission(
+    tmp_path,
+):
+    async def scenario():
+        store = WorkflowStore(tmp_path / "envoy-runtime.sqlite3")
+        base = _foundation(store)
+        envoy_snapshot = _snapshot(
+            blockers=[
+                {
+                    "type": "end_turn_blocker",
+                    "blocking_type": "ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN",
+                    "message": "Send an envoy",
+                }
+            ]
+        )
+        observation = normalize_runtime_snapshot(envoy_snapshot).canonical.model_copy(
+            update={"observation_id": "obs-envoy-runtime", "observed_at": NOW}
+        )
+        store.save_normalized_observation(observation)
+        activated, _tick = store.activate_diplomacy_trade_authority(
+            game_session_id=GAME_ID,
+            expected_base_revision=base.revision,
+            mission=_mission(base.contract_id, envoy_player_id=8),
+            activation_id="activate-envoy-runtime",
+            observation_id=observation.observation_id,
+            turn_number=observation.turn_number,
+            activated_at=NOW + timedelta(minutes=1),
+        )
+
+        class EnvoyGame(_Game):
+            def __init__(self):
+                super().__init__(envoy_snapshot)
+                self.executed = []
+
+            async def execute_task(self, task):
+                assert task.action_type == "send_envoy"
+                assert task.arguments == {"player_id": 8}
+                self.executed.append(task.task_id)
+                self.snapshot = self.snapshot.model_copy(update={"blockers": []})
+                return ActionResult(
+                    success=True,
+                    delivery_status=MutationDeliveryStatus.ACKNOWLEDGED,
+                )
+
+            async def list_tools(self):
+                return {
+                    "send_envoy",
+                    "end_turn",
+                    "get_notifications",
+                    "get_pending_diplomacy",
+                    "get_pending_trades",
+                }
+
+        game = EnvoyGame()
+        engine = WorkflowRuntime(
+            service_factory=build_runtime_services,
+            store=store,
+            game=game,
+            planner=_Planner(),
+            config=RuntimeConfig(
+                execution_mode=ExecutionMode.AUTO,
+                auto_end_turn=False,
+                auto_action_types={"send_envoy"},
+                allowed_action_types={"send_envoy"},
+                allowed_tools={"send_envoy", "end_turn"},
+                verification_delay_seconds=0,
+            ),
+        )
+
+        sent = await engine.tick()
+        assert sent.workflow_tick["outcome"] == "MUTATION_SENT", sent.workflow_tick
+        assert len(game.executed) == 1
+        graph, nodes = store.active_turn_action_graph(GAME_ID)
+        attempt = store.latest_attempt_for_task(GAME_ID, nodes[0].task_id)
+        assert attempt is not None
+        assert attempt.retry_classification.value == "NEVER_BLIND_RETRY"
+
+        restarted_store = WorkflowStore(tmp_path / "envoy-runtime.sqlite3")
+        engine = WorkflowRuntime(
+            service_factory=build_runtime_services,
+            store=restarted_store,
+            game=game,
+            planner=_Planner(),
+            config=RuntimeConfig(
+                execution_mode=ExecutionMode.AUTO,
+                auto_end_turn=False,
+                auto_action_types={"send_envoy"},
+                allowed_action_types={"send_envoy"},
+                allowed_tools={"send_envoy", "end_turn"},
+                verification_delay_seconds=0,
+            ),
+        )
+        verified = await engine.tick()
+        assert verified.workflow_tick["outcome"] == "ATTEMPT_RECONCILED"
+        assert len(game.executed) == 1
+        store = restarted_store
+        completed = store.get_active_strategic_contract(GAME_ID)
+        assert completed.revision == activated.revision + 1
+        mission = next(
+            item
+            for item in completed.mission_graph.missions
+            if item.scope == "diplomacy_trade"
+        )
+        assert mission.status is MissionStatus.COMPLETED
+        assert mission.mission_revision == 2
+        assert store.active_turn_action_graph(GAME_ID) is None
+
+        replay = store.export_replay_state(GAME_ID)
+        restored = WorkflowStore(tmp_path / "envoy-runtime-restored.sqlite3")
+        restored.import_replay_state(replay)
+        assert restored.export_replay_state(GAME_ID) == replay
+
+    asyncio.run(scenario())
 
 
 def test_replay_rejects_missing_diplomacy_trade_activation_audit_before_delete(

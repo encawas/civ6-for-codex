@@ -77,13 +77,13 @@ def test_incompatible_observation_requires_rebaseline(update, reason):
     assert result.state_delta is None
 
 
-def test_not_loaded_research_is_unknown_not_deleted():
+def test_not_loaded_research_does_not_hide_other_complete_scope():
     baseline = _observation()
     current = _observation(include_research=False, include_available=False)
 
     result = StateDeltaBuilder().compare(baseline, current)
 
-    assert result.kind is ObservationComparisonKind.REBASELINE_REQUIRED
+    assert result.kind is ObservationComparisonKind.NO_CHANGE
     assert result.state_delta is None
 
 
@@ -242,3 +242,99 @@ def test_mission_graph_patch_rejects_out_of_scope_or_inactive_updates(updates, m
             created_from_observation_id="obs-current",
             created_at=NOW,
         )
+
+
+def test_extension_only_changes_do_not_create_state_delta():
+    baseline = normalize_runtime_snapshot(
+        RuntimeSnapshot(
+            game_id="game-1",
+            turn=10,
+            cities=[{"city_id": 1, "currently_building": "UNIT_SCOUT", "ui": "a"}],
+            units=[
+                {
+                    "unit_id": 7,
+                    "unit_type": "UNIT_WARRIOR",
+                    "moves_remaining": 1,
+                    "animation": "idle",
+                }
+            ],
+        )
+    ).canonical
+    current = normalize_runtime_snapshot(
+        RuntimeSnapshot(
+            game_id="game-1",
+            turn=10,
+            cities=[{"city_id": 1, "currently_building": "UNIT_SCOUT", "ui": "b"}],
+            units=[
+                {
+                    "unit_id": 7,
+                    "unit_type": "UNIT_WARRIOR",
+                    "moves_remaining": 1,
+                    "animation": "walk",
+                }
+            ],
+        )
+    ).canonical
+
+    assert (
+        StateDeltaBuilder().compare(baseline, current).kind
+        is ObservationComparisonKind.NO_CHANGE
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "scope"),
+    [
+        (
+            [],
+            [
+                {
+                    "type": "pending_diplomacy",
+                    "data": [{"request_id": "d1", "status": "PENDING"}],
+                }
+            ],
+            "diplomacy_trade",
+        ),
+        (
+            [
+                {
+                    "type": "end_turn_blocker",
+                    "blocking_type": "ENDTURN_BLOCKING_UNITS",
+                    "status": "PENDING",
+                }
+            ],
+            [],
+            "tactical_emergency",
+        ),
+    ],
+)
+def test_blocker_changes_create_scope_delta(before, after, scope):
+    baseline = normalize_runtime_snapshot(
+        RuntimeSnapshot(game_id="game-1", turn=10, blockers=before)
+    ).canonical
+    current = normalize_runtime_snapshot(
+        RuntimeSnapshot(game_id="game-1", turn=10, blockers=after)
+    ).canonical
+
+    result = StateDeltaBuilder().compare(baseline, current)
+
+    assert result.kind is ObservationComparisonKind.STATE_DELTA
+    assert result.state_delta is not None
+    assert scope in {change.scope for change in result.state_delta.changes}
+
+
+@pytest.mark.parametrize("complete_scope", ["city_roles", "diplomacy_trade"])
+def test_single_complete_scope_can_establish_no_change(complete_scope):
+    baseline = _observation(include_research=False, include_available=False)
+    completeness = baseline.completeness.model_copy(
+        update={name: False for name in type(baseline.completeness).model_fields}
+    )
+    key = "cities" if complete_scope == "city_roles" else "blockers"
+    completeness = completeness.model_copy(update={key: True})
+    baseline = baseline.model_copy(update={"completeness": completeness})
+    current = baseline.model_copy(update={"observation_id": "obs-current"})
+
+    assert (
+        StateDeltaBuilder().compare(baseline, current).kind
+        is ObservationComparisonKind.NO_CHANGE
+    )

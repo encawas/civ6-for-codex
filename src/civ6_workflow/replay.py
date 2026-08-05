@@ -70,6 +70,7 @@ class ReplayEngineSettings(StrictModel):
     max_agent_calls_per_turn: int = Field(ge=0, le=2)
     repeated_failure_threshold: int = Field(ge=1, le=10)
     verification_attempts: int = Field(ge=1, le=20)
+    verification_delay_seconds: float = Field(default=0, ge=0, le=60)
     auto_action_types: list[str]
     allowed_action_types: list[str]
     allowed_tools: list[str]

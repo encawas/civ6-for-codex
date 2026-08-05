@@ -44,9 +44,7 @@ async def _run_tick(config: AppConfig, config_path: Path):
     async with Civ6McpClient(config.mcp_config()) as client:
         async with Civ6StateApi(config.state_api_config()) as state_api:
             engine = _engine(config, config_path, client, state_api)
-            return await asyncio.wait_for(
-                engine.tick(), timeout=config.runtime.max_turn_seconds
-            )
+            return await engine.tick()
 
 
 @app.command()
@@ -182,9 +180,7 @@ def run(
             async with Civ6StateApi(loaded.state_api_config()) as state_api:
                 engine = _engine(loaded, config, client, state_api)
                 while max_ticks is None or count < max_ticks:
-                    result = await asyncio.wait_for(
-                        engine.tick(), timeout=loaded.runtime.max_turn_seconds
-                    )
+                    result = await engine.tick()
                     count += 1
                     console.print(
                         f"turn={result.turn} ended={result.turn_ended} "
@@ -216,6 +212,7 @@ def record(
             max_agent_calls_per_turn=recorded_config.max_agent_calls_per_turn,
             repeated_failure_threshold=recorded_config.repeated_failure_threshold,
             verification_attempts=recorded_config.verification_attempts,
+            verification_delay_seconds=(recorded_config.verification_delay_seconds),
             auto_action_types=sorted(recorded_config.auto_action_types),
             allowed_action_types=sorted(recorded_config.allowed_action_types),
             allowed_tools=sorted(recorded_config.allowed_tools),
@@ -240,9 +237,7 @@ def record(
                     on_first_snapshot=capture_store_state,
                 ).runtime
                 for _ in range(max_ticks):
-                    result = await asyncio.wait_for(
-                        engine.tick(), timeout=loaded.runtime.max_turn_seconds
-                    )
+                    result = await engine.tick()
                     results.append(result.model_dump(mode="json"))
                     if result.paused:
                         break

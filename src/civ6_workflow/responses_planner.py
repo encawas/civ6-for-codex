@@ -14,6 +14,7 @@ from .workflow_protocol import (
     MissionGraphPatchResponse,
     StrategicResearchProposalResponse,
     WorkflowAgentRequest as AgentRequest,
+    planner_response_json_schema_for_request,
     planner_response_model_for_request,
 )
 
@@ -87,7 +88,7 @@ class ResponsesPlanner:
                 "format": {
                     "type": "json_schema",
                     "name": response_name,
-                    "schema": response_model.model_json_schema(),
+                    "schema": planner_response_json_schema_for_request(request),
                     # Pydantic defaults intentionally remain optional in the remote
                     # schema. The returned object is validated strictly and with
                     # extra="forbid" locally before any task is persisted.

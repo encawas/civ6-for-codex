@@ -88,7 +88,7 @@ def test_information_phase_cannot_also_create_tasks():
     info = InformationRequest(
         request_id="info-1",
         event_dedupe_key=event.dedupe_key,
-        query_type="settler_select_site",
+        query_type="get_settle_advisor",
         tool_name="get_settle_advisor",
         arguments={"unit_id": 7},
         purpose="rank sites",

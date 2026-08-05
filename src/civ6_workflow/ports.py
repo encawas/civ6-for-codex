@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from .actions import PreparedAction
 from .domain import (
     Mission,
     MissionGraphPatch,
@@ -214,6 +215,14 @@ class WorkflowStorePort(Protocol):
         source_observation_id: str,
     ) -> list[TurnActionExecution]: ...
 
+    def invalidate_active_turn_action_graph(
+        self,
+        game_id: str,
+        *,
+        expected_contract_revision: int,
+        invalidated_at: datetime,
+    ) -> None: ...
+
     def recover_turn_rewind(
         self, game_id: str, loaded_turn: int, *, recovered_at: datetime
     ) -> None: ...
@@ -271,13 +280,65 @@ class GamePort(Protocol):
 
     async def execute_task(self, task: TurnActionExecution) -> ActionResult: ...
 
+    async def execute_prepared_action(
+        self, prepared: PreparedAction, task: TurnActionExecution
+    ) -> ActionResult: ...
+
     async def end_turn(self, reflections: dict[str, str]) -> ActionResult: ...
+
+    def preflight_mutation(self, tool_name: str) -> None: ...
+
+    async def recover_mutation_session(self) -> bool: ...
 
     async def list_tools(self) -> set[str]: ...
 
     async def query_tool(
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> Any: ...
+
+
+class ReadOnlyGameQueryPort(Protocol):
+    call_count: int
+
+    @property
+    def call_metrics(self) -> dict[str, float | int]: ...
+
+    async def read_snapshot(
+        self, *, include_units: bool = False
+    ) -> RuntimeSnapshot: ...
+
+    async def list_tools(self) -> set[str]: ...
+
+    async def query_tool(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> Any: ...
+
+
+class ReadOnlyGameQueryPortView:
+    """Capability view that does not expose game mutation methods."""
+
+    def __init__(self, delegate: GamePort):
+        self._delegate = delegate
+
+    @property
+    def call_count(self) -> int:
+        return self._delegate.call_count
+
+    @property
+    def call_metrics(self) -> dict[str, float | int]:
+        value = getattr(self._delegate, "call_metrics", None)
+        return dict(value) if isinstance(value, dict) else {}
+
+    async def read_snapshot(self, *, include_units: bool = False) -> RuntimeSnapshot:
+        return await self._delegate.read_snapshot(include_units=include_units)
+
+    async def list_tools(self) -> set[str]:
+        return await self._delegate.list_tools()
+
+    async def query_tool(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> Any:
+        return await self._delegate.query_tool(name, arguments)
 
 
 class Planner(Protocol):
@@ -304,23 +365,53 @@ class MutationBudget:
 class BoundedGamePort:
     """Per-Tick structural guard around every mutating GamePort call."""
 
-    def __init__(self, delegate: GamePort, budget: MutationBudget):
+    def __init__(
+        self,
+        delegate: GamePort,
+        budget: MutationBudget,
+        *,
+        reserved_operation: str | None = None,
+    ):
         self.delegate = delegate
         self.budget = budget
+        self.reserved_operation = reserved_operation
+        self._mutation_called = False
 
     @property
     def call_count(self) -> int:
         return self.delegate.call_count
 
+    def _consume_or_validate_reservation(self, operation: str) -> None:
+        if self._mutation_called:
+            raise MutationBudgetExceeded(
+                "bounded game port already performed its one mutation"
+            )
+        if self.reserved_operation is None:
+            self.budget.consume(operation)
+        elif self.reserved_operation != operation:
+            raise MutationBudgetExceeded(
+                "reserved mutation does not match the requested operation"
+            )
+        self._mutation_called = True
+
     async def read_snapshot(self, *, include_units: bool = False) -> RuntimeSnapshot:
         return await self.delegate.read_snapshot(include_units=include_units)
 
     async def execute_task(self, task: TurnActionExecution) -> ActionResult:
-        self.budget.consume(task.action_type)
+        self._consume_or_validate_reservation(task.action_type)
+        return await self.delegate.execute_task(task)
+
+    async def execute_prepared_action(
+        self, prepared: PreparedAction, task: TurnActionExecution
+    ) -> ActionResult:
+        self._consume_or_validate_reservation(prepared.action_type)
+        execute = getattr(self.delegate, "execute_prepared_action", None)
+        if execute is not None:
+            return await execute(prepared, task)
         return await self.delegate.execute_task(task)
 
     async def end_turn(self, reflections: dict[str, str] | None = None) -> ActionResult:
-        self.budget.consume("end_turn")
+        self._consume_or_validate_reservation("end_turn")
         return await self.delegate.end_turn(reflections or {})
 
     async def list_tools(self) -> set[str]:

@@ -21,6 +21,7 @@ from .domain import (
     tactical_emergency_mission_order,
     thaw_json,
 )
+from .actions import canonical_action_types, resolve_action_spec
 from .models import ExecutionMode, RiskLevel, TurnActionExecution, TaskStatus
 
 
@@ -30,6 +31,54 @@ class TurnCompilation:
     nodes: tuple[TurnActionNode, ...]
     unavailable_target: str | None = None
     unavailable_targets: tuple[tuple[str, str], ...] = ()
+
+
+def _requires_confirmation(
+    action_type: str,
+    *,
+    mode: ExecutionMode,
+    auto_action_types: set[str],
+) -> bool:
+    spec = resolve_action_spec(action_type)
+    return (
+        spec.always_requires_confirmation
+        or mode is not ExecutionMode.AUTO
+        or action_type not in auto_action_types
+    )
+
+
+def _build_node(
+    node_identity: dict[str, object],
+    *,
+    source_observation_projection_hash: str,
+    entity_type: str,
+    preconditions: tuple[dict[str, object], ...],
+    postconditions: tuple[dict[str, object], ...],
+    invalidators: tuple[dict[str, object], ...] = (),
+    risk: RiskLevel,
+    requires_confirmation: bool,
+    dependency_node_ids: tuple[str, ...] = (),
+    reason: str,
+) -> TurnActionNode:
+    complete_identity = {
+        **node_identity,
+        "source_observation_projection_hash": source_observation_projection_hash,
+        "entity_type": entity_type,
+        "preconditions": preconditions,
+        "postconditions": postconditions,
+        "invalidators": invalidators,
+        "risk": risk.value,
+        "requires_confirmation": requires_confirmation,
+        "dependency_node_ids": dependency_node_ids,
+        "reason": reason,
+    }
+    node_id = build_turn_action_node_id(**complete_identity)
+    return TurnActionNode(
+        node_id=node_id,
+        graph_id="pending",
+        idempotency_key=f"turn-action:{node_id}",
+        **complete_identity,
+    )
 
 
 class TurnCompiler:
@@ -81,8 +130,8 @@ class TurnCompiler:
                     isinstance(target, dict)
                     and target.get("x") == plan["order"]["target_x"]
                     and target.get("y") == plan["order"]["target_y"]
-                    and target.get("legal", True) is True
-                    and target.get("reachable", True) is True
+                    and target.get("legal") is True
+                    and target.get("reachable") is True
                     for target in targets
                 ):
                     return (
@@ -119,6 +168,7 @@ class TurnCompiler:
         mode: ExecutionMode,
         auto_action_types: set[str],
         compiled_at: datetime,
+        allowed_action_types: set[str] | None = None,
     ) -> TurnCompilation:
         return self.compile_missions(
             observation,
@@ -127,6 +177,7 @@ class TurnCompiler:
             mode=mode,
             auto_action_types=auto_action_types,
             compiled_at=compiled_at,
+            allowed_action_types=allowed_action_types,
         )
 
     def compile_missions(
@@ -138,7 +189,13 @@ class TurnCompiler:
         mode: ExecutionMode,
         auto_action_types: set[str],
         compiled_at: datetime,
+        allowed_action_types: set[str] | None = None,
     ) -> TurnCompilation:
+        allowed_actions = (
+            set(canonical_action_types())
+            if allowed_action_types is None
+            else set(allowed_action_types)
+        )
         ordered_missions = tuple(sorted(missions, key=lambda item: item.mission_id))
         if len({mission.scope for mission in ordered_missions}) != len(
             ordered_missions
@@ -153,6 +210,7 @@ class TurnCompiler:
                 mission,
                 mode=mode,
                 auto_action_types=auto_action_types,
+                allowed_action_types=allowed_actions,
             )
             if node is not None:
                 provisional_nodes.append(node)
@@ -193,6 +251,7 @@ class TurnCompiler:
         *,
         mode: ExecutionMode,
         auto_action_types: set[str],
+        allowed_action_types: set[str],
     ) -> tuple[TurnActionNode | None, str | None]:
         if mission.scope == "settler":
             return self._compile_settler_node(
@@ -201,6 +260,7 @@ class TurnCompiler:
                 mission,
                 mode=mode,
                 auto_action_types=auto_action_types,
+                allowed_action_types=allowed_action_types,
             )
         if mission.scope == "city_roles":
             return self._compile_city_roles_node(
@@ -209,10 +269,17 @@ class TurnCompiler:
                 mission,
                 mode=mode,
                 auto_action_types=auto_action_types,
+                allowed_action_types=allowed_action_types,
             )
         if mission.scope == "diplomacy_trade":
-            diplomacy_trade_mission_policy(mission)
-            return None, None
+            return self._compile_diplomacy_trade_node(
+                observation,
+                contract,
+                mission,
+                mode=mode,
+                auto_action_types=auto_action_types,
+                allowed_action_types=allowed_action_types,
+            )
         if mission.scope == "tactical_emergency":
             return self._compile_tactical_emergency_node(
                 observation,
@@ -220,6 +287,7 @@ class TurnCompiler:
                 mission,
                 mode=mode,
                 auto_action_types=auto_action_types,
+                allowed_action_types=allowed_action_types,
             )
         action_type = strategic_mission_action(mission)
         desired = thaw_json(mission.desired_outcome)
@@ -259,36 +327,36 @@ class TurnCompiler:
                     "arguments": {"tech_or_civic": target},
                     "target_turn": observation.turn_number,
                 }
-                node_id = build_turn_action_node_id(**node_identity)
-                requires_confirmation = (
-                    mode is not ExecutionMode.AUTO
-                    or action_type not in auto_action_types
+                if action_type not in allowed_action_types:
+                    return None, f"action_not_allowed:{action_type}"
+                preconditions = (
+                    {"type": f"{condition_prefix}_unselected"},
+                    {
+                        "type": f"{condition_prefix}_available",
+                        condition_target_key: target,
+                    },
                 )
-                provisional = TurnActionNode(
-                    node_id=node_id,
-                    graph_id="pending",
+                postconditions = (
+                    {
+                        "type": f"{condition_prefix}_equals",
+                        condition_target_key: target,
+                    },
+                )
+                provisional = _build_node(
+                    node_identity,
                     source_observation_projection_hash=observation.projection_hash,
                     entity_type=mission.scope,
-                    preconditions=(
-                        {"type": f"{condition_prefix}_unselected"},
-                        {
-                            "type": f"{condition_prefix}_available",
-                            condition_target_key: target,
-                        },
+                    preconditions=preconditions,
+                    postconditions=postconditions,
+                    risk=RiskLevel.LOW,
+                    requires_confirmation=_requires_confirmation(
+                        action_type,
+                        mode=mode,
+                        auto_action_types=auto_action_types,
                     ),
-                    postconditions=(
-                        {
-                            "type": f"{condition_prefix}_equals",
-                            condition_target_key: target,
-                        },
-                    ),
-                    risk=RiskLevel.LOW.value,
-                    requires_confirmation=requires_confirmation,
                     reason=(
                         f"Execute the active StrategicContract {mission.scope} Mission."
                     ),
-                    idempotency_key=f"turn-action:{node_id}",
-                    **node_identity,
                 )
                 return provisional, unavailable_target
         return None, unavailable_target
@@ -301,6 +369,7 @@ class TurnCompiler:
         *,
         mode: ExecutionMode,
         auto_action_types: set[str],
+        allowed_action_types: set[str],
     ) -> tuple[TurnActionNode | None, str | None]:
         plan = settler_mission_plan(mission)
         unit_id = str(plan["unit_id"])
@@ -358,10 +427,10 @@ class TurnCompiler:
             if at_target
             else (
                 {
-                    "type": "unit_moved_from",
+                    "type": "unit_at",
                     "unit_id": plan["unit_id"],
-                    "x": x,
-                    "y": y,
+                    "x": target_x,
+                    "y": target_y,
                 },
             )
         )
@@ -378,21 +447,21 @@ class TurnCompiler:
             "arguments": arguments,
             "target_turn": observation.turn_number,
         }
-        node_id = build_turn_action_node_id(**node_identity)
-        node = TurnActionNode(
-            node_id=node_id,
-            graph_id="pending",
+        if action_type not in allowed_action_types:
+            return None, f"action_not_allowed:{action_type}"
+        node = _build_node(
+            node_identity,
             source_observation_projection_hash=observation.projection_hash,
             entity_type="unit",
             preconditions=tuple(preconditions),
             postconditions=postconditions,
-            risk=RiskLevel.HIGH.value,
-            requires_confirmation=(
-                mode is not ExecutionMode.AUTO or action_type not in auto_action_types
+            risk=RiskLevel.HIGH,
+            requires_confirmation=_requires_confirmation(
+                action_type,
+                mode=mode,
+                auto_action_types=auto_action_types,
             ),
             reason="Advance the active settlement Mission using fresh game facts.",
-            idempotency_key=f"turn-action:{node_id}",
-            **node_identity,
         )
         return node, None
 
@@ -404,6 +473,7 @@ class TurnCompiler:
         *,
         mode: ExecutionMode,
         auto_action_types: set[str],
+        allowed_action_types: set[str],
     ) -> tuple[TurnActionNode | None, str | None]:
         policy = city_roles_mission_plan(mission)
         unavailable = self.unavailable_target(observation, mission)
@@ -439,35 +509,37 @@ class TurnCompiler:
                 "arguments": arguments,
                 "target_turn": observation.turn_number,
             }
-            node_id = build_turn_action_node_id(**node_identity)
-            node = TurnActionNode(
-                node_id=node_id,
-                graph_id="pending",
+            action_type = "city_set_production"
+            if action_type not in allowed_action_types:
+                return None, f"action_not_allowed:{action_type}"
+            preconditions = (
+                {
+                    "type": "entity_exists",
+                    "entity_type": "city",
+                    "entity_id": city_id,
+                },
+                {"type": "city_has_no_production", "city_id": city_id},
+            )
+            postconditions = (
+                {
+                    "type": "city_production_equals",
+                    "city_id": city_id,
+                    "item_name": item["item_name"],
+                },
+            )
+            node = _build_node(
+                node_identity,
                 source_observation_projection_hash=observation.projection_hash,
                 entity_type="city",
-                preconditions=(
-                    {
-                        "type": "entity_exists",
-                        "entity_type": "city",
-                        "entity_id": city_id,
-                    },
-                    {"type": "city_has_no_production", "city_id": city_id},
-                ),
-                postconditions=(
-                    {
-                        "type": "city_production_equals",
-                        "city_id": city_id,
-                        "item_name": item["item_name"],
-                    },
-                ),
-                risk=RiskLevel.LOW.value,
-                requires_confirmation=(
-                    mode is not ExecutionMode.AUTO
-                    or "city_set_production" not in auto_action_types
+                preconditions=preconditions,
+                postconditions=postconditions,
+                risk=RiskLevel.LOW,
+                requires_confirmation=_requires_confirmation(
+                    action_type,
+                    mode=mode,
+                    auto_action_types=auto_action_types,
                 ),
                 reason="Advance the active city-role production policy.",
-                idempotency_key=f"turn-action:{node_id}",
-                **node_identity,
             )
             return node, None
         return None, None
@@ -480,6 +552,7 @@ class TurnCompiler:
         *,
         mode: ExecutionMode,
         auto_action_types: set[str],
+        allowed_action_types: set[str],
     ) -> tuple[TurnActionNode | None, str | None]:
         plan = tactical_emergency_mission_order(mission)
         unavailable = self.unavailable_target(observation, mission)
@@ -543,22 +616,75 @@ class TurnCompiler:
             "arguments": arguments,
             "target_turn": int(plan["target_turn"]),
         }
-        node_id = build_turn_action_node_id(**node_identity)
-        node = TurnActionNode(
-            node_id=node_id,
-            graph_id="pending",
+        if action_type not in allowed_action_types:
+            return None, f"action_not_allowed:{action_type}"
+        node = _build_node(
+            node_identity,
             source_observation_projection_hash=observation.projection_hash,
             entity_type="unit",
             preconditions=tuple(preconditions),
             postconditions=tuple(postconditions),
-            risk=RiskLevel.HIGH.value,
+            risk=RiskLevel.HIGH,
             requires_confirmation=True,
             reason=(
                 "Execute the reviewed tactical/emergency unit response for "
                 f"turn {plan['target_turn']}."
             ),
-            idempotency_key=f"turn-action:{node_id}",
-            **node_identity,
+        )
+        return node, None
+
+    def _compile_diplomacy_trade_node(
+        self,
+        observation: NormalizedObservation,
+        contract: StrategicContract,
+        mission: Mission,
+        *,
+        mode: ExecutionMode,
+        auto_action_types: set[str],
+        allowed_action_types: set[str],
+    ) -> tuple[TurnActionNode | None, str | None]:
+        policy = diplomacy_trade_mission_policy(mission)
+        target_player_id = policy.get("envoy_player_id")
+        if target_player_id is None:
+            return None, None
+        blocker_kind = "ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN"
+        if not any(
+            blocker.blocker_type == blocker_kind for blocker in observation.blockers
+        ):
+            return None, None
+        node_identity = {
+            "game_session_id": observation.game_session_id,
+            "turn_number": observation.turn_number,
+            "source_observation_id": observation.observation_id,
+            "source_contract_id": contract.contract_id,
+            "source_contract_revision": contract.revision,
+            "source_mission_id": mission.mission_id,
+            "source_mission_revision": mission.mission_revision,
+            "action_type": "send_envoy",
+            "entity_id": str(target_player_id),
+            "arguments": {"player_id": target_player_id},
+            "target_turn": observation.turn_number,
+        }
+        action_type = "send_envoy"
+        if action_type not in allowed_action_types:
+            return None, f"action_not_allowed:{action_type}"
+        preconditions = (
+            {"type": "blocker_kind_present", "blocker_kind": blocker_kind},
+        )
+        postconditions = ({"type": "no_blocker_kind", "blocker_kind": blocker_kind},)
+        node = _build_node(
+            node_identity,
+            source_observation_projection_hash=observation.projection_hash,
+            entity_type="city_state",
+            preconditions=preconditions,
+            postconditions=postconditions,
+            risk=RiskLevel.HIGH,
+            requires_confirmation=_requires_confirmation(
+                action_type,
+                mode=mode,
+                auto_action_types=auto_action_types,
+            ),
+            reason="Send one reviewed envoy to clear the current turn blocker.",
         )
         return node, None
 

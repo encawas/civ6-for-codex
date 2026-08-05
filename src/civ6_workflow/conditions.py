@@ -15,6 +15,33 @@ from .observation_normalization import (
 ObservationInput = RuntimeSnapshot | NormalizedRuntimeObservation
 
 
+CONDITION_REQUIRED_FACTS: dict[str, tuple[str, ...]] = {
+    "no_blocker_type": ("blockers",),
+    "blocker_kind_present": ("blockers",),
+    "no_blocker_kind": ("blockers",),
+    "city_production_equals": ("cities",),
+    "city_has_no_production": ("cities",),
+    "city_count_at_least": ("cities",),
+    "city_at_target": ("cities",),
+    "tile_unoccupied": ("cities",),
+    "research_unselected": ("current_research",),
+    "research_available": ("available_research",),
+    "research_equals": ("current_research",),
+    "civic_unselected": ("current_civic",),
+    "civic_available": ("available_civics",),
+    "civic_equals": ("current_civic",),
+    "unit_at": ("units",),
+    "unit_has_moves": ("units",),
+    "unit_no_moves": ("units",),
+    "unit_has_build_charge": ("units",),
+    "unit_build_charges_equals": ("units",),
+    "unit_can_improve": ("units",),
+    "unit_type_contains": ("units",),
+    "unit_moved_from": ("units",),
+    "unit_absent": ("units",),
+}
+
+
 @dataclass(slots=True)
 class ConditionResult:
     valid: bool
@@ -33,9 +60,17 @@ class ConditionEvaluator:
         decision_projection: Mapping[str, Any] | None = None,
     ) -> ConditionResult:
         observation = self._normalize(snapshot)
+        compatibility_projection = (
+            observation.snapshot.model_dump(mode="json")
+            if any(_uses_field_projection(condition) for condition in conditions)
+            else None
+        )
         for condition in conditions:
             result = self._evaluate_normalized(
-                condition, observation, decision_projection=decision_projection
+                condition,
+                observation,
+                decision_projection=decision_projection,
+                compatibility_projection=compatibility_projection,
             )
             if not result.valid:
                 return result
@@ -48,10 +83,17 @@ class ConditionEvaluator:
         *,
         decision_projection: Mapping[str, Any] | None = None,
     ) -> ConditionResult:
+        observation = self._normalize(snapshot)
+        compatibility_projection = (
+            observation.snapshot.model_dump(mode="json")
+            if _uses_field_projection(condition)
+            else None
+        )
         return self._evaluate_normalized(
             condition,
-            self._normalize(snapshot),
+            observation,
             decision_projection=decision_projection,
+            compatibility_projection=compatibility_projection,
         )
 
     @staticmethod
@@ -66,9 +108,22 @@ class ConditionEvaluator:
         observation: NormalizedRuntimeObservation,
         *,
         decision_projection: Mapping[str, Any] | None = None,
+        compatibility_projection: Mapping[str, Any] | None = None,
     ) -> ConditionResult:
         normalized_snapshot = observation.snapshot
         kind = condition.get("type")
+        if kind != "all_of":
+            missing = [
+                fact
+                for fact in _required_facts(condition)
+                if not bool(getattr(observation.canonical.completeness, fact))
+            ]
+            if missing:
+                return ConditionResult(
+                    False,
+                    "condition evidence unavailable: " + ", ".join(sorted(missing)),
+                    known=False,
+                )
         if kind == "all_of":
             nested = condition.get("conditions")
             if not isinstance(nested, (list, tuple)) or not nested:
@@ -82,6 +137,7 @@ class ConditionEvaluator:
                     dict(item),
                     observation,
                     decision_projection=decision_projection,
+                    compatibility_projection=compatibility_projection,
                 )
                 if not result.valid:
                     return result
@@ -108,10 +164,25 @@ class ConditionEvaluator:
             return ConditionResult(
                 not present, f"blocker {blocker_type} is currently present"
             )
+        if kind in {"blocker_kind_present", "no_blocker_kind"}:
+            blocker_kind = str(condition["blocker_kind"]).strip().upper()
+            present = any(
+                blocker.blocker_type == blocker_kind
+                for blocker in observation.canonical.blockers
+            )
+            expected = kind == "blocker_kind_present"
+            return ConditionResult(
+                present is expected,
+                (
+                    f"blocker kind {blocker_kind} is not present"
+                    if expected
+                    else f"blocker kind {blocker_kind} is still present"
+                ),
+            )
         if kind == "field_equals":
             path = str(condition["path"])
             expected = condition.get("value")
-            actual = self._get_path(normalized_snapshot.model_dump(mode="json"), path)
+            actual = self._get_path(compatibility_projection or {}, path)
             return ConditionResult(
                 actual == expected,
                 f"field {path} expected {expected!r}, got {actual!r}",
@@ -119,7 +190,7 @@ class ConditionEvaluator:
         if kind == "field_in":
             path = str(condition["path"])
             allowed = condition.get("values", [])
-            actual = self._get_path(normalized_snapshot.model_dump(mode="json"), path)
+            actual = self._get_path(compatibility_projection or {}, path)
             return ConditionResult(
                 actual in allowed,
                 f"field {path} value {actual!r} is not in {allowed!r}",
@@ -140,6 +211,12 @@ class ConditionEvaluator:
             city = observation.canonical.city(city_id)
             if city is None:
                 return ConditionResult(False, f"city {city_id} does not exist")
+            if city.production.state is SlotState.NOT_LOADED:
+                return ConditionResult(
+                    False,
+                    "condition evidence unavailable: city production",
+                    known=False,
+                )
             actual = city.production.value
             return ConditionResult(
                 actual == expected,
@@ -150,6 +227,12 @@ class ConditionEvaluator:
             city = observation.canonical.city(city_id)
             if city is None:
                 return ConditionResult(False, f"city {city_id} does not exist")
+            if city.production.state is SlotState.NOT_LOADED:
+                return ConditionResult(
+                    False,
+                    "condition evidence unavailable: city production",
+                    known=False,
+                )
             empty = city.production.state is SlotState.EMPTY
             return ConditionResult(
                 empty,
@@ -157,12 +240,22 @@ class ConditionEvaluator:
             )
         if kind == "research_unselected":
             slot = observation.canonical.progression.current_research
+            if slot.state is SlotState.NOT_LOADED:
+                return ConditionResult(
+                    False,
+                    "condition evidence unavailable: current research",
+                    known=False,
+                )
             return ConditionResult(
                 slot.state is SlotState.EMPTY,
                 f"research is already selected: {slot.value!r}",
             )
         if kind == "civic_unselected":
             slot = observation.canonical.progression.current_civic
+            if slot.state is SlotState.NOT_LOADED:
+                return ConditionResult(
+                    False, "condition evidence unavailable: current civic", known=False
+                )
             return ConditionResult(
                 slot.state is SlotState.EMPTY,
                 f"civic is already selected: {slot.value!r}",
@@ -203,94 +296,95 @@ class ConditionEvaluator:
             )
         if kind == "unit_at":
             unit_id = str(condition["unit_id"])
-            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
+            unit = observation.canonical.unit(unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
-            expected_x = int(condition["x"])
-            expected_y = int(condition["y"])
-            actual = (unit.get("x"), unit.get("y"))
+            if unit.x is None or unit.y is None:
+                return _unknown("unit position")
+            expected = (int(condition["x"]), int(condition["y"]))
+            actual = (unit.x, unit.y)
             return ConditionResult(
-                actual == (expected_x, expected_y),
-                f"unit {unit_id} expected at {(expected_x, expected_y)}, got {actual}",
+                actual == expected,
+                f"unit {unit_id} expected at {expected}, got {actual}",
             )
         if kind in {"unit_has_moves", "unit_no_moves"}:
             unit_id = str(condition["unit_id"])
-            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
+            unit = observation.canonical.unit(unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
-            moves = _unit_moves(unit)
+            if unit.moves_remaining is None:
+                return _unknown("unit moves")
             if kind == "unit_has_moves":
                 return ConditionResult(
-                    moves > 0,
-                    f"unit {unit_id} has no moves remaining ({moves})",
+                    unit.moves_remaining > 0,
+                    f"unit {unit_id} has no moves remaining ({unit.moves_remaining})",
                 )
             return ConditionResult(
-                moves <= 0,
-                f"unit {unit_id} still has {moves} moves remaining",
+                unit.moves_remaining <= 0,
+                f"unit {unit_id} still has {unit.moves_remaining} moves remaining",
             )
-        if kind == "unit_has_build_charge":
+        if kind in {"unit_has_build_charge", "unit_build_charges_equals"}:
             unit_id = str(condition["unit_id"])
-            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
+            unit = observation.canonical.unit(unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
-            charges = int(unit.get("build_charges", 0) or 0)
-            return ConditionResult(charges > 0, f"unit {unit_id} has no build charges")
-        if kind == "unit_build_charges_equals":
-            unit_id = str(condition["unit_id"])
+            if unit.build_charges is None:
+                return _unknown("unit build charges")
+            if kind == "unit_has_build_charge":
+                return ConditionResult(
+                    unit.build_charges > 0,
+                    f"unit {unit_id} has no build charges",
+                )
             expected = int(condition["charges"])
-            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
-            if unit is None:
-                return ConditionResult(False, f"unit {unit_id} does not exist")
-            actual = int(unit.get("build_charges", 0) or 0)
             return ConditionResult(
-                actual == expected,
-                f"unit {unit_id} charges expected {expected}, got {actual}",
+                unit.build_charges == expected,
+                (
+                    f"unit {unit_id} charges expected {expected}, "
+                    f"got {unit.build_charges}"
+                ),
             )
         if kind == "unit_can_improve":
             unit_id = str(condition["unit_id"])
-            improvement = str(condition["improvement_type"])
-            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
+            improvement = str(condition["improvement_type"]).strip().upper()
+            unit = observation.canonical.unit(unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
-            valid = unit.get("valid_improvements", []) or []
             return ConditionResult(
-                improvement in valid,
-                f"unit {unit_id} cannot build {improvement}; valid={valid}",
+                improvement in unit.valid_improvements,
+                (
+                    f"unit {unit_id} cannot build {improvement}; "
+                    f"valid={list(unit.valid_improvements)}"
+                ),
             )
         if kind == "unit_type_contains":
             unit_id = str(condition["unit_id"])
             marker = str(condition["marker"]).upper()
-            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
-            actual = (
-                ""
-                if unit is None
-                else str(unit.get("unit_type", unit.get("type", ""))).upper()
-            )
+            unit = observation.canonical.unit(unit_id)
+            actual = "" if unit is None else unit.unit_type
             return ConditionResult(
                 marker in actual,
                 f"unit {unit_id} type {actual!r} does not contain {marker!r}",
             )
         if kind == "unit_moved_from":
             unit_id = str(condition["unit_id"])
-            unit = find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
+            unit = observation.canonical.unit(unit_id)
             if unit is None:
                 return ConditionResult(False, f"unit {unit_id} does not exist")
+            if unit.x is None or unit.y is None:
+                return _unknown("unit position")
             original = (int(condition["x"]), int(condition["y"]))
-            current = (unit.get("x"), unit.get("y"))
+            current = (unit.x, unit.y)
             return ConditionResult(
                 current != original,
                 f"unit {unit_id} did not move from {original}; current={current}",
             )
         if kind == "unit_absent":
             unit_id = str(condition["unit_id"])
-            absent = (
-                find_entity(normalized_snapshot.units, ("unit_id", "id"), unit_id)
-                is None
-            )
+            absent = observation.canonical.unit(unit_id) is None
             return ConditionResult(absent, f"unit {unit_id} still exists")
         if kind == "city_count_at_least":
             expected = int(condition["count"])
-            actual = len(_rows(normalized_snapshot.cities))
+            actual = len(observation.canonical.cities)
             return ConditionResult(
                 actual >= expected,
                 f"city count {actual} is below required {expected}",
@@ -345,13 +439,15 @@ class ConditionEvaluator:
             expected = (int(condition["x"]), int(condition["y"]))
             owner = condition.get("owner")
             matches = [
-                row
-                for row in _rows(normalized_snapshot.cities)
-                if (row.get("x"), row.get("y")) == expected
+                city
+                for city in observation.canonical.cities
+                if (city.values.get("x"), city.values.get("y")) == expected
             ]
             if owner is not None:
                 matches = [
-                    row for row in matches if str(row.get("owner")) == str(owner)
+                    city
+                    for city in matches
+                    if str(city.values.get("owner")) == str(owner)
                 ]
             return ConditionResult(
                 bool(matches),
@@ -484,6 +580,43 @@ class ConditionEvaluator:
             else:
                 return None
         return current
+
+
+def _required_facts(condition: Mapping[str, Any]) -> tuple[str, ...]:
+    kind = str(condition.get("type"))
+    if kind == "entity_exists":
+        return {
+            "city": ("cities",),
+            "unit": ("units",),
+            "builder": ("units",),
+            "research": ("available_research",),
+            "civic": ("available_civics",),
+        }.get(str(condition.get("entity_type")), ())
+    if kind in {"field_equals", "field_in"}:
+        root = str(condition.get("path", "")).split(".", 1)[0]
+        return {
+            "cities": ("cities",),
+            "units": ("units",),
+            "blockers": ("blockers",),
+        }.get(root, ())
+    return CONDITION_REQUIRED_FACTS.get(kind, ())
+
+
+def _uses_field_projection(condition: Mapping[str, Any]) -> bool:
+    if condition.get("type") in {"field_equals", "field_in"}:
+        return True
+    nested = condition.get("conditions")
+    return isinstance(nested, (list, tuple)) and any(
+        isinstance(item, Mapping) and _uses_field_projection(item) for item in nested
+    )
+
+
+def _unknown(fact: str) -> ConditionResult:
+    return ConditionResult(
+        valid=False,
+        known=False,
+        reason=f"condition evidence unavailable: {fact}",
+    )
 
 
 def extract_known_entities(

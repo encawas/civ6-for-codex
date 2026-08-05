@@ -10,9 +10,11 @@ from .approvals import (
     StrategicProposalApprovalRecord,
 )
 from .attempts import (
+    SUPPORTED_POSTCONDITION_VERSION,
     UNRESOLVED_ATTEMPT_STATUSES,
     ActionAttempt,
     AttemptStatus,
+    VerificationEvidence,
     VerificationStatus,
 )
 from .action_graph import (
@@ -229,6 +231,7 @@ __all__ = [
     "InformationRequestedTick",
     "InformationCollectedTick",
     "WORKFLOW_TICK_ADAPTER",
+    "SUPPORTED_POSTCONDITION_VERSION",
     "ActionAttempt",
     "AttemptReconciledTick",
     "AttemptRecoveredTick",
@@ -299,6 +302,7 @@ __all__ = [
     "UnitActionState",
     "UnitDetailReason",
     "UnitSummary",
+    "VerificationEvidence",
     "VerificationStatus",
     "WorkflowTick",
     "build_task_idempotency_key",

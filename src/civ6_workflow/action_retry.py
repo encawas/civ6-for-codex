@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from .domain import ActionAttempt, AttemptStatus, RetryClassification
 from .models import MutationDeliveryStatus, TaskStatus
-from .verification import VerificationEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,18 +44,16 @@ def resolve_failed_attempt(
         if attempt.tool_result is None
         else attempt.tool_result.get("delivery_status")
     )
-    proven_not_sent = MutationDeliveryStatus.PROVEN_NOT_SENT.value in {
-        transport_delivery_status,
-        tool_delivery_status,
-    }
-    explicit_non_commit = (
-        attempt.transport_result is not None
-        and attempt.transport_result.get("verification_evidence")
-        == VerificationEvidence.EXPLICIT_NON_COMMIT_EVIDENCE.value
+    proven_not_committed = bool(
+        {
+            MutationDeliveryStatus.PROVEN_NOT_SENT.value,
+            MutationDeliveryStatus.EXPLICITLY_REJECTED.value,
+        }
+        & {transport_delivery_status, tool_delivery_status}
     )
     retry_eligible = (
         attempt.retry_classification is RetryClassification.SAFE_IF_PROVEN_NOT_SENT
-        and (proven_not_sent or explicit_non_commit)
+        and proven_not_committed
     )
     if not retry_eligible:
         return FailedAttemptResolution(
@@ -68,13 +65,13 @@ def resolve_failed_attempt(
             ),
         )
 
-    next_retry_count = retry_count if retry_count >= max_retries else retry_count + 1
-    if next_retry_count >= max_retries:
+    if retry_count >= max_retries:
         return FailedAttemptResolution(
             task_status=TaskStatus.ESCALATED,
-            retry_count=next_retry_count,
+            retry_count=retry_count,
             reason="safe retry limit reached",
         )
+    next_retry_count = retry_count + 1
     return FailedAttemptResolution(
         task_status=TaskStatus.READY,
         retry_count=next_retry_count,

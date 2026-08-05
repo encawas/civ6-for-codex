@@ -3,12 +3,15 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 
 def _load_installer():
-    script = Path(__file__).resolve().parents[1] / "scripts" / "apply_upstream_overlay.py"
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "apply_upstream_overlay.py"
+    )
     spec = importlib.util.spec_from_file_location("apply_upstream_overlay", script)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -46,6 +49,13 @@ def _fake_checkout(tmp_path: Path, *, host: str = "127.0.0.1") -> Path:
         "    main()\n",
         encoding="utf-8",
     )
+    (source / "game_launcher.py").write_text(
+        "def is_game_running(name, r):\n"
+        "            if name.lower() in r.stdout.lower():\n"
+        "                return True\n"
+        "            return False\n",
+        encoding="utf-8",
+    )
     return source
 
 
@@ -54,24 +64,40 @@ def test_overlay_installer_is_idempotent(tmp_path: Path):
     source = _fake_checkout(tmp_path)
     web_api = source / "web_api.py"
     server = source / "server.py"
+    launcher = source / "game_launcher.py"
 
     module.apply_overlay(tmp_path)
     first_web = web_api.read_text(encoding="utf-8")
     first_server = server.read_text(encoding="utf-8")
+    first_launcher = launcher.read_text(encoding="utf-8")
     module.apply_overlay(tmp_path)
     second_web = web_api.read_text(encoding="utf-8")
     second_server = server.read_text(encoding="utf-8")
+    second_launcher = launcher.read_text(encoding="utf-8")
 
     assert first_web == second_web
     assert first_server == second_server
-    assert first_web.count("from civ_mcp.workflow_api import mount_workflow_routes") == 1
+    assert first_launcher == second_launcher
+    assert (
+        first_web.count("from civ_mcp.workflow_api import mount_workflow_routes") == 1
+    )
     assert first_web.count("mount_workflow_routes(app)") == 1
     assert "access_log=False" in first_server
     assert "log_config=None" in first_server
     assert 'log_level="warning"' in first_server
+    assert 'name.lower() in (r.stdout or "").lower()' in first_launcher
+    namespace = {}
+    exec(first_launcher, namespace)
+    assert (
+        namespace["is_game_running"](
+            "CivilizationVI_DX12.exe", SimpleNamespace(stdout=None)
+        )
+        is False
+    )
     assert (source / "workflow_api.py").exists()
     assert web_api.with_suffix(".py.workflow-backup").exists()
     assert server.with_suffix(".py.workflow-backup").exists()
+    assert launcher.with_suffix(".py.workflow-backup").exists()
     module.apply_overlay(tmp_path, check_only=True)
 
 

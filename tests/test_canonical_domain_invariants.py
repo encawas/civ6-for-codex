@@ -24,6 +24,7 @@ from civ6_workflow.domain import (
     Task,
     TaskStatus,
     TickOutcomeKind,
+    VerificationEvidence,
     VerificationStatus,
     build_task_idempotency_key,
     validate_workflow_tick,
@@ -216,7 +217,7 @@ def test_attempt_timestamps_are_monotonic(extra, message):
 def test_succeeded_attempt_requires_later_observation_and_passed_verification():
     """VER-001/VER-002: delivery acknowledgement cannot construct success."""
 
-    with pytest.raises(ValidationError, match="verification observation"):
+    with pytest.raises(ValidationError, match="complete verification evidence"):
         ActionAttempt(
             **(
                 _attempt_payload(AttemptStatus.SUCCEEDED)
@@ -234,6 +235,10 @@ def test_succeeded_attempt_requires_later_observation_and_passed_verification():
                 | {
                     "sent_at": NOW + timedelta(seconds=1),
                     "last_verification_observation_id": "obs-2",
+                    "last_verification_projection_hash": "a" * 64,
+                    "verification_evidence": VerificationEvidence.POSITIVE_COMMIT_EVIDENCE,
+                    "verification_reason": "test evidence",
+                    "verified_at": NOW + timedelta(seconds=2),
                     "verification_status": VerificationStatus.INCONCLUSIVE,
                 }
             )
@@ -249,6 +254,10 @@ def test_verified_succeeded_attempt_round_trips_with_immutable_evidence():
                 "response_received_at": NOW + timedelta(seconds=2),
                 "tool_result": {"accepted": True},
                 "last_verification_observation_id": "obs-2",
+                "last_verification_projection_hash": "a" * 64,
+                "verification_evidence": VerificationEvidence.POSITIVE_COMMIT_EVIDENCE,
+                "verification_reason": "test evidence",
+                "verified_at": NOW + timedelta(seconds=3),
                 "verification_status": VerificationStatus.PASSED,
             }
         )

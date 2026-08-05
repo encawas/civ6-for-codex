@@ -5,7 +5,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from civ6_workflow.actions import resolve_action_spec
+from civ6_workflow.actions import (
+    build_action_attempt_idempotency_key,
+    resolve_action_spec,
+)
 from civ6_workflow.domain import (
     ActionAttempt,
     ApprovalStatus,
@@ -23,6 +26,7 @@ from civ6_workflow.domain import (
     StrategicContract,
     StrategicContractCommit,
     SubjectRef,
+    VerificationEvidence,
     VerificationStatus,
     build_strategic_contract_id,
     thaw_json,
@@ -92,7 +96,7 @@ def _observation(
                     "owner": owner,
                     "x": 1,
                     "y": 1,
-                    "production": production,
+                    "currently_building": production,
                 }
             ],
             tech_civics={
@@ -227,6 +231,7 @@ def _compile_activate(store, observation, contract):
 
 def _finalize(store, task, observation_id: str, suffix: str):
     spec = resolve_action_spec(task.action_type)
+    normalized_arguments = spec.build_arguments(task)
     prepared = ActionAttempt(
         action_attempt_id=f"attempt-city-{suffix}",
         game_session_id=GAME_ID,
@@ -234,30 +239,37 @@ def _finalize(store, task, observation_id: str, suffix: str):
         action_type=task.action_type,
         attempt_number=1,
         request_id=f"request-city-{suffix}",
-        idempotency_key=f"city-role:{suffix}",
+        idempotency_key=build_action_attempt_idempotency_key(
+            task, normalized_arguments
+        ),
         prepared_from_observation_id=task.created_from_observation_id,
-        prepared_at=NOW + timedelta(minutes=3),
+        prepared_at=NOW,
         status=AttemptStatus.PREPARED,
         retry_classification=spec.retry_classification,
-        normalized_arguments=spec.build_arguments(task),
+        normalized_arguments=normalized_arguments,
         postconditions=tuple(task.postconditions),
     )
     store.save_action_attempt(prepared)
     uncertain = prepared.model_copy(
         update={
             "status": AttemptStatus.UNCERTAIN,
-            "sent_at": NOW + timedelta(minutes=3),
+            "sent_at": NOW,
             "transport_result": {"phase": "delivery_started"},
         }
     )
     store.update_action_attempt(uncertain)
+    observation = store.get_normalized_observation(observation_id)
     succeeded = uncertain.model_copy(
         update={
             "status": AttemptStatus.SUCCEEDED,
-            "response_received_at": NOW + timedelta(minutes=3),
+            "response_received_at": NOW,
             "tool_result": {"success": True},
             "verification_status": VerificationStatus.PASSED,
             "last_verification_observation_id": observation_id,
+            "last_verification_projection_hash": observation.projection_hash,
+            "verification_evidence": VerificationEvidence.POSITIVE_COMMIT_EVIDENCE,
+            "verification_reason": "test postconditions satisfied",
+            "verified_at": observation.observed_at,
             "verification_count": 1,
         }
     )

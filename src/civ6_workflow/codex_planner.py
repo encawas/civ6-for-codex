@@ -12,6 +12,7 @@ from .ports import Planner as Planner
 from .workflow_prompt import EXTENDED_SYSTEM_INSTRUCTIONS
 from .workflow_protocol import (
     WorkflowAgentRequest as AgentRequest,
+    planner_response_json_schema_for_request,
     planner_response_model_for_request,
 )
 
@@ -153,10 +154,12 @@ class CodexPlanner:
         schema_path = request_dir / "plan.schema.json"
         output_path = request_dir / "plan.json"
         prompt_path = request_dir / "request.txt"
-        response_model = planner_response_model_for_request(request)
+        planner_response_model_for_request(request)
         schema_path.write_text(
             json.dumps(
-                response_model.model_json_schema(), ensure_ascii=False, indent=2
+                planner_response_json_schema_for_request(request),
+                ensure_ascii=False,
+                indent=2,
             ),
             encoding="utf-8",
         )

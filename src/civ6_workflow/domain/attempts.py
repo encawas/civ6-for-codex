@@ -36,6 +36,18 @@ class VerificationStatus(StrEnum):
     PASSED = "PASSED"
 
 
+class VerificationEvidence(StrEnum):
+    POSITIVE_COMMIT_EVIDENCE = "POSITIVE_COMMIT_EVIDENCE"
+    CURRENT_STATE_DOES_NOT_SHOW_EFFECT = "CURRENT_STATE_DOES_NOT_SHOW_EFFECT"
+    EXPLICIT_NON_COMMIT_EVIDENCE = "EXPLICIT_NON_COMMIT_EVIDENCE"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    CONFLICTING_STATE = "CONFLICTING_STATE"
+    IMPOSSIBLE_POSTCONDITION = "IMPOSSIBLE_POSTCONDITION"
+
+
+SUPPORTED_POSTCONDITION_VERSION = 1
+
+
 class ActionAttempt(DomainModel):
     action_attempt_id: str
     task_id: str
@@ -49,10 +61,17 @@ class ActionAttempt(DomainModel):
     status: AttemptStatus
     retry_classification: RetryClassification
     normalized_arguments: ImmutableJsonObject
+    authorization_evidence: ImmutableJsonObject = Field(default_factory=dict)
     transport_result: ImmutableJsonObject | None = None
     tool_result: ImmutableJsonObject | None = None
     verification_status: VerificationStatus | None = None
     last_verification_observation_id: str | None = None
+    last_verification_projection_hash: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
+    verification_evidence: VerificationEvidence | None = None
+    verification_reason: str | None = None
+    verified_at: datetime | None = None
     parent_attempt_id: str | None = None
     game_session_id: str | None = None
     action_type: str | None = None
@@ -71,6 +90,10 @@ class ActionAttempt(DomainModel):
                 self.tool_result,
                 self.verification_status,
                 self.last_verification_observation_id,
+                self.last_verification_projection_hash,
+                self.verification_evidence,
+                self.verification_reason,
+                self.verified_at,
             )
             if any(value is not None for value in evidence):
                 raise ValueError("a prepared attempt cannot contain delivery evidence")
@@ -85,6 +108,10 @@ class ActionAttempt(DomainModel):
                     self.tool_result,
                     self.verification_status,
                     self.last_verification_observation_id,
+                    self.last_verification_projection_hash,
+                    self.verification_evidence,
+                    self.verification_reason,
+                    self.verified_at,
                 )
             ):
                 raise ValueError(
@@ -103,12 +130,26 @@ class ActionAttempt(DomainModel):
             raise ValueError(f"{self.status} requires sent_at")
 
         if self.status is AttemptStatus.SUCCEEDED:
-            if self.last_verification_observation_id is None:
+            if any(
+                value is None
+                for value in (
+                    self.last_verification_observation_id,
+                    self.last_verification_projection_hash,
+                    self.verification_evidence,
+                    self.verification_reason,
+                    self.verified_at,
+                )
+            ):
                 raise ValueError(
-                    "a succeeded attempt requires a verification observation"
+                    "a succeeded attempt requires complete verification evidence"
                 )
             if self.verification_status is not VerificationStatus.PASSED:
                 raise ValueError("a succeeded attempt requires passed verification")
+            if (
+                self.verification_evidence
+                is not VerificationEvidence.POSITIVE_COMMIT_EVIDENCE
+            ):
+                raise ValueError("a succeeded attempt requires positive evidence")
         elif self.verification_status is VerificationStatus.PASSED:
             raise ValueError("passed verification requires succeeded attempt status")
 
@@ -116,6 +157,17 @@ class ActionAttempt(DomainModel):
             raise ValueError("response_received_at requires sent_at")
         if self.last_verification_observation_id is not None and self.sent_at is None:
             raise ValueError("verification evidence requires sent_at")
+        verification_facts = (
+            self.last_verification_observation_id,
+            self.last_verification_projection_hash,
+            self.verification_evidence,
+            self.verification_reason,
+            self.verified_at,
+        )
+        if any(value is not None for value in verification_facts) and not all(
+            value is not None for value in verification_facts
+        ):
+            raise ValueError("verification evidence must be all present or all null")
         if self.parent_attempt_id == self.action_attempt_id:
             raise ValueError("an attempt cannot be its own parent")
         if self.action_type == "end_turn" and self.pre_send_turn is None:
@@ -130,6 +182,12 @@ class ActionAttempt(DomainModel):
                 and self.response_received_at < self.sent_at
             ):
                 raise ValueError("response_received_at must not precede sent_at")
+            if (
+                self.verified_at is not None
+                and self.sent_at is not None
+                and self.verified_at < self.sent_at
+            ):
+                raise ValueError("verified_at must not precede sent_at")
         except TypeError as exc:
             raise ValueError(
                 "attempt timestamps must use compatible timezones"
