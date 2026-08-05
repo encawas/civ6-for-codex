@@ -1,0 +1,95 @@
+{
+  "source_head": "c2f56f0bca007bc0aadc466abedff4531688a8e7",
+  "scenario": "approved research Mission selects Writing, verifies it, sends end_turn, and verifies the turn increment",
+  "proposal_application_tick": "StrategicProposalAppliedTick",
+  "runtime_ticks": [
+    {
+      "runtime_tick": 1,
+      "observed_turn": 1,
+      "outcome": "MUTATION_SENT",
+      "runtime_state": "ACTION_SENT",
+      "executed_task_ids": [],
+      "turn_ended": false,
+      "paused": false,
+      "mutation_count": 1
+    },
+    {
+      "runtime_tick": 2,
+      "observed_turn": 1,
+      "outcome": "ATTEMPT_RECONCILED",
+      "runtime_state": "ROUTING",
+      "executed_task_ids": [
+        "turn_action_node_eaecb2d5d17fb3ebf2d99833"
+      ],
+      "turn_ended": false,
+      "paused": false,
+      "mutation_count": 0
+    },
+    {
+      "runtime_tick": 3,
+      "observed_turn": 1,
+      "outcome": "TURN_TRANSITION_STARTED",
+      "runtime_state": "TURN_TRANSITIONING",
+      "executed_task_ids": [],
+      "turn_ended": false,
+      "paused": false,
+      "mutation_count": 1
+    },
+    {
+      "runtime_tick": 4,
+      "observed_turn": 2,
+      "outcome": "TURN_TRANSITION_CONFIRMED",
+      "runtime_state": "OBSERVING",
+      "executed_task_ids": [],
+      "turn_ended": true,
+      "paused": false,
+      "mutation_count": 0
+    }
+  ],
+  "mutations": [
+    {
+      "kind": "task",
+      "action_type": "set_research",
+      "arguments": {
+        "tech_or_civic": "TECH_WRITING"
+      }
+    },
+    {
+      "kind": "end_turn",
+      "from_turn": 1,
+      "reflections": {
+        "tactical": "Turn 1: 1 city(s), production 1:UNIT_SCOUT; 0 actionable unit(s).",
+        "strategic": "Research TECH_WRITING; civic EMPTY; 1 city(s) are active.",
+        "tooling": "No tool errors observed; current end-turn checks passed.",
+        "planning": "After transition, reobserve and continue approved work or route new blockers.",
+        "hypothesis": "If no new mandatory blocker appears, current research and production remain valid next turn."
+      }
+    }
+  ],
+  "final_game_turn": 2,
+  "final_runtime_state": "OBSERVING",
+  "active_contract_revision": 2,
+  "mission_statuses": {
+    "mission-research-writing": "COMPLETED"
+  },
+  "attempts": [
+    {
+      "action_type": "set_research",
+      "status": "SUCCEEDED",
+      "verification_status": "PASSED",
+      "verification_count": 1
+    },
+    {
+      "action_type": "end_turn",
+      "status": "SUCCEEDED",
+      "verification_status": "PASSED",
+      "verification_count": 1
+    }
+  ],
+  "tasks": [
+    {
+      "action_type": "set_research",
+      "status": "done"
+    }
+  ]
+}
